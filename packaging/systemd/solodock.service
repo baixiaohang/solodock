@@ -1,0 +1,44 @@
+[Unit]
+Description=SoloDock container deployment console
+Documentation=https://github.com/baixiaohang/solodock
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=solodock
+Group=solodock
+SupplementaryGroups=docker
+Environment=SOLODOCK_LISTEN_ADDR=127.0.0.1:8080
+Environment=RUST_LOG=solodock=info
+ExecStart=/usr/local/bin/solodock
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+
+StateDirectory=solodock
+StateDirectoryMode=0700
+RuntimeDirectory=solodock
+RuntimeDirectoryMode=0700
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+TasksMax=256
+LimitNOFILE=4096
+MemoryHigh=256M
+
+[Install]
+WantedBy=multi-user.target
