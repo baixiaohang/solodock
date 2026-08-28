@@ -53,8 +53,8 @@ MVP 必须：
 - 创建和管理多个单 service 应用；
 - 接受来自 GHCR、Docker Hub 和兼容 Registry 的预构建 OCI/Docker 镜像引用；
 - 支持私有 GHCR 拉取凭据；
-- 为每个应用配置环境变量、挂载配置文件、端口、volume、network 和一套容器健康策略；
-- 启动、停止、重启、部署、取消注册和移除应用容器，同时不删除 volume；
+- 为每个应用配置环境变量、挂载配置文件、端口、named volume、受限宿主路径 bind mount、network 和一套容器健康策略；
+- 启动、停止、重启、部署、取消注册和移除应用容器，同时不删除 volume 或 bind mount 数据；
 - 展示容器状态、有界日志流和实时 CPU/内存/网络统计；
 - 轮询配置的镜像 tag，并将其解析为不可变 digest；
 - 只按不可变 digest 部署；
@@ -77,7 +77,8 @@ MVP 不做：
 - 导入、扫描或接管任意已有 Compose 目录；
 - 暴露任意 Compose YAML 编辑器；
 - 提供浏览器 shell、宿主命令执行器、容器 exec 终端或自定义 Compose 参数；
-- 自动修改、备份、恢复、prune 或删除已有 volume；
+- 接受未由宿主配置预先授权的任意 bind mount 路径，或挂载宿主根目录、Docker socket 和其他敏感路径；
+- 自动修改、备份、恢复、prune 或删除已有 named volume，或创建、修改权限、备份、恢复、prune 或删除 bind mount 源目录；
 - 承诺零停机部署；
 - 回滚数据库 schema 或持久化数据；
 - 在断电后自动精确续跑到部署中断的 phase；
@@ -127,13 +128,19 @@ UI 对同一份规范环境变量数据提供两种视图：
 
 普通文件和 secret 文件使用不同的宿主目录与权限。secret 内容首次提交后只能通过 API 替换，不能读取。路径必须规范化，不得指向 Docker socket、宿主根目录或其他敏感宿主路径。
 
-### 5.4 端口、volume 与 network
+### 5.4 端口、volume、bind mount 与 network
 
 - 发布端口默认显式绑定 loopback，例如 `127.0.0.1:8000:8000`。
 - MVP 拒绝绑定非 loopback 宿主地址。
 - SoloDock 可以创建应用自有 named volume，也可以挂载显式指定的已有 named volume。
 - 已有 volume 视为 external，永不修改或删除。
 - 移除应用绝不向 Compose 传入 `-v`/`--volumes`。
+- 宿主配置通过 `allowed_bind_roots` 声明可以用于持久数据的目录根，例如 `/srv/solodock-data`；默认列表为空，即禁用宿主路径 bind mount。
+- 应用只能选择某个授权根目录下已经存在的子目录，并配置绝对的容器内目标路径。授权根、源目录和目标路径都必须规范化；源目录必须在每次 validate、preview 和 Compose mutation 前重新解析，并保持在授权根内。
+- 授权根和源目录不得是 symlink；包含 symlink、`..`、路径逃逸、Docker socket、宿主根目录或其他敏感宿主路径的输入一律拒绝。应用不得直接挂载整个授权根。
+- bind mount 默认只读；可读写挂载必须由用户显式选择并确认无法随 release 回滚的警告。配置文件继续使用 5.3 节的受管只读机制，不借用通用 bind mount 绕过 secret 和配额约束。
+- SoloDock 不创建 bind mount 源目录，不执行 `chown`/`chmod`，不修改、备份或删除其中内容。unregister、容器移除和应用删除都保留源目录及其数据。
+- named volume、bind mount 和受管配置文件的容器目标路径不得冲突。validate、deploy preview 和 deletion preview 必须展示规范化后的宿主源路径、容器目标路径和读写模式。
 - 每个应用拥有隔离的默认 network，也可挂载显式指定的已有 external network，以连接共享 PostgreSQL 等依赖。
 - 移除应用绝不删除 external network。
 
@@ -229,7 +236,7 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
 id, slug, display_name, project_name
 discovery_image_ref, credential_ref
 desired_state, auto_deploy_enabled, poll_interval
-ports[], volumes[], networks[]
+ports[], named_volumes[], bind_mounts[], networks[]
 health_policy
 active_release_id
 schema_version, created_at, updated_at
@@ -386,6 +393,7 @@ SupplementaryGroups=docker
 - 只提供固定生命周期动作和结构化配置字段；
 - 在破坏性操作前核对精确 Compose project name、Docker label 和实际对象 ID；
 - 绝不调用 shell，也不接受任意命令参数；
+- 宿主 bind mount 只允许来自管理员配置的根目录，默认禁用；每次 mutation 前重新校验规范路径、symlink 和敏感路径，并默认只读；
 - 应用和 Registry secret 不得进入日志、错误、审计 metadata、Compose 文件、进程参数或普通 API 响应；
 - 限制日志行长度、stream buffer、速率和并发连接数；
 - 对 root 用户、privileged mode、host namespace、device 或 Docker socket mount 做 lint 和醒目警告。MVP 的结构化模型应拒绝所有不支持的能力。
@@ -444,7 +452,7 @@ GET    /api/v1/system/drift
 
 events、logs 和 stats endpoint 都是有界 SSE stream。日志只接受与 service 无关的有限筛选项，例如 tail 数量和 since 时间；不存在 shell 或 exec endpoint。
 
-破坏性删除采用两阶段操作。preview 返回精确 project、container、network、自有文件和保留 volume，并附带短期 confirmation token。删除请求同时提交 token 和应用 slug。默认仅 unregister；移除容器必须显式选择，且仍然保留所有 volume。
+破坏性删除采用两阶段操作。preview 返回精确 project、container、network、自有文件、保留 volume 和保留 bind mount 源目录，并附带短期 confirmation token。删除请求同时提交 token 和应用 slug。默认仅 unregister；移除容器必须显式选择，且仍然保留所有 volume 和 bind mount 数据。
 
 ## 13. UI 草图
 
@@ -463,7 +471,7 @@ Application / SoloGrove
 ```
 
 - Dashboard：Docker/system 健康、磁盘压力、部署活动和应用卡片；
-- New application：镜像引用、credential、环境变量、文件、端口、volume、network、健康与自动部署策略；创建前进行校验和精确 preview；
+- New application：镜像引用、credential、环境变量、文件、端口、named volume、授权根目录内的 bind mount、network、健康与自动部署策略；创建前进行校验和精确 preview；
 - Overview：实际 digest 与 active digest、容器状态、端口、mount、network、实时资源摘要和固定生命周期动作；
 - Configuration：环境变量表格/批量编辑、write-only secret、挂载文件和 deploy 前 preview；
 - Deployments：trigger、来源 tag、不可变 digest、phase、耗时、健康结果、错误分类和回滚关系；
@@ -546,12 +554,12 @@ docs/
 ### M3：受管单 service 生命周期
 
 - 实现结构化应用 schema 和最小生成 Compose adapter；
-- 实现环境变量表格/批量解析、挂载普通/secret 文件、loopback 端口、volume、network 和健康策略；
+- 实现环境变量表格/批量解析、挂载普通/secret 文件、loopback 端口、named volume、授权根目录内的 bind mount、network 和健康策略；
 - 实现校验/preview，以及精确 create/start/stop/restart/unregister/remove 动作。
 
 路径：`src/domain/`、`src/compose/`、`src/security/`、`src/api/apps.rs`、配置 UI。
 
-测试：注入与路径逃逸、重复环境变量 key、write-only secret、external 资源、project 冲突、命令超时，以及删除绝不使用 `-v` 或删除 external 资源的证明。
+测试：注入与路径逃逸、bind mount allowlist/symlink/重复目标路径、只读默认和显式可读写确认、重复环境变量 key、write-only secret、external 资源、project 冲突、命令超时，以及删除绝不使用 `-v` 或删除 external/bind mount 数据的证明。
 
 ### M4：Digest release 与回滚
 
@@ -590,6 +598,7 @@ docs/
 - cleanup 前先验证 project prefix、测试 label 和 run token；
 - 测试绝不运行 `docker system prune`、通配删除、全局镜像清理或 `compose down -v`；
 - 测试绝不扫描并删除自己未创建的对象；
+- bind mount 测试只使用本次运行创建的临时目录；cleanup 不删除目录内的模拟持久数据，除非它是测试框架在隔离临时根下记录的精确 fixture；
 - 已有 SoloGrove、PostgreSQL、insight-agent、pgAdmin、network 和 volume 永不进入测试 selector。
 
 ### 16.3 MVP 验收标准
@@ -601,6 +610,7 @@ docs/
 - 环境变量表格与批量视图共享同一份规范值，重复 key 被拒绝；
 - secret canary 不出现在普通 API 响应、SSE、审计行、tracing、错误、Compose 文件、release 文件或 CLI 参数中；
 - 删除默认只 unregister；显式移除容器也保留全部 named/external volume 和 external network；
+- bind mount 源目录只有位于 `allowed_bind_roots` 下且不存在 symlink/路径逃逸时才能进入生成的 Compose；默认只读，可读写必须显式确认，应用删除后宿主目录及其数据保持不变；
 - 删除演练副本中的 SQLite 后，仍可从文件系统恢复应用、active release、生成 Compose 和镜像 digest；
 - 管理 HTTP 只绑定 loopback，且不存在 shell/exec endpoint；
 - Docker E2E cleanup 无法匹配已有宿主应用或数据。
@@ -627,6 +637,7 @@ docs/
 - 全局部署并发为 1；
 - Registry 默认每五分钟轮询并带 jitter；
 - 只有 UI subscriber 存在时才采样 Docker stats；
+- `allowed_bind_roots` 默认为空；只有管理员在宿主配置中显式加入根目录后才启用 bind mount；
 - 报告并警告磁盘空间，但不自动 Docker prune。
 
 在 2C4G 主机上，镜像拉取/解压和应用重启比 SoloDock 空闲进程更可能形成资源压力。因此，串行部署、无本地构建和部署前磁盘/内存检查是核心要求。
@@ -638,6 +649,7 @@ docs/
 | 单容器原地替换 | 短暂停机 | 明确为非目标；使用健康门禁和快速 digest 回滚。 |
 | 不可逆应用 migration | 旧镜像可能无法使用变更后的数据 | 强警告、可关闭自动回滚、expand/contract migration 指南和独立备份。 |
 | Docker socket 被攻陷 | 影响等同宿主 root | 受限且认证的 loopback API、固定动作、无 shell、精确目标、WAF/Tunnel/密码分层和安全测试。 |
+| bind mount 暴露宿主数据 | 容器可能读取、修改或破坏宿主目录 | 默认禁用、宿主 allowlist、拒绝 symlink/路径逃逸与敏感路径、只读默认、读写显式确认，并且不自动管理目录内容。 |
 | Compose CLI 版本差异 | mutation 行为或参数不一致 | 启动时 capability probe 并定义最低支持版本；不兼容时禁用 mutation，但保留只读观测。 |
 | Registry 故障或限流 | 自动部署延迟 | 条件请求（可用时）、jitter、有界退避和明确错误分类；当前 release 不受影响。 |
 | 多平台 manifest 混淆 | 审计或恢复信息错误 | 记录 index/manifest digest、platform 和 local image ID；测试 amd64/arm64 fixture。 |
@@ -651,4 +663,4 @@ docs/
 - **替代而非并存：** SoloDock 不实现第二套 Compose 规范，只生成受限 schema，并把权威校验和执行交给已安装的 Compose CLI。
 - **适度抽象：** 单进程、单 Rust crate、单 service 应用、SQLite、SSE 和全局单部署避免个人单机用例不需要的平台抽象。
 - **明确失败与原子动作：** Registry、credential、确定性配置、健康、宿主资源和中断错误彼此区分。candidate 持久化先于 Docker 变更，active 切换晚于健康验证。
-- **影响范围审计：** 镜像 digest 语义覆盖 deploy/start/restart/rollback/drift/UI；删除前 preview container、文件、network 和保留 volume。
+- **影响范围审计：** 镜像 digest 语义覆盖 deploy/start/restart/rollback/drift/UI；bind mount allowlist 覆盖配置 schema、validate、Compose 生成、release snapshot、preview、删除和恢复；删除前 preview container、文件、network、保留 volume 和保留 bind mount 源目录。
