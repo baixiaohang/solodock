@@ -1,28 +1,72 @@
-use std::{env, error::Error};
+use std::{error::Error, net::SocketAddr};
 
+use solodock::{
+    AppState, app_store::AppStore, auth::AuthService, config::Config, db::Database,
+    security::permissions::ensure_private_directory,
+};
 use tokio::net::TcpListener;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("solodock=info")),
-        )
-        .json()
-        .init();
+    let config = Config::load()?;
+    solodock::telemetry::initialize();
 
-    let configured_address = env::var("SOLODOCK_LISTEN_ADDR").ok();
-    let address = solodock::parse_listen_address(configured_address.as_deref())?;
-    let listener = TcpListener::bind(address).await?;
+    ensure_private_directory(&config.state_directory)?;
+    ensure_private_directory(&config.runtime_directory)?;
+    let app_store = AppStore::initialize(config.apps_directory())?;
+    let database = Database::open(&config.database_path()).await?;
+    let recovery = app_store.scan()?;
+    database.refresh_app_index(&recovery).await?;
+    for issue in &recovery.issues {
+        warn!(
+            issue_code = issue.code,
+            app_id = issue.app_id.map(|id| id.to_string()),
+            "filesystem recovery issue"
+        );
+    }
 
-    info!(listen_address = %address, "SoloDock API listening");
+    let auth = AuthService::new(database.clone(), config.bootstrap_token_path());
+    if auth.prepare_bootstrap().await? {
+        info!(
+            bootstrap_token_path = %config.bootstrap_token_path().display(),
+            "administrator bootstrap required"
+        );
+    }
 
-    axum::serve(listener, solodock::app())
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
-
+    let listener = TcpListener::bind(config.listen_address).await?;
+    info!(listen_address = %config.listen_address, "SoloDock API listening");
+    let state = AppState {
+        auth,
+        public_origin: config.public_origin,
+    };
+    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = shutdown_sender.send(true);
+    });
+    let mut graceful_receiver = shutdown_receiver.clone();
+    let server = axum::serve(
+        listener,
+        solodock::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        while !*graceful_receiver.borrow() {
+            if graceful_receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    let server = async move { server.await };
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        () = shutdown_deadline(shutdown_receiver) => {
+            warn!("graceful shutdown deadline exceeded");
+        }
+    }
+    database.close().await;
     Ok(())
 }
 
@@ -53,6 +97,14 @@ async fn shutdown_signal() {
         () = ctrl_c => {},
         () = terminate => {},
     }
-
     info!("shutdown signal received");
+}
+
+async fn shutdown_deadline(mut shutdown: watch::Receiver<bool>) {
+    while !*shutdown.borrow() {
+        if shutdown.changed().await.is_err() {
+            return;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 }

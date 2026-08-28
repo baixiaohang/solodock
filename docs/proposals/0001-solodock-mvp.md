@@ -187,10 +187,10 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
 - 应用配置、公开环境数据、挂载文件、credential 引用和不可变 release snapshot：文件系统；
 - secret 值：专用权限受限文件，永不复制进 Compose 或 SQLite；
 - 容器实际状态：Docker daemon；
-- session、部署执行状态、幂等键、审计事件和查询索引：SQLite；
+- 管理员凭据、session、认证节流、部署执行状态、幂等键、审计事件和可重建查询索引：SQLite；
 - 可变 tag 当前 digest：Registry；release 创建后，该 release 中记录的 digest 即为权威。
 
-即使 SQLite 丢失，系统仍必须能扫描应用目录，恢复应用、active release、生成的 Compose 和镜像 digest。数据库丢失后不得重建或伪造历史审计记录。
+`active` symlink 是 active release 的唯一权威来源；应用配置文件不重复保存 active release ID。文件系统权威事实先原子提交，再刷新 SQLite 查询投影，不虚构跨存储事务。即使 SQLite 丢失，系统仍必须能扫描应用目录，恢复应用、active release、生成的 Compose 和镜像 digest。数据库丢失后不得重建或伪造管理员、session 或历史审计记录，管理员需要重新 bootstrap。
 
 关键文件写入使用同目录临时文件、文件 `fsync`、原子 rename 和父目录 `fsync`。release 目录创建后保持不可变。
 
@@ -231,7 +231,6 @@ discovery_image_ref, credential_ref
 desired_state, auto_deploy_enabled, poll_interval
 ports[], volumes[], networks[]
 health_policy
-active_release_id
 schema_version, created_at, updated_at
 ```
 
@@ -394,7 +393,7 @@ SupplementaryGroups=docker
 
 ## 12. API 草图
 
-所有 mutation endpoint 接受 `Idempotency-Key`。错误使用统一格式：
+所有持久业务 mutation endpoint 接受 `Idempotency-Key`。认证协议 endpoint 不接受该 header：login 会生成随机 session 和 cookie，bootstrap 已由 singleton credential 与一次性 token 保证至多一次。错误使用统一格式：
 
 ```json
 {

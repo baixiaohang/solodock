@@ -8,12 +8,27 @@ repository = "https://github.com/baixiaohang/solodock"
 
 [dependencies]
 axum = "0.8"
+argon2 = "0.5"
+base64 = "0.22"
+cookie = "0.18"
+getrandom = "0.3"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+subtle = "2"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = { version = "1", features = ["derive"] }
 
 [dev-dependencies]
 http-body-util = "0.1"
-serde_json = "1"
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
