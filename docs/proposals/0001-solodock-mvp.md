@@ -1,13 +1,13 @@
 # SoloDock MVP 设计提案
 
-- 状态：提议
+- 状态：已确认
 - 日期：2026-08-28
 - 目标环境：Ubuntu 24.04、单机、单管理员
 - 仓库：`baixiaohang/solodock`
 
 ## 1. 摘要
 
-SoloDock 是面向个人单机 Docker 工作负载的轻量级开源部署控制台。它部署预构建容器镜像，提供精简的 Web UI，将可变镜像 tag 解析为不可变 digest，检查应用健康状态，并在新版本失败时回滚。
+SoloDock 是面向个人单机 Docker 工作负载的轻量级部署控制台。它部署预构建容器镜像，提供精简的 Web UI，将可变镜像 tag 解析为不可变 digest，检查应用健康状态，并在新版本失败时回滚。
 
 SoloDock 不是通用 Docker 管理套件，也不是完整 PaaS。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。预期部署方式是在现有 Cloudflare Tunnel 和 IP 白名单之后，服务自身只监听宿主机 loopback。
 
@@ -515,7 +515,7 @@ docs/
 
 ### M0：仓库与可执行骨架
 
-- 创建 Rust/Axum 与 Svelte/Vite 骨架、格式检查、lint、测试、CI、Apache-2.0 license 和开发 README；
+- 创建 Rust/Axum 与 Svelte/Vite 骨架、格式检查、lint、测试、CI、仓库元数据和开发 README；
 - 增加默认 loopback 服务、`GET /healthz` 和 graceful shutdown；
 - 增加前端 type check/build 脚本和最小页面；
 - 增加使用专用 `solodock` 用户的 systemd 包装骨架。
