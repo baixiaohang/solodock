@@ -135,6 +135,7 @@ UI 对同一份规范环境变量数据提供两种视图：
 - SoloDock 可以创建应用自有 named volume，也可以挂载显式指定的已有 named volume。
 - 已有 volume 视为 external，永不修改或删除。
 - 移除应用绝不向 Compose 传入 `-v`/`--volumes`。
+- start、stop、restart、deploy、rollback、unregister、容器移除和应用删除都只能改变容器及其挂载关系，不得清空、覆盖、迁移或删除 named volume 与 bind mount 源目录中的实际内容。
 - 宿主配置通过 `allowed_bind_roots` 声明可以用于持久数据的目录根，例如 `/srv/solodock-data`；默认列表为空，即禁用宿主路径 bind mount。
 - 应用只能选择某个授权根目录下已经存在的子目录，并配置绝对的容器内目标路径。授权根、源目录和目标路径都必须规范化；源目录必须在每次 validate、preview 和 Compose mutation 前重新解析，并保持在授权根内。
 - 授权根和源目录不得是 symlink；包含 symlink、`..`、路径逃逸、Docker socket、宿主根目录或其他敏感宿主路径的输入一律拒绝。应用不得直接挂载整个授权根。
@@ -559,7 +560,7 @@ docs/
 
 路径：`src/domain/`、`src/compose/`、`src/security/`、`src/api/apps.rs`、配置 UI。
 
-测试：注入与路径逃逸、bind mount allowlist/symlink/重复目标路径、只读默认和显式可读写确认、重复环境变量 key、write-only secret、external 资源、project 冲突、命令超时，以及删除绝不使用 `-v` 或删除 external/bind mount 数据的证明。
+测试：注入与路径逃逸、bind mount allowlist/symlink/重复目标路径、只读默认和显式可读写确认、重复环境变量 key、write-only secret、external 资源、project 冲突、命令超时，以及全部生命周期动作绝不使用 `-v`、清空或删除 named/external/bind mount 数据的证明。
 
 ### M4：Digest release 与回滚
 
@@ -609,7 +610,7 @@ docs/
 - 中断部署标记为 interrupted/drifted；下一次部署收敛到选定 release，最终成功或进入正常回滚路径；
 - 环境变量表格与批量视图共享同一份规范值，重复 key 被拒绝；
 - secret canary 不出现在普通 API 响应、SSE、审计行、tracing、错误、Compose 文件、release 文件或 CLI 参数中；
-- 删除默认只 unregister；显式移除容器也保留全部 named/external volume 和 external network；
+- start、stop、restart、重新部署、回滚、unregister、容器移除和应用删除都保留全部 named/external volume、bind mount 实际内容和 external network；
 - bind mount 源目录只有位于 `allowed_bind_roots` 下且不存在 symlink/路径逃逸时才能进入生成的 Compose；默认只读，可读写必须显式确认，应用删除后宿主目录及其数据保持不变；
 - 删除演练副本中的 SQLite 后，仍可从文件系统恢复应用、active release、生成 Compose 和镜像 digest；
 - 管理 HTTP 只绑定 loopback，且不存在 shell/exec endpoint；
