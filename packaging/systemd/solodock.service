@@ -10,7 +10,7 @@ Type=simple
 User=solodock
 Group=solodock
 SupplementaryGroups=docker
-Environment=SOLODOCK_LISTEN_ADDR=127.0.0.1:8080
+Environment=SOLODOCK_CONFIG_PATH=/etc/solodock/config.toml
 Environment=RUST_LOG=solodock=info
 ExecStart=/usr/local/bin/solodock
 Restart=on-failure
