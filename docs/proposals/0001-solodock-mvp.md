@@ -400,6 +400,19 @@ SupplementaryGroups=docker
 
 宿主 root 已失陷、Docker daemon 已失陷以及恶意唯一管理员，不属于同机控制面能够防护的范围。
 
+### 11.4 M2 只读观察边界
+
+- 生产代码只连接固定 `/var/run/docker.sock`，不读取 `DOCKER_HOST`，不接受自定义 socket、TCP endpoint 或 TLS credential；
+- Docker socket 缺失、权限不足、daemon 重启或 API 不兼容不会阻止认证控制面启动。system health 和 app catalog 继续可用并明确 degraded，stream 在发送 headers 前返回稳定 `503`；
+- 一个容器只有同时精确匹配 `com.solodock.managed=true`、`com.solodock.schema-version=1`、canonical app/release UUID、Compose project、`service=app` 和 `oneoff=False`，且 app 存在于 filesystem catalog 时才属于 SoloDock；
+- list、detail、drift、events、logs 和 stats 共用同一 ownership validator，stream 建立前按 full container ID 重新 inspect；非 SoloDock 容器完全忽略；
+- API 只返回 SoloDock 自有 allowlist DTO，不序列化 Bollard raw model、环境变量、命令、任意 labels、HostConfig 或 daemon 原始错误；
+- M2 生产代码只调用 Docker ping/version/info/list/inspect/events/logs/stats，不提供 create/start/stop/restart/remove、Compose、exec/shell 或应用 CRUD。
+
+M2 的 SSE 固定全局上限 24、单 session 8；events 全局 16/单 app 4，logs 和 stats 各全局 8/单 app 2。events/logs queue 上限 128，慢消费者收到 `SLOW_CONSUMER` 后断开；stats 只保留最新 sample，最后一个 subscriber 离开后取消采样。15 秒 heartbeat 重新验证 session，revoke-all 和过期 session 最迟在一个 heartbeat 周期内关闭连接。events 使用每进程 boot UUID + 单调序号和 512 条 ring 支持 replay/reset；logs 使用 timestamp cursor，保持 at-least-once 边界语义。
+
+日志先按完整 logical line framing，再以 byte 形式脱敏 SoloDock 已知的受管 secret；跨 Docker chunk 的 secret 仍会替换为 `[REDACTED]`。64 KiB 以上原始行整行省略，正常 message 上限 16 KiB，并移除 NUL 和终端控制序列。应用自行产生、SoloDock 从未持有的 secret 无法可靠识别，系统不对此作虚假保证。
+
 ## 12. API 草图
 
 所有持久业务 mutation endpoint 接受 `Idempotency-Key`。认证协议 endpoint 不接受该 header：login 会生成随机 session 和 cookie，bootstrap 已由 singleton credential 与一次性 token 保证至多一次。错误使用统一格式：
@@ -452,6 +465,8 @@ GET    /api/v1/system/drift
 
 events、logs 和 stats endpoint 都是有界 SSE stream。日志只接受与 service 无关的有限筛选项，例如 tail 数量和 since 时间；不存在 shell 或 exec endpoint。
 
+M2 的所有 `/api/v1/**` read endpoint 都要求有效 session，并设置 `Cache-Control: no-store`。`GET /api/v1/system/health` 在认证后始终返回 `200`，将 Docker、filesystem recovery、state/Docker disk 和 active stream 数分别投影；`GET /api/v1/apps` 与 detail 在 Docker 不可用时仍返回 filesystem app 和 typed drift；`GET /api/v1/system/drift` 在无法完整观察时返回 `complete=false`，不会把未知状态误报为 container missing。
+
 破坏性删除采用两阶段操作。preview 返回精确 project、container、network、自有文件、保留 volume 和保留 bind mount 源目录，并附带短期 confirmation token。删除请求同时提交 token 和应用 slug。默认仅 unregister；移除容器必须显式选择，且仍然保留所有 volume 和 bind mount 数据。
 
 ## 13. UI 草图
@@ -472,7 +487,7 @@ Application / SoloGrove
 
 - Dashboard：Docker/system 健康、磁盘压力、部署活动和应用卡片；
 - New application：镜像引用、credential、环境变量、文件、端口、named volume、授权根目录内的 bind mount、network、健康与自动部署策略；创建前进行校验和精确 preview；
-- Overview：实际 digest 与 active digest、容器状态、端口、mount、network、实时资源摘要和固定生命周期动作；
+- Overview：实际 digest 与 active digest、容器状态、端口、mount、network 和实时资源摘要；固定生命周期动作从 M3 开始提供，M2 UI 严格只读；
 - Configuration：环境变量表格/批量编辑、write-only secret、挂载文件和 deploy 前 preview；
 - Deployments：trigger、来源 tag、不可变 digest、phase、耗时、健康结果、错误分类和回滚关系；
 - Logs：有界 tail/stream、暂停和下载当前窗口；无 terminal；
@@ -546,6 +561,7 @@ docs/
 - 通过 label 实现 Docker capability probe 和精确应用发现；
 - 通过 Bollard 实现容器状态、有界日志、按需 stats 和 events；
 - 实现 Dashboard、Overview 和 Logs 页面。
+- 补齐 bootstrap/login/logout auth shell；M2 前端由 Vite same-origin proxy 提供，静态资源到 M5 才嵌入 Rust binary。
 
 路径：`src/docker/`、`src/api/streams.rs`、`web/src/`。
 
@@ -608,7 +624,7 @@ docs/
 - 正常的不健康 candidate 会恢复并验证上一 digest，且不删除或替换 volume；
 - 中断部署标记为 interrupted/drifted；下一次部署收敛到选定 release，最终成功或进入正常回滚路径；
 - 环境变量表格与批量视图共享同一份规范值，重复 key 被拒绝；
-- secret canary 不出现在普通 API 响应、SSE、审计行、tracing、错误、Compose 文件、release 文件或 CLI 参数中；
+- SoloDock 已知的受管 secret canary 不出现在普通 API 响应、SSE、审计行、tracing、错误、Compose 文件、release 文件或 CLI 参数中；应用自行产生且控制面从未持有的值不在此保证范围内；
 - start、stop、restart、重新部署、回滚、unregister、容器移除和应用删除都保留全部 named/external volume、bind mount 实际内容和 external network；
 - bind mount 源目录只有位于 `allowed_bind_roots` 下且不存在 symlink/路径逃逸时才能进入生成的 Compose；默认只读，可读写必须显式确认，应用删除后宿主目录及其数据保持不变；
 - 删除演练副本中的 SQLite 后，仍可从文件系统恢复应用、active release、生成 Compose 和镜像 digest；

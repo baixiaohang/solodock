@@ -79,6 +79,63 @@ impl ApiError {
         )
     }
 
+    pub fn app_not_found(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "APP_NOT_FOUND",
+            "The application was not found",
+            request_id,
+        )
+    }
+
+    pub fn invalid_query(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "INVALID_QUERY",
+            "The query is invalid",
+            request_id,
+        )
+    }
+
+    pub fn stream_limit(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "STREAM_LIMIT_REACHED",
+            "The stream limit has been reached",
+            request_id,
+        )
+    }
+
+    pub fn docker(request_id: RequestId, code: &'static str) -> Self {
+        let (status, message) = match code {
+            "APP_CONTAINER_NOT_FOUND" => (
+                StatusCode::CONFLICT,
+                "The application container is not available",
+            ),
+            "APP_CONTAINER_AMBIGUOUS" => (
+                StatusCode::CONFLICT,
+                "The application has multiple containers",
+            ),
+            "APP_CONTAINER_INVALID" => (
+                StatusCode::CONFLICT,
+                "The application container identity is invalid",
+            ),
+            "DOCKER_PERMISSION_DENIED" => {
+                (StatusCode::SERVICE_UNAVAILABLE, "Docker access is denied")
+            }
+            "DOCKER_API_INCOMPATIBLE" => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The Docker Engine is incompatible",
+            ),
+            _ => (StatusCode::SERVICE_UNAVAILABLE, "Docker is unavailable"),
+        };
+        let mut error = Self::new(status, code, message, request_id);
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            error.retry_after = Some(3);
+        }
+        error
+    }
+
     pub fn from_auth(error_value: AuthError, request_id: RequestId) -> Self {
         match error_value {
             AuthError::SetupRequired => Self::new(

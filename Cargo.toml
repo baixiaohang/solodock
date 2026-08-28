@@ -7,10 +7,15 @@ description = "A lightweight single-host container deployment console"
 repository = "https://github.com/baixiaohang/solodock"
 
 [dependencies]
+async-stream = "0.3"
+async-trait = "0.1"
 axum = "0.8"
 argon2 = "0.5"
 base64 = "0.22"
+bollard = { version = "0.21", default-features = false, features = ["http", "pipe"] }
+bytes = "1"
 cookie = "0.18"
+futures-util = "0.3"
 getrandom = "0.3"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
@@ -20,7 +25,8 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 subtle = "2"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
-tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -32,3 +38,7 @@ zeroize = { version = "1", features = ["derive"] }
 http-body-util = "0.1"
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
+
+[features]
+default = []
+docker-e2e = []

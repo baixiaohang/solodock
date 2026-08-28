@@ -36,10 +36,11 @@ impl Harness {
         let auth = AuthService::new(database.clone(), bootstrap_path.clone());
         assert!(auth.prepare_bootstrap().await.unwrap());
         let bootstrap_token = fs::read_to_string(bootstrap_path).unwrap();
-        let app = router(AppState {
+        let app = router(AppState::control_plane(
             auth,
-            public_origin: "https://solodock.example.com".into(),
-        });
+            "https://solodock.example.com".into(),
+            root.path().to_owned(),
+        ));
         Self {
             _root: root,
             database,
@@ -157,6 +158,7 @@ async fn bootstrap_login_me_and_logout_follow_security_contract() {
         .await
         .unwrap();
     assert_eq!(me.status(), StatusCode::OK);
+    assert_eq!(me.headers()[header::CACHE_CONTROL], "no-store");
     let body: Value =
         serde_json::from_slice(&me.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["username"], "admin");

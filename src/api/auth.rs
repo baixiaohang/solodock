@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use axum::{
     Json,
-    extract::{ConnectInfo, Extension, State, rejection::JsonRejection},
+    extract::{ConnectInfo, Extension, FromRequestParts, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -19,6 +19,38 @@ use crate::{
 
 const SESSION_COOKIE: &str = "__Host-solodock_session";
 const CSRF_COOKIE: &str = "__Host-solodock_csrf";
+
+pub struct Authenticated {
+    pub token: SecretValue,
+    pub session: AuthenticatedSession,
+}
+
+impl FromRequestParts<AppState> for Authenticated {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .copied()
+            .unwrap_or(RequestId(uuid::Uuid::nil()));
+        let token = cookie_value(&parts.headers, SESSION_COOKIE).ok_or_else(|| {
+            ApiError::from_auth(crate::auth::AuthError::SessionRequired, request_id)
+        })?;
+        let session = state
+            .auth
+            .authenticate(&token)
+            .await
+            .map_err(|error| ApiError::from_auth(error, request_id))?;
+        Ok(Self {
+            token: SecretValue::new(token),
+            session,
+        })
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -95,7 +127,7 @@ pub async fn login(
 pub async fn me(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
-    headers: HeaderMap,
+    authenticated: Result<Authenticated, ApiError>,
 ) -> Result<Json<MeResponse>, ApiError> {
     if !state
         .auth
@@ -108,7 +140,7 @@ pub async fn me(
             request_id,
         ));
     }
-    let (_, session) = authenticated(&state, &headers, request_id).await?;
+    let session = authenticated?.session;
     Ok(Json(MeResponse {
         username: "admin",
         session: MeSession {
@@ -125,7 +157,13 @@ pub async fn logout(
 ) -> Result<Response, ApiError> {
     validate_required_origin(&state, &headers, request_id)?;
     validate_csrf(&headers, request_id)?;
-    let (token, _) = authenticated(&state, &headers, request_id).await?;
+    let token = cookie_value(&headers, SESSION_COOKIE)
+        .ok_or_else(|| ApiError::from_auth(crate::auth::AuthError::SessionRequired, request_id))?;
+    state
+        .auth
+        .authenticate(&token)
+        .await
+        .map_err(|error| ApiError::from_auth(error, request_id))?;
     state
         .auth
         .logout(&token, request_id.0)
@@ -141,28 +179,19 @@ pub async fn revoke_all(
 ) -> Result<Response, ApiError> {
     validate_required_origin(&state, &headers, request_id)?;
     validate_csrf(&headers, request_id)?;
-    authenticated(&state, &headers, request_id).await?;
+    let token = cookie_value(&headers, SESSION_COOKIE)
+        .ok_or_else(|| ApiError::from_auth(crate::auth::AuthError::SessionRequired, request_id))?;
+    state
+        .auth
+        .authenticate(&token)
+        .await
+        .map_err(|error| ApiError::from_auth(error, request_id))?;
     state
         .auth
         .revoke_all(request_id.0)
         .await
         .map_err(|error| ApiError::from_auth(error, request_id))?;
     Ok(expired_cookie_response())
-}
-
-async fn authenticated(
-    state: &AppState,
-    headers: &HeaderMap,
-    request_id: RequestId,
-) -> Result<(String, AuthenticatedSession), ApiError> {
-    let token = cookie_value(headers, SESSION_COOKIE)
-        .ok_or_else(|| ApiError::from_auth(crate::auth::AuthError::SessionRequired, request_id))?;
-    let session = state
-        .auth
-        .authenticate(&token)
-        .await
-        .map_err(|error| ApiError::from_auth(error, request_id))?;
-    Ok((token, session))
 }
 
 fn validate_required_origin(

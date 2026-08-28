@@ -13,9 +13,9 @@ SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构�
 
 - Rust stable（edition 2024），包含 `rustfmt` 和 `clippy`
 - Node.js 24 和 npm
-- 计划中的生产环境为 Ubuntu 24.04 和 Docker Compose
+- 计划中的生产环境为 Ubuntu 24.04、Docker Engine 和 Docker Compose
 
-当前脚手架不会访问 Docker。后续版本将使用 Docker socket。访问 `/var/run/docker.sock`（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。
+M2 通过固定的 `/var/run/docker.sock` 只读观察 Docker Engine，不接受 `DOCKER_HOST`、TCP endpoint 或自定义 socket 配置。访问 Docker socket（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。Docker 不可用时认证控制面仍会启动，应用目录和系统健康 API 返回 degraded 状态；logs、stats 和 events stream 会在建立响应前返回稳定的 `503`。
 
 ## 配置与后端开发
 
@@ -60,6 +60,8 @@ unset SOLODOCK_ADMIN_PASSWORD
 
 SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
 
+M2 只识别同时存在于文件系统 catalog 且包含完整 SoloDock ownership labels 的容器。Docker 输出在 adapter 内投影为固定 DTO；环境变量、命令、任意 labels、HostConfig 和 daemon 原始错误不会进入 API。M2 不提供容器生命周期 mutation、Compose、exec/shell 或应用 CRUD。
+
 运行后端验证：
 
 ```bash
@@ -77,10 +79,13 @@ npm ci
 npm run dev
 ```
 
+Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。M2 UI 由 Vite 提供，尚未嵌入生产二进制；静态资源嵌入属于 M5。
+
 运行前端验证：
 
 ```bash
 npm run check
+npm run test
 npm run build
 ```
 

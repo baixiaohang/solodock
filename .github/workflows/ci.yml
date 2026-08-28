@@ -29,5 +29,32 @@ jobs:
         working-directory: web
       - run: npm run check
         working-directory: web
+      - run: npm run test
+        working-directory: web
       - run: npm run build
         working-directory: web
+
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      docker:
+        image: docker:27-dind
+        env:
+          DOCKER_TLS_CERTDIR: ""
+        ports:
+          - 2375:2375
+        options: >-
+          --privileged
+          --health-cmd "docker info"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: docker pull alpine:3.20
+      - run: cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture
