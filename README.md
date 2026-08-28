@@ -1,35 +1,37 @@
 # SoloDock
 
-SoloDock is a lightweight single-host container deployment console for personal Docker workloads.
+SoloDock 是面向个人 Docker 工作负载的轻量级单机容器部署控制台。
 
 > [!WARNING]
-> SoloDock is in early development and is not ready to manage production workloads.
+> SoloDock 仍处于早期开发阶段，尚不适合管理生产工作负载。
 
-SoloDock will provide a focused Web UI for deploying prebuilt container images by immutable digest, checking health, and rolling back failed releases. It intentionally does not build source code, manage domains or TLS, provide a reverse proxy, or orchestrate multiple hosts.
+SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时回滚。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
 
-## Prerequisites
+本仓库是私有项目，未授予公开使用、复制或分发许可。
 
-- Rust stable (edition 2024) with `rustfmt` and `clippy`
-- Node.js 24 and npm
-- Ubuntu 24.04 and Docker Compose for the planned production environment
+## 环境要求
 
-The current bootstrap does not access Docker. Future versions will use the Docker socket. Access to `/var/run/docker.sock`, including through membership in the `docker` group, is effectively root-equivalent and must not be treated as a security boundary.
+- Rust stable（edition 2024），包含 `rustfmt` 和 `clippy`
+- Node.js 24 和 npm
+- 计划中的生产环境为 Ubuntu 24.04 和 Docker Compose
 
-## Backend development
+当前脚手架不会访问 Docker。后续版本将使用 Docker socket。访问 `/var/run/docker.sock`（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。
 
-Run the API scaffold:
+## 后端开发
+
+运行 API 骨架：
 
 ```bash
 cargo run
 ```
 
-It listens on `127.0.0.1:8080` and exposes `GET /healthz`. A loopback-only override is available through `SOLODOCK_LISTEN_ADDR`:
+服务监听 `127.0.0.1:8080`，并提供 `GET /healthz`。可以通过 `SOLODOCK_LISTEN_ADDR` 改为其他 loopback 地址：
 
 ```bash
 SOLODOCK_LISTEN_ADDR=127.0.0.1:9090 cargo run
 ```
 
-Run backend verification:
+运行后端验证：
 
 ```bash
 cargo fmt --check
@@ -38,7 +40,7 @@ cargo test --all-targets --all-features
 cargo build --release
 ```
 
-## Frontend development
+## 前端开发
 
 ```bash
 cd web
@@ -46,13 +48,11 @@ npm ci
 npm run dev
 ```
 
-Run frontend verification:
+运行前端验证：
 
 ```bash
 npm run check
 npm run build
 ```
 
-## License
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
+Node/npm 只用于开发和构建 Web UI。最终生产版本会把静态资源嵌入 Rust 二进制，不需要运行 Node 服务。
