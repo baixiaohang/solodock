@@ -76,7 +76,6 @@ jobs:
     env:
       DOCKER_HOST: tcp://127.0.0.1:2375
       SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
-      SOLODOCK_E2E_RESOURCE_REPORT: ${{ runner.temp }}/docker-e2e-resource-report.json
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,6 +84,8 @@ jobs:
       - run: docker pull nginx:1.27-alpine
       - run: docker pull registry:2
       - name: Run isolated Docker E2E with separate daemon sampling
+        env:
+          SOLODOCK_E2E_RESOURCE_REPORT: ${{ runner.temp }}/docker-e2e-resource-report.json
         run: |
           chmod +x scripts/measure-dind-daemon.sh
           scripts/measure-dind-daemon.sh '${{ job.services.docker.id }}' "$RUNNER_TEMP/docker-daemon-resource-report.json" -- \
