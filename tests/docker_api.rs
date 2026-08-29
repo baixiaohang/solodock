@@ -165,6 +165,9 @@ impl Harness {
                 active_image_ref: Some(expected_image.clone()),
                 active_config_revision: None,
                 active_config_sha256: None,
+                pending_release_id: None,
+                pending_image_ref: None,
+                pending_config_revision: None,
                 discovery_image_ref: None,
                 draft_revision: None,
                 draft_config_sha256: None,
@@ -246,6 +249,7 @@ impl Harness {
             shutdown: shutdown.clone(),
             stream_tasks: stream_tasks.clone(),
             m3: None,
+            m4: None,
         };
         Self {
             _root: root,
@@ -354,11 +358,11 @@ async fn revoked_session_closes_sse_on_the_next_heartbeat_and_releases_permit() 
     tokio::task::yield_now().await;
     harness.auth.revoke_all(Uuid::new_v4()).await.unwrap();
     tokio::time::advance(std::time::Duration::from_secs(16)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    assert!(body_task.is_finished());
-    let body = body_task.await.unwrap();
+    tokio::time::resume();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_task)
+        .await
+        .expect("revoked SSE session must close after the heartbeat")
+        .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("SESSION_EXPIRED"));
     assert_eq!(harness.stream_gate.active(), 0);

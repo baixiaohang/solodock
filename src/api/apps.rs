@@ -90,10 +90,33 @@ pub async fn detail(
         .into_iter()
         .find(|app| app.id == app_id)
         .ok_or_else(|| ApiError::app_not_found(request_id))?;
-    let available_actions = if catalog.active_release_id.is_some() {
-        vec!["start", "stop", "restart", "deletion_preview"]
+    let nonterminal = if let Some(m4) = state.m4.as_ref() {
+        m4.ledger
+            .list(app_id, 1)
+            .await
+            .ok()
+            .and_then(|values| values.into_iter().next())
+            .is_some_and(|value| !value.status.is_terminal())
     } else {
+        false
+    };
+    let actual_release = app.actual_release_id;
+    let available_actions = if nonterminal {
         vec!["deletion_preview"]
+    } else if let Some(pending) = catalog.pending_release_id {
+        if actual_release == Some(pending) {
+            vec!["stop", "deletion_preview"]
+        } else {
+            vec!["deploy", "deletion_preview"]
+        }
+    } else if let Some(active) = catalog.active_release_id {
+        if actual_release == Some(active) {
+            vec!["start", "stop", "restart", "deploy", "deletion_preview"]
+        } else {
+            vec!["deploy", "deletion_preview"]
+        }
+    } else {
+        vec!["deploy", "deletion_preview"]
     };
     Ok(Json(AppDetailResponse {
         observation: app,
@@ -101,8 +124,14 @@ pub async fn detail(
         draft_revision: catalog.draft_revision,
         draft_config_sha256: catalog.draft_config_sha256,
         active_config_revision: catalog.active_config_revision,
+        pending_release_id: catalog.pending_release_id,
+        pending_image_ref: catalog.pending_image_ref,
         desired_state: catalog.desired_state,
-        deployment_status: if catalog.active_release_id.is_some() {
+        deployment_status: if nonterminal {
+            "RUNNING"
+        } else if catalog.pending_release_id.is_some() {
+            "PENDING"
+        } else if catalog.active_release_id.is_some() {
             "ACTIVE"
         } else {
             "DEPLOY_REQUIRED"
@@ -122,6 +151,8 @@ struct AppDetailResponse {
     draft_revision: Option<Uuid>,
     draft_config_sha256: Option<String>,
     active_config_revision: Option<Uuid>,
+    pending_release_id: Option<Uuid>,
+    pending_image_ref: Option<String>,
     desired_state: crate::domain::DesiredState,
     deployment_status: &'static str,
     available_actions: Vec<&'static str>,

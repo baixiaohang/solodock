@@ -180,6 +180,15 @@ pub struct DockerResource {
     pub labels: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageRecord {
+    pub id: String,
+    pub repo_digests: Vec<String>,
+    pub os: String,
+    pub architecture: String,
+    pub variant: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ContainerProjection {
     pub id: String,
@@ -361,6 +370,9 @@ pub trait DockerReadApi: Send + Sync {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
     async fn inspect_network(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
+        Err(DockerError::new(DockerErrorKind::Unavailable))
+    }
+    async fn inspect_image(&self, _reference: &str) -> Result<ImageRecord, DockerError> {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
 }

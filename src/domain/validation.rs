@@ -47,6 +47,8 @@ pub struct NormalizedDraft {
     pub slug: String,
     pub display_name: String,
     pub discovery_image_ref: String,
+    pub credential_ref: Option<uuid::Uuid>,
+    pub auto_deploy_enabled: bool,
     pub poll_interval_seconds: u32,
     pub public_environment: Vec<PublicEnvInput>,
     pub secret_environment: SecretMap,
@@ -81,7 +83,7 @@ pub fn normalize_draft(
     validate_slug(&input.slug)?;
     validate_display_name(&input.display_name)?;
     validate_discovery_image(&input.discovery_image_ref)?;
-    if input.credential_ref.is_some() || input.auto_deploy_enabled {
+    if input.auto_deploy_enabled {
         return Err(DomainError::FeatureNotAvailable);
     }
     if !(60..=86_400).contains(&input.poll_interval_seconds) {
@@ -163,6 +165,8 @@ pub fn normalize_draft(
         slug: input.slug,
         display_name: input.display_name.trim().to_owned(),
         discovery_image_ref: input.discovery_image_ref,
+        credential_ref: input.credential_ref,
+        auto_deploy_enabled: input.auto_deploy_enabled,
         poll_interval_seconds: input.poll_interval_seconds,
         public_environment,
         secret_environment,
@@ -393,35 +397,9 @@ fn validate_display_name(value: &str) -> Result<(), DomainError> {
 }
 
 fn validate_discovery_image(value: &str) -> Result<(), DomainError> {
-    if value.len() > 255
-        || value.contains(['@', '$', '{', '}', '`', '\\', '"', '\''])
-        || value.contains("://")
-        || value
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
-    {
-        return Err(DomainError::ConfigInvalid);
-    }
-    let slash = value.rfind('/');
-    let colon = value.rfind(':').ok_or(DomainError::ConfigInvalid)?;
-    if slash.is_some_and(|slash| colon < slash) {
-        return Err(DomainError::ConfigInvalid);
-    }
-    let (repository, tag_with_colon) = value.split_at(colon);
-    let tag = &tag_with_colon[1..];
-    if repository.is_empty()
-        || tag.is_empty()
-        || tag.len() > 128
-        || !tag.bytes().enumerate().all(|(index, byte)| {
-            byte.is_ascii_alphanumeric()
-                || byte == b'_'
-                || (index > 0 && matches!(byte, b'.' | b'-'))
-        })
-        || !valid_repository(repository)
-    {
-        return Err(DomainError::ConfigInvalid);
-    }
-    Ok(())
+    crate::registry::ImageReference::parse(value)
+        .map(|_| ())
+        .map_err(|_| DomainError::ConfigInvalid)
 }
 
 pub fn validate_runnable_image(value: &str) -> Result<(), DomainError> {
@@ -1126,6 +1104,7 @@ mod tests {
         assert_eq!(normalized.public_files["config"], "public-file");
         let response = serde_json::to_string(&crate::domain::dto::DraftResponse {
             discovery_image_ref: normalized.discovery_image_ref,
+            credential_ref: None,
             poll_interval_seconds: normalized.poll_interval_seconds,
             public_environment: normalized.public_environment,
             secret_keys: normalized.metadata.secret_keys,

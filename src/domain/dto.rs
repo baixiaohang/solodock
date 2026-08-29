@@ -1,4 +1,5 @@
 use serde::Serialize;
+use uuid::Uuid;
 
 use super::{
     HealthPolicy, ManagedFileMetadata, NetworkInput, PortInput, PublicEnvInput, VolumeInput,
@@ -7,6 +8,7 @@ use super::{
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DraftResponse {
     pub discovery_image_ref: String,
+    pub credential_ref: Option<Uuid>,
     pub poll_interval_seconds: u32,
     pub public_environment: Vec<PublicEnvInput>,
     pub secret_keys: Vec<String>,

@@ -118,6 +118,7 @@ pub async fn create(
         &services.allowed_bind_roots,
     )
     .map_err(|error| ApiError::domain(error, request_id))?;
+    validate_registry_credential(&state, &draft, request_id)?;
     let route = "/api/v1/apps";
     let raw_key =
         idempotency_key(&headers).map_err(|error| ApiError::idempotency(error, request_id))?;
@@ -136,6 +137,17 @@ pub async fn create(
         ClaimResult::Replay { .. } => unreachable!(),
     };
     let _catalog = services.coordinator.catalog_lock().await;
+    if validate_registry_credential(&state, &draft, request_id).is_err() {
+        return finish_error(
+            services,
+            route,
+            raw_key,
+            "REGISTRY_CREDENTIAL_INVALID",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            request_id,
+        )
+        .await;
+    }
     if let Ok(existing) = services.store.read_metadata(operation_id)
         && existing.last_operation_id == operation_id
         && existing.draft_revision == operation_id
@@ -321,6 +333,7 @@ pub async fn update_draft(
                 current_metadata.slug.clone(),
                 current_metadata.display_name.clone(),
                 current_metadata.discovery_image_ref.clone(),
+                current_metadata.credential_ref,
                 current_metadata.poll_interval_seconds,
             ),
             &loaded.secrets,
@@ -345,6 +358,21 @@ pub async fn update_draft(
             request_id,
         )
         .await;
+    }
+    match services.store.read_release_link(app_id, "pending") {
+        Ok(Some(_)) => {
+            return finish_error(
+                services,
+                &route,
+                raw_key,
+                "DEPLOYMENT_PENDING",
+                StatusCode::CONFLICT,
+                request_id,
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
     }
     if current_metadata.draft_revision != payload.expected_revision {
         return finish_error(
@@ -380,6 +408,7 @@ pub async fn update_draft(
             .await;
         }
     };
+    validate_registry_credential(&state, &draft, request_id)?;
     let report = match services.store.scan_read_only() {
         Ok(report) => report,
         Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
@@ -588,6 +617,38 @@ fn services(state: &AppState, request_id: RequestId) -> Result<&M3Services, ApiE
         .as_deref()
         .ok_or_else(|| ApiError::compose("FEATURE_NOT_AVAILABLE", request_id))
 }
+fn validate_registry_credential(
+    state: &AppState,
+    draft: &NormalizedDraft,
+    request_id: RequestId,
+) -> Result<(), ApiError> {
+    let Some(id) = draft.credential_ref else {
+        return Ok(());
+    };
+    let image = crate::registry::ImageReference::parse(&draft.discovery_image_ref)
+        .map_err(|_| ApiError::validation(request_id))?;
+    let services = state
+        .m4
+        .as_deref()
+        .ok_or_else(|| ApiError::compose("FEATURE_NOT_AVAILABLE", request_id))?;
+    let credential = services.credentials.load(id).map_err(|_| {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "CREDENTIAL_NOT_FOUND",
+            "The registry credential was not found",
+            request_id,
+        )
+    })?;
+    if credential.metadata.registry != image.logical_registry {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "REGISTRY_CREDENTIAL_MISMATCH",
+            "The registry credential does not match the image registry",
+            request_id,
+        ));
+    }
+    Ok(())
+}
 fn idempotency_key(headers: &HeaderMap) -> Result<&str, IdempotencyError> {
     headers
         .get("idempotency-key")
@@ -600,7 +661,7 @@ fn draft_fingerprint(
     route: &str,
     draft: &NormalizedDraft,
 ) -> Result<Vec<u8>, ApiError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":draft.slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
+    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":draft.slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
     Ok(services.idempotency.fingerprint(&canonical))
 }
 fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> AppMutationDetail {
@@ -639,25 +700,37 @@ async fn refresh_outcome(state: &AppState, services: &M3Services) -> Publication
             };
         }
     };
-    state.observer.catalog.replace(&report);
-    let mut secrets = Vec::new();
-    for app in &report.valid_apps {
-        for revision in [app.draft_revision, app.active_config_revision]
-            .into_iter()
-            .flatten()
-        {
-            if let Ok(loaded) = load_config(services, app.app_id, revision) {
-                secrets.extend(loaded.known_secrets());
-            }
+    let secrets = match collect_secret_inventory(state, services, &report) {
+        Ok(values) => values,
+        Err(_) => {
+            services.projection_degraded.store(true, Ordering::Release);
+            services.reconcile_notify.notify_one();
+            return PublicationOutcome {
+                warning: Some("SECRET_INVENTORY_FAILED"),
+                catalog_published: false,
+            };
         }
+    };
+    state.observer.catalog.replace(&report);
+    // A degraded report may omit an app whose already-running container and
+    // log stream still exist. Never remove known patterns until the complete
+    // filesystem inventory has been proven readable again.
+    if report.issues.is_empty() {
+        state.redactor.replace(secrets);
+    } else {
+        state.redactor.extend(secrets);
     }
-    state.redactor.replace(secrets);
-    let warning = services
+    let sqlite_warning = services
         .database
         .refresh_app_index(&report)
         .await
         .err()
         .map(|_| "SQLITE_PROJECTION_DEGRADED");
+    let warning = if !report.issues.is_empty() {
+        Some("FILESYSTEM_RECOVERY_DEGRADED")
+    } else {
+        sqlite_warning
+    };
     services
         .projection_degraded
         .store(warning.is_some(), Ordering::Release);
@@ -670,7 +743,43 @@ async fn refresh_outcome(state: &AppState, services: &M3Services) -> Publication
     }
 }
 
-async fn refresh(state: &AppState, services: &M3Services) -> Option<&'static str> {
+fn collect_secret_inventory(
+    state: &AppState,
+    services: &M3Services,
+    report: &crate::app_store::recovery::RecoveryReport,
+) -> Result<Vec<Vec<u8>>, StoreError> {
+    let mut secrets = Vec::new();
+    for app in &report.valid_apps {
+        let mut revisions = [
+            app.draft_revision,
+            app.active_config_revision,
+            app.pending_config_revision,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        revisions.sort_unstable();
+        revisions.dedup();
+        for revision in revisions {
+            secrets.extend(load_config(services, app.app_id, revision)?.known_secrets());
+        }
+    }
+    if let Some(m4) = state.m4.as_ref() {
+        for metadata in m4.credentials.list()? {
+            secrets.push(
+                m4.credentials
+                    .load(metadata.id)?
+                    .secret
+                    .expose()
+                    .as_bytes()
+                    .to_vec(),
+            );
+        }
+    }
+    Ok(secrets)
+}
+
+pub(crate) async fn refresh(state: &AppState, services: &M3Services) -> Option<&'static str> {
     refresh_outcome(state, services).await.warning
 }
 
@@ -731,6 +840,16 @@ pub fn start_projection_reconciler(
                     && services
                         .idempotency
                         .finalize_succeeded_tombstones(&services.store)
+                        .await
+                        .is_err()
+                {
+                    services.projection_degraded.store(true, Ordering::Release);
+                    services.reconcile_notify.notify_one();
+                }
+                if let Some(m4) = state.m4.as_deref()
+                    && services
+                        .idempotency
+                        .finalize_succeeded_credential_tombstones(&m4.credentials)
                         .await
                         .is_err()
                 {
@@ -957,6 +1076,45 @@ fn load_verified_active(
     })
 }
 
+fn load_verified_pending(
+    services: &M3Services,
+    app_id: Uuid,
+) -> Result<VerifiedActive, &'static str> {
+    let report = services
+        .store
+        .scan_read_only()
+        .map_err(|_| "FILESYSTEM_RESCAN_FAILED")?;
+    let recovered = report
+        .valid_apps
+        .iter()
+        .find(|candidate| candidate.app_id == app_id)
+        .ok_or("APP_NOT_FOUND")?;
+    let app = AppCatalogEntry::from(recovered);
+    if app.active_release_id.is_some() {
+        return load_verified_active(services, app_id);
+    }
+    let release_id = app.pending_release_id.ok_or("APP_DEPLOY_REQUIRED")?;
+    let release = services
+        .store
+        .load_v2_release(app_id, release_id)
+        .map_err(|_| "PENDING_RELEASE_INVALID")?;
+    if app.pending_config_revision != Some(release.config_revision) {
+        return Err("PENDING_RELEASE_INVALID");
+    }
+    let loaded = load_config(services, app_id, release.config_revision)
+        .map_err(|_| "PENDING_RELEASE_CONFIG_UNKNOWN")?;
+    let bind_identities =
+        crate::domain::validate_binds(&loaded.metadata.binds, &services.allowed_bind_roots)
+            .map_err(|_| "BIND_INVALID")?;
+    Ok(VerifiedActive {
+        app,
+        release_id,
+        loaded,
+        compose_file: services.store.release_compose_path(app_id, release_id),
+        bind_identities,
+    })
+}
+
 async fn mutation_container(
     state: &AppState,
     app: &AppCatalogEntry,
@@ -968,6 +1126,36 @@ async fn mutation_container(
         .await
         .map_err(|error| error.public_code())?;
     classify_mutation_candidates(app, candidates)
+}
+
+async fn mutation_container_policy(
+    state: &AppState,
+    app: &AppCatalogEntry,
+    allow_pending: bool,
+) -> Result<Option<ContainerRecord>, &'static str> {
+    if !allow_pending {
+        return mutation_container(state, app).await;
+    }
+    let candidates = state
+        .observer
+        .api()
+        .list_compose_app_containers(&app.project_name)
+        .await
+        .map_err(|error| error.public_code())?;
+    if candidates.len() > 1 {
+        return Err("APP_CONTAINER_AMBIGUOUS");
+    }
+    let Some(container) = candidates.into_iter().next() else {
+        return Ok(None);
+    };
+    let identity = crate::docker::ownership::validate_syntactic_identity(&container.labels, app)
+        .ok_or("APP_CONTAINER_INVALID")?;
+    if Some(identity.release_id) != app.active_release_id
+        && Some(identity.release_id) != app.pending_release_id
+    {
+        return Err("APP_CONTAINER_INVALID");
+    }
+    Ok(Some(container))
 }
 
 fn classify_mutation_candidates(
@@ -986,15 +1174,27 @@ fn classify_mutation_candidates(
     Ok(Some(container))
 }
 
-async fn validate_runtime_paths(
+pub(crate) async fn validate_runtime_paths(
     state: &AppState,
     services: &M3Services,
     metadata: &crate::domain::ConfigMetadata,
 ) -> Result<Vec<crate::domain::BindIdentity>, &'static str> {
+    let probe = state.observer.supervisor.current().await;
+    validate_runtime_paths_for_docker_root(
+        services,
+        metadata,
+        probe.docker_root_directory.as_deref(),
+    )
+}
+
+pub(crate) fn validate_runtime_paths_for_docker_root(
+    services: &M3Services,
+    metadata: &crate::domain::ConfigMetadata,
+    docker_root: Option<&str>,
+) -> Result<Vec<crate::domain::BindIdentity>, &'static str> {
     let identities = crate::domain::validate_binds(&metadata.binds, &services.allowed_bind_roots)
         .map_err(|_| "BIND_INVALID")?;
-    let probe = state.observer.supervisor.current().await;
-    if let Some(root) = probe.docker_root_directory.map(PathBuf::from)
+    if let Some(root) = docker_root.map(PathBuf::from)
         && (services
             .allowed_bind_roots
             .iter()
@@ -1057,6 +1257,22 @@ async fn lifecycle(
     };
     let verified = match load_verified_active(services, app_id) {
         Ok(value) => value,
+        Err("APP_DEPLOY_REQUIRED") if matches!(action, LifecycleAction::Stop) => {
+            match load_verified_pending(services, app_id) {
+                Ok(value) => value,
+                Err(code) => {
+                    return finish_error(
+                        services,
+                        &route,
+                        raw_key,
+                        code,
+                        mutation_status(code),
+                        request_id,
+                    )
+                    .await;
+                }
+            }
+        }
         Err(code) => {
             return finish_error(
                 services,
@@ -1070,6 +1286,17 @@ async fn lifecycle(
         }
     };
     let app = verified.app.clone();
+    if app.pending_release_id.is_some() && !matches!(action, LifecycleAction::Stop) {
+        return finish_error(
+            services,
+            &route,
+            raw_key,
+            "DEPLOYMENT_PENDING",
+            StatusCode::CONFLICT,
+            request_id,
+        )
+        .await;
+    }
     let active_release = verified.release_id;
     let active_metadata = verified.loaded.metadata.clone();
     if let Err(code) = validate_runtime_paths(state, services, &active_metadata).await {
@@ -1087,7 +1314,8 @@ async fn lifecycle(
         let (code, status) = error.code_and_status();
         return finish_error(services, &route, raw_key, code, status, request_id).await;
     }
-    let current = mutation_container(state, &app).await;
+    let allow_pending = matches!(action, LifecycleAction::Stop);
+    let current = mutation_container_policy(state, &app, allow_pending).await;
     let expected_container_id = current
         .as_ref()
         .ok()
@@ -1156,7 +1384,7 @@ async fn lifecycle(
         Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
     };
     if resumed && let Some(marker) = &effect_marker {
-        let observed = mutation_container(state, &app).await;
+        let observed = mutation_container_policy(state, &app, allow_pending).await;
         let observed_ref = observed.as_ref().ok().and_then(|value| value.as_ref());
         if effect_completed(action, marker, observed_ref) {
             compose_action = None;
@@ -1234,7 +1462,9 @@ async fn lifecycle(
             let (code, status) = error.code_and_status();
             return finish_error(services, &route, raw_key, code, status, request_id).await;
         }
-        let identity_still_matches = match mutation_container(state, &app).await {
+        let identity_still_matches = match mutation_container_policy(state, &app, allow_pending)
+            .await
+        {
             Ok(Some(container)) => expected_container_id.as_deref() == Some(container.id.as_str()),
             Ok(None) => expected_container_id.is_none(),
             Err(_) => false,
@@ -1267,14 +1497,21 @@ async fn lifecycle(
         // Re-read the filesystem fact and every Compose project candidate
         // after the durable marker. Bind identity is deliberately the final
         // operation before spawning the CLI.
-        let final_active = match load_verified_active(services, app_id) {
+        let final_verified =
+            if app.active_release_id.is_none() && matches!(action, LifecycleAction::Stop) {
+                load_verified_pending(services, app_id)
+            } else {
+                load_verified_active(services, app_id)
+            };
+        let final_active = match final_verified {
             Ok(value) if value.release_id == active_release => value,
             _ => return interrupt_internal(services, &route, raw_key, request_id).await,
         };
-        let final_container = match mutation_container(state, &final_active.app).await {
-            Ok(value) => value,
-            Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
-        };
+        let final_container =
+            match mutation_container_policy(state, &final_active.app, allow_pending).await {
+                Ok(value) => value,
+                Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
+            };
         if final_container.as_ref().map(|value| value.id.as_str())
             != expected_container_id.as_deref()
         {
@@ -1318,7 +1555,8 @@ async fn lifecycle(
         {
             let _ = error;
             if expected_container_id.is_none()
-                && let Ok(Some(container)) = mutation_container(state, &final_active.app).await
+                && let Ok(Some(container)) =
+                    mutation_container_policy(state, &final_active.app, allow_pending).await
             {
                 let _ = services
                     .idempotency
@@ -1327,7 +1565,7 @@ async fn lifecycle(
             }
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
-        let final_container = mutation_container(state, &app).await;
+        let final_container = mutation_container_policy(state, &app, allow_pending).await;
         let final_state_matches = match (compose_action, action, final_container.as_ref()) {
             (ComposeAction::Recreate, LifecycleAction::Start, Ok(Some(container))) => {
                 expected_container_id.is_none() && container.status == ContainerStatus::Running
@@ -1572,6 +1810,8 @@ struct DeletionFacts {
     project_name: String,
     active_release_id: Option<Uuid>,
     active_config_revision: Option<Uuid>,
+    pending_release_id: Option<Uuid>,
+    pending_config_revision: Option<Uuid>,
     remove_container: bool,
     container_ids: Vec<String>,
     managed_files: Vec<RetainedManagedFile>,
@@ -2266,7 +2506,24 @@ async fn canonical_deletion_snapshot(
         (None, None) => None,
         _ => return Err("ACTIVE_RELEASE_CONFIG_UNKNOWN"),
     };
-    let container = mutation_container(state, &app).await?;
+    let pending = match (app.pending_release_id, app.pending_config_revision) {
+        (Some(release_id), Some(revision)) => {
+            let release = services
+                .store
+                .load_v2_release(app_id, release_id)
+                .map_err(|_| "PENDING_RELEASE_INVALID")?;
+            if release.config_revision != revision {
+                return Err("PENDING_RELEASE_INVALID");
+            }
+            let loaded = load_config(services, app_id, revision)
+                .map_err(|_| "PENDING_RELEASE_CONFIG_UNKNOWN")?;
+            validate_runtime_paths(state, services, &loaded.metadata).await?;
+            Some(loaded)
+        }
+        (None, None) => None,
+        _ => return Err("PENDING_RELEASE_INVALID"),
+    };
+    let container = mutation_container_policy(state, &app, true).await?;
     let container_ids = container
         .as_ref()
         .map(|container| vec![container.id.clone()])
@@ -2275,6 +2532,7 @@ async fn canonical_deletion_snapshot(
         state,
         app_id,
         active.as_ref().map(|loaded| &loaded.metadata),
+        pending.as_ref().map(|loaded| &loaded.metadata),
         &draft.metadata,
         if remove_container {
             &[]
@@ -2285,6 +2543,7 @@ async fn canonical_deletion_snapshot(
     .await?;
     let managed_files = managed_file_inventory(
         active.as_ref().map(|loaded| &loaded.metadata),
+        pending.as_ref().map(|loaded| &loaded.metadata),
         &draft.metadata,
     );
     Ok(DeletionSnapshot {
@@ -2295,6 +2554,8 @@ async fn canonical_deletion_snapshot(
             project_name: app.project_name.clone(),
             active_release_id: app.active_release_id,
             active_config_revision: app.active_config_revision,
+            pending_release_id: app.pending_release_id,
+            pending_config_revision: app.pending_config_revision,
             remove_container,
             container_ids,
             managed_files,
@@ -2332,35 +2593,47 @@ fn deletion_facts_match(
         .unwrap_or(false)
 }
 
-fn configured_scope(active: bool, draft: bool) -> String {
-    match (active, draft) {
-        (true, true) => "active_and_draft",
-        (true, false) => "active",
-        (false, true) => "draft",
-        (false, false) => unreachable!("inventory entries have a configuration source"),
+fn configured_scope(active: bool, pending: bool, draft: bool) -> String {
+    match (active, pending, draft) {
+        (true, true, true) => "active_pending_and_draft",
+        (true, true, false) => "active_and_pending",
+        (true, false, true) => "active_and_draft",
+        (false, true, true) => "pending_and_draft",
+        (true, false, false) => "active",
+        (false, true, false) => "pending",
+        (false, false, true) => "draft",
+        (false, false, false) => unreachable!("inventory entries have a configuration source"),
     }
     .into()
 }
 
 fn managed_file_inventory(
     active: Option<&crate::domain::ConfigMetadata>,
+    pending: Option<&crate::domain::ConfigMetadata>,
     draft: &crate::domain::ConfigMetadata,
 ) -> Vec<RetainedManagedFile> {
-    let mut files: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    let mut files: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
     if let Some(active) = active {
         for file in &active.files {
             files.entry(file.logical_name.clone()).or_default().0 = true;
         }
     }
+    if let Some(pending) = pending {
+        for file in &pending.files {
+            files.entry(file.logical_name.clone()).or_default().1 = true;
+        }
+    }
     for file in &draft.files {
-        files.entry(file.logical_name.clone()).or_default().1 = true;
+        files.entry(file.logical_name.clone()).or_default().2 = true;
     }
     files
         .into_iter()
-        .map(|(logical_name, (active, draft))| RetainedManagedFile {
-            logical_name,
-            configured_in: configured_scope(active, draft),
-        })
+        .map(
+            |(logical_name, (active, pending, draft))| RetainedManagedFile {
+                logical_name,
+                configured_in: configured_scope(active, pending, draft),
+            },
+        )
         .collect()
 }
 
@@ -2368,12 +2641,13 @@ async fn retained_resources(
     state: &AppState,
     app_id: Uuid,
     active: Option<&crate::domain::ConfigMetadata>,
+    pending: Option<&crate::domain::ConfigMetadata>,
     draft: &crate::domain::ConfigMetadata,
     containers: &[String],
 ) -> Result<RetainedResources, &'static str> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        retained_resources_inner(state, app_id, active, draft, containers),
+        retained_resources_inner(state, app_id, active, pending, draft, containers),
     )
     .await
     .map_err(|_| "DOCKER_TIMEOUT")?
@@ -2383,17 +2657,19 @@ async fn retained_resources_inner(
     state: &AppState,
     app_id: Uuid,
     active: Option<&crate::domain::ConfigMetadata>,
+    pending: Option<&crate::domain::ConfigMetadata>,
     draft: &crate::domain::ConfigMetadata,
     containers: &[String],
 ) -> Result<RetainedResources, &'static str> {
-    let mut owned: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-    let mut external: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-    let mut networks: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-    let mut binds: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+    let mut owned: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+    let mut external: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+    let mut networks: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+    let mut binds: BTreeMap<String, (bool, bool, bool, bool)> = BTreeMap::new();
     for (metadata, is_active) in active
         .into_iter()
-        .map(|metadata| (metadata, true))
-        .chain(std::iter::once((draft, false)))
+        .map(|metadata| (metadata, 0_u8))
+        .chain(pending.into_iter().map(|metadata| (metadata, 1_u8)))
+        .chain(std::iter::once((draft, 2_u8)))
     {
         for volume in &metadata.volumes {
             let entry = match volume {
@@ -2404,45 +2680,45 @@ async fn retained_resources_inner(
                     external.entry(name.clone()).or_default()
                 }
             };
-            if is_active {
-                entry.0 = true;
-            } else {
-                entry.1 = true;
+            match is_active {
+                0 => entry.0 = true,
+                1 => entry.1 = true,
+                _ => entry.2 = true,
             }
         }
         let default = networks
             .entry(format!("solodock-{}-default", app_id.simple()))
             .or_default();
-        if is_active {
-            default.0 = true;
-        } else {
-            default.1 = true;
+        match is_active {
+            0 => default.0 = true,
+            1 => default.1 = true,
+            _ => default.2 = true,
         }
         for network in &metadata.networks {
             if let crate::domain::NetworkInput::External { name } = network {
                 let entry = networks.entry(name.clone()).or_default();
-                if is_active {
-                    entry.0 = true;
-                } else {
-                    entry.1 = true;
+                match is_active {
+                    0 => entry.0 = true,
+                    1 => entry.1 = true,
+                    _ => entry.2 = true,
                 }
             }
         }
         for bind in &metadata.binds {
             let entry = binds
                 .entry(bind.source.clone())
-                .or_insert((false, false, true));
-            if is_active {
-                entry.0 = true;
-            } else {
-                entry.1 = true;
+                .or_insert((false, false, false, true));
+            match is_active {
+                0 => entry.0 = true,
+                1 => entry.1 = true,
+                _ => entry.2 = true,
             }
-            entry.2 &= bind.readonly;
+            entry.3 &= bind.readonly;
         }
     }
 
     let mut owned_volumes = Vec::new();
-    for (name, (active, draft)) in owned {
+    for (name, (active, pending, draft)) in owned {
         let exists = state
             .observer
             .api
@@ -2452,12 +2728,12 @@ async fn retained_resources_inner(
             .is_some();
         owned_volumes.push(RetainedNamedResource {
             name,
-            configured_in: configured_scope(active, draft),
+            configured_in: configured_scope(active, pending, draft),
             exists,
         });
     }
     let mut external_volumes = Vec::new();
-    for (name, (active, draft)) in external {
+    for (name, (active, pending, draft)) in external {
         let exists = state
             .observer
             .api
@@ -2467,12 +2743,12 @@ async fn retained_resources_inner(
             .is_some();
         external_volumes.push(RetainedNamedResource {
             name,
-            configured_in: configured_scope(active, draft),
+            configured_in: configured_scope(active, pending, draft),
             exists,
         });
     }
     let mut retained_networks = Vec::new();
-    for (name, (active, draft)) in networks {
+    for (name, (active, pending, draft)) in networks {
         let exists = state
             .observer
             .api
@@ -2482,7 +2758,7 @@ async fn retained_resources_inner(
             .is_some();
         retained_networks.push(RetainedNamedResource {
             name,
-            configured_in: configured_scope(active, draft),
+            configured_in: configured_scope(active, pending, draft),
             exists,
         });
     }
@@ -2492,14 +2768,16 @@ async fn retained_resources_inner(
         external_volumes,
         binds: binds
             .into_iter()
-            .map(|(source, (active, draft, readonly))| RetainedBind {
-                exists: std::fs::symlink_metadata(&source)
-                    .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-                    .unwrap_or(false),
-                source,
-                readonly,
-                configured_in: configured_scope(active, draft),
-            })
+            .map(
+                |(source, (active, pending, draft, readonly))| RetainedBind {
+                    exists: std::fs::symlink_metadata(&source)
+                        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+                        .unwrap_or(false),
+                    source,
+                    readonly,
+                    configured_in: configured_scope(active, pending, draft),
+                },
+            )
             .collect(),
         networks: retained_networks,
     })
@@ -2525,11 +2803,12 @@ fn current_draft_input(
         app.slug.clone(),
         app.display_name.clone(),
         app.discovery_image_ref.clone().unwrap_or_default(),
+        app.draft.as_ref().and_then(|draft| draft.credential_ref),
         app.poll_interval_seconds,
     )
 }
 
-async fn validate_resources(
+pub(crate) async fn validate_resources(
     state: &AppState,
     app_id: Uuid,
     metadata: &crate::domain::ConfigMetadata,
@@ -2821,6 +3100,9 @@ mod tests {
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
             active_config_revision: None,
             active_config_sha256: None,
+            pending_release_id: None,
+            pending_image_ref: None,
+            pending_config_revision: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,

@@ -22,16 +22,39 @@ pub fn validate_identity(
     labels: &HashMap<String, String>,
     app: &AppCatalogEntry,
 ) -> Option<OwnedIdentity> {
+    let identity = validate_syntactic_identity(labels, app)?;
+    (app.active_release_id == Some(identity.release_id)).then_some(identity)
+}
+
+/// Validates only the immutable SoloDock/Compose identity. Callers must apply
+/// their own active/pending/deployment release policy afterwards.
+pub fn validate_syntactic_identity(
+    labels: &HashMap<String, String>,
+    app: &AppCatalogEntry,
+) -> Option<OwnedIdentity> {
     let app_id = canonical_uuid(labels.get(APP_ID_LABEL)?)?;
     let release_id = canonical_uuid(labels.get(RELEASE_ID_LABEL)?)?;
     (labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
         && labels.get(SCHEMA_LABEL).map(String::as_str) == Some("1")
         && app_id == app.id
-        && app.active_release_id == Some(release_id)
         && labels.get(PROJECT_LABEL).map(String::as_str) == Some(app.project_name.as_str())
         && labels.get(SERVICE_LABEL).map(String::as_str) == Some("app")
         && labels.get(ONEOFF_LABEL).map(String::as_str) == Some("False"))
     .then_some(OwnedIdentity { app_id, release_id })
+}
+
+pub fn release_is_allowed(identity: OwnedIdentity, releases: &[Uuid]) -> bool {
+    releases.contains(&identity.release_id)
+}
+
+pub fn validate_observed_identity(
+    labels: &HashMap<String, String>,
+    app: &AppCatalogEntry,
+) -> Option<OwnedIdentity> {
+    let identity = validate_syntactic_identity(labels, app)?;
+    (Some(identity.release_id) == app.active_release_id
+        || Some(identity.release_id) == app.pending_release_id)
+        .then_some(identity)
 }
 
 pub fn claimed_app_id(labels: &HashMap<String, String>) -> Option<Uuid> {
@@ -71,6 +94,9 @@ mod tests {
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
             active_config_revision: None,
             active_config_sha256: None,
+            pending_release_id: None,
+            pending_image_ref: None,
+            pending_config_revision: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,

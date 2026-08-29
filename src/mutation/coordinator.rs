@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use tokio::sync::{Mutex, OwnedMutexGuard, Semaphore, SemaphorePermit};
+use tokio::sync::{Mutex, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 use crate::security::permissions::{check_private, ensure_private_directory};
@@ -80,6 +80,13 @@ impl AppMutationCoordinator {
     pub fn try_compose(&self) -> Result<SemaphorePermit<'_>, CoordinatorError> {
         self.compose
             .try_acquire()
+            .map_err(|_| CoordinatorError::Busy)
+    }
+
+    pub fn try_compose_owned(&self) -> Result<OwnedSemaphorePermit, CoordinatorError> {
+        self.compose
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| CoordinatorError::Busy)
     }
 }

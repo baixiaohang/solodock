@@ -5,6 +5,7 @@ use std::{
 };
 
 use serde::{Deserialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -25,6 +26,9 @@ pub struct RecoveredApp {
     pub active_image_ref: Option<String>,
     pub active_config_revision: Option<Uuid>,
     pub active_config_sha256: Option<String>,
+    pub pending_release_id: Option<Uuid>,
+    pub pending_image_ref: Option<String>,
+    pub pending_config_revision: Option<Uuid>,
     pub discovery_image_ref: Option<String>,
     pub draft_revision: Option<Uuid>,
     pub draft_config_sha256: Option<String>,
@@ -58,7 +62,7 @@ struct AppHeader {
     #[serde(default)]
     discovery_image_ref: Option<String>,
     #[serde(default)]
-    credential_ref: Option<String>,
+    credential_ref: Option<Uuid>,
     #[serde(default)]
     draft_revision: Option<Uuid>,
     #[serde(default)]
@@ -421,7 +425,6 @@ fn scan_app(
             || header.draft_revision.is_none()
             || header.draft_config_sha256.is_none()
             || header.last_operation_id.is_none()
-            || header.credential_ref.is_some()
             || header.auto_deploy_enabled
             || !(60..=86_400).contains(&header.poll_interval_seconds)
             || header.project_name != crate::domain::AppMetadata::project_name(directory_id))
@@ -440,6 +443,7 @@ fn scan_app(
                         header.slug.clone(),
                         header.display_name.clone(),
                         image.clone(),
+                        header.credential_ref,
                         header.poll_interval_seconds,
                     );
                     match crate::domain::normalize_draft(
@@ -452,7 +456,11 @@ fn scan_app(
                         _ => return Ok(Err("CONFIG_REVISION_INVALID")),
                     }
                 }
-                Some(loaded.response(image.clone(), header.poll_interval_seconds))
+                Some(loaded.response(
+                    image.clone(),
+                    header.credential_ref,
+                    header.poll_interval_seconds,
+                ))
             }
             Ok(_) | Err(StoreError::ContentInvalid) => {
                 return Ok(Err("CONFIG_REVISION_INVALID"));
@@ -475,7 +483,13 @@ fn scan_app(
         }
         Err(error) => return Err(error.into()),
     }
-    let release_revisions = match collect_release_revisions(path, directory_id, mode)? {
+    let release_revisions = match collect_release_revisions(
+        path,
+        directory_id,
+        integrity_key,
+        allowed_bind_roots,
+        mode,
+    )? {
         Ok(revisions) => revisions,
         Err(code) => return Ok(Err(code)),
     };
@@ -493,17 +507,19 @@ fn scan_app(
         }
     }
     let active = match active {
-        Some(link) => match read_release_header(link, directory_id)? {
+        Some(link) => match read_release_header(link, directory_id, integrity_key)? {
             Ok(release) => Some(release),
             Err(code) => return Ok(Err(code)),
         },
         None => None,
     };
-    if let Some(link) = pending
-        && let Err(code) = read_release_header(link, directory_id)?
-    {
-        return Ok(Err(code));
-    }
+    let pending = match pending {
+        Some(link) => match read_release_header(link, directory_id, integrity_key)? {
+            Ok(release) => Some(release),
+            Err(code) => return Ok(Err(code)),
+        },
+        None => None,
+    };
     let (active_release_id, active_image_ref, active_config_revision, active_config_sha256) =
         match active {
             Some(release) => (
@@ -514,6 +530,14 @@ fn scan_app(
             ),
             None => (None, None, None, None),
         };
+    let (pending_release_id, pending_image_ref, pending_config_revision) = match pending {
+        Some(release) => (
+            Some(release.id),
+            Some(release.runnable_image_ref),
+            release.config_revision,
+        ),
+        None => (None, None, None),
+    };
     if let Some(revision) = active_config_revision {
         match load_revision(path, revision, integrity_key) {
             Ok(loaded)
@@ -567,6 +591,9 @@ fn scan_app(
         active_image_ref,
         active_config_revision,
         active_config_sha256,
+        pending_release_id,
+        pending_image_ref,
+        pending_config_revision,
         discovery_image_ref: header.discovery_image_ref,
         draft_revision: header.draft_revision,
         draft_config_sha256: header.draft_config_sha256,
@@ -610,6 +637,7 @@ fn validate_active_compose(
         app.slug.clone(),
         app.display_name.clone(),
         app.discovery_image_ref.clone().unwrap_or_default(),
+        app.credential_ref,
         app.poll_interval_seconds,
     );
     let draft =
@@ -648,6 +676,8 @@ fn validate_active_compose(
 fn collect_release_revisions(
     app_directory: &Path,
     app_id: Uuid,
+    integrity_key: Option<&[u8]>,
+    allowed_bind_roots: &[PathBuf],
     mode: ScanMode,
 ) -> Result<Result<HashMap<Uuid, String>, &'static str>, StoreError> {
     let releases = app_directory.join("releases");
@@ -685,10 +715,22 @@ fn collect_release_revisions(
             release_id,
             release_directory: entry.path(),
         };
-        let release = match read_release_header(&link, app_id)? {
+        let release = match read_release_header(&link, app_id, integrity_key)? {
             Ok(release) => release,
             Err(code) => return Ok(Err(code)),
         };
+        if release.schema_version == 2 {
+            match validate_v2_release(
+                app_directory,
+                app_id,
+                release_id,
+                integrity_key,
+                allowed_bind_roots,
+            )? {
+                Ok(()) => {}
+                Err(code) => return Ok(Err(code)),
+            }
+        }
         match (release.config_revision, release.config_sha256) {
             (Some(revision), Some(hash)) => {
                 if let Some(previous) = references.insert(revision, hash.clone())
@@ -705,6 +747,86 @@ fn collect_release_revisions(
         super::sync_directory(&releases)?;
     }
     Ok(Ok(references))
+}
+
+fn validate_v2_release(
+    app_directory: &Path,
+    app_id: Uuid,
+    release_id: Uuid,
+    integrity_key: Option<&[u8]>,
+    allowed_bind_roots: &[PathBuf],
+) -> Result<Result<(), &'static str>, StoreError> {
+    let Some(key) = integrity_key else {
+        return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
+    };
+    let directory = app_directory.join("releases").join(release_id.to_string());
+    let release: super::releases::ReleaseV2 = match read_toml(
+        &directory.join("release.toml"),
+        "RELEASE_HEADER_MISSING",
+        "RELEASE_HEADER_INVALID",
+    )? {
+        Ok(value) => value,
+        Err(code) => return Ok(Err(code)),
+    };
+    if release.app_id != app_id
+        || release.id != release_id
+        || super::releases::sign(&release, key) != release.integrity_hmac
+    {
+        return Ok(Err("RELEASE_INTEGRITY_INVALID"));
+    }
+    let loaded = match load_revision(app_directory, release.config_revision, integrity_key) {
+        Ok(value) if value.metadata.config_sha256 == release.config_sha256 => value,
+        Ok(_) | Err(StoreError::ContentInvalid) => {
+            return Ok(Err("RELEASE_CONFIG_REVISION_INVALID"));
+        }
+        Err(error) => return Err(error),
+    };
+    let app: AppHeader = match read_toml(
+        &app_directory.join("app.toml"),
+        "APP_HEADER_MISSING",
+        "APP_HEADER_INVALID",
+    )? {
+        Ok(value) => value,
+        Err(code) => return Ok(Err(code)),
+    };
+    let input = loaded.input(
+        app.slug,
+        app.display_name,
+        release.source_image_ref.clone(),
+        release.credential_ref,
+        app.poll_interval_seconds,
+    );
+    let draft =
+        match crate::domain::normalize_draft(input, &loaded.secrets, key, allowed_bind_roots) {
+            Ok(value) if value.metadata == loaded.metadata => value,
+            _ => return Ok(Err("RELEASE_CONFIG_REVISION_INVALID")),
+        };
+    let (canonical, _) = generate(
+        ComposeInput {
+            app_id,
+            release_id,
+            image_ref: &release.runnable_image_ref,
+            revision_directory: &app_directory
+                .join("config-revisions")
+                .join(release.config_revision.to_string()),
+            draft: &draft,
+        },
+        true,
+    )
+    .map_err(|_| StoreError::ContentInvalid)?;
+    let compose = match fs::read(directory.join("compose.yaml")) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err("RELEASE_COMPOSE_MISSING"));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if compose != canonical.as_bytes()
+        || format!("{:x}", Sha256::digest(&compose)) != release.compose_sha256
+    {
+        return Ok(Err("RELEASE_COMPOSE_INVALID"));
+    }
+    Ok(Ok(()))
 }
 
 fn is_release_temp_name(name: &std::ffi::OsStr) -> bool {
@@ -815,6 +937,7 @@ fn validate_release_link_path(
 fn read_release_header(
     link: &ValidatedReleaseLink,
     app_id: Uuid,
+    integrity_key: Option<&[u8]>,
 ) -> Result<Result<ReleaseHeader, &'static str>, StoreError> {
     let release_path = link.release_directory.join("release.toml");
     let release: ReleaseHeader = match read_toml(
@@ -825,12 +948,31 @@ fn read_release_header(
         Ok(release) => release,
         Err(code) => return Ok(Err(code)),
     };
-    if release.schema_version != 1
-        || release.id != link.release_id
+    if release.id != link.release_id
         || release.app_id != app_id
         || !valid_runnable_image_ref(&release.runnable_image_ref)
     {
         return Ok(Err("RELEASE_HEADER_INVALID"));
+    }
+    match release.schema_version {
+        1 => {}
+        2 => {
+            let Some(key) = integrity_key else {
+                return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
+            };
+            let value: super::releases::ReleaseV2 = match read_toml(
+                &release_path,
+                "RELEASE_HEADER_MISSING",
+                "RELEASE_HEADER_INVALID",
+            )? {
+                Ok(value) => value,
+                Err(code) => return Ok(Err(code)),
+            };
+            if super::releases::sign(&value, key) != value.integrity_hmac {
+                return Ok(Err("RELEASE_INTEGRITY_INVALID"));
+            }
+        }
+        _ => return Ok(Err("RELEASE_SCHEMA_UNSUPPORTED")),
     }
     let _ = release.created_at;
     Ok(Ok(release))

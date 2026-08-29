@@ -14,6 +14,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
     db::{Database, DbError, format_time},
+    registry::CredentialStore,
     security::permissions::{check_private, ensure_private_directory},
 };
 
@@ -47,6 +48,41 @@ pub struct EffectMarker {
 }
 
 impl IdempotencyService {
+    /// Reads a completed response without acquiring or changing an operation.
+    /// This lets callers replay before consulting mutable application facts.
+    pub async fn completed(
+        &self,
+        route: &str,
+        raw_key: &str,
+        request_hmac: &[u8],
+    ) -> Result<Option<ClaimResult>, IdempotencyError> {
+        Self::validate_key(raw_key)?;
+        let key_hmac = hmac(&self.key.0, raw_key.as_bytes());
+        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor='admin' AND route=? AND key_hmac=?")
+            .bind(route)
+            .bind(key_hmac)
+            .fetch_optional(self.database.pool())
+            .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let stored: Vec<u8> = row.get(0);
+        if stored != request_hmac {
+            return Err(IdempotencyError::Reused);
+        }
+        if !matches!(row.get::<String, _>(2).as_str(), "succeeded" | "failed") {
+            return Ok(None);
+        }
+        Ok(Some(ClaimResult::Replay {
+            operation_id: row
+                .get::<String, _>(1)
+                .parse()
+                .map_err(|_| IdempotencyError::RecordInvalid)?,
+            status: row.get::<i64, _>(3) as u16,
+            body: row.get(4),
+        }))
+    }
+
     pub fn initialize(
         database: Database,
         state_directory: &Path,
@@ -141,6 +177,51 @@ impl IdempotencyService {
         Ok(())
     }
 
+    /// Finalizes credential tombstones only after the exact deletion response
+    /// is durable. Interrupted operations remain resumable; malformed or
+    /// unowned markers fail closed instead of becoming a broad startup cleanup.
+    pub async fn finalize_succeeded_credential_tombstones(
+        &self,
+        store: &CredentialStore,
+    ) -> Result<(), IdempotencyError> {
+        for (credential_id, operation_id) in store.tombstones()? {
+            let route = format!("/api/v1/registry-credentials/{credential_id}");
+            let row = sqlx::query(
+                "SELECT status,response_status,response_body FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?",
+            )
+            .bind(&route)
+            .bind(operation_id.to_string())
+            .fetch_optional(self.database.pool())
+            .await?;
+            let Some(row) = row else {
+                return Err(IdempotencyError::RecordInvalid);
+            };
+            match row.get::<String, _>(0).as_str() {
+                "pending" | "interrupted" => continue,
+                "succeeded" => {
+                    let status = row.get::<Option<i64>, _>(1);
+                    let body = row.get::<Option<String>, _>(2);
+                    let valid = status == Some(200)
+                        && body
+                            .as_deref()
+                            .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                            .is_some_and(|value| {
+                                value.get("id").and_then(|value| value.as_str())
+                                    == Some(credential_id.to_string().as_str())
+                                    && value.get("deleted").and_then(|value| value.as_bool())
+                                        == Some(true)
+                            });
+                    if !valid {
+                        return Err(IdempotencyError::RecordInvalid);
+                    }
+                    store.finalize_tombstone(credential_id, operation_id)?;
+                }
+                _ => return Err(IdempotencyError::RecordInvalid),
+            }
+        }
+        Ok(())
+    }
+
     pub async fn claim(
         &self,
         route: &str,
@@ -186,6 +267,85 @@ impl IdempotencyService {
                 tx.commit().await?;
                 Ok(ClaimResult::Resume(operation_id))
             }
+            "pending" => Err(IdempotencyError::InProgress),
+            _ => Err(IdempotencyError::RecordInvalid),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn claim_deployment(
+        &self,
+        route: &str,
+        raw_key: &str,
+        request_hmac: &[u8],
+        request_id: Uuid,
+        app_id: Uuid,
+        trigger: &str,
+        requested_revision: Uuid,
+        from_release_id: Option<Uuid>,
+        expected_pending_release_id: Option<Uuid>,
+        expected_actual_release_id: Option<Uuid>,
+        expected_actual_container_id: Option<&str>,
+        rollback_target_release_id: Option<Uuid>,
+        rollback_of_deployment_id: Option<Uuid>,
+    ) -> Result<ClaimResult, IdempotencyError> {
+        Self::validate_key(raw_key)?;
+        let key_hmac = hmac(&self.key.0, raw_key.as_bytes());
+        let now = format_time(OffsetDateTime::now_utc())?;
+        let operation_id = Uuid::new_v4();
+        let mut tx = self.database.pool().begin().await?;
+        let inserted = sqlx::query("INSERT OR IGNORE INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,created_at,updated_at) VALUES ('admin',?,?,?,?, 'pending',?,?)")
+            .bind(route).bind(&key_hmac).bind(request_hmac).bind(operation_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await?.rows_affected();
+        if inserted == 1 {
+            let deployment = sqlx::query("INSERT INTO deployments (id,app_id,trigger,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,expected_actual_container_id,rollback_target_release_id,rollback_of_deployment_id,status,phase,request_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'queued','queued',?,?,?)")
+                .bind(operation_id.to_string()).bind(app_id.to_string()).bind(trigger).bind(requested_revision.to_string())
+                .bind(from_release_id.map(|v|v.to_string()))
+                .bind(expected_pending_release_id.map(|v|v.to_string()))
+                .bind(expected_actual_release_id.map(|v|v.to_string()))
+                .bind(expected_actual_container_id)
+                .bind(rollback_target_release_id.map(|v|v.to_string())).bind(rollback_of_deployment_id.map(|v|v.to_string()))
+                .bind(request_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await;
+            if let Err(error) = deployment {
+                if error
+                    .as_database_error()
+                    .is_some_and(|value| value.is_unique_violation())
+                {
+                    return Err(IdempotencyError::InProgress);
+                }
+                return Err(error.into());
+            }
+            sqlx::query("INSERT INTO deployment_transitions (deployment_id,seq,phase,result,created_at) VALUES (?,1,'queued','scheduled',?)")
+                .bind(operation_id.to_string()).bind(&now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO audit_events (actor,request_id,action,target_type,target_id,result,redacted_metadata,created_at) VALUES ('admin',?,?, 'deployment',?,'attempt','{}',?)")
+                .bind(request_id.to_string()).bind(route).bind(operation_id.to_string()).bind(&now).execute(&mut *tx).await?;
+            let response_body = serde_json::json!({
+                "deployment_id": operation_id,
+                "status": "queued",
+                "idempotency_replayed": false,
+                "detail_url": format!("/api/v1/deployments/{operation_id}")
+            })
+            .to_string();
+            sqlx::query("UPDATE idempotency_records SET status='succeeded',response_status=202,response_body=?,updated_at=? WHERE actor='admin' AND route=? AND key_hmac=? AND operation_id=?")
+                .bind(response_body).bind(&now).bind(route).bind(&key_hmac).bind(operation_id.to_string()).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok(ClaimResult::New(operation_id));
+        }
+        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor='admin' AND route=? AND key_hmac=?").bind(route).bind(&key_hmac).fetch_one(&mut *tx).await?;
+        let stored: Vec<u8> = row.get(0);
+        if stored != request_hmac {
+            return Err(IdempotencyError::Reused);
+        }
+        let operation_id = row
+            .get::<String, _>(1)
+            .parse()
+            .map_err(|_| IdempotencyError::RecordInvalid)?;
+        match row.get::<String, _>(2).as_str() {
+            "succeeded" | "failed" => Ok(ClaimResult::Replay {
+                operation_id,
+                status: row.get::<i64, _>(3) as u16,
+                body: row.get(4),
+            }),
+            "interrupted" => Err(IdempotencyError::InProgress),
             "pending" => Err(IdempotencyError::InProgress),
             _ => Err(IdempotencyError::RecordInvalid),
         }
@@ -372,5 +532,232 @@ pub enum IdempotencyError {
 impl From<sqlx::Error> for IdempotencyError {
     fn from(error: sqlx::Error) -> Self {
         Self::Database(DbError::from(error))
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+    use crate::{registry::CredentialStore, security::secret::SecretValue};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn deployment_claim_is_atomic_with_unique_nonterminal_row() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let app = Uuid::new_v4();
+        let revision = Uuid::new_v4();
+        let first = service
+            .claim_deployment(
+                "/deploy",
+                "abcdefghijklmnop",
+                b"first",
+                Uuid::new_v4(),
+                app,
+                "manual",
+                revision,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let deployment_id = match first {
+            ClaimResult::New(id) => id,
+            _ => panic!("first claim creates the durable deployment"),
+        };
+        let replay = service
+            .claim_deployment(
+                "/deploy",
+                "abcdefghijklmnop",
+                b"first",
+                Uuid::new_v4(),
+                app,
+                "manual",
+                revision,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        match replay {
+            ClaimResult::Replay {
+                operation_id,
+                status,
+                body,
+            } => {
+                assert_eq!(operation_id, deployment_id);
+                assert_eq!(status, 202);
+                assert!(body.contains(&deployment_id.to_string()));
+            }
+            _ => panic!("accepted response must replay across the spawn/crash window"),
+        }
+        assert!(matches!(
+            service
+                .claim_deployment(
+                    "/deploy",
+                    "qrstuvwxyzABCDEF",
+                    b"second",
+                    Uuid::new_v4(),
+                    app,
+                    "manual",
+                    revision,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None
+                )
+                .await,
+            Err(IdempotencyError::InProgress)
+        ));
+        let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        let deployments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deployments")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!((records, deployments), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn succeeded_credential_tombstones_retry_remove_and_parent_sync_failures() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database, root.path()).unwrap();
+        let store = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+
+        async fn completed_deletion(
+            service: &IdempotencyService,
+            store: &CredentialStore,
+            id: Uuid,
+            key: &str,
+        ) -> (Uuid, std::path::PathBuf) {
+            store
+                .create(
+                    id,
+                    Uuid::new_v4(),
+                    "ghcr.io",
+                    &format!("robot-{id}"),
+                    &SecretValue::new("credential-secret".into()),
+                )
+                .unwrap();
+            let route = format!("/api/v1/registry-credentials/{id}");
+            let fingerprint = service.fingerprint(route.as_bytes());
+            let operation = match service
+                .claim(&route, key, &fingerprint, Uuid::new_v4())
+                .await
+                .unwrap()
+            {
+                ClaimResult::New(value) => value,
+                _ => panic!("first deletion claim must be new"),
+            };
+            let tombstone = store.tombstone(id, operation).unwrap();
+            service
+                .finish(
+                    &route,
+                    key,
+                    200,
+                    &serde_json::json!({"id": id, "deleted": true}).to_string(),
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+            (operation, tombstone)
+        }
+
+        let first_id = Uuid::new_v4();
+        let (_, first_tombstone) =
+            completed_deletion(&service, &store, first_id, "credential-delete-remove-0001").await;
+        store.fail_next_finalize_remove_for_test();
+        assert!(
+            service
+                .finalize_succeeded_credential_tombstones(&store)
+                .await
+                .is_err()
+        );
+        assert!(first_tombstone.exists());
+        service
+            .finalize_succeeded_credential_tombstones(&store)
+            .await
+            .unwrap();
+        assert!(!first_tombstone.exists());
+
+        let second_id = Uuid::new_v4();
+        let (_, second_tombstone) =
+            completed_deletion(&service, &store, second_id, "credential-delete-sync-00002").await;
+        store.fail_next_finalize_sync_for_test();
+        assert!(
+            service
+                .finalize_succeeded_credential_tombstones(&store)
+                .await
+                .is_err()
+        );
+        assert!(
+            !second_tombstone.exists(),
+            "the visible removal must be repaired by the next parent fsync"
+        );
+        service
+            .finalize_succeeded_credential_tombstones(&store)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_tombstone_without_an_exact_ledger_record_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database, root.path()).unwrap();
+        let store = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let id = Uuid::new_v4();
+        store
+            .create(
+                id,
+                Uuid::new_v4(),
+                "ghcr.io",
+                "robot",
+                &SecretValue::new("credential-secret".into()),
+            )
+            .unwrap();
+        let tombstone = store.tombstone(id, Uuid::new_v4()).unwrap();
+        assert!(matches!(
+            service
+                .finalize_succeeded_credential_tombstones(&store)
+                .await,
+            Err(IdempotencyError::RecordInvalid)
+        ));
+        assert!(
+            tombstone.exists(),
+            "an unowned marker must never be removed"
+        );
     }
 }

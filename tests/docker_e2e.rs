@@ -9,6 +9,7 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     models::{
@@ -27,11 +28,15 @@ use solodock::docker::{
 };
 use solodock::{
     AppState,
-    api::mutations::M3Services,
+    api::{deployments::M4Services, mutations::M3Services},
     app_store::AppStore,
     auth::AuthService,
     compose::{ComposeAction, ComposeCapability, ComposeRunner, FixedComposeRunner, RunContext},
     db::Database,
+    deploy::{
+        DeploymentEngine, DeploymentLedger, FixedImagePuller, HealthVerifier, TestEffectAction,
+        TestEffectGate, TestPullAction, TestPullGate,
+    },
     docker::{
         AppCatalog, DockerObserver,
         events::DockerEventHub,
@@ -40,6 +45,7 @@ use solodock::{
         stats::StatsHub,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
+    registry::{CredentialStore, RegistryResolver},
     router,
 };
 use tempfile::TempDir;
@@ -70,6 +76,15 @@ struct MutationHarness {
 
 impl MutationHarness {
     async fn new(endpoint: String, bind_root: std::path::PathBuf) -> Self {
+        Self::new_with_test_gates(endpoint, bind_root, None, None).await
+    }
+
+    async fn new_with_test_gates(
+        endpoint: String,
+        bind_root: std::path::PathBuf,
+        pull_gate: Option<TestPullGate>,
+        effect_gate: Option<TestEffectGate>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = root.path().join("state");
@@ -116,7 +131,7 @@ impl MutationHarness {
             shutdown.clone(),
             tasks.clone(),
             redactor.clone(),
-            endpoint,
+            endpoint.clone(),
         ));
         let capability = ComposeCapability::default();
         capability.probe(compose.as_ref()).await;
@@ -130,17 +145,18 @@ impl MutationHarness {
             public_origin: "https://solodock.example.com".into(),
             observer,
             events: DockerEventHub::new(),
-            stats: StatsHub::new(docker_api, shutdown.clone(), tasks.clone()),
+            stats: StatsHub::new(docker_api.clone(), shutdown.clone(), tasks.clone()),
             stream_gate: solodock::api::streams::StreamGate::default(),
             redactor,
             state_directory: state_directory.clone(),
             shutdown,
             stream_tasks: tasks,
             m3: None,
+            m4: None,
         };
-        state.m3 = Some(Arc::new(M3Services {
+        let m3 = Arc::new(M3Services {
             store: store.clone(),
-            database,
+            database: database.clone(),
             allowed_bind_roots: vec![bind_root],
             runtime_directory: runtime_directory.clone(),
             idempotency: idempotency.clone(),
@@ -150,6 +166,44 @@ impl MutationHarness {
             projection_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconcile_notify: Arc::new(tokio::sync::Notify::new()),
             publication_lock: Arc::new(tokio::sync::Mutex::new(())),
+        });
+        state.m3 = Some(m3.clone());
+        let credentials = CredentialStore::initialize(
+            state_directory.join("registry-credentials"),
+            idempotency.integrity_key(),
+        )
+        .unwrap();
+        let ledger = DeploymentLedger::new(database);
+        let mut puller = FixedImagePuller::new(
+            state_directory.clone(),
+            state_directory.join("pull-runtime"),
+            docker_api.clone(),
+            state.shutdown.clone(),
+            state.stream_tasks.clone(),
+        )
+        .unwrap()
+        .with_test_host(endpoint)
+        .with_test_pressure_root(state_directory.clone());
+        if let Some(gate) = pull_gate {
+            puller = puller.with_test_gate(gate);
+        }
+        let engine = DeploymentEngine {
+            store: store.clone(),
+            credentials: credentials.clone(),
+            resolver: RegistryResolver::for_test_http().unwrap(),
+            ledger: ledger.clone(),
+            puller: Arc::new(puller),
+            compose: m3.compose.clone(),
+            docker: docker_api.clone(),
+            health: HealthVerifier::new(docker_api, state.shutdown.clone()),
+            shutdown: state.shutdown.clone(),
+            tasks: state.stream_tasks.clone(),
+            test_effect_gate: effect_gate,
+        };
+        state.m4 = Some(Arc::new(M4Services {
+            credentials,
+            ledger,
+            engine,
         }));
         let app = router(state.clone());
         Self {
@@ -210,6 +264,7 @@ impl MutationHarness {
                 metadata.slug,
                 metadata.display_name,
                 metadata.discovery_image_ref,
+                metadata.credential_ref,
                 metadata.poll_interval_seconds,
             ),
             &loaded.secrets,
@@ -263,7 +318,10 @@ async fn observes_owned_container_on_isolated_daemon() {
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST")
         .expect("SOLODOCK_TEST_DOCKER_HOST must point to the isolated daemon");
     assert!(endpoint.starts_with("tcp://127.0.0.1:") || endpoint.starts_with("tcp://localhost:"));
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+    // Fixture setup is not part of the production five-second unary contract;
+    // allow a busy shared DinD daemon to create this container while another
+    // isolated test is exercising image/Registry I/O.
+    let docker = Docker::connect_with_http(&endpoint, 30, API_DEFAULT_VERSION)
         .unwrap()
         .negotiate_version()
         .await
@@ -781,7 +839,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         cancellation.clone(),
         tasks.clone(),
         SecretRedactor::new(&EmptySecretProvider),
-        endpoint,
+        endpoint.clone(),
     ));
     let context = || RunContext {
         project_name: format!("solodock-{}", app_id.simple()),
@@ -1093,7 +1151,7 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
         .unwrap();
     remove_test_container(&docker, &daemon_seed, token).await;
 
-    let harness = MutationHarness::new(endpoint, bind_root.clone()).await;
+    let harness = MutationHarness::new(endpoint.clone(), bind_root.clone()).await;
     let create_body = |slug: &str| {
         json!({
             "slug": slug, "display_name": slug, "discovery_image_ref": "nginx:1.27-alpine",
@@ -1247,7 +1305,6 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
             .await
             .is_ok()
     );
-
     for id in [app_id, remove_app_id] {
         let volume = format!("solodock-{}-owned", id.simple());
         let network = format!("solodock-{}-default", id.simple());
@@ -1293,6 +1350,695 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
     let _ = std::fs::remove_dir_all(bind_root);
 }
 
+#[tokio::test]
+#[ignore = "requires a dedicated Docker-in-Docker daemon, Registry access, and docker compose CLI"]
+async fn production_m4_digest_deploy_auto_rollback_and_manual_rollback() {
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    let registry_user = "solodock-fixture";
+    let registry_secret = format!("m4-private-canary-{token}");
+    let auth_directory = tempfile::tempdir().unwrap();
+    let registry_network = format!("solodock-m4-registry-network-{token}");
+    let registry_data_volume = format!("solodock-m4-registry-data-{token}");
+    docker
+        .create_volume(VolumeCreateRequest {
+            name: Some(registry_data_volume.clone()),
+            labels: Some(HashMap::from([(
+                "com.solodock.test-run".into(),
+                token.to_string(),
+            )])),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    docker_cli(
+        &endpoint,
+        &[
+            "network",
+            "create",
+            "--label",
+            &format!("com.solodock.test-run={token}"),
+            &registry_network,
+        ],
+    )
+    .await;
+    let registry_name = format!("solodock-m4-registry-backend-{token}");
+    let registry_id = docker_cli(
+        &endpoint,
+        &[
+            "create",
+            "--name",
+            &registry_name,
+            "--label",
+            &format!("com.solodock.test-run={token}"),
+            "--network",
+            &registry_network,
+            "--network-alias",
+            "registry-backend",
+            "-v",
+            &format!("{registry_data_volume}:/var/lib/registry"),
+            "registry:2",
+        ],
+    )
+    .await;
+    docker_cli(&endpoint, &["start", registry_id.trim()]).await;
+    let basic = STANDARD.encode(format!("{registry_user}:{registry_secret}"));
+    let proxy_config = auth_directory.path().join("nginx.conf");
+    std::fs::write(
+        &proxy_config,
+        format!(
+            r#"events {{}}
+http {{
+  server {{
+    listen 5000;
+    client_max_body_size 0;
+    location = /token {{
+      if ($http_authorization != "Basic {basic}") {{ return 403; }}
+      default_type application/json;
+      return 200 '{{"token":"fixture-bearer-token"}}';
+    }}
+    location /v2/ {{
+      error_page 418 = @challenge;
+      if ($http_authorization != "Bearer fixture-bearer-token") {{ return 418; }}
+      proxy_set_header Authorization "";
+      proxy_set_header Host $http_host;
+      proxy_pass http://registry-backend:5000;
+    }}
+    location @challenge {{
+      add_header WWW-Authenticate 'Bearer realm="http://127.0.0.1:5000/token",service="solodock-fixture"' always;
+      return 401;
+    }}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+    let proxy_name = format!("solodock-m4-registry-proxy-{token}");
+    let proxy_id = docker_cli(
+        &endpoint,
+        &[
+            "create",
+            "--name",
+            &proxy_name,
+            "--label",
+            &format!("com.solodock.test-run={token}"),
+            "--network",
+            &registry_network,
+            "-p",
+            "5000:5000",
+            "nginx:1.27-alpine",
+        ],
+    )
+    .await;
+    docker_cli(
+        &endpoint,
+        &[
+            "cp",
+            proxy_config.to_str().unwrap(),
+            &format!("{}:/etc/nginx/nginx.conf", proxy_id.trim()),
+        ],
+    )
+    .await;
+    docker_cli(&endpoint, &["start", proxy_id.trim()]).await;
+    let readiness_client = reqwest::Client::new();
+    let mut registry_ready = false;
+    for _ in 0..100 {
+        if readiness_client
+            .get("http://127.0.0.1:5000/v2/")
+            .bearer_auth("fixture-bearer-token")
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
+        {
+            registry_ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        registry_ready,
+        "Bearer proxy and Registry backend never became ready"
+    );
+    let docker_config = tempfile::tempdir().unwrap();
+    docker_cli_with_input(
+        &endpoint,
+        docker_config.path(),
+        &[
+            "login",
+            "127.0.0.1:5000",
+            "--username",
+            registry_user,
+            "--password-stdin",
+        ],
+        registry_secret.as_bytes(),
+    )
+    .await;
+    for (source, target) in [
+        ("nginx:1.27-alpine", "127.0.0.1:5000/solodock/nginx:stable"),
+        ("alpine:3.20", "127.0.0.1:5000/solodock/alpine:stable"),
+    ] {
+        docker_cli(&endpoint, &["tag", source, target]).await;
+        docker_cli_with_input(&endpoint, docker_config.path(), &["push", target], &[]).await;
+    }
+    let external_volume = format!("solodock-m4-external-volume-{token}");
+    let external_network = format!("solodock-m4-external-network-{token}");
+    let labels = HashMap::from([("com.solodock.test-run".into(), token.to_string())]);
+    docker
+        .create_volume(VolumeCreateRequest {
+            name: Some(external_volume.clone()),
+            labels: Some(labels.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    docker
+        .create_network(NetworkCreateRequest {
+            name: external_network.clone(),
+            labels: Some(labels),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let bind_root = std::path::PathBuf::from(format!("/tmp/solodock-m4-bind-root-{token}"));
+    std::fs::create_dir_all(&bind_root).unwrap();
+    let bind_source = bind_root.join("persistent-data");
+    std::fs::create_dir_all(&bind_source).unwrap();
+    let bind_canary = format!("m4-bind-canary-{token}");
+    std::fs::write(bind_source.join("canary"), &bind_canary).unwrap();
+    let pull_gate = TestPullGate::new([TestPullAction::Pause, TestPullAction::Interrupt]);
+    let effect_gate = TestEffectGate::new([
+        TestEffectAction::Continue,
+        TestEffectAction::Continue,
+        TestEffectAction::Continue,
+        TestEffectAction::Pause,
+    ]);
+    let harness = MutationHarness::new_with_test_gates(
+        endpoint.clone(),
+        bind_root.clone(),
+        Some(pull_gate.clone()),
+        Some(effect_gate.clone()),
+    )
+    .await;
+    let credential = harness
+        .request(
+            "POST",
+            "/api/v1/registry-credentials",
+            Some("m4-e2e-credential-0001"),
+            Some(&json!({
+                "registry":"127.0.0.1:5000",
+                "username":registry_user,
+                "secret":registry_secret,
+            })),
+        )
+        .await;
+    assert_eq!(credential.status(), StatusCode::CREATED);
+    let credential_body = MutationHarness::json(credential).await;
+    assert!(!credential_body.to_string().contains(&registry_secret));
+    let credential_id = credential_body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        harness.state.redactor.redact(registry_secret.as_bytes()),
+        b"[REDACTED]"
+    );
+    let draft = |slug: &str, image: &str, health: Value| {
+        json!({
+            "slug": slug, "display_name": "M4 E2E", "discovery_image_ref": image,
+            "credential_ref": credential_id, "auto_deploy_enabled": false, "poll_interval_seconds": 300,
+            "environment": {"public": [], "secrets": []}, "files": [], "ports": [],
+            "volumes": [
+                {"kind":"owned","logical_name":"owned","target_path":"/owned"},
+                {"kind":"external","name":external_volume,"target_path":"/external"}
+            ],
+            "binds": [{
+                "source": bind_source,
+                "target_path": "/bind",
+                "readonly": true,
+                "acknowledge_non_rollbackable": false
+            }],
+            "networks": [{"kind":"owned_default"},{"kind":"external","name":external_network}],
+            "health": health
+        })
+    };
+    let create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("m4-e2e-create-0001"),
+            Some(&draft(
+                "m4-e2e",
+                "127.0.0.1:5000/solodock/nginx:stable",
+                json!({"policy":"running","stable_window_seconds":5}),
+            )),
+        )
+        .await;
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let app_id = MutationHarness::json(create).await["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    assert_eq!(
+        harness.state.redactor.redact(registry_secret.as_bytes()),
+        b"[REDACTED]",
+        "app publication must not drop registry credentials from the inventory"
+    );
+
+    let project = format!("solodock-{}", app_id.simple());
+    let collision_name = format!("solodock-m4-collision-{token}");
+    let collision_id = docker_cli(
+        &endpoint,
+        &[
+            "run",
+            "-d",
+            "--name",
+            &collision_name,
+            "--label",
+            &format!("com.solodock.test-run={token}"),
+            "--label",
+            &format!("com.docker.compose.project={project}"),
+            "--label",
+            "com.docker.compose.service=app",
+            "nginx:1.27-alpine",
+        ],
+    )
+    .await;
+    let current = app_detail(&harness, app_id).await;
+    let blocked = harness
+        .request(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/deployments"),
+            Some("m4-e2e-collision-0001"),
+            Some(&json!({
+                "expected_draft_revision":current["draft_revision"],
+                "expected_active_release_id":current["active_release"]["id"].as_str(),
+                "expected_pending_release_id":current["pending_release_id"],
+                "expected_actual_release_id":current["actual_release_id"],
+                "expected_actual_container_id":current["actual"]["id"].as_str(),
+                "acknowledge_non_rollbackable_data":true
+            })),
+        )
+        .await;
+    assert_eq!(blocked.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        MutationHarness::json(blocked).await["code"],
+        "APP_CONTAINER_INVALID"
+    );
+    remove_test_container(&docker, collision_id.trim(), token).await;
+
+    let first = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0001").await;
+    // The worker has already resolved the tag and published the immutable
+    // candidate when the test-only pull boundary pauses. Moving the tag here
+    // proves the production pull/Compose path remains pinned to that digest.
+    pull_gate.wait_until_reached().await;
+    docker_cli(
+        &endpoint,
+        &["tag", "alpine:3.20", "127.0.0.1:5000/solodock/nginx:stable"],
+    )
+    .await;
+    docker_cli_with_input(
+        &endpoint,
+        docker_config.path(),
+        &["push", "127.0.0.1:5000/solodock/nginx:stable"],
+        &[],
+    )
+    .await;
+    pull_gate.resume();
+    let first = wait_for_deployment(&harness, first).await;
+    assert_eq!(first["status"], "succeeded", "{first}");
+    assert!(!first.to_string().contains(&registry_secret));
+    let first_release = first["candidate_release_id"].as_str().unwrap().to_owned();
+    let owned_volume = format!("solodock-{}-owned", app_id.simple());
+    write_m4_volume_canaries(&docker, &owned_volume, &external_volume, token).await;
+    assert!(
+        first["source_image_ref"]
+            .as_str()
+            .unwrap()
+            .ends_with("/solodock/nginx:stable")
+    );
+
+    let after_tag_move = app_detail(&harness, app_id).await;
+    assert_eq!(after_tag_move["active_release"]["id"], first_release);
+    assert!(
+        after_tag_move["actual"]["configured_image_ref"]
+            .as_str()
+            .unwrap()
+            .contains("@sha256:")
+    );
+    assert!(
+        first["manifest_digest"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
+
+    let current = app_detail(&harness, app_id).await;
+    let unhealthy = draft(
+        "m4-e2e",
+        "127.0.0.1:5000/solodock/alpine:stable",
+        json!({"policy":"healthy"}),
+    );
+    update_draft(
+        &harness,
+        app_id,
+        current["draft_revision"].as_str().unwrap(),
+        unhealthy,
+        "m4-e2e-update-0001",
+    )
+    .await;
+    let interrupted = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0002").await;
+    let interrupted = wait_for_deployment(&harness, interrupted).await;
+    assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+    let interrupted_facts = app_detail(&harness, app_id).await;
+    assert!(interrupted_facts["pending_release_id"].is_string());
+    assert_eq!(
+        interrupted_facts["actual_release_id"],
+        interrupted_facts["active_release"]["id"]
+    );
+    let failed = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0002-resume").await;
+    let failed = wait_for_deployment(&harness, failed).await;
+    assert_eq!(failed["status"], "rolled_back", "{failed}");
+    assert_eq!(
+        app_detail(&harness, app_id).await["active_release"]["id"],
+        first_release
+    );
+
+    let current = app_detail(&harness, app_id).await;
+    update_draft(
+        &harness,
+        app_id,
+        current["draft_revision"].as_str().unwrap(),
+        draft(
+            "m4-e2e",
+            "127.0.0.1:5000/solodock/alpine:stable",
+            json!({"policy":"completed"}),
+        ),
+        "m4-e2e-update-0002",
+    )
+    .await;
+    let blocked_by_final_recheck =
+        schedule_from_current(&harness, app_id, "m4-e2e-deploy-0003").await;
+    effect_gate.wait_until_reached().await;
+    let final_collision_name = format!("solodock-m4-final-collision-{token}");
+    let final_collision = docker_cli(
+        &endpoint,
+        &[
+            "run",
+            "-d",
+            "--name",
+            &final_collision_name,
+            "--label",
+            &format!("com.solodock.test-run={token}"),
+            "--label",
+            &format!("com.docker.compose.project={project}"),
+            "--label",
+            "com.docker.compose.service=app",
+            "alpine:3.20",
+            "sleep",
+            "300",
+        ],
+    )
+    .await;
+    effect_gate.resume();
+    let blocked_by_final_recheck = wait_for_deployment(&harness, blocked_by_final_recheck).await;
+    assert_eq!(
+        blocked_by_final_recheck["status"], "needs_attention",
+        "{blocked_by_final_recheck}"
+    );
+    assert_eq!(
+        blocked_by_final_recheck["error_code"],
+        "APP_CONTAINER_AMBIGUOUS"
+    );
+    remove_test_container(&docker, final_collision.trim(), token).await;
+    let second = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0003-resume").await;
+    let second = wait_for_deployment(&harness, second).await;
+    assert_eq!(second["status"], "succeeded", "{second}");
+    assert_ne!(second["candidate_release_id"], first_release);
+
+    let current = app_detail(&harness, app_id).await;
+    let rollback = harness
+        .request(
+            "POST",
+            &format!(
+                "/api/v1/deployments/{}/rollback",
+                first["id"].as_str().unwrap()
+            ),
+            Some("m4-e2e-rollback-0001"),
+            Some(&json!({
+                "expected_active_release_id":current["active_release"]["id"],
+                "expected_pending_release_id":current["pending_release_id"],
+                "expected_actual_release_id":current["actual_release_id"],
+                "expected_actual_container_id":current["actual"]["id"],
+                "acknowledge_non_rollbackable_data":true
+            })),
+        )
+        .await;
+    assert_eq!(rollback.status(), StatusCode::ACCEPTED);
+    let rollback_id = MutationHarness::json(rollback).await["deployment_id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let rollback = wait_for_deployment(&harness, rollback_id).await;
+    assert_eq!(rollback["status"], "succeeded", "{rollback}");
+    assert_eq!(
+        app_detail(&harness, app_id).await["active_release"]["id"],
+        first_release
+    );
+    assert!(docker.inspect_volume(&external_volume).await.is_ok());
+    assert!(
+        docker
+            .inspect_network(&external_network, None)
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        std::fs::read_to_string(bind_source.join("canary")).unwrap(),
+        bind_canary,
+        "deploy and both rollback paths must preserve bind-mounted data"
+    );
+    assert_m4_volume_canaries(&docker, &owned_volume, &external_volume, token).await;
+    assert_secret_absent(&harness.state.state_directory, registry_secret.as_bytes());
+
+    let candidates = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers(&format!("solodock-{}", app_id.simple()))
+        .await
+        .unwrap();
+    assert_eq!(candidates.len(), 1);
+    remove_owned_container(&docker, &candidates[0].id, app_id).await;
+    assert_eq!(
+        docker
+            .inspect_volume(&owned_volume)
+            .await
+            .unwrap()
+            .labels
+            .get(APP_ID_LABEL),
+        Some(&app_id.to_string())
+    );
+    docker
+        .remove_volume(
+            &owned_volume,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+        .unwrap();
+    let owned_network = format!("solodock-{}-default", app_id.simple());
+    assert_eq!(
+        docker
+            .inspect_network(&owned_network, None)
+            .await
+            .unwrap()
+            .labels
+            .as_ref()
+            .and_then(|value| value.get(APP_ID_LABEL)),
+        Some(&app_id.to_string())
+    );
+    docker.remove_network(&owned_network).await.unwrap();
+    docker.remove_network(&external_network).await.unwrap();
+    docker
+        .remove_volume(
+            &external_volume,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+        .unwrap();
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    harness.state.stream_tasks.wait().await;
+    remove_test_container(&docker, proxy_id.trim(), token).await;
+    remove_test_container(&docker, registry_id.trim(), token).await;
+    let inspected_registry_network = docker
+        .inspect_network(&registry_network, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        inspected_registry_network
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("com.solodock.test-run")),
+        Some(&token.to_string())
+    );
+    docker.remove_network(&registry_network).await.unwrap();
+    let inspected_registry_volume = docker.inspect_volume(&registry_data_volume).await.unwrap();
+    assert_eq!(
+        inspected_registry_volume
+            .labels
+            .get("com.solodock.test-run"),
+        Some(&token.to_string())
+    );
+    docker
+        .remove_volume(
+            &registry_data_volume,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(bind_root);
+}
+
+async fn docker_cli(endpoint: &str, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("docker")
+        .arg("-H")
+        .arg(endpoint)
+        .args(args)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "docker {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+async fn docker_cli_with_input(
+    endpoint: &str,
+    config: &std::path::Path,
+    args: &[&str],
+    input: &[u8],
+) -> String {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("docker")
+        .arg("-H")
+        .arg(endpoint)
+        .env("DOCKER_CONFIG", config)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input).await.unwrap();
+    }
+    let output = child.wait_with_output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "docker {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+fn assert_secret_absent(root: &std::path::Path, secret: &[u8]) {
+    fn visit(path: &std::path::Path, secret: &[u8]) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name() == "registry-credentials" {
+                continue;
+            }
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                visit(&entry.path(), secret);
+            } else if kind.is_file() {
+                let bytes = std::fs::read(entry.path()).unwrap();
+                assert!(
+                    !bytes.windows(secret.len()).any(|window| window == secret),
+                    "secret canary leaked into {}",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    visit(root, secret);
+}
+
+async fn app_detail(harness: &MutationHarness, app_id: Uuid) -> Value {
+    let response = harness
+        .request("GET", &format!("/api/v1/apps/{app_id}"), None, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    MutationHarness::json(response).await
+}
+
+async fn schedule_from_current(harness: &MutationHarness, app_id: Uuid, key: &str) -> Uuid {
+    let current = app_detail(harness, app_id).await;
+    let response = harness
+        .request(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/deployments"),
+            Some(key),
+            Some(&json!({
+                "expected_draft_revision":current["draft_revision"],
+                "expected_active_release_id":current["active_release"]["id"].as_str(),
+                "expected_pending_release_id":current["pending_release_id"],
+                "expected_actual_release_id":current["actual_release_id"],
+                "expected_actual_container_id":current["actual"]["id"].as_str(),
+                "acknowledge_non_rollbackable_data":true
+            })),
+        )
+        .await;
+    let status = response.status();
+    let body = MutationHarness::json(response).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    body["deployment_id"].as_str().unwrap().parse().unwrap()
+}
+
+async fn wait_for_deployment(harness: &MutationHarness, id: Uuid) -> Value {
+    for _ in 0..360 {
+        let response = harness
+            .request("GET", &format!("/api/v1/deployments/{id}"), None, None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let value = MutationHarness::json(response).await;
+        if !matches!(value["status"].as_str(), Some("queued" | "running")) {
+            return value;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("deployment {id} did not become terminal")
+}
+
+async fn update_draft(
+    harness: &MutationHarness,
+    app_id: Uuid,
+    expected: &str,
+    draft: Value,
+    key: &str,
+) {
+    let response = harness
+        .request(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some(key),
+            Some(&json!({"expected_revision":expected,"draft":draft})),
+        )
+        .await;
+    let status = response.status();
+    let body = MutationHarness::json(response).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 async fn remove_owned_container(docker: &Docker, container_id: &str, app_id: Uuid) {
     let inspected = docker.inspect_container(container_id, None).await.unwrap();
     assert_eq!(
@@ -1327,4 +2073,150 @@ async fn remove_test_container(docker: &Docker, container_id: &str, run_token: U
         )
         .await
         .unwrap();
+}
+
+async fn write_m4_volume_canaries(docker: &Docker, owned: &str, external: &str, run_token: Uuid) {
+    let labels = HashMap::from([("com.solodock.test-run".into(), run_token.to_string())]);
+    let writer_name = format!("solodock-m4-volume-writer-{run_token}");
+    let writer = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&writer_name)
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf owned-canary >/owned/value; printf external-canary >/external/value"
+                        .into(),
+                ]),
+                labels: Some(labels),
+                host_config: Some(HostConfig {
+                    mounts: Some(vec![
+                        Mount {
+                            target: Some("/owned".into()),
+                            source: Some(owned.into()),
+                            typ: Some(MountType::VOLUME),
+                            ..Default::default()
+                        },
+                        Mount {
+                            target: Some("/external".into()),
+                            source: Some(external.into()),
+                            typ: Some(MountType::VOLUME),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    docker.start_container(&writer, None).await.unwrap();
+    docker
+        .wait_container(
+            &writer,
+            Some(
+                WaitContainerOptionsBuilder::default()
+                    .condition("not-running")
+                    .build(),
+            ),
+        )
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    remove_test_container(docker, &writer, run_token).await;
+}
+
+async fn assert_m4_volume_canaries(docker: &Docker, owned: &str, external: &str, run_token: Uuid) {
+    let labels = HashMap::from([("com.solodock.test-run".into(), run_token.to_string())]);
+    let reader_name = format!("solodock-m4-volume-reader-{run_token}");
+    let reader = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&reader_name)
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "cat /owned/value /external/value".into(),
+                ]),
+                labels: Some(labels),
+                host_config: Some(HostConfig {
+                    mounts: Some(vec![
+                        Mount {
+                            target: Some("/owned".into()),
+                            source: Some(owned.into()),
+                            typ: Some(MountType::VOLUME),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
+                        Mount {
+                            target: Some("/external".into()),
+                            source: Some(external.into()),
+                            typ: Some(MountType::VOLUME),
+                            read_only: Some(true),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    docker.start_container(&reader, None).await.unwrap();
+    docker
+        .wait_container(
+            &reader,
+            Some(
+                WaitContainerOptionsBuilder::default()
+                    .condition("not-running")
+                    .build(),
+            ),
+        )
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    let output = docker
+        .logs(
+            &reader,
+            Some(
+                bollard::query_parameters::LogsOptionsBuilder::default()
+                    .stdout(true)
+                    .build(),
+            ),
+        )
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .flat_map(|chunk| chunk.into_bytes())
+        .collect::<Vec<_>>();
+    assert!(
+        output
+            .windows(b"owned-canary".len())
+            .any(|part| part == b"owned-canary")
+    );
+    assert!(
+        output
+            .windows(b"external-canary".len())
+            .any(|part| part == b"external-canary")
+    );
+    remove_test_container(docker, &reader, run_token).await;
 }

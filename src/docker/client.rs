@@ -18,9 +18,9 @@ use tokio::sync::Mutex;
 use super::{
     models::{
         ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerReadApi,
-        DockerResource, DockerStream, HealthStatus, LogChunk, LogRequest, LogStreamKind, MountKind,
-        MountProjection, NetworkProjection, PortProjection, ProbeSnapshot, ProbeStatus,
-        RawDockerEvent, RawStats,
+        DockerResource, DockerStream, HealthStatus, ImageRecord, LogChunk, LogRequest,
+        LogStreamKind, MountKind, MountProjection, NetworkProjection, PortProjection,
+        ProbeSnapshot, ProbeStatus, RawDockerEvent, RawStats,
     },
     ownership::{MANAGED_LABEL, valid_container_id},
 };
@@ -326,6 +326,23 @@ impl DockerReadApi for BollardReadClient {
             Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(classify(&error, false)),
         }
+    }
+
+    async fn inspect_image(&self, reference: &str) -> Result<ImageRecord, DockerError> {
+        let docker = self.client().await?;
+        let image = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_image(reference))
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
+            .map_err(|error| classify(&error, true))?;
+        Ok(ImageRecord {
+            id: image
+                .id
+                .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?,
+            repo_digests: image.repo_digests.unwrap_or_default(),
+            os: image.os.unwrap_or_default(),
+            architecture: image.architecture.unwrap_or_default(),
+            variant: image.variant,
+        })
     }
 }
 

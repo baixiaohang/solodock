@@ -18,6 +18,8 @@ pub struct SystemHealthResponse {
     disk: DiskHealth,
     streams: StreamHealth,
     projection: ProjectionHealth,
+    deployments: DeploymentHealth,
+    registry_credentials: CredentialHealth,
 }
 
 #[derive(Serialize)]
@@ -42,6 +44,18 @@ struct StreamHealth {
 #[derive(Serialize)]
 struct ProjectionHealth {
     status: &'static str,
+}
+#[derive(Serialize)]
+struct DeploymentHealth {
+    active: i64,
+    interrupted: i64,
+    needs_attention: i64,
+    limit: usize,
+}
+#[derive(Serialize)]
+struct CredentialHealth {
+    status: &'static str,
+    count: usize,
 }
 
 #[derive(Serialize)]
@@ -80,10 +94,31 @@ pub async fn health(
             .projection_degraded
             .load(std::sync::atomic::Ordering::Acquire)
     });
+    let (credential_status, credential_count) =
+        state.m4.as_ref().map_or(("unavailable", 0), |services| {
+            services
+                .credentials
+                .list()
+                .map(|values| ("ok", values.len()))
+                .unwrap_or(("degraded", 0))
+        });
+    let deployment_active = if let Some(services) = state.m4.as_ref() {
+        services.ledger.active_count().await.unwrap_or(0)
+    } else {
+        0
+    };
+    let (deployment_interrupted, deployment_needs_attention) =
+        if let Some(services) = state.m4.as_ref() {
+            services.ledger.attention_counts().await.unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
     let degraded = docker.status != ProbeStatus::Ready
         || recovery_degraded
         || disk_degraded
-        || projection_degraded;
+        || projection_degraded
+        || deployment_interrupted > 0
+        || deployment_needs_attention > 0;
     Json(SystemHealthResponse {
         status: if degraded { "degraded" } else { "ok" },
         docker,
@@ -106,6 +141,16 @@ pub async fn health(
             } else {
                 "ok"
             },
+        },
+        deployments: DeploymentHealth {
+            active: deployment_active,
+            interrupted: deployment_interrupted,
+            needs_attention: deployment_needs_attention,
+            limit: 1,
+        },
+        registry_credentials: CredentialHealth {
+            status: credential_status,
+            count: credential_count,
         },
     })
 }

@@ -20,7 +20,7 @@ use crate::domain::{DesiredState, dto::DraftResponse};
 
 use self::{
     models::{ContainerProjection, ContainerRecord, DockerErrorKind, DockerReadApi, ProbeStatus},
-    ownership::{claimed_app_id, is_managed_candidate, validate_identity},
+    ownership::{claimed_app_id, is_managed_candidate, validate_observed_identity},
     probe::DockerSupervisor,
 };
 
@@ -35,6 +35,9 @@ pub struct AppCatalogEntry {
     pub active_image_ref: Option<String>,
     pub active_config_revision: Option<Uuid>,
     pub active_config_sha256: Option<String>,
+    pub pending_release_id: Option<Uuid>,
+    pub pending_image_ref: Option<String>,
+    pub pending_config_revision: Option<Uuid>,
     pub discovery_image_ref: Option<String>,
     pub draft_revision: Option<Uuid>,
     pub draft_config_sha256: Option<String>,
@@ -54,6 +57,9 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             active_image_ref: value.active_image_ref.clone(),
             active_config_revision: value.active_config_revision,
             active_config_sha256: value.active_config_sha256.clone(),
+            pending_release_id: value.pending_release_id,
+            pending_image_ref: value.pending_image_ref.clone(),
+            pending_config_revision: value.pending_config_revision,
             discovery_image_ref: value.discovery_image_ref.clone(),
             draft_revision: value.draft_revision,
             draft_config_sha256: value.draft_config_sha256.clone(),
@@ -129,6 +135,7 @@ pub enum DriftCode {
     ActiveReleaseMissing,
     ReleaseIdMismatch,
     ImageRefMismatch,
+    DeploymentPending,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -150,6 +157,7 @@ pub struct AppObservation {
     pub slug: String,
     pub display_name: String,
     pub active_release: Option<ActiveRelease>,
+    pub actual_release_id: Option<Uuid>,
     pub actual: Option<ContainerProjection>,
     pub drift_codes: Vec<DriftCode>,
 }
@@ -207,6 +215,7 @@ impl DockerObserver {
                         slug: app.slug.clone(),
                         display_name: app.display_name.clone(),
                         active_release: active_release(app),
+                        actual_release_id: None,
                         actual: None,
                         drift_codes: vec![DriftCode::DockerUnavailable],
                     })
@@ -230,6 +239,7 @@ impl DockerObserver {
                         slug: app.slug.clone(),
                         display_name: app.display_name.clone(),
                         active_release: active_release(app),
+                        actual_release_id: None,
                         actual: None,
                         drift_codes: vec![DriftCode::DockerUnavailable],
                     })
@@ -273,7 +283,7 @@ impl DockerObserver {
             if is_managed_candidate(&container.labels)
                 && claimed_app_id(&container.labels) == Some(app_id)
             {
-                if validate_identity(&container.labels, &app).is_some() {
+                if validate_observed_identity(&container.labels, &app).is_some() {
                     valid.push(container);
                 } else {
                     invalid = true;
@@ -295,7 +305,7 @@ impl DockerObserver {
                     DockerErrorKind::ContainerChanged => OwnedContainerError::Changed,
                     kind => OwnedContainerError::Docker(kind),
                 })?;
-        validate_identity(&inspected.labels, &app).ok_or(OwnedContainerError::Invalid)?;
+        validate_observed_identity(&inspected.labels, &app).ok_or(OwnedContainerError::Invalid)?;
         Ok(inspected)
     }
 }
@@ -335,7 +345,7 @@ fn associate(
             }
             if claimed_app_id(&container.labels) == Some(app.id) {
                 considered[index] = true;
-                if let Some(identity) = validate_identity(&container.labels, app) {
+                if let Some(identity) = validate_observed_identity(&container.labels, app) {
                     valid.push((container, identity));
                 } else {
                     invalid.push(container);
@@ -353,6 +363,7 @@ fn associate(
                 ));
             }
         }
+        let mut actual_release_id = None;
         let actual = if valid.len() > 1 {
             codes.push(DriftCode::ContainerAmbiguous);
             for (container, _) in &valid {
@@ -364,12 +375,25 @@ fn associate(
             }
             None
         } else if let Some((container, identity)) = valid.first() {
-            if app.active_release_id.is_none() {
+            actual_release_id = Some(identity.release_id);
+            if app.pending_release_id.is_some() {
+                codes.push(DriftCode::DeploymentPending);
+            }
+            let observed_image = if app.pending_release_id == Some(identity.release_id) {
+                app.pending_image_ref.as_deref()
+            } else {
+                app.active_image_ref.as_deref()
+            };
+            if app.active_release_id.is_none()
+                && app.pending_release_id != Some(identity.release_id)
+            {
                 codes.push(DriftCode::ActiveReleaseMissing);
-            } else if app.active_release_id != Some(identity.release_id) {
+            } else if app.active_release_id != Some(identity.release_id)
+                && app.pending_release_id != Some(identity.release_id)
+            {
                 codes.push(DriftCode::ReleaseIdMismatch);
             }
-            if app.active_image_ref.as_deref() != container.configured_image_ref.as_deref() {
+            if observed_image != container.configured_image_ref.as_deref() {
                 codes.push(DriftCode::ImageRefMismatch);
             }
             for code in codes
@@ -391,6 +415,7 @@ fn associate(
             slug: app.slug.clone(),
             display_name: app.display_name.clone(),
             active_release: active_release(app),
+            actual_release_id,
             actual,
             drift_codes: codes,
         });
@@ -443,6 +468,9 @@ mod tests {
             active_image_ref: Some(image.clone()),
             active_config_revision: None,
             active_config_sha256: None,
+            pending_release_id: None,
+            pending_image_ref: None,
+            pending_config_revision: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,
