@@ -5,13 +5,14 @@
   import { driftText, formatBytes, shortRef } from '../lib/presentation'
   import { parseDotenv, serializeDotenv } from '../lib/dotenv'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { credentialsForReference } from '../lib/registryReference'
   import { canConfirmDeletion } from '../lib/deletionState'
-  import type { AppDetailResponse, DeletionPreviewResponse, DraftInput, StatsSample } from '../lib/types'
+  import type { AppDetailResponse, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, RegistryCredential, StatsSample } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   let { appId }: { appId: string } = $props()
   let app = $state<AppDetailResponse | null>(null)
   let stats = $state<StatsSample | null>(null)
-  let tab = $state<'overview' | 'configuration' | 'logs'>('overview')
+  let tab = $state<'overview' | 'configuration' | 'deployments' | 'logs'>('overview')
   let error = $state('')
   let actionBusy = $state(false)
   let deletion = $state<DeletionPreviewResponse | null>(null)
@@ -38,6 +39,14 @@
   let editBinds = $state('[]')
   let editNetworks = $state('[]')
   let editHealth = $state('{"policy":"running","stable_window_seconds":15}')
+  let credentials = $state<RegistryCredential[]>([])
+  let editCredential = $state<string | null>(null)
+  let deployments = $state<Deployment[]>([])
+  let deployRetry = $state<RetryIdentity | undefined>()
+  let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
+  $effect(() => {
+    if (editCredential && credentials.length > 0 && !matchingCredentials.some((value) => value.id === editCredential)) editCredential = null
+  })
 
   onMount(() => {
     void load()
@@ -46,7 +55,12 @@
   })
 
   async function load() {
-    app = await api<AppDetailResponse>(`/api/v1/apps/${appId}`)
+    const [loadedApp, page, loadedCredentials] = await Promise.all([
+      api<AppDetailResponse>(`/api/v1/apps/${appId}`),
+      api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
+      api<RegistryCredential[]>('/api/v1/registry-credentials'),
+    ])
+    app = loadedApp; deployments = page.items; credentials = loadedCredentials
   }
 
   async function lifecycle(action: 'start' | 'stop' | 'restart') {
@@ -99,6 +113,7 @@
     editPorts = pretty(app.draft.ports); editVolumes = pretty(app.draft.volumes)
     editBinds = pretty(app.draft.binds); editNetworks = pretty(app.draft.networks)
     editHealth = pretty(app.draft.health); editRetry = undefined; validation = null; editing = true
+    editCredential = app.draft.credential_ref
   }
   function parseLines(value: string): Array<{ key: string; value: string }> {
     return parseDotenv(value)
@@ -131,7 +146,7 @@
       logical_name: file.logical_name, target_path: file.target_path, sensitive: true as const, readonly: true as const, operation: 'keep' as const,
     }))
     return {
-      slug: editSlug, display_name: editName, discovery_image_ref: editImage, credential_ref: null,
+      slug: editSlug, display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
       auto_deploy_enabled: false, poll_interval_seconds: editPoll,
       environment: { public: parseLines(editPublicEnv), secrets: secretEnvironment },
       files: [...publicFiles, ...keptSecretFiles, ...secretFiles],
@@ -141,6 +156,26 @@
       networks: jsonArray(editNetworks) as unknown as DraftInput['networks'],
       health: JSON.parse(editHealth) as DraftInput['health'],
     }
+  }
+  async function deploy() {
+    if (!app?.draft_revision) return
+    const nonRollbackable = (app.draft?.volumes.length ?? 0) > 0 || (app.draft?.binds.length ?? 0) > 0
+    if (nonRollbackable && !window.confirm('部署/回滚不会回退 named volume 或 bind 内容。继续？')) return
+    actionBusy = true; error = ''
+    const request = {
+      expected_draft_revision: app.draft_revision,
+      expected_active_release_id: app.active_release?.id ?? null,
+      expected_pending_release_id: app.pending_release_id,
+      expected_actual_release_id: app.actual_release_id,
+      expected_actual_container_id: app.actual?.id ?? null,
+      acknowledge_non_rollbackable_data: true,
+    }
+    deployRetry = retryIdentity(deployRetry, request)
+    try {
+      const result = await mutation<{ deployment_id: string }>(`/api/v1/apps/${appId}/deployments`, request, { idempotencyKey: deployRetry.key })
+      deployRetry = undefined
+      window.location.hash = `/deployments/${result.deployment_id}`
+    } catch { error = '部署 facts 已变化、Registry/Docker 不可用或已有部署正在运行。' } finally { actionBusy = false }
   }
   async function validateDraft() {
     actionBusy = true; error = ''
@@ -164,11 +199,13 @@
   {#if error}<p class="notice danger">{error}</p>{/if}
   {#if app}
     <div class="detail-heading"><div><p class="eyebrow">APPLICATION</p><h1>{app.display_name}</h1><code>{app.id}</code></div><span class:healthy={app.actual?.health === 'healthy'} class="state-pill large">{app.deployment_status === 'DEPLOY_REQUIRED' ? '等待首次部署' : `${app.actual?.status ?? 'unavailable'} · ${app.actual?.health ?? 'unknown'}`}</span></div>
-    <div class="actions"><button disabled={actionBusy || !app.available_actions.includes('start')} onclick={() => void lifecycle('start')}>启动</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('stop')} onclick={() => void lifecycle('stop')}>停止</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('restart')} onclick={() => void lifecycle('restart')}>重启</button><button class="danger" disabled={actionBusy} onclick={() => { deletionDialog = true; deletion = null; removeContainer = false }}>取消登记…</button></div>
-    {#if app.deployment_status === 'DEPLOY_REQUIRED'}<p class="notice warning">当前只有 draft config；M3 不解析可变 tag，也不会暗中部署。首次部署将在 M4 提供。</p>{/if}
-    <div class="tabs"><button class:active={tab === 'overview'} onclick={() => { tab = 'overview' }}>概览</button><button class:active={tab === 'configuration'} onclick={() => { tab = 'configuration' }}>配置</button><button class:active={tab === 'logs'} onclick={() => { tab = 'logs' }}>实时日志</button></div>
+    <div class="actions"><button disabled={actionBusy || !app.available_actions.includes('deploy')} onclick={() => void deploy()}>部署 draft</button><button disabled={actionBusy || !app.available_actions.includes('start')} onclick={() => void lifecycle('start')}>启动</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('stop')} onclick={() => void lifecycle('stop')}>停止</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('restart')} onclick={() => void lifecycle('restart')}>重启</button><button class="danger" disabled={actionBusy} onclick={() => { deletionDialog = true; deletion = null; removeContainer = false }}>取消登记…</button></div>
+    {#if app.deployment_status === 'DEPLOY_REQUIRED'}<p class="notice warning">当前只有 draft config；点击“部署 draft”后才会把 tag 解析为本机平台 digest。</p>{:else if app.deployment_status === 'RUNNING'}<p class="notice warning">部署正在执行，期间只允许查看与安全删除预览。</p>{:else if app.deployment_status === 'PENDING'}<p class="notice warning">存在 pending release 或中断现场。请查看部署历史并基于当前 facts 明确重新收敛。</p>{/if}
+    <div class="tabs"><button class:active={tab === 'overview'} onclick={() => { tab = 'overview' }}>概览</button><button class:active={tab === 'configuration'} onclick={() => { tab = 'configuration' }}>配置</button><button class:active={tab === 'deployments'} onclick={() => { tab = 'deployments' }}>部署历史</button><button class:active={tab === 'logs'} onclick={() => { tab = 'logs' }}>实时日志</button></div>
     {#if tab === 'logs'}
       <LogsPane {appId} />
+    {:else if tab === 'deployments'}
+      <section class="detail-grid">{#each deployments as deployment}<a class="panel" href={`#/deployments/${deployment.id}`}><h2>{deployment.status} · {deployment.phase}</h2><p><code>{deployment.source_image_ref ?? deployment.candidate_release_id ?? 'resolving'}</code></p><p class="muted">{deployment.created_at} · {deployment.error_code ?? '无错误'}</p></a>{:else}<article class="panel wide"><p class="muted">尚无部署历史。</p></article>{/each}</section>
     {:else if tab === 'configuration'}
       <section class="detail-grid">
         <article class="panel wide"><h2>不可变 draft revision</h2><dl class="fact-list"><div><dt>Revision</dt><dd><code>{app.draft_revision ?? '—'}</code></dd></div><div><dt>配置摘要</dt><dd><code>{app.draft_config_sha256?.slice(0, 16) ?? '—'}…</code></dd></div><div><dt>发现镜像</dt><dd><code>{app.draft?.discovery_image_ref ?? '—'}</code></dd></div><div><dt>期望状态</dt><dd>{app.desired_state}</dd></div></dl></article>
@@ -180,6 +217,7 @@
         <form class="panel form-grid" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
           <label>Slug<input bind:value={editSlug} required /></label><label>显示名称<input bind:value={editName} required /></label>
           <label class="wide">发现镜像 tag<input bind:value={editImage} required /></label><label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={editPoll} /></label>
+          <label class="wide">Registry credential<select bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
           <label class="wide">公开环境变量<textarea rows="5" bind:value={editPublicEnv}></textarea></label>
           <label>新增/替换 secret（KEY=value）<textarea rows="5" bind:value={editSecretReplace} autocomplete="off"></textarea></label>
           <label>删除 secret（每行一个 key）<textarea rows="5" bind:value={editSecretDelete}></textarea></label>
@@ -205,6 +243,6 @@
     {/if}
   {/if}
   {#if deletionDialog}
-    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
+    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>Pending release：</strong><code>{deletion.pending_release_id ?? '无'}</code></p><p><strong>Pending config：</strong><code>{deletion.pending_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
   {/if}
 </main>

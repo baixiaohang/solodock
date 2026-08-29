@@ -69,6 +69,7 @@ pub enum ComposeAction {
     Validate,
     Start,
     Recreate,
+    DeployCandidate,
     Stop,
     Restart,
     Remove,
@@ -236,9 +237,10 @@ fn classify_failure(stderr: &[u8], validation: bool) -> ComposeError {
     } else if validation {
         ComposeError::ValidationFailed
     } else {
-        // A lifecycle non-zero exit without a recognized daemon/permission
-        // signal is deterministic for this pinned canonical project.
-        ComposeError::ValidationFailed
+        // A non-zero mutation may occur after Compose has already created or
+        // replaced a container. The caller must observe exact runtime facts
+        // before deciding whether recovery is safe.
+        ComposeError::UnknownEffect
     }
 }
 
@@ -268,6 +270,19 @@ fn argv(action: ComposeAction, context: &RunContext) -> Vec<String> {
                 "--pull",
                 "never",
                 "--no-deps",
+                "app",
+            ]
+            .map(str::to_owned),
+        ),
+        ComposeAction::DeployCandidate => result.extend(
+            [
+                "up",
+                "--detach",
+                "--no-build",
+                "--pull",
+                "never",
+                "--no-deps",
+                "--force-recreate",
                 "app",
             ]
             .map(str::to_owned),
@@ -319,6 +334,7 @@ mod tests {
             ComposeAction::Validate,
             ComposeAction::Start,
             ComposeAction::Recreate,
+            ComposeAction::DeployCandidate,
             ComposeAction::Stop,
             ComposeAction::Restart,
             ComposeAction::Remove,
@@ -340,6 +356,18 @@ mod tests {
                     | "--remove-orphans"
             )));
         }
+    }
+
+    #[test]
+    fn mutation_nonzero_is_unknown_until_runtime_observation() {
+        assert!(matches!(
+            classify_failure(b"service app failed after create", false),
+            ComposeError::UnknownEffect
+        ));
+        assert!(matches!(
+            classify_failure(b"invalid compose model", true),
+            ComposeError::ValidationFailed
+        ));
     }
 
     #[test]

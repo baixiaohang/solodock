@@ -21,7 +21,7 @@ pub struct DraftInput {
     pub display_name: String,
     pub discovery_image_ref: String,
     #[serde(default)]
-    pub credential_ref: Option<String>,
+    pub credential_ref: Option<Uuid>,
     #[serde(default)]
     pub auto_deploy_enabled: bool,
     #[serde(default = "default_poll_interval")]
@@ -54,7 +54,7 @@ pub struct AppMetadata {
     pub display_name: String,
     pub project_name: String,
     pub discovery_image_ref: String,
-    pub credential_ref: Option<String>,
+    pub credential_ref: Option<Uuid>,
     pub draft_revision: Uuid,
     pub draft_config_sha256: String,
     pub desired_state: DesiredState,

@@ -14,6 +14,8 @@ pub enum ComposeError {
     Timeout,
     #[error("Docker Compose operation was cancelled")]
     Cancelled,
+    #[error("Docker Compose may have changed runtime state")]
+    UnknownEffect,
     #[error("Docker Compose output was invalid")]
     OutputInvalid,
     #[error("Docker Compose temporary path is unsafe")]
@@ -31,6 +33,7 @@ impl ComposeError {
             }
             Self::Timeout => "COMPOSE_TIMEOUT",
             Self::Cancelled => "OPERATION_INTERRUPTED",
+            Self::UnknownEffect => "COMPOSE_EFFECT_UNKNOWN",
         }
     }
 }

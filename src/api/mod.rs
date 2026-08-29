@@ -1,5 +1,6 @@
 pub mod apps;
 pub mod auth;
+pub mod deployments;
 pub mod middleware;
 pub mod mutations;
 pub mod streams;
@@ -41,6 +42,7 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     pub stream_tasks: TaskTracker,
     pub m3: Option<Arc<mutations::M3Services>>,
+    pub m4: Option<Arc<deployments::M4Services>>,
 }
 
 impl AppState {
@@ -65,6 +67,7 @@ impl AppState {
             shutdown,
             stream_tasks,
             m3: None,
+            m4: None,
         }
     }
 }
@@ -96,6 +99,25 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/apps/{id}", delete(mutations::delete_app))
         .layer(DefaultBodyLimit::max(16 * 1024));
+    let m4_mutations = Router::new()
+        .route(
+            "/api/v1/registry-credentials",
+            post(deployments::create_credential),
+        )
+        .route(
+            "/api/v1/registry-credentials/{id}",
+            put(deployments::update_credential).delete(deployments::delete_credential),
+        )
+        .route(
+            "/api/v1/apps/{id}/deployments",
+            post(deployments::schedule).get(deployments::list),
+        )
+        .route("/api/v1/deployments/{id}", get(deployments::detail))
+        .route(
+            "/api/v1/deployments/{id}/rollback",
+            post(deployments::rollback),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/me", get(auth::me))
@@ -106,10 +128,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/apps/{id}/events", get(streams::events))
         .route("/api/v1/apps/{id}/logs", get(streams::logs))
         .route("/api/v1/apps/{id}/stats", get(streams::stats))
+        .route(
+            "/api/v1/registry-credentials",
+            get(deployments::list_credentials),
+        )
         .merge(auth)
         .merge(draft_mutations)
         .merge(lifecycle_mutations)
         .merge(delete_mutations)
+        .merge(m4_mutations)
         .with_state(state)
         .layer(axum_middleware::from_fn(middleware::request_context))
 }

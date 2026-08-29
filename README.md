@@ -60,7 +60,11 @@ unset SOLODOCK_ADMIN_PASSWORD
 
 SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。只有 HTTP listen 前的启动恢复会清理 crash 遗留的临时目录和未引用 revision；运行期 catalog/reconciliation 扫描严格只读，不能与正在发布的 revision 竞争。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
 
-M3 可以注册应用、发布不可变 draft config revision，并对已有 active release 执行 start/stop/restart。注册不会解析可变 tag、拉取镜像或创建容器；首次 digest-pinned deploy 属于 M4。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
+M4 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，发布带 HMAC 的 immutable release，并通过后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。注册应用本身仍不会解析 tag、拉取镜像或创建容器；必须显式调用 Deploy。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
+
+Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
+
+Deploy/rollback 均返回 `202 Accepted` 和 deployment ID。可在应用页查看 transition timeline；`pending` 表示有尚未 commit 的 candidate 或需要人工重新收敛的中断现场。健康通过前 `active` symlink 不改变。回滚会恢复旧 release 的镜像和 Compose 配置，但不会回退数据库 migration、named volume 或 bind 内容。
 
 每次 draft 更新先完整写入新的 `config-revisions/<uuid>/`，再以 `app.toml` 的原子替换作为 commit point，因此 draft 编辑不会改变正在运行的旧 release 所挂载的内容。生成的 Compose 固定为单一 `app` service，并由 `/usr/bin/docker compose` 的固定参数向量校验/执行；不存在 shell、exec、原始 Compose 编辑器或用户参数。
 

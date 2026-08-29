@@ -5,6 +5,8 @@
   import Dashboard from './views/Dashboard.svelte'
   import AppDetail from './views/AppDetail.svelte'
   import NewApp from './views/NewApp.svelte'
+  import Credentials from './views/Credentials.svelte'
+  import DeploymentDetail from './views/DeploymentDetail.svelte'
 
   let route = window.location.hash
   const updateRoute = () => { route = window.location.hash }
@@ -17,6 +19,8 @@
 
   $: appId = route.match(/^#\/apps\/([0-9a-f-]+)$/)?.[1]
   $: creating = route === '#/apps/new'
+  $: credentials = route === '#/credentials'
+  $: deploymentId = route.match(/^#\/deployments\/([0-9a-f-]+)$/)?.[1]
 </script>
 
 <svelte:head><title>SoloDock</title></svelte:head>
@@ -29,12 +33,17 @@
   <header class="topbar">
     <a class="brand" href="#/">SoloDock <span>观察台</span></a>
     <nav aria-label="用户操作">
+      <a class="ghost button-link" href="#/credentials">Registry credentials</a>
       <span class="user">admin</span>
       <button class="ghost" onclick={() => void revokeAll()}>撤销全部会话</button>
       <button class="ghost" onclick={() => void logout()}>退出</button>
     </nav>
   </header>
-  {#if creating}
+  {#if credentials}
+    <Credentials />
+  {:else if deploymentId}
+    <DeploymentDetail {deploymentId} />
+  {:else if creating}
     <NewApp />
   {:else if appId}
     <AppDetail {appId} />

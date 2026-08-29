@@ -425,6 +425,7 @@ impl Harness {
             metadata.slug.clone(),
             metadata.display_name.clone(),
             metadata.discovery_image_ref.clone(),
+            metadata.credential_ref,
             metadata.poll_interval_seconds,
         );
         let normalized = solodock::domain::normalize_draft(
@@ -1317,6 +1318,56 @@ async fn projection_reconciler_recovers_without_another_mutation() {
     })
     .await
     .unwrap();
+    cancellation.cancel();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn degraded_recovery_never_removes_a_live_stream_secret_pattern() {
+    let harness = Harness::new().await;
+    let canary = "DEGRADED_STREAM_SECRET_CANARY";
+    let (status, created) = body(
+        harness
+            .create(Some("m4-redactor-degraded-0001"), &draft(canary))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id = created["app"]["id"].as_str().unwrap();
+    assert_eq!(
+        harness.state.redactor.redact(canary.as_bytes()),
+        b"[REDACTED]"
+    );
+
+    fs::write(harness.apps.join(app_id).join("app.toml"), b"not = [valid").unwrap();
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let worker = solodock::api::mutations::start_projection_reconciler(
+        harness.state.clone(),
+        cancellation.clone(),
+    );
+    let services = harness.state.m3.as_ref().unwrap();
+    services
+        .projection_degraded
+        .store(true, std::sync::atomic::Ordering::Release);
+    services.reconcile_notify.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while harness.catalog.get(app_id.parse().unwrap()).is_some() {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        services
+            .projection_degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+    );
+    assert_eq!(
+        harness.state.redactor.redact(canary.as_bytes()),
+        b"[REDACTED]",
+        "an existing log framer shares this dynamic redactor"
+    );
     cancellation.cancel();
     worker.await.unwrap();
 }

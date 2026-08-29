@@ -1,6 +1,7 @@
 pub mod atomic;
 pub mod config_revision;
 pub mod recovery;
+pub mod releases;
 
 use std::{
     fs,
@@ -75,6 +76,17 @@ impl AppStore {
         &self.apps_directory
     }
 
+    pub fn integrity_key(&self) -> Result<&[u8], StoreError> {
+        self.integrity_key
+            .as_deref()
+            .map(Vec::as_slice)
+            .ok_or(StoreError::ContentInvalid)
+    }
+
+    pub fn allowed_bind_roots(&self) -> &[PathBuf] {
+        &self.allowed_bind_roots
+    }
+
     pub fn app_directory(&self, app_id: Uuid) -> PathBuf {
         self.apps_directory.join(app_id.to_string())
     }
@@ -104,7 +116,7 @@ impl AppStore {
                 display_name: draft.display_name.clone(),
                 project_name: AppMetadata::project_name(app_id),
                 discovery_image_ref: draft.discovery_image_ref.clone(),
-                credential_ref: None,
+                credential_ref: draft.credential_ref,
                 draft_revision: revision_id,
                 draft_config_sha256: draft.metadata.config_sha256.clone(),
                 desired_state: DesiredState::Stopped,
@@ -163,6 +175,8 @@ impl AppStore {
         metadata.slug = draft.slug.clone();
         metadata.display_name = draft.display_name.clone();
         metadata.discovery_image_ref = draft.discovery_image_ref.clone();
+        metadata.credential_ref = draft.credential_ref;
+        metadata.auto_deploy_enabled = draft.auto_deploy_enabled;
         metadata.draft_revision = revision_id;
         metadata.draft_config_sha256 = draft.metadata.config_sha256.clone();
         metadata.poll_interval_seconds = draft.poll_interval_seconds;

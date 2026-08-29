@@ -165,6 +165,9 @@ impl Harness {
                 active_image_ref: Some(expected_image.clone()),
                 active_config_revision: None,
                 active_config_sha256: None,
+                pending_release_id: None,
+                pending_image_ref: None,
+                pending_config_revision: None,
                 discovery_image_ref: None,
                 draft_revision: None,
                 draft_config_sha256: None,
@@ -246,6 +249,7 @@ impl Harness {
             shutdown: shutdown.clone(),
             stream_tasks: stream_tasks.clone(),
             m3: None,
+            m4: None,
         };
         Self {
             _root: root,

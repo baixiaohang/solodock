@@ -43,6 +43,7 @@ jobs:
           DOCKER_TLS_CERTDIR: ""
         ports:
           - 2375:2375
+          - 5000:5000
         options: >-
           --privileged
           --health-cmd "docker info"
@@ -58,4 +59,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: docker pull alpine:3.20
       - run: docker pull nginx:1.27-alpine
+      - run: docker pull registry:2
       - run: cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2

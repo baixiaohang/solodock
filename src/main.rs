@@ -6,12 +6,13 @@ use std::{
 
 use solodock::{
     AppState,
-    api::mutations::M3Services,
+    api::{deployments::M4Services, mutations::M3Services},
     app_store::AppStore,
     auth::AuthService,
     compose::{ComposeCapability, ComposeRunner, FixedComposeRunner},
     config::Config,
     db::Database,
+    deploy::{DeploymentEngine, DeploymentLedger, FixedImagePuller, HealthVerifier},
     docker::{
         AppCatalog, DockerObserver,
         client::BollardReadClient,
@@ -22,6 +23,7 @@ use solodock::{
         stats::StatsHub,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
+    registry::{CredentialStore, RegistryResolver},
     security::permissions::ensure_private_directory,
 };
 use tokio::net::TcpListener;
@@ -81,18 +83,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let redactor = SecretRedactor::new(&EmptySecretProvider);
     let mut known_secrets = Vec::new();
     for app in &recovery.valid_apps {
-        for revision in [app.draft_revision, app.active_config_revision]
-            .into_iter()
-            .flatten()
+        for revision in [
+            app.draft_revision,
+            app.active_config_revision,
+            app.pending_config_revision,
+        ]
+        .into_iter()
+        .flatten()
         {
-            if let Ok(loaded) = solodock::app_store::config_revision::load_verified(
+            let loaded = solodock::app_store::config_revision::load_verified(
                 &app_store.app_directory(app.app_id),
                 revision,
                 &idempotency.integrity_key(),
-            ) {
-                known_secrets.extend(loaded.known_secrets());
-            }
+            )?;
+            known_secrets.extend(loaded.known_secrets());
         }
+    }
+    let credential_store = CredentialStore::initialize(
+        config.state_directory.join("registry-credentials"),
+        idempotency.integrity_key(),
+    )?;
+    credential_store.startup_cleanup()?;
+    idempotency
+        .finalize_succeeded_credential_tombstones(&credential_store)
+        .await?;
+    for credential in credential_store.list()? {
+        let loaded = credential_store.load(credential.id)?;
+        known_secrets.push(loaded.secret.expose().as_bytes().to_vec());
     }
     redactor.replace(known_secrets);
     let coordinator = AppMutationCoordinator::new(config.runtime_directory.clone())?;
@@ -104,6 +121,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let compose_capability = ComposeCapability::default();
     compose_capability.probe(compose.as_ref()).await;
     let compose_capability_task = compose_capability.start(compose.clone(), shutdown.clone());
+    let recovery_degraded = !recovery.issues.is_empty();
     let m3 = Arc::new(M3Services {
         store: app_store,
         database: database.clone(),
@@ -113,9 +131,39 @@ async fn main() -> Result<(), Box<dyn Error>> {
         coordinator,
         compose,
         compose_capability,
-        projection_degraded: Arc::new(AtomicBool::new(false)),
+        projection_degraded: Arc::new(AtomicBool::new(recovery_degraded)),
         reconcile_notify: Arc::new(tokio::sync::Notify::new()),
         publication_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
+    let ledger = DeploymentLedger::new(database.clone());
+    ledger.interrupt_nonterminal().await?;
+    let puller = Arc::new(FixedImagePuller::new(
+        config.state_directory.clone(),
+        config.runtime_directory.clone(),
+        observer.api(),
+        shutdown.clone(),
+        stream_tasks.clone(),
+    )?);
+    puller.cleanup_stale()?;
+    let resolver = RegistryResolver::production()?;
+    let engine = DeploymentEngine {
+        store: m3.store.clone(),
+        credentials: credential_store.clone(),
+        resolver,
+        ledger: ledger.clone(),
+        puller,
+        compose: m3.compose.clone(),
+        docker: observer.api(),
+        health: HealthVerifier::new(observer.api(), shutdown.clone()),
+        shutdown: shutdown.clone(),
+        tasks: stream_tasks.clone(),
+        #[cfg(feature = "docker-e2e")]
+        test_effect_gate: None,
+    };
+    let m4 = Arc::new(M4Services {
+        credentials: credential_store,
+        ledger,
+        engine,
     });
 
     let listener = TcpListener::bind(config.listen_address).await?;
@@ -132,6 +180,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         shutdown: shutdown.clone(),
         stream_tasks: stream_tasks.clone(),
         m3: Some(m3),
+        m4: Some(m4),
     };
     let projection_task =
         solodock::api::mutations::start_projection_reconciler(state.clone(), shutdown.clone());

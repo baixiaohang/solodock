@@ -31,10 +31,12 @@ impl LoadedRevision {
     pub fn response(
         &self,
         discovery_image_ref: String,
+        credential_ref: Option<Uuid>,
         poll_interval_seconds: u32,
     ) -> DraftResponse {
         DraftResponse {
             discovery_image_ref,
+            credential_ref,
             poll_interval_seconds,
             public_environment: self.public_environment.clone(),
             secret_keys: self.metadata.secret_keys.clone(),
@@ -75,13 +77,14 @@ impl LoadedRevision {
         slug: String,
         display_name: String,
         discovery_image_ref: String,
+        credential_ref: Option<Uuid>,
         poll_interval_seconds: u32,
     ) -> DraftInput {
         DraftInput {
             slug,
             display_name,
             discovery_image_ref,
-            credential_ref: None,
+            credential_ref,
             auto_deploy_enabled: false,
             poll_interval_seconds,
             environment: EnvironmentInput {

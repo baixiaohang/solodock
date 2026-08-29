@@ -209,7 +209,10 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
 
 /var/lib/solodock/
   state.sqlite3
-  credentials/<credential-id>.json
+  registry-credentials/<credential-id>/
+    credential.toml
+    secret-revisions/<revision-id>/token
+  registry-credentials/.trash/<credential-id>-<operation-id>/
   apps/<app-id>/
     app.toml
     config-revisions/<revision-id>/
@@ -272,11 +275,13 @@ started_at, completed_at
 ### RegistryCredential
 
 ```text
-id, registry, username, secret_file_ref
-created_at, rotated_at
+id, registry, username, metadata_revision, secret_revision
+last_operation_id, integrity_hmac, created_at, rotated_at
 ```
 
 API 只返回 credential metadata。GHCR 文档应建议在可行时使用专用 classic PAT，且仅授予 `read:packages`。
+
+credential metadata 与 immutable secret revision 都由 filesystem 作为事实源；HMAC 同时覆盖 metadata 与 token hash。Registry host 创建后不可修改，轮换只允许修改 username 并显式 keep/replace secret。任何 draft、active/pending 或历史 v2 release 引用存在时，删除返回 `CREDENTIAL_IN_USE`。
 
 ### AuditEvent
 
@@ -311,7 +316,7 @@ APPLYING 后正常失败 -> ROLLING_BACK -> VERIFYING_ROLLBACK
 
 ### 9.1 并发
 
-- SQLite 原子 claim 应用变更；应用级 advisory file lock 提供第二层进程边界。
+- SQLite 原子 claim 应用变更；应用级 owned mutex 与 advisory file lock 提供第二层进程边界。deployment schedule 在同一短事务持久 idempotency claim、queued row、transition 和 audit attempt。
 - 并发变更返回 `409 APP_BUSY`。
 - 全局部署 semaphore 默认值为 1，限制 2C4G 主机上的镜像拉取和解压压力。
 - 轮询不建立无限队列。应用繁忙时留到下一轮检查，自然合并中间 tag 变化。

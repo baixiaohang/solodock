@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{
     AppCatalog,
     models::{AppEvent, DockerReadApi, EventKind, RawDockerEvent},
-    ownership::{claimed_app_id, valid_container_id, validate_identity},
+    ownership::{claimed_app_id, valid_container_id},
 };
 
 const RING_LIMIT: usize = 512;
@@ -153,7 +153,7 @@ fn map_event(catalog: &AppCatalog, raw: RawDockerEvent) -> Option<(Uuid, AppEven
     }
     let app_id = claimed_app_id(&raw.labels)?;
     let app = catalog.get(app_id)?;
-    validate_identity(&raw.labels, &app)?;
+    crate::docker::ownership::validate_observed_identity(&raw.labels, &app)?;
     let kind = match raw.action.as_str() {
         "create" => EventKind::Created,
         "start" => EventKind::Started,
@@ -260,6 +260,9 @@ mod tests {
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
             active_config_revision: None,
             active_config_sha256: None,
+            pending_release_id: None,
+            pending_image_ref: None,
+            pending_config_revision: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,

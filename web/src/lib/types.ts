@@ -33,6 +33,8 @@ export interface SystemHealth {
   disk: { state: DiskSnapshot; docker: DiskSnapshot | null }
   streams: { active: number; limit: number }
   projection: { status: 'ok' | 'degraded' }
+  deployments: { active: number; limit: number }
+  registry_credentials: { status: 'ok' | 'degraded' | 'unavailable'; count: number }
 }
 
 export interface ActiveRelease { id: string; image_ref: string }
@@ -58,6 +60,7 @@ export interface AppObservation {
   slug: string
   display_name: string
   active_release: ActiveRelease | null
+  actual_release_id: string | null
   actual: ContainerProjection | null
   drift_codes: string[]
 }
@@ -83,7 +86,7 @@ export interface DraftInput {
   slug: string
   display_name: string
   discovery_image_ref: string
-  credential_ref: null
+  credential_ref: string | null
   auto_deploy_enabled: false
   poll_interval_seconds: number
   environment: {
@@ -123,23 +126,28 @@ export interface DeletionPreviewResponse {
   project_name: string
   active_release_id: string | null
   active_config_revision: string | null
+  pending_release_id: string | null
+  pending_config_revision: string | null
   remove_container: boolean
   container_ids: string[]
-  managed_files: Array<{ logical_name: string; configured_in: 'active' | 'draft' | 'active_and_draft' }>
+  managed_files: Array<{ logical_name: string; configured_in: ConfiguredScope }>
   retained: {
     containers: string[]
-    owned_volumes: Array<{ name: string; configured_in: 'active' | 'draft' | 'active_and_draft'; exists: boolean }>
-    external_volumes: Array<{ name: string; configured_in: 'active' | 'draft' | 'active_and_draft'; exists: boolean }>
-    binds: Array<{ source: string; readonly: boolean; configured_in: 'active' | 'draft' | 'active_and_draft'; exists: boolean }>
-    networks: Array<{ name: string; configured_in: 'active' | 'draft' | 'active_and_draft'; exists: boolean }>
+    owned_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
+    external_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
+    binds: Array<{ source: string; readonly: boolean; configured_in: ConfiguredScope; exists: boolean }>
+    networks: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
   }
   orphan_warning: boolean
   confirmation_token: string
   expires_at: string
 }
 
+export type ConfiguredScope = 'active' | 'pending' | 'draft' | 'active_and_pending' | 'active_and_draft' | 'pending_and_draft' | 'active_pending_and_draft'
+
 export interface DraftResponse {
   discovery_image_ref: string
+  credential_ref: string | null
   poll_interval_seconds: number
   public_environment: Array<{ key: string; value: string }>
   secret_keys: string[]
@@ -156,9 +164,11 @@ export interface AppDetailResponse extends AppObservation {
   draft_revision: string | null
   draft_config_sha256: string | null
   active_config_revision: string | null
+  pending_release_id: string | null
+  pending_image_ref: string | null
   desired_state: 'running' | 'stopped'
-  deployment_status: 'ACTIVE' | 'DEPLOY_REQUIRED'
-  available_actions: Array<'start' | 'stop' | 'restart' | 'deletion_preview'>
+  deployment_status: 'ACTIVE' | 'PENDING' | 'RUNNING' | 'DEPLOY_REQUIRED'
+  available_actions: Array<'start' | 'stop' | 'restart' | 'deploy' | 'deletion_preview'>
   compose_available: boolean
 }
 
@@ -190,3 +200,42 @@ export interface StatsSample {
 }
 
 export interface LogEvent { timestamp: string; stream: 'stdout' | 'stderr'; message: string; truncated: boolean }
+
+export interface RegistryCredential {
+  id: string
+  registry: string
+  username: string
+  revision: string
+  created_at: string
+  rotated_at: string
+  referenced_by_apps: number
+}
+
+export type DeploymentStatus = 'queued' | 'running' | 'succeeded' | 'no_op' | 'failed' | 'rolled_back' | 'needs_attention' | 'interrupted'
+export interface Deployment {
+  id: string
+  app_id: string
+  trigger: 'manual' | 'rollback'
+  requested_revision: string
+  from_release_id: string | null
+  candidate_release_id: string | null
+  rollback_target_release_id: string | null
+  status: DeploymentStatus
+  phase: string
+  source_image_ref: string | null
+  manifest_digest: string | null
+  platform: string | null
+  error_code: string | null
+  health_result: string | null
+  created_at: string
+  started_at: string | null
+  completed_at: string | null
+  transitions?: Array<{ seq: number; phase: string; result: string; code: string | null; created_at: string }>
+  available_actions: Array<'rollback'>
+  safe_release_id?: string | null
+  current_active_release_id?: string | null
+  current_pending_release_id?: string | null
+  current_actual_release_id?: string | null
+  warnings?: string[]
+}
+export interface DeploymentPage { items: Deployment[]; next_cursor: string | null }

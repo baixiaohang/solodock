@@ -1,8 +1,10 @@
 <script lang="ts">
-  import { mutation } from '../lib/api'
+  import { api, mutation } from '../lib/api'
+  import { onMount } from 'svelte'
   import { parseDotenv } from '../lib/dotenv'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
-  import type { AppMutationResponse, DraftInput } from '../lib/types'
+  import { credentialsForReference } from '../lib/registryReference'
+  import type { AppMutationResponse, DraftInput, RegistryCredential } from '../lib/types'
 
   let slug = $state('')
   let displayName = $state('')
@@ -19,6 +21,13 @@
   let busy = $state(false)
   let error = $state('')
   let retry = $state<RetryIdentity | undefined>()
+  let credentials = $state<RegistryCredential[]>([])
+  let credentialRef = $state<string | null>(null)
+  let matchingCredentials = $derived(credentialsForReference(credentials, image))
+  $effect(() => {
+    if (credentialRef && credentials.length > 0 && !matchingCredentials.some((value) => value.id === credentialRef)) credentialRef = null
+  })
+  onMount(() => { void api<RegistryCredential[]>('/api/v1/registry-credentials').then((value) => { credentials = value }) })
 
   function environment() {
     const publicEntries = parseDotenv(publicEnv)
@@ -32,7 +41,7 @@
     try {
       const draft: DraftInput = {
         slug, display_name: displayName, discovery_image_ref: image,
-        credential_ref: null, auto_deploy_enabled: false, poll_interval_seconds: pollInterval,
+        credential_ref: credentialRef, auto_deploy_enabled: false, poll_interval_seconds: pollInterval,
         environment: environment(), files: JSON.parse(files), ports: JSON.parse(ports),
         volumes: JSON.parse(volumes), binds: JSON.parse(binds), networks: JSON.parse(networks),
         health: JSON.parse(health),
@@ -59,6 +68,7 @@
     <label>Slug<input bind:value={slug} required pattern="[a-z0-9-]+" maxlength="63" /></label>
     <label>显示名称<input bind:value={displayName} required maxlength="80" /></label>
     <label class="wide">发现镜像（必须带 tag）<input bind:value={image} required placeholder="registry.example/app:stable" /></label>
+    <label class="wide">Registry credential<select bind:value={credentialRef}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select><span class="muted">只显示与镜像 logical registry 精确匹配的 credential。</span></label>
     <label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={pollInterval} /></label>
     <label class="wide">公开环境变量<textarea bind:value={publicEnv} rows="5" placeholder="KEY=value&#10;OTHER=value"></textarea><span class="muted">有限 dotenv 语法；重复 key 会被拒绝。</span></label>
     <label class="wide">Secret 环境变量（可多项，KEY=value）<textarea bind:value={secretEnv} rows="5" autocomplete="new-password"></textarea><span class="muted">write-only；成功后立即清空。</span></label>
