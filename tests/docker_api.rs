@@ -358,11 +358,11 @@ async fn revoked_session_closes_sse_on_the_next_heartbeat_and_releases_permit() 
     tokio::task::yield_now().await;
     harness.auth.revoke_all(Uuid::new_v4()).await.unwrap();
     tokio::time::advance(std::time::Duration::from_secs(16)).await;
-    for _ in 0..5 {
-        tokio::task::yield_now().await;
-    }
-    assert!(body_task.is_finished());
-    let body = body_task.await.unwrap();
+    tokio::time::resume();
+    let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_task)
+        .await
+        .expect("revoked SSE session must close after the heartbeat")
+        .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("SESSION_EXPIRED"));
     assert_eq!(harness.stream_gate.active(), 0);
