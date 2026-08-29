@@ -426,6 +426,7 @@ impl Harness {
             metadata.display_name.clone(),
             metadata.discovery_image_ref.clone(),
             metadata.credential_ref,
+            metadata.auto_deploy_enabled,
             metadata.poll_interval_seconds,
         );
         let normalized = solodock::domain::normalize_draft(
@@ -559,6 +560,40 @@ async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
         !app_toml
             .windows(canary.len())
             .any(|window| window == canary.as_bytes())
+    );
+}
+
+#[tokio::test]
+async fn create_requires_auto_deploy_ack_and_persists_enabled_state() {
+    let harness = Harness::new().await;
+    let mut enabled = draft("auto-secret");
+    enabled["auto_deploy_enabled"] = json!(true);
+    let (status, rejected) = body(
+        harness
+            .create(Some("m5-auto-create-without-ack"), &enabled)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+
+    enabled["auto_deploy_acknowledged"] = json!(true);
+    let key = "m5-auto-create-with-ack";
+    let (status, created) = body(harness.create(Some(key), &enabled).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let metadata = harness.store.read_metadata(app_id).unwrap();
+    assert!(metadata.auto_deploy_enabled);
+    assert_eq!(metadata.poll_interval_seconds, 300);
+
+    let (status, replay) = body(harness.create(Some(key), &enabled).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{replay}");
+    assert!(
+        harness
+            .store
+            .read_metadata(app_id)
+            .unwrap()
+            .auto_deploy_enabled
     );
 }
 

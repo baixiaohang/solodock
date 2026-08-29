@@ -1,4 +1,5 @@
 pub mod apps;
+pub mod assets;
 pub mod auth;
 pub mod deployments;
 pub mod middleware;
@@ -137,6 +138,7 @@ pub fn router(state: AppState) -> Router {
         .merge(lifecycle_mutations)
         .merge(delete_mutations)
         .merge(m4_mutations)
+        .fallback(assets::serve)
         .with_state(state)
         .layer(axum_middleware::from_fn(middleware::request_context))
 }

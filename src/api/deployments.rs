@@ -18,8 +18,9 @@ use super::{
 };
 use crate::{
     deploy::{
-        DeploymentEngine, DeploymentLedger, DeploymentRecord, DeploymentStatus,
-        DeploymentTransition, DeploymentTrigger,
+        DeploymentEngine, DeploymentLedger, DeploymentRecord, DeploymentScheduler,
+        DeploymentStatus, DeploymentTransition, DeploymentTrigger, ScheduleCommand, ScheduleError,
+        ScheduleFacts, ScheduleResult,
     },
     docker::ownership::validate_syntactic_identity,
     error::{ApiError, RequestId},
@@ -32,6 +33,8 @@ pub struct M4Services {
     pub credentials: CredentialStore,
     pub ledger: DeploymentLedger,
     pub engine: DeploymentEngine,
+    pub scheduler: DeploymentScheduler,
+    pub poller: crate::registry::PollCoordinator,
 }
 
 #[derive(Serialize)]
@@ -486,117 +489,69 @@ async fn schedule_inner(
     let raw = idempotency_key(&headers, request_id)?;
     let canonical=serde_json::to_vec(&serde_json::json!({"route":route,"app_id":app_id,"trigger":trigger,"request":payload,"rollback_target":rollback_target})).map_err(|_|ApiError::internal(request_id))?;
     let fingerprint = m3.idempotency.fingerprint(&canonical);
-    if let Some(ClaimResult::Replay { status, body, .. }) = m3
-        .idempotency
-        .completed(&route, raw, &fingerprint)
-        .await
-        .map_err(|error| ApiError::idempotency(error, request_id))?
-    {
-        return replay(status, body);
-    }
-    let app_guard = m3
-        .coordinator
-        .try_app(app_id)
-        .map_err(|_| ApiError::conflict("APP_BUSY", request_id))?;
-    let global_guard = m3
-        .coordinator
-        .try_compose_owned()
-        .map_err(|_| ApiError::conflict("DEPLOYMENT_BUSY", request_id))?;
-    let metadata = m3
-        .store
-        .read_metadata(app_id)
-        .map_err(|_| ApiError::app_not_found(request_id))?;
-    let active = m3
-        .store
-        .read_release_link(app_id, "active")
-        .map_err(|_| ApiError::internal(request_id))?;
-    let pending = m3
-        .store
-        .read_release_link(app_id, "pending")
-        .map_err(|_| ApiError::internal(request_id))?;
-    let actual = actual_fact(&state, app_id, active, request_id).await?;
-    if metadata.draft_revision != payload.expected_draft_revision
-        || active != payload.expected_active_release_id
-        || pending != payload.expected_pending_release_id
-        || actual.as_ref().map(|v| v.0) != payload.expected_actual_release_id
-        || actual.as_ref().map(|v| v.1.as_str()) != payload.expected_actual_container_id.as_deref()
-    {
-        return finish_error(
-            &m3,
-            &route,
-            raw,
-            "DEPLOYMENT_FACTS_CHANGED",
-            StatusCode::CONFLICT,
-            request_id,
+    let result = m4
+        .scheduler
+        .schedule(
+            state.clone(),
+            m3.clone(),
+            ScheduleCommand {
+                route: route.clone(),
+                idempotency_key: raw.to_owned(),
+                fingerprint,
+                request_id: request_id.0,
+                app_id,
+                trigger,
+                facts: ScheduleFacts {
+                    draft_revision: payload.expected_draft_revision,
+                    active_release_id: payload.expected_active_release_id,
+                    pending_release_id: payload.expected_pending_release_id,
+                    actual_release_id: payload.expected_actual_release_id,
+                    actual_container_id: payload.expected_actual_container_id,
+                    acknowledge_non_rollbackable_data: payload.acknowledge_non_rollbackable_data,
+                },
+                rollback_target,
+                rollback_of,
+                scheduled: None,
+            },
         )
         .await;
-    }
-    let draft = crate::app_store::config_revision::load_verified(
-        &m3.store.app_directory(app_id),
-        metadata.draft_revision,
-        m3.store
-            .integrity_key()
-            .map_err(|_| ApiError::internal(request_id))?,
-    )
-    .map_err(|_| ApiError::conflict("APP_CONFIG_INVALID", request_id))?;
-    let requires_data_ack = !draft.metadata.volumes.is_empty() || !draft.metadata.binds.is_empty();
-    if requires_data_ack && !payload.acknowledge_non_rollbackable_data {
-        return finish_error(
-            &m3,
-            &route,
-            raw,
-            "DATA_ACK_REQUIRED",
+    match result {
+        Ok(ScheduleResult::Replay { status, body }) => replay(status, body),
+        Ok(ScheduleResult::Scheduled(deployment_id)) => {
+            let response = ScheduleResponse {
+                deployment_id,
+                status: DeploymentStatus::Queued,
+                idempotency_replayed: false,
+                detail_url: format!("/api/v1/deployments/{deployment_id}"),
+            };
+            Ok((
+                StatusCode::ACCEPTED,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::to_string(&response).map_err(|_| ApiError::internal(request_id))?,
+            )
+                .into_response())
+        }
+        Err(ScheduleError::AppNotFound) => Err(ApiError::app_not_found(request_id)),
+        Err(ScheduleError::Busy) => Err(ApiError::conflict("DEPLOYMENT_BUSY", request_id)),
+        Err(ScheduleError::FactsChanged) => {
+            Err(ApiError::conflict("DEPLOYMENT_FACTS_CHANGED", request_id))
+        }
+        Err(ScheduleError::DataAckRequired) => Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
+            "DATA_ACK_REQUIRED",
+            "Non-rollbackable data acknowledgement is required",
             request_id,
-        )
-        .await;
+        )),
+        Err(ScheduleError::ContainerInvalid) => {
+            Err(ApiError::conflict("APP_CONTAINER_INVALID", request_id))
+        }
+        Err(ScheduleError::Docker(code)) => Err(ApiError::docker(request_id, code)),
+        Err(ScheduleError::ConfigInvalid) => {
+            Err(ApiError::conflict("APP_CONFIG_INVALID", request_id))
+        }
+        Err(ScheduleError::Idempotency(error)) => Err(ApiError::idempotency(error, request_id)),
+        Err(ScheduleError::Internal) => Err(ApiError::internal(request_id)),
     }
-    let claim = m3
-        .idempotency
-        .claim_deployment(
-            &route,
-            raw,
-            &fingerprint,
-            request_id.0,
-            app_id,
-            trigger.as_str(),
-            metadata.draft_revision,
-            active,
-            pending,
-            actual.as_ref().map(|value| value.0),
-            actual.as_ref().map(|value| value.1.as_str()),
-            rollback_target,
-            rollback_of,
-        )
-        .await
-        .map_err(|e| ApiError::idempotency(e, request_id))?;
-    if let ClaimResult::Replay { status, body, .. } = claim {
-        return replay(status, body);
-    }
-    let deployment_id = match claim {
-        ClaimResult::New(v) => v,
-        _ => return Err(ApiError::conflict("DEPLOYMENT_BUSY", request_id)),
-    };
-    let response = ScheduleResponse {
-        deployment_id,
-        status: DeploymentStatus::Queued,
-        idempotency_replayed: false,
-        detail_url: format!("/api/v1/deployments/{deployment_id}"),
-    };
-    let body = serde_json::to_string(&response).map_err(|_| ApiError::internal(request_id))?;
-    m4.engine.spawn(
-        state.clone(),
-        m3.clone(),
-        deployment_id,
-        app_guard,
-        global_guard,
-    );
-    Ok((
-        StatusCode::ACCEPTED,
-        [(header::CONTENT_TYPE, "application/json")],
-        body,
-    )
-        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -754,6 +709,7 @@ async fn actual_fact(
         draft_revision: None,
         draft_config_sha256: None,
         desired_state: crate::domain::DesiredState::Stopped,
+        auto_deploy_enabled: false,
         poll_interval_seconds: 300,
         draft: None,
     };

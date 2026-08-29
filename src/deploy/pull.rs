@@ -54,6 +54,7 @@ pub struct FixedImagePuller {
 #[cfg(feature = "docker-e2e")]
 #[derive(Clone, Copy, Debug)]
 pub enum TestPullAction {
+    Continue,
     Pause,
     Interrupt,
 }
@@ -88,6 +89,13 @@ impl TestPullGate {
         self.resume.add_permits(1);
     }
 
+    pub fn push(&self, action: TestPullAction) {
+        self.actions
+            .lock()
+            .expect("test pull gate lock is not poisoned")
+            .push_back(action);
+    }
+
     async fn enter(&self, shutdown: &CancellationToken) -> Result<(), PullError> {
         let action = self
             .actions
@@ -97,16 +105,19 @@ impl TestPullGate {
         let Some(action) = action else {
             return Ok(());
         };
-        self.reached.add_permits(1);
         match action {
+            TestPullAction::Continue => Ok(()),
             TestPullAction::Interrupt => Err(PullError::Interrupted),
-            TestPullAction::Pause => tokio::select! {
-                () = shutdown.cancelled() => Err(PullError::Interrupted),
-                permit = self.resume.acquire() => {
-                    permit.expect("test pull resume gate remains open").forget();
-                    Ok(())
+            TestPullAction::Pause => {
+                self.reached.add_permits(1);
+                tokio::select! {
+                    () = shutdown.cancelled() => Err(PullError::Interrupted),
+                    permit = self.resume.acquire() => {
+                        permit.expect("test pull resume gate remains open").forget();
+                        Ok(())
+                    }
                 }
-            },
+            }
         }
     }
 }

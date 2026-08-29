@@ -32,11 +32,13 @@ impl LoadedRevision {
         &self,
         discovery_image_ref: String,
         credential_ref: Option<Uuid>,
+        auto_deploy_enabled: bool,
         poll_interval_seconds: u32,
     ) -> DraftResponse {
         DraftResponse {
             discovery_image_ref,
             credential_ref,
+            auto_deploy_enabled,
             poll_interval_seconds,
             public_environment: self.public_environment.clone(),
             secret_keys: self.metadata.secret_keys.clone(),
@@ -78,6 +80,7 @@ impl LoadedRevision {
         display_name: String,
         discovery_image_ref: String,
         credential_ref: Option<Uuid>,
+        auto_deploy_enabled: bool,
         poll_interval_seconds: u32,
     ) -> DraftInput {
         DraftInput {
@@ -85,7 +88,8 @@ impl LoadedRevision {
             display_name,
             discovery_image_ref,
             credential_ref,
-            auto_deploy_enabled: false,
+            auto_deploy_enabled,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds,
             environment: EnvironmentInput {
                 public: self.public_environment.clone(),
@@ -402,6 +406,7 @@ mod tests {
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
             auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: EnvironmentInput {
                 public: vec![PublicEnvInput {
@@ -453,6 +458,7 @@ mod tests {
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
             auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: EnvironmentInput::default(),
             files: vec![],

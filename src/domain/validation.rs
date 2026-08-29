@@ -49,6 +49,7 @@ pub struct NormalizedDraft {
     pub discovery_image_ref: String,
     pub credential_ref: Option<uuid::Uuid>,
     pub auto_deploy_enabled: bool,
+    pub auto_deploy_acknowledged: bool,
     pub poll_interval_seconds: u32,
     pub public_environment: Vec<PublicEnvInput>,
     pub secret_environment: SecretMap,
@@ -83,9 +84,6 @@ pub fn normalize_draft(
     validate_slug(&input.slug)?;
     validate_display_name(&input.display_name)?;
     validate_discovery_image(&input.discovery_image_ref)?;
-    if input.auto_deploy_enabled {
-        return Err(DomainError::FeatureNotAvailable);
-    }
     if !(60..=86_400).contains(&input.poll_interval_seconds) {
         return Err(DomainError::ConfigInvalid);
     }
@@ -167,6 +165,7 @@ pub fn normalize_draft(
         discovery_image_ref: input.discovery_image_ref,
         credential_ref: input.credential_ref,
         auto_deploy_enabled: input.auto_deploy_enabled,
+        auto_deploy_acknowledged: input.auto_deploy_acknowledged,
         poll_interval_seconds: input.poll_interval_seconds,
         public_environment,
         secret_environment,
@@ -935,6 +934,7 @@ mod tests {
             discovery_image_ref: "registry.example/app:latest".into(),
             credential_ref: None,
             auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: EnvironmentInput::default(),
             files: Vec::new(),
@@ -1105,6 +1105,7 @@ mod tests {
         let response = serde_json::to_string(&crate::domain::dto::DraftResponse {
             discovery_image_ref: normalized.discovery_image_ref,
             credential_ref: None,
+            auto_deploy_enabled: false,
             poll_interval_seconds: normalized.poll_interval_seconds,
             public_environment: normalized.public_environment,
             secret_keys: normalized.metadata.secret_keys,

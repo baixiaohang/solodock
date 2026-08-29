@@ -111,6 +111,14 @@ pub async fn create(
 ) -> Result<Response, ApiError> {
     let services = services(&state, request_id)?;
     let Json(input) = payload.map_err(|error| json_error(error, request_id))?;
+    if input.auto_deploy_enabled && !input.auto_deploy_acknowledged {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "AUTO_DEPLOY_ACK_REQUIRED",
+            "Automatic deployment requires explicit acknowledgement",
+            request_id,
+        ));
+    }
     let draft = normalize_draft(
         input,
         &ExistingSecrets::default(),
@@ -321,6 +329,20 @@ pub async fn update_draft(
         }
         Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
     };
+    if !current_metadata.auto_deploy_enabled
+        && payload.draft.auto_deploy_enabled
+        && !payload.draft.auto_deploy_acknowledged
+    {
+        return finish_error(
+            services,
+            &route,
+            raw_key,
+            "AUTO_DEPLOY_ACK_REQUIRED",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            request_id,
+        )
+        .await;
+    }
     if current_metadata.last_operation_id == operation_id
         && current_metadata.draft_revision == operation_id
     {
@@ -334,6 +356,7 @@ pub async fn update_draft(
                 current_metadata.display_name.clone(),
                 current_metadata.discovery_image_ref.clone(),
                 current_metadata.credential_ref,
+                current_metadata.auto_deploy_enabled,
                 current_metadata.poll_interval_seconds,
             ),
             &loaded.secrets,
@@ -661,7 +684,7 @@ fn draft_fingerprint(
     route: &str,
     draft: &NormalizedDraft,
 ) -> Result<Vec<u8>, ApiError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":draft.slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
+    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":draft.slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"auto_deploy_acknowledged":draft.auto_deploy_acknowledged,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
     Ok(services.idempotency.fingerprint(&canonical))
 }
 fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> AppMutationDetail {
@@ -712,6 +735,9 @@ async fn refresh_outcome(state: &AppState, services: &M3Services) -> Publication
         }
     };
     state.observer.catalog.replace(&report);
+    if let Some(m4) = state.m4.as_ref() {
+        m4.poller.notify.notify_one();
+    }
     // A degraded report may omit an app whose already-running container and
     // log stream still exist. Never remove known patterns until the complete
     // filesystem inventory has been proven readable again.
@@ -2804,6 +2830,7 @@ fn current_draft_input(
         app.display_name.clone(),
         app.discovery_image_ref.clone().unwrap_or_default(),
         app.draft.as_ref().and_then(|draft| draft.credential_ref),
+        app.auto_deploy_enabled,
         app.poll_interval_seconds,
     )
 }
@@ -3107,6 +3134,7 @@ mod tests {
             draft_revision: None,
             draft_config_sha256: None,
             desired_state: DesiredState::Stopped,
+            auto_deploy_enabled: false,
             poll_interval_seconds: 300,
             draft: None,
         };

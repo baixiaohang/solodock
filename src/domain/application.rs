@@ -24,6 +24,9 @@ pub struct DraftInput {
     pub credential_ref: Option<Uuid>,
     #[serde(default)]
     pub auto_deploy_enabled: bool,
+    /// One-request acknowledgement. It is fingerprinted but never persisted.
+    #[serde(default)]
+    pub auto_deploy_acknowledged: bool,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u32,
     #[serde(default)]

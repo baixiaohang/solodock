@@ -197,6 +197,18 @@ impl DeploymentEngine {
             DeploymentTrigger::Rollback => {
                 self.resolve_rollback(&record, &metadata, active).await?
             }
+            DeploymentTrigger::Poll => {
+                let result = if let Some(existing_pending) = record.expected_pending_release_id {
+                    self.resume_poll_pending(&record, existing_pending).await
+                } else {
+                    self.resolve_poll(&record, &metadata, active).await
+                };
+                match result {
+                    Ok(value) => value,
+                    Err(EngineError::AlreadyTerminal) => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+            }
         };
         let pending_before = self
             .store
@@ -615,6 +627,130 @@ impl DeploymentEngine {
         Ok((resolved, target, release))
     }
 
+    async fn resolve_poll(
+        &self,
+        record: &DeploymentRecord,
+        metadata: &crate::domain::AppMetadata,
+        active: Option<Uuid>,
+    ) -> Result<(ResolvedImage, Uuid, ReleaseV2), EngineError> {
+        if !metadata.auto_deploy_enabled {
+            return Err(EngineError::Stable("AUTO_DEPLOY_DISABLED"));
+        }
+        let source = record
+            .scheduled_source_image_ref
+            .as_deref()
+            .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?;
+        if source != metadata.discovery_image_ref {
+            return Err(EngineError::Stable("DEPLOYMENT_FACTS_CHANGED"));
+        }
+        let image = ImageReference::parse(source)
+            .map_err(|_| EngineError::Stable("POLL_TARGET_INVALID"))?;
+        let manifest = record
+            .scheduled_manifest_digest
+            .as_deref()
+            .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?;
+        let platform = crate::registry::Platform::canonical(
+            record
+                .scheduled_platform_os
+                .as_deref()
+                .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
+            record
+                .scheduled_platform_architecture
+                .as_deref()
+                .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
+            record.scheduled_platform_variant.as_deref(),
+        )
+        .map_err(|_| EngineError::Stable("POLL_TARGET_INVALID"))?;
+        let resolved = ResolvedImage {
+            source_image_ref: source.to_owned(),
+            logical_registry: image.logical_registry.clone(),
+            repository: record
+                .scheduled_repository
+                .clone()
+                .filter(|value| value == &image.repository)
+                .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
+            source_tag: image.tag.clone(),
+            source_descriptor_digest: record
+                .scheduled_source_descriptor_digest
+                .clone()
+                .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
+            index_digest: record.scheduled_index_digest.clone(),
+            manifest_digest: manifest.to_owned(),
+            runnable_image_ref: image
+                .runnable(manifest)
+                .map_err(|_| EngineError::Stable("POLL_TARGET_INVALID"))?,
+            platform,
+            local_image_id: record
+                .scheduled_local_image_id
+                .clone()
+                .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
+        };
+        if let Some(active_id) = active
+            && let Ok(old) = self.store.load_v2_release(record.app_id, active_id)
+            && old.manifest_digest == resolved.manifest_digest
+        {
+            if old.config_revision != metadata.draft_revision
+                || old.config_sha256 != metadata.draft_config_sha256
+            {
+                return Err(EngineError::Stable("CONFIG_PENDING_MANUAL"));
+            }
+            if record.expected_pending_release_id.is_none()
+                && self
+                    .no_op_runtime_converged(record, active_id, &old)
+                    .await?
+            {
+                self.ledger
+                    .transition(
+                        record.id,
+                        DeploymentPhase::Terminal,
+                        DeploymentStatus::NoOp,
+                        "no_op",
+                        None,
+                    )
+                    .await
+                    .map_err(|_| EngineError::Internal)?;
+                return Err(EngineError::AlreadyTerminal);
+            }
+        }
+        let candidate_id = Uuid::new_v4();
+        self.ledger
+            .resolved(
+                record.id,
+                candidate_id,
+                active,
+                &resolved.source_image_ref,
+                &resolved.source_descriptor_digest,
+                &resolved.manifest_digest,
+                &format!(
+                    "{}/{}",
+                    resolved.platform.os, resolved.platform.architecture
+                ),
+            )
+            .await
+            .map_err(|_| EngineError::Internal)?;
+        self.ledger
+            .transition(
+                record.id,
+                DeploymentPhase::Preparing,
+                DeploymentStatus::Running,
+                "poll_target_verified",
+                None,
+            )
+            .await
+            .map_err(|_| EngineError::Internal)?;
+        let release = self
+            .store
+            .publish_v2_release(
+                metadata,
+                candidate_id,
+                &resolved,
+                ReleaseTrigger::Poll,
+                None,
+            )
+            .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
+        Ok((resolved, candidate_id, release))
+    }
+
     async fn resume_pending(
         &self,
         record: &DeploymentRecord,
@@ -651,6 +787,23 @@ impl DeploymentEngine {
             .await
             .map_err(|_| EngineError::Internal)?;
         Ok((resolved, pending, release))
+    }
+
+    async fn resume_poll_pending(
+        &self,
+        record: &DeploymentRecord,
+        pending: Uuid,
+    ) -> Result<(ResolvedImage, Uuid, ReleaseV2), EngineError> {
+        let value = self.resume_pending(record, pending).await?;
+        if record.scheduled_manifest_digest.as_deref() != Some(value.2.manifest_digest.as_str())
+            || record.scheduled_source_image_ref.as_deref()
+                != Some(value.2.source_image_ref.as_str())
+            || record.scheduled_target_key.is_none()
+            || record.poll_generation.is_none()
+        {
+            return Err(EngineError::NeedsAttention("POLL_PENDING_TARGET_CHANGED"));
+        }
+        Ok(value)
     }
 
     fn load_credential(
@@ -1163,6 +1316,7 @@ fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
         draft_revision: None,
         draft_config_sha256: None,
         desired_state: crate::domain::DesiredState::Stopped,
+        auto_deploy_enabled: false,
         poll_interval_seconds: 300,
         draft: None,
     }

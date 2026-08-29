@@ -20,6 +20,7 @@ pub struct SystemHealthResponse {
     projection: ProjectionHealth,
     deployments: DeploymentHealth,
     registry_credentials: CredentialHealth,
+    polling: PollingHealth,
 }
 
 #[derive(Serialize)]
@@ -56,6 +57,14 @@ struct DeploymentHealth {
 struct CredentialHealth {
     status: &'static str,
     count: usize,
+}
+#[derive(Serialize)]
+struct PollingHealth {
+    coordinator: crate::registry::PollHealthSnapshot,
+    store_status: &'static str,
+    enabled: i64,
+    suppressed: i64,
+    app_errors: i64,
 }
 
 #[derive(Serialize)]
@@ -113,12 +122,26 @@ pub async fn health(
         } else {
             (0, 0)
         };
+    let (poll_snapshot, poll_counts, poll_store_degraded) =
+        if let Some(services) = state.m4.as_ref() {
+            match services.poller.store.counts().await {
+                Ok(counts) => (services.poller.health.snapshot(), counts, false),
+                Err(_) => (services.poller.health.snapshot(), (0, 0, 0), true),
+            }
+        } else {
+            (
+                crate::registry::PollHealth::default().snapshot(),
+                (0, 0, 0),
+                true,
+            )
+        };
     let degraded = docker.status != ProbeStatus::Ready
         || recovery_degraded
         || disk_degraded
         || projection_degraded
         || deployment_interrupted > 0
         || deployment_needs_attention > 0;
+    let degraded = degraded || poll_snapshot.status == "degraded" || poll_store_degraded;
     Json(SystemHealthResponse {
         status: if degraded { "degraded" } else { "ok" },
         docker,
@@ -151,6 +174,17 @@ pub async fn health(
         registry_credentials: CredentialHealth {
             status: credential_status,
             count: credential_count,
+        },
+        polling: PollingHealth {
+            coordinator: poll_snapshot,
+            store_status: if poll_store_degraded {
+                "degraded"
+            } else {
+                "ok"
+            },
+            enabled: poll_counts.0,
+            suppressed: poll_counts.1,
+            app_errors: poll_counts.2,
         },
     })
 }

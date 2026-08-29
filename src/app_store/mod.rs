@@ -120,7 +120,7 @@ impl AppStore {
                 draft_revision: revision_id,
                 draft_config_sha256: draft.metadata.config_sha256.clone(),
                 desired_state: DesiredState::Stopped,
-                auto_deploy_enabled: false,
+                auto_deploy_enabled: draft.auto_deploy_enabled,
                 poll_interval_seconds: draft.poll_interval_seconds,
                 last_operation_id: operation_id,
                 created_at: now,
