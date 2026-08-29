@@ -3,8 +3,10 @@ pub mod app_store;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod docker;
 pub mod error;
 pub mod security;
+pub mod system;
 pub mod telemetry;
 
 pub use api::{AppState, router};
@@ -31,10 +33,11 @@ mod tests {
             .await
             .unwrap();
         let auth = AuthService::new(database, root.path().join("bootstrap.token"));
-        let response = crate::router(crate::AppState {
+        let response = crate::router(crate::AppState::control_plane(
             auth,
-            public_origin: "https://example.com".into(),
-        })
+            "https://example.com".into(),
+            root.path().to_owned(),
+        ))
         .oneshot(
             Request::builder()
                 .uri("/healthz")

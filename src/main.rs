@@ -1,11 +1,23 @@
-use std::{error::Error, net::SocketAddr};
+use std::{error::Error, net::SocketAddr, sync::Arc};
 
 use solodock::{
-    AppState, app_store::AppStore, auth::AuthService, config::Config, db::Database,
+    AppState,
+    app_store::AppStore,
+    auth::AuthService,
+    config::Config,
+    db::Database,
+    docker::{
+        AppCatalog, DockerObserver,
+        client::BollardReadClient,
+        events::DockerEventHub,
+        logs::{EmptySecretProvider, SecretRedactor},
+        probe::DockerSupervisor,
+        stats::StatsHub,
+    },
     security::permissions::ensure_private_directory,
 };
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -35,36 +47,64 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
+    let catalog = AppCatalog::from_recovery(&recovery);
+    let docker_api = Arc::new(BollardReadClient::production());
+    let shutdown = CancellationToken::new();
+    let stream_tasks = TaskTracker::new();
+    let supervisor = DockerSupervisor::new();
+    let supervisor_task = supervisor.start(docker_api.clone(), shutdown.clone());
+    let event_hub = DockerEventHub::new();
+    let event_task = event_hub.start(docker_api.clone(), catalog.clone(), shutdown.clone());
+    let observer = DockerObserver::new(docker_api.clone(), catalog, supervisor);
+    let stats = StatsHub::new(docker_api, shutdown.clone(), stream_tasks.clone());
+
     let listener = TcpListener::bind(config.listen_address).await?;
     info!(listen_address = %config.listen_address, "SoloDock API listening");
     let state = AppState {
         auth,
         public_origin: config.public_origin,
+        observer,
+        events: event_hub,
+        stats,
+        stream_gate: solodock::api::streams::StreamGate::default(),
+        redactor: SecretRedactor::new(&EmptySecretProvider),
+        state_directory: config.state_directory.clone(),
+        shutdown: shutdown.clone(),
+        stream_tasks: stream_tasks.clone(),
     };
-    let (shutdown_sender, shutdown_receiver) = watch::channel(false);
-    tokio::spawn(async move {
-        shutdown_signal().await;
-        let _ = shutdown_sender.send(true);
-    });
-    let mut graceful_receiver = shutdown_receiver.clone();
-    let server = axum::serve(
-        listener,
-        solodock::router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        while !*graceful_receiver.borrow() {
-            if graceful_receiver.changed().await.is_err() {
-                break;
+    {
+        let server_shutdown = shutdown.clone();
+        let server = axum::serve(
+            listener,
+            solodock::router(state).into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            server_shutdown.cancelled().await;
+        });
+        let server = async move { server.await };
+        tokio::pin!(server);
+        tokio::select! {
+            result = &mut server => result?,
+            () = shutdown_signal() => {
+                shutdown.cancel();
+                match tokio::time::timeout(std::time::Duration::from_secs(10), &mut server).await {
+                    Ok(result) => result?,
+                    Err(_) => warn!("graceful HTTP shutdown deadline exceeded"),
+                }
             }
         }
-    });
-    let server = async move { server.await };
-    tokio::pin!(server);
-    tokio::select! {
-        result = &mut server => result?,
-        () = shutdown_deadline(shutdown_receiver) => {
-            warn!("graceful shutdown deadline exceeded");
-        }
+    }
+    shutdown.cancel();
+    stream_tasks.close();
+    if tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = supervisor_task.await;
+        let _ = event_task.await;
+        stream_tasks.wait().await;
+    })
+    .await
+    .is_err()
+    {
+        warn!("Docker observer task shutdown deadline exceeded");
     }
     database.close().await;
     Ok(())
@@ -98,13 +138,4 @@ async fn shutdown_signal() {
         () = terminate => {},
     }
     info!("shutdown signal received");
-}
-
-async fn shutdown_deadline(mut shutdown: watch::Receiver<bool>) {
-    while !*shutdown.borrow() {
-        if shutdown.changed().await.is_err() {
-            return;
-        }
-    }
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 }
