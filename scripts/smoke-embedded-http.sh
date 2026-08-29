@@ -13,6 +13,7 @@ cleanup() {
   rm -rf -- "$fixture"
 }
 trap cleanup EXIT
+trap 'status=$?; printf "embedded HTTP smoke failed at line %s (status %s)\n" "$LINENO" "$status" >&2; [[ -r $fixture/stderr ]] && sed -n "1,120p" "$fixture/stderr" >&2; exit "$status"' ERR
 chmod 0700 "$fixture"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
 origin='https://solodock.example.invalid'
@@ -38,7 +39,8 @@ grep -q '<div id="app"></div>' "$fixture/index"
 asset=$(grep -oE '/assets/[^" ]+\.js' "$fixture/index" | head -n 1)
 [[ -n $asset ]]
 curl --fail --silent "http://127.0.0.1:$port$asset" >/dev/null
-curl --fail --silent "http://127.0.0.1:$port/apps/fixture-spa-route" | cmp -s - "$fixture/index"
+curl --fail --silent -H 'accept: text/html' \
+  "http://127.0.0.1:$port/apps/fixture-spa-route" | cmp -s - "$fixture/index"
 
 bootstrap=$(tr -d '\n' <"$fixture/run/bootstrap.token")
 curl --fail --silent -X POST "http://127.0.0.1:$port/api/v1/auth/bootstrap" \
