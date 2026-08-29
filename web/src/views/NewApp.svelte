@@ -12,6 +12,7 @@
   let publicEnv = $state('')
   let secretEnv = $state('')
   let pollInterval = $state(300)
+  let autoDeploy = $state(false)
   let files = $state('[]')
   let ports = $state('[]')
   let volumes = $state('[]')
@@ -41,7 +42,7 @@
     try {
       const draft: DraftInput = {
         slug, display_name: displayName, discovery_image_ref: image,
-        credential_ref: credentialRef, auto_deploy_enabled: false, poll_interval_seconds: pollInterval,
+        credential_ref: credentialRef, auto_deploy_enabled: autoDeploy, auto_deploy_acknowledged: autoDeploy, poll_interval_seconds: pollInterval,
         environment: environment(), files: JSON.parse(files), ports: JSON.parse(ports),
         volumes: JSON.parse(volumes), binds: JSON.parse(binds), networks: JSON.parse(networks),
         health: JSON.parse(health),
@@ -70,6 +71,8 @@
     <label class="wide">发现镜像（必须带 tag）<input bind:value={image} required placeholder="registry.example/app:stable" /></label>
     <label class="wide">Registry credential<select bind:value={credentialRef}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select><span class="muted">只显示与镜像 logical registry 精确匹配的 credential。</span></label>
     <label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={pollInterval} /></label>
+    <label class="wide"><input type="checkbox" bind:checked={autoDeploy} /> 自动部署 Registry tag 的新 digest</label>
+    {#if autoDeploy}<div class="wide notice warning">新 digest 会自动替换容器，并在健康失败时恢复旧 release；volume 与 bind 中的数据不会随镜像回滚。</div>{/if}
     <label class="wide">公开环境变量<textarea bind:value={publicEnv} rows="5" placeholder="KEY=value&#10;OTHER=value"></textarea><span class="muted">有限 dotenv 语法；重复 key 会被拒绝。</span></label>
     <label class="wide">Secret 环境变量（可多项，KEY=value）<textarea bind:value={secretEnv} rows="5" autocomplete="new-password"></textarea><span class="muted">write-only；成功后立即清空。</span></label>
     <label class="wide">托管文件 JSON<textarea bind:value={files} rows="5"></textarea></label>

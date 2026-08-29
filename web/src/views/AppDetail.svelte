@@ -7,6 +7,7 @@
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { credentialsForReference } from '../lib/registryReference'
   import { canConfirmDeletion } from '../lib/deletionState'
+  import { pollNeedsAttention, pollOutcomeText } from '../lib/pollingState'
   import type { AppDetailResponse, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, RegistryCredential, StatsSample } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   let { appId }: { appId: string } = $props()
@@ -29,6 +30,7 @@
   let editName = $state('')
   let editImage = $state('')
   let editPoll = $state(300)
+  let editAutoDeploy = $state(false)
   let editPublicEnv = $state('')
   let editSecretReplace = $state('')
   let editSecretDelete = $state('')
@@ -106,6 +108,7 @@
     if (!app?.draft || !app.draft_revision) return
     editSlug = app.slug; editName = app.display_name; editImage = app.draft.discovery_image_ref
     editPoll = app.draft.poll_interval_seconds
+    editAutoDeploy = app.draft.auto_deploy_enabled
     editPublicEnv = serializeDotenv(app.draft.public_environment)
     editSecretReplace = ''; editSecretDelete = ''
     editPublicFiles = pretty(app.draft.files.filter((file) => !file.sensitive).map((file) => ({ logical_name: file.logical_name, target_path: file.target_path, content: file.content ?? '' })))
@@ -147,7 +150,7 @@
     }))
     return {
       slug: editSlug, display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
-      auto_deploy_enabled: false, poll_interval_seconds: editPoll,
+      auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !app.draft.auto_deploy_enabled, poll_interval_seconds: editPoll,
       environment: { public: parseLines(editPublicEnv), secrets: secretEnvironment },
       files: [...publicFiles, ...keptSecretFiles, ...secretFiles],
       ports: jsonArray(editPorts) as unknown as DraftInput['ports'],
@@ -217,6 +220,8 @@
         <form class="panel form-grid" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
           <label>Slug<input bind:value={editSlug} required /></label><label>显示名称<input bind:value={editName} required /></label>
           <label class="wide">发现镜像 tag<input bind:value={editImage} required /></label><label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={editPoll} /></label>
+          <label class="wide"><input type="checkbox" bind:checked={editAutoDeploy} /> 自动部署 tag 的新 digest</label>
+          {#if editAutoDeploy}<p class="wide notice warning">启用后，新 digest 会自动替换容器并在健康失败时恢复旧 release；volume/bind 数据不会回滚。禁用不会取消已经 durable claim 的部署。</p>{/if}
           <label class="wide">Registry credential<select bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
           <label class="wide">公开环境变量<textarea rows="5" bind:value={editPublicEnv}></textarea></label>
           <label>新增/替换 secret（KEY=value）<textarea rows="5" bind:value={editSecretReplace} autocomplete="off"></textarea></label>
@@ -236,6 +241,7 @@
       <section class="detail-grid">
         <article class="panel"><h2>版本对照</h2><dl class="fact-list"><div><dt>活动镜像</dt><dd><code>{shortRef(app.active_release?.image_ref)}</code></dd></div><div><dt>实际镜像</dt><dd><code>{shortRef(app.actual?.configured_image_ref)}</code></dd></div><div><dt>容器 ID</dt><dd><code>{app.actual?.id.slice(0, 12) ?? '—'}</code></dd></div><div><dt>重启次数</dt><dd>{app.actual?.restart_count ?? '—'}</dd></div><div><dt>退出码</dt><dd>{app.actual?.exit_code ?? '—'}</dd></div></dl></article>
         <article class="panel"><h2>实时资源</h2><dl class="fact-list"><div><dt>CPU</dt><dd>{stats?.cpu_percent?.toFixed(2) ?? '—'}%</dd></div><div><dt>内存</dt><dd>{formatBytes(stats?.memory_usage_bytes ?? null)} / {formatBytes(stats?.memory_limit_bytes ?? null)}</dd></div><div><dt>接收</dt><dd>{formatBytes(stats?.network_rx_bytes ?? null)}</dd></div><div><dt>发送</dt><dd>{formatBytes(stats?.network_tx_bytes ?? null)}</dd></div></dl></article>
+        <article class="panel wide"><h2>自动部署</h2><dl class="fact-list"><div><dt>状态</dt><dd>{app.draft?.auto_deploy_enabled ? '已启用' : '已禁用'}</dd></div><div><dt>最近结果</dt><dd class:warning={pollNeedsAttention(app.polling)}>{pollOutcomeText(app.polling)}</dd></div><div><dt>最近检查</dt><dd>{app.polling?.last_checked_at ?? '—'}</dd></div><div><dt>下次不早于</dt><dd>{app.polling?.next_check_not_before ?? '—'}</dd></div><div><dt>Manifest</dt><dd><code>{app.polling?.last_manifest_digest ?? '—'}</code></dd></div><div><dt>平台</dt><dd>{app.polling?.last_platform ?? '—'}</dd></div><div><dt>错误</dt><dd>{app.polling?.last_error_code ?? '无'}</dd></div></dl>{#if app.polling?.suppressed_deployment_id}<a href={`#/deployments/${app.polling.suppressed_deployment_id}`}>查看被抑制的失败部署</a>{/if}</article>
         <article class="panel wide"><h2>端口</h2>{#each app.actual?.ports ?? [] as port}<p><code>{port.host_ip}:{port.host_port}</code> → {port.container_port}/{port.protocol}</p>{:else}<p class="muted">无 loopback 端口映射</p>{/each}</article>
         <article class="panel"><h2>挂载</h2>{#each app.actual?.mounts ?? [] as mount}<p><span class="tag">{mount.kind}</span> {mount.destination} · {mount.read_only ? '只读' : '读写'}</p>{:else}<p class="muted">无挂载</p>{/each}</article>
         <article class="panel"><h2>网络</h2>{#each app.actual?.networks ?? [] as network}<p>{network.name} · <code>{network.container_ip ?? '—'}</code></p>{:else}<p class="muted">无网络信息</p>{/each}</article>

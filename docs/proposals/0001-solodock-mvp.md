@@ -1,6 +1,6 @@
 # SoloDock MVP 设计提案
 
-- 状态：已确认
+- 状态：已实现（当前行为以 [架构](../architecture.md)、[运维](../operations.md)、[恢复](../recovery.md) 和 [威胁模型](../threat-model.md) 为准）
 - 日期：2026-08-28
 - 目标环境：Ubuntu 24.04、单机、单管理员
 - 仓库：`baixiaohang/solodock`

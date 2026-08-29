@@ -22,9 +22,6 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-targets --all-features
       - run: npm ci
         working-directory: web
       - run: npm run check
@@ -33,6 +30,32 @@ jobs:
         working-directory: web
       - run: npm run build
         working-directory: web
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --all-features -- --test-threads=2
+      - run: cargo build --release --locked --features embed-ui
+      - run: chmod +x scripts/smoke-embedded-http.sh && scripts/smoke-embedded-http.sh target/release/solodock
+      - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/smoke-test.sh && packaging/smoke-test.sh
+      - run: chmod +x packaging/verify-unit.sh && packaging/verify-unit.sh
+      - name: Measure control-plane resource baseline
+        run: |
+          chmod +x scripts/measure-resources.sh
+          scripts/measure-resources.sh target/release/solodock "$RUNNER_TEMP/resource-report.json"
+      - name: Stage package artifact
+        run: |
+          package="$RUNNER_TEMP/solodock-package"
+          install -d "$package/docs"
+          install -m 0755 target/release/solodock packaging/install.sh packaging/solodock-backup packaging/solodock-restore "$package/"
+          install -m 0644 packaging/systemd/solodock.service packaging/solodock.toml.example README.md "$package/"
+          install -m 0644 docs/architecture.md docs/operations.md docs/recovery.md docs/threat-model.md docs/resource-budget.md "$package/docs/"
+          cp "$RUNNER_TEMP/resource-report.json" "$package/resource-report.json"
+          (cd "$package" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solodock-embedded-package
+          path: |
+            ${{ runner.temp }}/solodock-package
+            ${{ runner.temp }}/resource-report.json
 
   docker-e2e:
     runs-on: ubuntu-24.04
@@ -60,4 +83,18 @@ jobs:
       - run: docker pull alpine:3.20
       - run: docker pull nginx:1.27-alpine
       - run: docker pull registry:2
-      - run: cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2
+      - name: Run isolated Docker E2E with separate daemon sampling
+        env:
+          SOLODOCK_E2E_RESOURCE_REPORT: ${{ runner.temp }}/docker-e2e-resource-report.json
+        run: |
+          chmod +x scripts/measure-dind-daemon.sh
+          scripts/measure-dind-daemon.sh '${{ job.services.docker.id }}' "$RUNNER_TEMP/docker-daemon-resource-report.json" -- \
+            cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: solodock-docker-e2e-resource-report
+          path: |
+            ${{ runner.temp }}/docker-e2e-resource-report.json
+            ${{ runner.temp }}/docker-daemon-resource-report.json
+          if-no-files-found: error

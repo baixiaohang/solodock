@@ -15,6 +15,7 @@ Environment=RUST_LOG=solodock=info
 ExecStart=/usr/local/bin/solodock
 Restart=on-failure
 RestartSec=5s
+TimeoutStopSec=20s
 UMask=0077
 
 StateDirectory=solodock
@@ -29,7 +30,11 @@ ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
 RestrictSUIDSGID=true
+RestrictRealtime=true
 LockPersonality=true
 MemoryDenyWriteExecute=true
 CapabilityBoundingSet=

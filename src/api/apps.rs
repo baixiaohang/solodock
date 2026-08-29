@@ -101,6 +101,11 @@ pub async fn detail(
         false
     };
     let actual_release = app.actual_release_id;
+    let polling = if let Some(m4) = state.m4.as_ref() {
+        m4.poller.store.get(app_id).await.ok().flatten()
+    } else {
+        None
+    };
     let available_actions = if nonterminal {
         vec!["deletion_preview"]
     } else if let Some(pending) = catalog.pending_release_id {
@@ -140,6 +145,7 @@ pub async fn detail(
         compose_available: state.m3.as_ref().is_some_and(|m3| {
             m3.compose_capability.current() == crate::compose::ComposeStatus::Ready
         }),
+        polling,
     }))
 }
 
@@ -157,4 +163,5 @@ struct AppDetailResponse {
     deployment_status: &'static str,
     available_actions: Vec<&'static str>,
     compose_available: bool,
+    polling: Option<crate::registry::PollState>,
 }

@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+
+validate_managed_links() {
+  local state_root=$1
+  local uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  local link relative target app
+  while IFS= read -r -d '' link; do
+    relative=${link#"$state_root/"}
+    if [[ ! $relative =~ ^apps/($uuid)/(active|pending)$ ]]; then
+      return 1
+    fi
+    app=${BASH_REMATCH[1]}
+    target=$(readlink -- "$link")
+    if [[ ! $target =~ ^releases/($uuid)$ || ! -d $state_root/apps/$app/$target || -L $state_root/apps/$app/$target ]]; then
+      return 1
+    fi
+  done < <(find "$state_root" -xdev -type l -print0)
+}
+
+archive=''
+checksum=''
+output=''
+validator=''
+while (($#)); do
+  case "$1" in
+    --archive) archive=${2-}; shift 2 ;;
+    --checksum) checksum=${2-}; shift 2 ;;
+    --output) output=${2-}; shift 2 ;;
+    --validator) validator=${2-}; shift 2 ;;
+    *) printf '%s\n' 'usage: solodock-restore --archive FILE --checksum FILE --output NEW_DIRECTORY' >&2; exit 2 ;;
+  esac
+done
+if [[ -z $validator ]]; then
+  if [[ -x $script_dir/solodock ]]; then
+    validator="$script_dir/solodock"
+  else
+    validator='target/release/solodock'
+  fi
+fi
+[[ -x $validator && ! -L $validator ]] || { printf '%s\n' 'restore validator is missing or unsafe' >&2; exit 2; }
+[[ $archive = /* && -f $archive && ! -L $archive && $checksum = /* && -f $checksum && ! -L $checksum ]] || { printf '%s\n' 'archive/checksum inputs are unsafe' >&2; exit 2; }
+[[ $output = /* && ! -e $output && ! -L $output ]] || { printf '%s\n' 'output must be a new absolute directory' >&2; exit 2; }
+parent=$(dirname -- "$output")
+[[ -d $parent && ! -L $parent && $(realpath -e -- "$parent") == "$parent" ]] || { printf '%s\n' 'output parent is unsafe' >&2; exit 2; }
+expected=$(awk 'NR==1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$checksum")
+[[ -n $expected && $expected == $(sha256sum "$archive" | awk '{print $1}') ]] || { printf '%s\n' 'backup checksum mismatch' >&2; exit 1; }
+while IFS= read -r name; do
+  case "$name" in /*|../*|*/../*|*/..|*//*) printf '%s\n' 'archive contains an unsafe path' >&2; exit 1;; esac
+  case "$name" in var/lib/solodock|var/lib/solodock/*|etc/solodock/config.toml) ;; *) printf '%s\n' 'archive contains an unexpected path' >&2; exit 1;; esac
+done < <(tar -tf "$archive")
+if tar -tvf "$archive" | awk 'substr($1,1,1) ~ /^[hbcps]$/ {found=1} END {exit !found}'; then
+  printf '%s\n' 'archive contains a hard link or unsupported file type' >&2
+  exit 1
+fi
+umask 077
+staging=$(mktemp -d "$parent/.solodock-restore.XXXXXX")
+trap 'rm -rf -- "$staging"' EXIT
+chmod 0700 "$staging"
+tar --no-same-owner --no-same-permissions -C "$staging" -xf "$archive"
+[[ -d $staging/var/lib/solodock && -f $staging/etc/solodock/config.toml ]] || { printf '%s\n' 'archive is incomplete' >&2; exit 1; }
+if ! validate_managed_links "$staging/var/lib/solodock" || find "$staging" -xdev \( ! -type d ! -type f ! -type l \) -print -quit | grep -q .; then
+  printf '%s\n' 'restored state contains an unsafe link or unsupported file type' >&2
+  exit 1
+fi
+chmod 0700 "$staging/var/lib/solodock"
+chmod 0600 "$staging/etc/solodock/config.toml"
+"$validator" validate-restore "$staging/var/lib/solodock" "$staging/etc/solodock/config.toml" >/dev/null
+sync -f "$staging/var/lib/solodock"
+sync -f "$staging/etc/solodock/config.toml"
+[[ ! -e $output && ! -L $output ]] || { printf '%s\n' 'output appeared during restore' >&2; exit 1; }
+mv -T -- "$staging" "$output"
+sync -f "$parent"
+trap - EXIT
+printf '%s\n' 'backup verified and extracted to a new staging directory; no live state was changed'

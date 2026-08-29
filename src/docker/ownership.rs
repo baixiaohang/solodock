@@ -101,6 +101,7 @@ mod tests {
             draft_revision: None,
             draft_config_sha256: None,
             desired_state: crate::domain::DesiredState::Stopped,
+            auto_deploy_enabled: false,
             poll_interval_seconds: 300,
             draft: None,
         };

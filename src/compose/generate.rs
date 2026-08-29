@@ -313,6 +313,7 @@ mod tests {
                 discovery_image_ref: "registry.example/app:latest".into(),
                 credential_ref: None,
                 auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
                 environment: crate::domain::EnvironmentInput {
                     public: vec![],
@@ -364,6 +365,7 @@ mod tests {
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
             auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: crate::domain::EnvironmentInput::default(),
             files: vec![],

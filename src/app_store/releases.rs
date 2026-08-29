@@ -22,6 +22,7 @@ use crate::{
 pub enum ReleaseTrigger {
     Manual,
     Rollback,
+    Poll,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +73,7 @@ impl AppStore {
             app.display_name.clone(),
             app.discovery_image_ref.clone(),
             app.credential_ref,
+            app.auto_deploy_enabled,
             app.poll_interval_seconds,
         );
         let draft = normalize_draft(
@@ -173,6 +175,7 @@ impl AppStore {
             app.display_name,
             release.source_image_ref.clone(),
             release.credential_ref,
+            app.auto_deploy_enabled,
             app.poll_interval_seconds,
         );
         let draft = normalize_draft(
@@ -350,6 +353,7 @@ mod tests {
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
                 auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
                 environment: EnvironmentInput::default(),
                 files: vec![],

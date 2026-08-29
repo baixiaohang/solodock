@@ -5,11 +5,19 @@ use uuid::Uuid;
 
 use crate::db::{Database, DbError, format_time, parse_time};
 
+#[derive(Clone, Debug)]
+pub struct ScheduledResolvedTarget {
+    pub image: crate::registry::ResolvedImage,
+    pub generation: String,
+    pub target_key: String,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DeploymentTrigger {
     Manual,
     Rollback,
+    Poll,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +68,17 @@ pub struct DeploymentRecord {
     pub source_descriptor_digest: Option<String>,
     pub manifest_digest: Option<String>,
     pub platform: Option<String>,
+    pub scheduled_source_image_ref: Option<String>,
+    pub scheduled_source_descriptor_digest: Option<String>,
+    pub scheduled_manifest_digest: Option<String>,
+    pub scheduled_index_digest: Option<String>,
+    pub scheduled_platform_os: Option<String>,
+    pub scheduled_platform_architecture: Option<String>,
+    pub scheduled_platform_variant: Option<String>,
+    pub scheduled_local_image_id: Option<String>,
+    pub scheduled_repository: Option<String>,
+    pub scheduled_target_key: Option<String>,
+    pub poll_generation: Option<String>,
     pub error_class: Option<String>,
     pub error_code: Option<String>,
     pub health_policy: Option<String>,
@@ -153,10 +172,12 @@ impl DeploymentLedger {
         sqlx::query("INSERT INTO deployment_transitions (deployment_id,seq,phase,result,code,created_at) VALUES (?,?,?,?,?,?)")
             .bind(id.to_string()).bind(seq).bind(phase.as_str()).bind(result).bind(code).bind(&now).execute(&mut *tx).await?;
         if terminal {
-            let row = sqlx::query("SELECT app_id,request_id,trigger FROM deployments WHERE id=?")
-                .bind(id.to_string())
-                .fetch_one(&mut *tx)
-                .await?;
+            let row = sqlx::query(
+                "SELECT app_id,request_id,trigger,scheduled_target_key,poll_generation FROM deployments WHERE id=?",
+            )
+            .bind(id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
             let metadata = serde_json::json!({
                 "deployment_id": id,
                 "trigger": row.get::<String, _>("trigger"),
@@ -172,6 +193,24 @@ impl DeploymentLedger {
                 .bind(&now)
                 .execute(&mut *tx)
                 .await?;
+            if row.get::<String, _>("trigger") == "poll"
+                && matches!(
+                    status,
+                    DeploymentStatus::Failed
+                        | DeploymentStatus::RolledBack
+                        | DeploymentStatus::NeedsAttention
+                )
+                && let Some(target) = row.get::<Option<String>, _>("scheduled_target_key")
+            {
+                sqlx::query("UPDATE poll_states SET suppressed_target_key=?,suppressed_deployment_id=?,last_outcome='suppressed_failed_target',updated_at=? WHERE app_id=? AND generation=?")
+                    .bind(target)
+                    .bind(id.to_string())
+                    .bind(&now)
+                    .bind(row.get::<String,_>("app_id"))
+                    .bind(row.get::<Option<String>,_>("poll_generation"))
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -405,6 +444,17 @@ fn parse_record(row: sqlx::sqlite::SqliteRow) -> Result<DeploymentRecord, Ledger
         source_descriptor_digest: row.get("source_descriptor_digest"),
         manifest_digest: row.get("manifest_digest"),
         platform: row.get("platform"),
+        scheduled_source_image_ref: row.get("scheduled_source_image_ref"),
+        scheduled_source_descriptor_digest: row.get("scheduled_source_descriptor_digest"),
+        scheduled_manifest_digest: row.get("scheduled_manifest_digest"),
+        scheduled_index_digest: row.get("scheduled_index_digest"),
+        scheduled_platform_os: row.get("scheduled_platform_os"),
+        scheduled_platform_architecture: row.get("scheduled_platform_architecture"),
+        scheduled_platform_variant: row.get("scheduled_platform_variant"),
+        scheduled_local_image_id: row.get("scheduled_local_image_id"),
+        scheduled_repository: row.get("scheduled_repository"),
+        scheduled_target_key: row.get("scheduled_target_key"),
+        poll_generation: row.get("poll_generation"),
         error_class: row.get("error_class"),
         error_code: row.get("error_code"),
         health_policy: row.get("health_policy"),
@@ -431,7 +481,7 @@ macro_rules! string_enum {
         }
     };
 }
-string_enum!(DeploymentTrigger, { Manual => "manual", Rollback => "rollback" });
+string_enum!(DeploymentTrigger, { Manual => "manual", Rollback => "rollback", Poll => "poll" });
 string_enum!(DeploymentStatus, { Queued=>"queued", Running=>"running", Succeeded=>"succeeded", NoOp=>"no_op", Failed=>"failed", RolledBack=>"rolled_back", NeedsAttention=>"needs_attention", Interrupted=>"interrupted" });
 string_enum!(DeploymentPhase, { Queued=>"queued", Resolving=>"resolving", Preparing=>"preparing", Pulling=>"pulling", Applying=>"applying", Verifying=>"verifying", Committing=>"committing", RollingBack=>"rolling_back", VerifyingRollback=>"verifying_rollback", Terminal=>"terminal" });
 impl DeploymentStatus {

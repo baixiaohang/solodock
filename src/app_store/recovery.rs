@@ -121,6 +121,7 @@ pub fn scan_with_options(
         integrity_key,
         allowed_bind_roots,
         ScanMode::StartupCleanup,
+        None,
     )
 }
 
@@ -134,6 +135,22 @@ pub fn scan_read_only_with_options(
         integrity_key,
         allowed_bind_roots,
         ScanMode::ReadOnly,
+        None,
+    )
+}
+
+pub fn scan_read_only_relocated(
+    apps_directory: &Path,
+    canonical_apps_directory: &Path,
+    integrity_key: Option<&[u8]>,
+    allowed_bind_roots: &[PathBuf],
+) -> Result<RecoveryReport, StoreError> {
+    scan_with_mode(
+        apps_directory,
+        integrity_key,
+        allowed_bind_roots,
+        ScanMode::ReadOnly,
+        Some(canonical_apps_directory),
     )
 }
 
@@ -148,6 +165,7 @@ fn scan_with_mode(
     integrity_key: Option<&[u8]>,
     allowed_bind_roots: &[PathBuf],
     mode: ScanMode,
+    canonical_apps_directory: Option<&Path>,
 ) -> Result<RecoveryReport, StoreError> {
     check_private(apps_directory, true)?;
     let mut report = RecoveryReport::default();
@@ -264,6 +282,9 @@ fn scan_with_mode(
         };
         match scan_app(
             &entry.path(),
+            &canonical_apps_directory
+                .map(|directory| directory.join(directory_id.to_string()))
+                .unwrap_or_else(|| entry.path()),
             directory_id,
             active.as_ref(),
             pending.as_ref(),
@@ -388,8 +409,10 @@ fn validate_managed_tree(app_directory: &Path) -> Result<usize, StoreError> {
     Ok(temporary_artifacts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_app(
     path: &Path,
+    canonical_app_directory: &Path,
     directory_id: Uuid,
     active: Option<&ValidatedReleaseLink>,
     pending: Option<&ValidatedReleaseLink>,
@@ -425,7 +448,6 @@ fn scan_app(
             || header.draft_revision.is_none()
             || header.draft_config_sha256.is_none()
             || header.last_operation_id.is_none()
-            || header.auto_deploy_enabled
             || !(60..=86_400).contains(&header.poll_interval_seconds)
             || header.project_name != crate::domain::AppMetadata::project_name(directory_id))
     {
@@ -444,6 +466,7 @@ fn scan_app(
                         header.display_name.clone(),
                         image.clone(),
                         header.credential_ref,
+                        header.auto_deploy_enabled,
                         header.poll_interval_seconds,
                     );
                     match crate::domain::normalize_draft(
@@ -459,6 +482,7 @@ fn scan_app(
                 Some(loaded.response(
                     image.clone(),
                     header.credential_ref,
+                    header.auto_deploy_enabled,
                     header.poll_interval_seconds,
                 ))
             }
@@ -485,6 +509,7 @@ fn scan_app(
     }
     let release_revisions = match collect_release_revisions(
         path,
+        canonical_app_directory,
         directory_id,
         integrity_key,
         allowed_bind_roots,
@@ -561,6 +586,7 @@ fn scan_app(
     ) {
         match validate_active_compose(
             path,
+            canonical_app_directory,
             &header,
             release_id,
             image,
@@ -609,6 +635,7 @@ fn scan_app(
 #[allow(clippy::too_many_arguments)]
 fn validate_active_compose(
     app_directory: &Path,
+    canonical_app_directory: &Path,
     app: &AppHeader,
     release_id: Uuid,
     image_ref: &str,
@@ -638,6 +665,7 @@ fn validate_active_compose(
         app.display_name.clone(),
         app.discovery_image_ref.clone().unwrap_or_default(),
         app.credential_ref,
+        app.auto_deploy_enabled,
         app.poll_interval_seconds,
     );
     let draft =
@@ -645,7 +673,7 @@ fn validate_active_compose(
             Ok(draft) if draft.metadata == loaded.metadata => draft,
             _ => return Ok(Err("ACTIVE_CONFIG_REVISION_INVALID")),
         };
-    let revision_directory = app_directory
+    let revision_directory = canonical_app_directory
         .join("config-revisions")
         .join(revision_id.to_string());
     let (expected, _) = generate(
@@ -675,6 +703,7 @@ fn validate_active_compose(
 
 fn collect_release_revisions(
     app_directory: &Path,
+    canonical_app_directory: &Path,
     app_id: Uuid,
     integrity_key: Option<&[u8]>,
     allowed_bind_roots: &[PathBuf],
@@ -722,6 +751,7 @@ fn collect_release_revisions(
         if release.schema_version == 2 {
             match validate_v2_release(
                 app_directory,
+                canonical_app_directory,
                 app_id,
                 release_id,
                 integrity_key,
@@ -751,6 +781,7 @@ fn collect_release_revisions(
 
 fn validate_v2_release(
     app_directory: &Path,
+    canonical_app_directory: &Path,
     app_id: Uuid,
     release_id: Uuid,
     integrity_key: Option<&[u8]>,
@@ -794,6 +825,7 @@ fn validate_v2_release(
         app.display_name,
         release.source_image_ref.clone(),
         release.credential_ref,
+        app.auto_deploy_enabled,
         app.poll_interval_seconds,
     );
     let draft =
@@ -806,7 +838,7 @@ fn validate_v2_release(
             app_id,
             release_id,
             image_ref: &release.runnable_image_ref,
-            revision_directory: &app_directory
+            revision_directory: &canonical_app_directory
                 .join("config-revisions")
                 .join(release.config_revision.to_string()),
             draft: &draft,
@@ -1037,6 +1069,7 @@ mod tests {
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
                 auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![],
@@ -1211,6 +1244,7 @@ mod tests {
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
                 auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![],

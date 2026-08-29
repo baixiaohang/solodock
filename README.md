@@ -3,7 +3,7 @@
 SoloDock 是面向个人 Docker 工作负载的轻量级单机容器部署控制台。
 
 > [!WARNING]
-> SoloDock 仍处于早期开发阶段，尚不适合管理生产工作负载。
+> SoloDock 是单主机 MVP。Docker socket 等同宿主 root；部署前必须完成独立业务数据备份和访问面硬化。
 
 SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时回滚。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
 
@@ -60,7 +60,7 @@ unset SOLODOCK_ADMIN_PASSWORD
 
 SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。只有 HTTP listen 前的启动恢复会清理 crash 遗留的临时目录和未引用 revision；运行期 catalog/reconciliation 扫描严格只读，不能与正在发布的 revision 竞争。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
 
-M4 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，发布带 HMAC 的 immutable release，并通过后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。注册应用本身仍不会解析 tag、拉取镜像或创建容器；必须显式调用 Deploy。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
+SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，并通过唯一后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。管理员可显式确认开启有界 Registry 轮询自动部署；busy 不排队，坏 target 会被抑制。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
 
 Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
 
@@ -79,8 +79,8 @@ allowed_bind_roots = ["/srv/solodock-data"]
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo build --release
+cargo test --all-targets --all-features -- --test-threads=2
+cargo build --release --locked --features embed-ui
 ```
 
 ## 前端开发
@@ -91,7 +91,7 @@ npm ci
 npm run dev
 ```
 
-Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。M3 UI 由 Vite 提供，尚未嵌入生产二进制；静态资源嵌入属于 M5。
+Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。生产构建把 Vite产物嵌入单一 Rust binary，不运行 Node服务。
 
 运行前端验证：
 
@@ -101,4 +101,6 @@ npm run test
 npm run build
 ```
 
-Node/npm 只用于开发和构建 Web UI。最终生产版本会把静态资源嵌入 Rust 二进制，不需要运行 Node 服务。
+Node/npm 只用于开发和构建 Web UI。
+
+当前权威说明见 [架构](docs/architecture.md)、[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md) 和 [资源预算](docs/resource-budget.md)。一次性迁移 runbook 位于 [`docs/migrations/`](docs/migrations/)。

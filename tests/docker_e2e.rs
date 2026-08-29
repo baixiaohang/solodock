@@ -1,6 +1,14 @@
 #![cfg(feature = "docker-e2e")]
 
-use std::{collections::HashMap, os::unix::fs::PermissionsExt, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -34,8 +42,8 @@ use solodock::{
     compose::{ComposeAction, ComposeCapability, ComposeRunner, FixedComposeRunner, RunContext},
     db::Database,
     deploy::{
-        DeploymentEngine, DeploymentLedger, FixedImagePuller, HealthVerifier, TestEffectAction,
-        TestEffectGate, TestPullAction, TestPullGate,
+        DeploymentEngine, DeploymentLedger, DeploymentScheduler, FixedImagePuller, HealthVerifier,
+        TestEffectAction, TestEffectGate, TestPullAction, TestPullGate,
     },
     docker::{
         AppCatalog, DockerObserver,
@@ -45,7 +53,10 @@ use solodock::{
         stats::StatsHub,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
-    registry::{CredentialStore, RegistryResolver},
+    registry::{
+        CredentialStore, PollCoordinator, PollObservation, PollOutcome, PollStateStore,
+        RegistryResolver,
+    },
     router,
 };
 use tempfile::TempDir;
@@ -61,6 +72,98 @@ struct Outcome {
     memory_observed: bool,
     event_container_id: String,
     event_run_token: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct ProcessMetrics {
+    rss_kib: u64,
+    fd_count: u64,
+    task_count: u64,
+}
+
+struct ProcessPeakSampler {
+    peak_rss_kib: Arc<AtomicU64>,
+    stop: CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl ProcessPeakSampler {
+    fn start(pid: u32) -> Self {
+        let peak_rss_kib = Arc::new(AtomicU64::new(0));
+        let stop = CancellationToken::new();
+        let peak = peak_rss_kib.clone();
+        let cancellation = stop.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if let Ok(metrics) = process_metrics(pid) {
+                    peak.fetch_max(metrics.rss_kib, Ordering::AcqRel);
+                }
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            }
+        });
+        Self {
+            peak_rss_kib,
+            stop,
+            task,
+        }
+    }
+
+    async fn finish(self) -> u64 {
+        self.stop.cancel();
+        let _ = self.task.await;
+        self.peak_rss_kib.load(Ordering::Acquire)
+    }
+}
+
+fn process_metrics(pid: u32) -> std::io::Result<ProcessMetrics> {
+    let process = format!("/proc/{pid}");
+    let status = std::fs::read_to_string(format!("{process}/status"))?;
+    let rss_kib = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|value| value.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| std::io::Error::other("VmRSS unavailable"))?;
+    let count = |path: &str| -> std::io::Result<u64> {
+        Ok(u64::try_from(std::fs::read_dir(path)?.count()).unwrap_or(u64::MAX))
+    };
+    Ok(ProcessMetrics {
+        rss_kib,
+        fd_count: count(&format!("{process}/fd"))?,
+        task_count: count(&format!("{process}/task"))?,
+    })
+}
+
+fn tree_bytes(path: &std::path::Path) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(metadata.len());
+    }
+    let mut total = 0_u64;
+    for entry in std::fs::read_dir(path)? {
+        total = total.saturating_add(tree_bytes(&entry?.path())?);
+    }
+    Ok(total)
+}
+
+fn resource_stream_hold_seconds() -> u64 {
+    match std::env::var("SOLODOCK_E2E_STREAM_HOLD_SECONDS") {
+        Ok(raw) => {
+            let seconds = raw
+                .parse::<u64>()
+                .expect("SOLODOCK_E2E_STREAM_HOLD_SECONDS must be an integer");
+            assert!(
+                (1..=60).contains(&seconds),
+                "SOLODOCK_E2E_STREAM_HOLD_SECONDS must be between 1 and 60"
+            );
+            seconds
+        }
+        Err(std::env::VarError::NotPresent) => 60,
+        Err(error) => panic!("invalid SOLODOCK_E2E_STREAM_HOLD_SECONDS: {error}"),
+    }
 }
 
 struct MutationHarness {
@@ -173,7 +276,7 @@ impl MutationHarness {
             idempotency.integrity_key(),
         )
         .unwrap();
-        let ledger = DeploymentLedger::new(database);
+        let ledger = DeploymentLedger::new(database.clone());
         let mut puller = FixedImagePuller::new(
             state_directory.clone(),
             state_directory.join("pull-runtime"),
@@ -200,10 +303,18 @@ impl MutationHarness {
             tasks: state.stream_tasks.clone(),
             test_effect_gate: effect_gate,
         };
+        let scheduler = DeploymentScheduler::new(engine.clone());
+        let poller = PollCoordinator::new(
+            PollStateStore::new(database),
+            state.shutdown.clone(),
+            state.stream_tasks.clone(),
+        );
         state.m4 = Some(Arc::new(M4Services {
             credentials,
             ledger,
             engine,
+            scheduler,
+            poller,
         }));
         let app = router(state.clone());
         Self {
@@ -265,6 +376,7 @@ impl MutationHarness {
                 metadata.display_name,
                 metadata.discovery_image_ref,
                 metadata.credential_ref,
+                metadata.auto_deploy_enabled,
                 metadata.poll_interval_seconds,
             ),
             &loaded.secrets,
@@ -782,6 +894,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
             discovery_image_ref: "alpine:3.20".into(),
             credential_ref: None,
             auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: solodock::domain::EnvironmentInput::default(),
             files: vec![],
@@ -1352,7 +1465,7 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
 
 #[tokio::test]
 #[ignore = "requires a dedicated Docker-in-Docker daemon, Registry access, and docker compose CLI"]
-async fn production_m4_digest_deploy_auto_rollback_and_manual_rollback() {
+async fn production_m5_polling_digest_deploy_auto_rollback_and_manual_rollback() {
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
     let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
         .unwrap()
@@ -1506,6 +1619,14 @@ http {{
         docker_cli(&endpoint, &["tag", source, target]).await;
         docker_cli_with_input(&endpoint, docker_config.path(), &["push", target], &[]).await;
     }
+    let unhealthy_image = format!("solodock-m5-unhealthy-{token}:latest");
+    docker_cli_with_input(
+        &endpoint,
+        docker_config.path(),
+        &["build", "-t", &unhealthy_image, "-"],
+        b"FROM nginx:1.27-alpine\nHEALTHCHECK --interval=1s --timeout=1s --retries=1 CMD false\n",
+    )
+    .await;
     let external_volume = format!("solodock-m4-external-volume-{token}");
     let external_network = format!("solodock-m4-external-network-{token}");
     let labels = HashMap::from([("com.solodock.test-run".into(), token.to_string())]);
@@ -1531,8 +1652,15 @@ http {{
     std::fs::create_dir_all(&bind_source).unwrap();
     let bind_canary = format!("m4-bind-canary-{token}");
     std::fs::write(bind_source.join("canary"), &bind_canary).unwrap();
-    let pull_gate = TestPullGate::new([TestPullAction::Pause, TestPullAction::Interrupt]);
+    let pull_gate = TestPullGate::new([
+        TestPullAction::Pause,
+        TestPullAction::Continue,
+        TestPullAction::Continue,
+        TestPullAction::Interrupt,
+    ]);
     let effect_gate = TestEffectGate::new([
+        TestEffectAction::Continue,
+        TestEffectAction::Continue,
         TestEffectAction::Continue,
         TestEffectAction::Continue,
         TestEffectAction::Continue,
@@ -1545,6 +1673,9 @@ http {{
         Some(effect_gate.clone()),
     )
     .await;
+    let resource_sampler = ProcessPeakSampler::start(std::process::id());
+    let idle_metrics = process_metrics(std::process::id()).unwrap();
+    let stream_hold_seconds = resource_stream_hold_seconds();
     let credential = harness
         .request(
             "POST",
@@ -1568,7 +1699,8 @@ http {{
     let draft = |slug: &str, image: &str, health: Value| {
         json!({
             "slug": slug, "display_name": "M4 E2E", "discovery_image_ref": image,
-            "credential_ref": credential_id, "auto_deploy_enabled": false, "poll_interval_seconds": 300,
+            "credential_ref": credential_id, "auto_deploy_enabled": true,
+            "auto_deploy_acknowledged": true, "poll_interval_seconds": 300,
             "environment": {"public": [], "secrets": []}, "files": [], "ports": [],
             "volumes": [
                 {"kind":"owned","logical_name":"owned","target_path":"/owned"},
@@ -1650,7 +1782,21 @@ http {{
     );
     remove_test_container(&docker, collision_id.trim(), token).await;
 
-    let first = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0001").await;
+    let m3 = harness.state.m3.as_ref().unwrap().clone();
+    let m4 = harness.state.m4.as_ref().unwrap().clone();
+    assert!(m3.store.read_metadata(app_id).unwrap().auto_deploy_enabled);
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    let deployments = m4.ledger.list(app_id, 1).await.unwrap();
+    assert!(
+        !deployments.is_empty(),
+        "first poll did not schedule a deployment: {:?}",
+        m4.poller.store.get(app_id).await.unwrap()
+    );
+    let first = deployments[0].id;
     // The worker has already resolved the tag and published the immutable
     // candidate when the test-only pull boundary pauses. Moving the tag here
     // proves the production pull/Compose path remains pinned to that digest.
@@ -1696,6 +1842,122 @@ http {{
             .starts_with("sha256:")
     );
 
+    // Hold the representative per-session maximum of real authenticated SSE
+    // responses (4 events + 2 logs + 2 stats) and record the control-plane
+    // delta. Dropping the bodies must release every stream permit again.
+    let mut stream_responses = Vec::new();
+    for suffix in [
+        "events", "events", "events", "events", "logs", "logs", "stats", "stats",
+    ] {
+        let response = harness
+            .request(
+                "GET",
+                &format!("/api/v1/apps/{app_id}/{suffix}"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "failed to open {suffix}");
+        stream_responses.push(response);
+    }
+    assert_eq!(harness.state.stream_gate.active(), 8);
+    tokio::time::sleep(Duration::from_secs(stream_hold_seconds)).await;
+    let stream_metrics = process_metrics(std::process::id()).unwrap();
+    drop(stream_responses);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while harness.state.stream_gate.active() != 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("SSE permits were not released");
+
+    // Restore the original tag and verify repeated observations do not create
+    // another deployment row for the active digest.
+    docker_cli(
+        &endpoint,
+        &[
+            "tag",
+            "nginx:1.27-alpine",
+            "127.0.0.1:5000/solodock/nginx:stable",
+        ],
+    )
+    .await;
+    docker_cli_with_input(
+        &endpoint,
+        docker_config.path(),
+        &["push", "127.0.0.1:5000/solodock/nginx:stable"],
+        &[],
+    )
+    .await;
+    let before_unchanged = m4.ledger.list(app_id, 20).await.unwrap().len();
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    assert_eq!(
+        m4.ledger.list(app_id, 20).await.unwrap().len(),
+        before_unchanged,
+        "an unchanged digest must not create a deployment"
+    );
+
+    // A new digest with a deterministically failing image healthcheck rolls
+    // back to the exact previous release and is durably suppressed.
+    let current = app_detail(&harness, app_id).await;
+    update_draft(
+        &harness,
+        app_id,
+        current["draft_revision"].as_str().unwrap(),
+        draft(
+            "m4-e2e",
+            "127.0.0.1:5000/solodock/nginx:stable",
+            json!({"policy":"healthy"}),
+        ),
+        "m5-e2e-health-update-0001",
+    )
+    .await;
+    docker_cli(
+        &endpoint,
+        &[
+            "tag",
+            &unhealthy_image,
+            "127.0.0.1:5000/solodock/nginx:stable",
+        ],
+    )
+    .await;
+    docker_cli_with_input(
+        &endpoint,
+        docker_config.path(),
+        &["push", "127.0.0.1:5000/solodock/nginx:stable"],
+        &[],
+    )
+    .await;
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    let failed_poll = m4.ledger.list(app_id, 1).await.unwrap()[0].id;
+    let failed_poll = wait_for_deployment(&harness, failed_poll).await;
+    assert_eq!(failed_poll["trigger"], "poll");
+    assert_eq!(failed_poll["status"], "rolled_back", "{failed_poll}");
+    assert_eq!(
+        app_detail(&harness, app_id).await["active_release"]["id"],
+        first_release
+    );
+    let before_suppressed = m4.ledger.list(app_id, 20).await.unwrap().len();
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    assert_eq!(
+        m4.ledger.list(app_id, 20).await.unwrap().len(),
+        before_suppressed,
+        "a failed poll target must remain suppressed"
+    );
+
     let current = app_detail(&harness, app_id).await;
     let unhealthy = draft(
         "m4-e2e",
@@ -1710,8 +1972,14 @@ http {{
         "m4-e2e-update-0001",
     )
     .await;
-    let interrupted = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0002").await;
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    let interrupted = m4.ledger.list(app_id, 1).await.unwrap()[0].id;
     let interrupted = wait_for_deployment(&harness, interrupted).await;
+    assert_eq!(interrupted["trigger"], "poll", "{interrupted}");
     assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
     let interrupted_facts = app_detail(&harness, app_id).await;
     assert!(interrupted_facts["pending_release_id"].is_string());
@@ -1719,8 +1987,16 @@ http {{
         interrupted_facts["actual_release_id"],
         interrupted_facts["active_release"]["id"]
     );
-    let failed = schedule_from_current(&harness, app_id, "m4-e2e-deploy-0002-resume").await;
+    let interrupted_id = interrupted["id"].as_str().unwrap();
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    let failed = m4.ledger.list(app_id, 1).await.unwrap()[0].id;
+    assert_ne!(failed.to_string(), interrupted_id);
     let failed = wait_for_deployment(&harness, failed).await;
+    assert_eq!(failed["trigger"], "poll", "{failed}");
     assert_eq!(failed["status"], "rolled_back", "{failed}");
     assert_eq!(
         app_detail(&harness, app_id).await["active_release"]["id"],
@@ -1743,6 +2019,17 @@ http {{
     let blocked_by_final_recheck =
         schedule_from_current(&harness, app_id, "m4-e2e-deploy-0003").await;
     effect_gate.wait_until_reached().await;
+    let before_busy_poll = m4.ledger.list(app_id, 20).await.unwrap().len();
+    assert!(
+        m4.poller
+            .run_once_for_test(&harness.state, &m3, &m4, app_id)
+            .await
+    );
+    assert_eq!(
+        m4.ledger.list(app_id, 20).await.unwrap().len(),
+        before_busy_poll,
+        "polling an app with a deployment lock must not queue work"
+    );
     let final_collision_name = format!("solodock-m4-final-collision-{token}");
     let final_collision = docker_cli(
         &endpoint,
@@ -1869,9 +2156,123 @@ http {{
         )
         .await
         .unwrap();
+
+    // Exercise the production heap/dispatch loop and shutdown ownership. A
+    // second auto-enabled app is made immediately due; the real coordinator
+    // schedules it, then global shutdown interrupts the worker at the pull
+    // boundary and joins both tasks with recoverable pending facts intact.
+    let shutdown_create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("m5-e2e-shutdown-create-0001"),
+            Some(&json!({
+                "slug":"m5-shutdown", "display_name":"M5 shutdown",
+                "discovery_image_ref":"127.0.0.1:5000/solodock/nginx:stable",
+                "credential_ref":credential_id, "auto_deploy_enabled":true,
+                "auto_deploy_acknowledged":true, "poll_interval_seconds":300,
+                "environment":{"public":[],"secrets":[]}, "files":[], "ports":[],
+                "volumes":[], "binds":[], "networks":[],
+                "health":{"policy":"running","stable_window_seconds":5}
+            })),
+        )
+        .await;
+    assert_eq!(shutdown_create.status(), StatusCode::CREATED);
+    let shutdown_app = MutationHarness::json(shutdown_create).await["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let shutdown_metadata = m3.store.read_metadata(shutdown_app).unwrap();
+    let shutdown_generation =
+        solodock::registry::poller::poll_generation(&m3.store, &m4.credentials, &shutdown_metadata)
+            .unwrap();
+    m4.poller
+        .store
+        .publish(
+            shutdown_app,
+            PollObservation {
+                generation: &shutdown_generation,
+                enabled: true,
+                next_check_not_before: Some(time::OffsetDateTime::now_utc()),
+                checked_at: None,
+                success: false,
+                replace_observed_fields: false,
+                source_descriptor_digest: None,
+                etag: None,
+                manifest_digest: None,
+                platform: None,
+                outcome: PollOutcome::Cancelled,
+                error_class: None,
+                error_code: None,
+                transient_failures: 0,
+            },
+        )
+        .await
+        .unwrap();
+    pull_gate.push(TestPullAction::Pause);
+    let coordinator_task = m4
+        .poller
+        .start(harness.state.clone(), m3.clone(), m4.clone());
+    m4.poller.notify.notify_one();
+    tokio::time::timeout(Duration::from_secs(30), pull_gate.wait_until_reached())
+        .await
+        .expect("production coordinator did not dispatch the due app");
+    let shutdown_deployment = m4.ledger.list(shutdown_app, 1).await.unwrap()[0].id;
     harness.state.shutdown.cancel();
     harness.state.stream_tasks.close();
-    harness.state.stream_tasks.wait().await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let _ = coordinator_task.await;
+        harness.state.stream_tasks.wait().await;
+    })
+    .await
+    .expect("poll coordinator and deployment worker did not join on shutdown");
+    let shutdown_record = m4.ledger.get(shutdown_deployment).await.unwrap().unwrap();
+    assert_eq!(
+        shutdown_record.trigger,
+        solodock::deploy::DeploymentTrigger::Poll
+    );
+    assert_eq!(
+        shutdown_record.status,
+        solodock::deploy::DeploymentStatus::Interrupted
+    );
+    assert!(
+        m3.store
+            .read_release_link(shutdown_app, "pending")
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        m3.store
+            .read_release_link(shutdown_app, "active")
+            .unwrap()
+            .is_none()
+    );
+    let control_plane_peak_rss_kib = resource_sampler.finish().await;
+    if let Ok(report_path) = std::env::var("SOLODOCK_E2E_RESOURCE_REPORT") {
+        let metadata_bytes = tree_bytes(&harness.state.state_directory).unwrap();
+        let report = json!({
+            "scenario": "authenticated streams plus private Registry resolve/pull/apply/health/rollback",
+            "stream_connections": 8,
+            "stream_hold_seconds": stream_hold_seconds,
+            "stream_sample_timing": "at end of hold window",
+            "idle": {
+                "rss_kib": idle_metrics.rss_kib,
+                "fd_count": idle_metrics.fd_count,
+                "task_count": idle_metrics.task_count,
+            },
+            "streams": {
+                "rss_kib": stream_metrics.rss_kib,
+                "rss_delta_kib": stream_metrics.rss_kib.saturating_sub(idle_metrics.rss_kib),
+                "fd_count": stream_metrics.fd_count,
+                "task_count": stream_metrics.task_count,
+            },
+            "control_plane_peak_rss_kib": control_plane_peak_rss_kib,
+            "control_plane_metadata_bytes": metadata_bytes,
+            "daemon_measurement": "reported separately by measure-dind-daemon.sh",
+        });
+        std::fs::write(report_path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
     remove_test_container(&docker, proxy_id.trim(), token).await;
     remove_test_container(&docker, registry_id.trim(), token).await;
     let inspected_registry_network = docker

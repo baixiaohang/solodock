@@ -33,8 +33,9 @@ export interface SystemHealth {
   disk: { state: DiskSnapshot; docker: DiskSnapshot | null }
   streams: { active: number; limit: number }
   projection: { status: 'ok' | 'degraded' }
-  deployments: { active: number; limit: number }
+  deployments: { active: number; interrupted: number; needs_attention: number; limit: number }
   registry_credentials: { status: 'ok' | 'degraded' | 'unavailable'; count: number }
+  polling: { coordinator: { status: 'running' | 'degraded' | 'stopped'; due: number; inflight: number }; store_status: 'ok' | 'degraded'; enabled: number; suppressed: number; app_errors: number }
 }
 
 export interface ActiveRelease { id: string; image_ref: string }
@@ -87,7 +88,8 @@ export interface DraftInput {
   display_name: string
   discovery_image_ref: string
   credential_ref: string | null
-  auto_deploy_enabled: false
+  auto_deploy_enabled: boolean
+  auto_deploy_acknowledged: boolean
   poll_interval_seconds: number
   environment: {
     public: Array<{ key: string; value: string }>
@@ -148,6 +150,7 @@ export type ConfiguredScope = 'active' | 'pending' | 'draft' | 'active_and_pendi
 export interface DraftResponse {
   discovery_image_ref: string
   credential_ref: string | null
+  auto_deploy_enabled: boolean
   poll_interval_seconds: number
   public_environment: Array<{ key: string; value: string }>
   secret_keys: string[]
@@ -170,6 +173,26 @@ export interface AppDetailResponse extends AppObservation {
   deployment_status: 'ACTIVE' | 'PENDING' | 'RUNNING' | 'DEPLOY_REQUIRED'
   available_actions: Array<'start' | 'stop' | 'restart' | 'deploy' | 'deletion_preview'>
   compose_available: boolean
+  polling: PollState | null
+}
+
+export interface PollState {
+  app_id: string
+  generation: string
+  enabled: boolean
+  consecutive_transient_failures: number
+  next_check_not_before: string | null
+  last_checked_at: string | null
+  last_success_at: string | null
+  last_source_descriptor_digest: string | null
+  last_manifest_digest: string | null
+  last_platform: string | null
+  last_outcome: 'disabled' | 'scheduled' | 'unchanged' | 'config_pending_manual' | 'busy_skipped' | 'blocked_drift' | 'blocked_attention' | 'suppressed_failed_target' | 'registry_error' | 'credential_error' | 'invalid_source' | 'cancelled'
+  last_error_class: string | null
+  last_error_code: string | null
+  suppressed_target_key: string | null
+  suppressed_deployment_id: string | null
+  updated_at: string
 }
 
 export interface AppMutationResponse {
@@ -215,7 +238,7 @@ export type DeploymentStatus = 'queued' | 'running' | 'succeeded' | 'no_op' | 'f
 export interface Deployment {
   id: string
   app_id: string
-  trigger: 'manual' | 'rollback'
+  trigger: 'manual' | 'rollback' | 'poll'
   requested_revision: string
   from_release_id: string | null
   candidate_release_id: string | null

@@ -42,6 +42,7 @@ pub struct AppCatalogEntry {
     pub draft_revision: Option<Uuid>,
     pub draft_config_sha256: Option<String>,
     pub desired_state: DesiredState,
+    pub auto_deploy_enabled: bool,
     pub poll_interval_seconds: u32,
     pub draft: Option<DraftResponse>,
 }
@@ -64,6 +65,7 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             draft_revision: value.draft_revision,
             draft_config_sha256: value.draft_config_sha256.clone(),
             desired_state: value.desired_state,
+            auto_deploy_enabled: value.auto_deploy_enabled,
             poll_interval_seconds: value.poll_interval_seconds,
             draft: value.draft.clone(),
         }

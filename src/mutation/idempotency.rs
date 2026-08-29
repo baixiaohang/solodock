@@ -56,9 +56,24 @@ impl IdempotencyService {
         raw_key: &str,
         request_hmac: &[u8],
     ) -> Result<Option<ClaimResult>, IdempotencyError> {
+        self.completed_for_actor("admin", route, raw_key, request_hmac)
+            .await
+    }
+
+    pub async fn completed_for_actor(
+        &self,
+        actor: &str,
+        route: &str,
+        raw_key: &str,
+        request_hmac: &[u8],
+    ) -> Result<Option<ClaimResult>, IdempotencyError> {
+        if !matches!(actor, "admin" | "system") {
+            return Err(IdempotencyError::KeyInvalid);
+        }
         Self::validate_key(raw_key)?;
         let key_hmac = hmac(&self.key.0, raw_key.as_bytes());
-        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor='admin' AND route=? AND key_hmac=?")
+        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor=? AND route=? AND key_hmac=?")
+            .bind(actor)
             .bind(route)
             .bind(key_hmac)
             .fetch_optional(self.database.pool())
@@ -288,22 +303,35 @@ impl IdempotencyService {
         expected_actual_container_id: Option<&str>,
         rollback_target_release_id: Option<Uuid>,
         rollback_of_deployment_id: Option<Uuid>,
+        scheduled: Option<&crate::deploy::ScheduledResolvedTarget>,
     ) -> Result<ClaimResult, IdempotencyError> {
         Self::validate_key(raw_key)?;
         let key_hmac = hmac(&self.key.0, raw_key.as_bytes());
         let now = format_time(OffsetDateTime::now_utc())?;
         let operation_id = Uuid::new_v4();
+        let actor = if trigger == "poll" { "system" } else { "admin" };
         let mut tx = self.database.pool().begin().await?;
-        let inserted = sqlx::query("INSERT OR IGNORE INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,created_at,updated_at) VALUES ('admin',?,?,?,?, 'pending',?,?)")
-            .bind(route).bind(&key_hmac).bind(request_hmac).bind(operation_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await?.rows_affected();
+        let inserted = sqlx::query("INSERT OR IGNORE INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,created_at,updated_at) VALUES (?,?,?,?,?,'pending',?,?)")
+            .bind(actor).bind(route).bind(&key_hmac).bind(request_hmac).bind(operation_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await?.rows_affected();
         if inserted == 1 {
-            let deployment = sqlx::query("INSERT INTO deployments (id,app_id,trigger,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,expected_actual_container_id,rollback_target_release_id,rollback_of_deployment_id,status,phase,request_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'queued','queued',?,?,?)")
+            let deployment = sqlx::query("INSERT INTO deployments (id,app_id,trigger,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,expected_actual_container_id,rollback_target_release_id,rollback_of_deployment_id,scheduled_source_image_ref,scheduled_source_descriptor_digest,scheduled_manifest_digest,scheduled_index_digest,scheduled_platform_os,scheduled_platform_architecture,scheduled_platform_variant,scheduled_local_image_id,scheduled_repository,scheduled_target_key,poll_generation,status,phase,request_id,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'queued','queued',?,?,?)")
                 .bind(operation_id.to_string()).bind(app_id.to_string()).bind(trigger).bind(requested_revision.to_string())
                 .bind(from_release_id.map(|v|v.to_string()))
                 .bind(expected_pending_release_id.map(|v|v.to_string()))
                 .bind(expected_actual_release_id.map(|v|v.to_string()))
                 .bind(expected_actual_container_id)
                 .bind(rollback_target_release_id.map(|v|v.to_string())).bind(rollback_of_deployment_id.map(|v|v.to_string()))
+                .bind(scheduled.map(|value| value.image.source_image_ref.as_str()))
+                .bind(scheduled.map(|value| value.image.source_descriptor_digest.as_str()))
+                .bind(scheduled.map(|value| value.image.manifest_digest.as_str()))
+                .bind(scheduled.and_then(|value| value.image.index_digest.as_deref()))
+                .bind(scheduled.map(|value| value.image.platform.os.as_str()))
+                .bind(scheduled.map(|value| value.image.platform.architecture.as_str()))
+                .bind(scheduled.and_then(|value| value.image.platform.variant.as_deref()))
+                .bind(scheduled.map(|value| value.image.local_image_id.as_str()))
+                .bind(scheduled.map(|value| value.image.repository.as_str()))
+                .bind(scheduled.map(|value| value.target_key.as_str()))
+                .bind(scheduled.map(|value| value.generation.as_str()))
                 .bind(request_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await;
             if let Err(error) = deployment {
                 if error
@@ -316,8 +344,8 @@ impl IdempotencyService {
             }
             sqlx::query("INSERT INTO deployment_transitions (deployment_id,seq,phase,result,created_at) VALUES (?,1,'queued','scheduled',?)")
                 .bind(operation_id.to_string()).bind(&now).execute(&mut *tx).await?;
-            sqlx::query("INSERT INTO audit_events (actor,request_id,action,target_type,target_id,result,redacted_metadata,created_at) VALUES ('admin',?,?, 'deployment',?,'attempt','{}',?)")
-                .bind(request_id.to_string()).bind(route).bind(operation_id.to_string()).bind(&now).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO audit_events (actor,request_id,action,target_type,target_id,result,redacted_metadata,created_at) VALUES (?,?,?, 'deployment',?,'attempt','{}',?)")
+                .bind(actor).bind(request_id.to_string()).bind(route).bind(operation_id.to_string()).bind(&now).execute(&mut *tx).await?;
             let response_body = serde_json::json!({
                 "deployment_id": operation_id,
                 "status": "queued",
@@ -325,12 +353,12 @@ impl IdempotencyService {
                 "detail_url": format!("/api/v1/deployments/{operation_id}")
             })
             .to_string();
-            sqlx::query("UPDATE idempotency_records SET status='succeeded',response_status=202,response_body=?,updated_at=? WHERE actor='admin' AND route=? AND key_hmac=? AND operation_id=?")
-                .bind(response_body).bind(&now).bind(route).bind(&key_hmac).bind(operation_id.to_string()).execute(&mut *tx).await?;
+            sqlx::query("UPDATE idempotency_records SET status='succeeded',response_status=202,response_body=?,updated_at=? WHERE actor=? AND route=? AND key_hmac=? AND operation_id=?")
+                .bind(response_body).bind(&now).bind(actor).bind(route).bind(&key_hmac).bind(operation_id.to_string()).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok(ClaimResult::New(operation_id));
         }
-        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor='admin' AND route=? AND key_hmac=?").bind(route).bind(&key_hmac).fetch_one(&mut *tx).await?;
+        let row = sqlx::query("SELECT request_hmac, operation_id, status, response_status, response_body FROM idempotency_records WHERE actor=? AND route=? AND key_hmac=?").bind(actor).bind(route).bind(&key_hmac).fetch_one(&mut *tx).await?;
         let stored: Vec<u8> = row.get(0);
         if stored != request_hmac {
             return Err(IdempotencyError::Reused);
@@ -538,7 +566,11 @@ impl From<sqlx::Error> for IdempotencyError {
 #[cfg(test)]
 mod deployment_tests {
     use super::*;
-    use crate::{registry::CredentialStore, security::secret::SecretValue};
+    use crate::{
+        deploy::ScheduledResolvedTarget,
+        registry::{CredentialStore, Platform, ResolvedImage},
+        security::secret::SecretValue,
+    };
     use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
@@ -566,6 +598,7 @@ mod deployment_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -582,6 +615,7 @@ mod deployment_tests {
                 app,
                 "manual",
                 revision,
+                None,
                 None,
                 None,
                 None,
@@ -618,6 +652,7 @@ mod deployment_tests {
                     None,
                     None,
                     None,
+                    None,
                     None
                 )
                 .await,
@@ -632,6 +667,68 @@ mod deployment_tests {
             .await
             .unwrap();
         assert_eq!((records, deployments), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn poll_deployment_records_system_actor() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let request_id = Uuid::new_v4();
+        let target = ScheduledResolvedTarget {
+            image: ResolvedImage {
+                source_image_ref: "registry.example/app:stable".to_owned(),
+                logical_registry: "registry.example".to_owned(),
+                repository: "app".to_owned(),
+                source_tag: "stable".to_owned(),
+                source_descriptor_digest: format!("sha256:{}", "1".repeat(64)),
+                index_digest: None,
+                manifest_digest: format!("sha256:{}", "2".repeat(64)),
+                runnable_image_ref: format!("registry.example/app@sha256:{}", "2".repeat(64)),
+                platform: Platform::canonical("linux", "amd64", None).unwrap(),
+                local_image_id: format!("sha256:{}", "3".repeat(64)),
+            },
+            generation: "generation".to_owned(),
+            target_key: "target".to_owned(),
+        };
+        let claim = service
+            .claim_deployment(
+                "/internal/poll",
+                "poll-abcdefghijkl",
+                b"poll-fingerprint",
+                request_id,
+                Uuid::new_v4(),
+                "poll",
+                Uuid::new_v4(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&target),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(claim, ClaimResult::New(_)));
+
+        let idempotency_actor: String =
+            sqlx::query_scalar("SELECT actor FROM idempotency_records WHERE request_hmac=?")
+                .bind(b"poll-fingerprint".as_slice())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        let audit_actor: String =
+            sqlx::query_scalar("SELECT actor FROM audit_events WHERE request_id=?")
+                .bind(request_id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(idempotency_actor, "system");
+        assert_eq!(audit_actor, "system");
     }
 
     #[tokio::test]

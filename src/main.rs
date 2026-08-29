@@ -12,7 +12,9 @@ use solodock::{
     compose::{ComposeCapability, ComposeRunner, FixedComposeRunner},
     config::Config,
     db::Database,
-    deploy::{DeploymentEngine, DeploymentLedger, FixedImagePuller, HealthVerifier},
+    deploy::{
+        DeploymentEngine, DeploymentLedger, DeploymentScheduler, FixedImagePuller, HealthVerifier,
+    },
     docker::{
         AppCatalog, DockerObserver,
         client::BollardReadClient,
@@ -23,7 +25,7 @@ use solodock::{
         stats::StatsHub,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
-    registry::{CredentialStore, RegistryResolver},
+    registry::{CredentialStore, PollCoordinator, PollStateStore, RegistryResolver},
     security::permissions::ensure_private_directory,
 };
 use tokio::net::TcpListener;
@@ -32,6 +34,20 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if arguments
+        .get(1)
+        .is_some_and(|value| value == "validate-restore")
+    {
+        if arguments.len() != 4 {
+            return Err("usage: solodock validate-restore STATE_DIRECTORY CONFIG_FILE".into());
+        }
+        validate_restore(
+            std::path::Path::new(&arguments[2]),
+            std::path::Path::new(&arguments[3]),
+        )?;
+        return Ok(());
+    }
     let config = Config::load()?;
     solodock::telemetry::initialize();
 
@@ -160,10 +176,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "docker-e2e")]
         test_effect_gate: None,
     };
+    let scheduler = DeploymentScheduler::new(engine.clone());
+    let poller = PollCoordinator::new(
+        PollStateStore::new(database.clone()),
+        shutdown.clone(),
+        stream_tasks.clone(),
+    );
     let m4 = Arc::new(M4Services {
         credentials: credential_store,
         ledger,
         engine,
+        scheduler,
+        poller,
     });
 
     let listener = TcpListener::bind(config.listen_address).await?;
@@ -181,6 +205,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stream_tasks: stream_tasks.clone(),
         m3: Some(m3),
         m4: Some(m4),
+    };
+    let poller_task = {
+        let m3 = state.m3.as_ref().expect("M3 services configured").clone();
+        let m4 = state.m4.as_ref().expect("M4 services configured").clone();
+        m4.poller.start(state.clone(), m3, m4.clone())
     };
     let projection_task =
         solodock::api::mutations::start_projection_reconciler(state.clone(), shutdown.clone());
@@ -213,6 +242,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = event_task.await;
         let _ = compose_capability_task.await;
         let _ = projection_task.await;
+        let _ = poller_task.await;
         stream_tasks.wait().await;
     })
     .await
@@ -221,6 +251,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
         warn!("Docker observer task shutdown deadline exceeded");
     }
     database.close().await;
+    Ok(())
+}
+
+fn validate_restore(
+    state_directory: &std::path::Path,
+    config_file: &std::path::Path,
+) -> Result<(), Box<dyn Error>> {
+    use solodock::security::permissions::{check_private, check_private_tree};
+
+    check_private(state_directory, true)?;
+    let config = Config::load_from(config_file)?;
+    let key_path = state_directory.join("secrets/idempotency.key");
+    check_private_tree(state_directory, &key_path, false)?;
+    let key = std::fs::read(&key_path)?;
+    if key.len() != 32 {
+        return Err("restore integrity key is invalid".into());
+    }
+    let apps_directory = state_directory.join("apps");
+    check_private_tree(state_directory, &apps_directory, true)?;
+    let store = AppStore::initialize_managed(
+        apps_directory,
+        key.clone(),
+        config.allowed_bind_roots.clone(),
+    )?;
+    let report = solodock::app_store::recovery::scan_read_only_relocated(
+        store.apps_directory(),
+        &config.apps_directory(),
+        Some(store.integrity_key()?),
+        store.allowed_bind_roots(),
+    )?;
+    if !report.issues.is_empty() {
+        return Err("restored application state is degraded".into());
+    }
+    let credential_root = state_directory.join("registry-credentials");
+    if credential_root.exists() {
+        check_private_tree(state_directory, &credential_root, true)?;
+        check_private_tree(state_directory, &credential_root.join(".trash"), true)?;
+        let credentials = CredentialStore::initialize(credential_root, key)?;
+        for metadata in credentials.list()? {
+            let _credential = credentials.load(metadata.id)?;
+        }
+    }
     Ok(())
 }
 
