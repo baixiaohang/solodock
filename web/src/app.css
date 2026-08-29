@@ -221,3 +221,15 @@ input:focus { border-color: #56d6a9; box-shadow: 0 0 0 3px #56d6a922; }
   .log-line { grid-template-columns: 1fr; gap: 0.15rem; }
   .logs-toolbar { flex-wrap: wrap; }
 }
+.button-link { display: inline-flex; align-items: center; justify-content: center; text-decoration: none; background: var(--accent); color: white; border-radius: .55rem; padding: .65rem .9rem; }
+.actions { display: flex; gap: .65rem; align-items: center; flex-wrap: wrap; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+.form-grid label, .modal label { display: grid; gap: .4rem; }
+.form-grid .wide { grid-column: 1 / -1; }
+input, textarea, select { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: .5rem; background: var(--panel); color: inherit; padding: .7rem; font: inherit; }
+button.danger, .danger { background: #a83c43; color: white; }
+.modal-backdrop { position: fixed; inset: 0; background: rgb(0 0 0 / .62); display: grid; place-items: center; z-index: 20; padding: 1rem; }
+.modal { width: min(34rem, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: .8rem; padding: 1.25rem; box-shadow: 0 1.5rem 4rem rgb(0 0 0 / .35); }
+.checkbox { grid-template-columns: auto 1fr !important; align-items: center; }
+.checkbox input { width: auto; }
+@media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } .form-grid .wide { grid-column: auto; } }

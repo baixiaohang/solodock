@@ -29,7 +29,7 @@
 </script>
 
 <main class="page-shell">
-  <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>应用观察台</h1><p class="muted">文件系统期望状态与 Docker 实际状态的只读对照。</p></div><button class="ghost" onclick={() => void load()}>刷新</button></div>
+  <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>应用控制台</h1><p class="muted">管理应用配置，并对已部署 release 执行安全的生命周期操作。</p></div><div class="actions"><a class="button-link" href="#/apps/new">注册应用</a><button class="ghost" onclick={() => void load()}>刷新</button></div></div>
   {#if error}<p class="notice danger">{error}</p>{/if}
   {#if health}<SystemBar {health} />{/if}
   {#if apps?.docker_status !== 'ready'}<p class="notice warning">Docker 当前不可用，仍可查看已恢复的应用目录；容器状态将在 daemon 恢复后自动更新。</p>{/if}
@@ -42,7 +42,7 @@
         {#if app.drift_codes.length}<div class="drifts">{#each app.drift_codes as code}<span title={driftText(code)}>{driftText(code)}</span>{/each}</div>{:else}<p class="aligned">期望与实际一致</p>{/if}
       </a>
     {:else}
-      <div class="empty"><h2>尚无应用</h2><p>M2 是只读观察层；应用注册将在后续里程碑提供。</p></div>
+      <div class="empty"><h2>尚无应用</h2><p>先注册应用配置。首次部署将在 M4 提供。</p><a class="button-link" href="#/apps/new">注册第一个应用</a></div>
     {/each}
   </section>
 </main>

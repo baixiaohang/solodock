@@ -18,7 +18,7 @@ use tokio::sync::Mutex;
 use super::{
     models::{
         ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerReadApi,
-        DockerStream, HealthStatus, LogChunk, LogRequest, LogStreamKind, MountKind,
+        DockerResource, DockerStream, HealthStatus, LogChunk, LogRequest, LogStreamKind, MountKind,
         MountProjection, NetworkProjection, PortProjection, ProbeSnapshot, ProbeStatus,
         RawDockerEvent, RawStats,
     },
@@ -177,6 +177,41 @@ impl DockerReadApi for BollardReadClient {
         }
     }
 
+    async fn list_compose_app_containers(
+        &self,
+        project_name: &str,
+    ) -> Result<Vec<ContainerRecord>, DockerError> {
+        let operation = async {
+            let docker = self.client().await?;
+            let filters = HashMap::from([(
+                "label".to_string(),
+                vec![
+                    format!("{}={project_name}", crate::docker::ownership::PROJECT_LABEL),
+                    format!("{}=app", crate::docker::ownership::SERVICE_LABEL),
+                ],
+            )]);
+            let options = ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build();
+            let summaries = docker
+                .list_containers(Some(options))
+                .await
+                .map_err(|error| classify(&error, false))?;
+            let mut result = Vec::with_capacity(summaries.len());
+            for summary in summaries {
+                let Some(id) = summary.id else { continue };
+                match self.inspect_container(&id).await {
+                    Ok(container) => result.push(container),
+                    Err(error) if error.kind == DockerErrorKind::ContainerChanged => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(result)
+        };
+        with_list_deadline(operation).await
+    }
+
     async fn inspect_container(&self, id: &str) -> Result<ContainerRecord, DockerError> {
         let docker = self.client().await?;
         let inspect = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_container(id, None))
@@ -261,6 +296,36 @@ impl DockerReadApi for BollardReadClient {
                 .map_err(|error| classify(&error, true))
         });
         Ok(Box::pin(stream))
+    }
+
+    async fn inspect_volume(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
+        let docker = self.client().await?;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_volume(name))
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?;
+        match result {
+            Ok(volume) => Ok(Some(DockerResource {
+                name: volume.name,
+                labels: volume.labels,
+            })),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(classify(&error, false)),
+        }
+    }
+
+    async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
+        let docker = self.client().await?;
+        let result = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_network(name, None))
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?;
+        match result {
+            Ok(network) => Ok(Some(DockerResource {
+                name: network.name.unwrap_or_default(),
+                labels: network.labels.unwrap_or_default(),
+            })),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(classify(&error, false)),
+        }
     }
 }
 
@@ -448,6 +513,16 @@ fn classify(error: &BollardError, container_context: bool) -> DockerError {
         }
     };
     DockerError::new(kind)
+}
+
+fn is_not_found(error: &BollardError) -> bool {
+    matches!(
+        error,
+        BollardError::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
 }
 
 fn error_chain_has_permission_denied(error: &(dyn std::error::Error + 'static)) -> bool {

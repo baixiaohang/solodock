@@ -13,7 +13,7 @@ SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构�
 
 - Rust stable（edition 2024），包含 `rustfmt` 和 `clippy`
 - Node.js 24 和 npm
-- 计划中的生产环境为 Ubuntu 24.04、Docker Engine 和 Docker Compose
+- 计划中的生产环境为 Ubuntu 24.04、Docker Engine 和 Docker Compose v2.24+
 
 M2 通过固定的 `/var/run/docker.sock` 只读观察 Docker Engine，不接受 `DOCKER_HOST`、TCP endpoint 或自定义 socket 配置。访问 Docker socket（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。Docker 不可用时认证控制面仍会启动，应用目录和系统健康 API 返回 degraded 状态；logs、stats 和 events stream 会在建立响应前返回稳定的 `503`。
 
@@ -58,9 +58,17 @@ unset SOLODOCK_ADMIN_PASSWORD
 # 使用结束后删除 "$SOLODOCK_COOKIE_JAR"
 ```
 
-SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
+SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。只有 HTTP listen 前的启动恢复会清理 crash 遗留的临时目录和未引用 revision；运行期 catalog/reconciliation 扫描严格只读，不能与正在发布的 revision 竞争。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
 
-M2 只识别同时存在于文件系统 catalog 且包含完整 SoloDock ownership labels 的容器。Docker 输出在 adapter 内投影为固定 DTO；环境变量、命令、任意 labels、HostConfig 和 daemon 原始错误不会进入 API。M2 不提供容器生命周期 mutation、Compose、exec/shell 或应用 CRUD。
+M3 可以注册应用、发布不可变 draft config revision，并对已有 active release 执行 start/stop/restart。注册不会解析可变 tag、拉取镜像或创建容器；首次 digest-pinned deploy 属于 M4。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
+
+每次 draft 更新先完整写入新的 `config-revisions/<uuid>/`，再以 `app.toml` 的原子替换作为 commit point，因此 draft 编辑不会改变正在运行的旧 release 所挂载的内容。生成的 Compose 固定为单一 `app` service，并由 `/usr/bin/docker compose` 的固定参数向量校验/执行；不存在 shell、exec、原始 Compose 编辑器或用户参数。
+
+`allowed_bind_roots` 默认是空列表，即禁用 host bind mount。授权根必须是既有、无 symlink 的安全绝对目录；应用只能使用其严格子目录，并且授权根不得与 Docker daemon 报告的实际 data-root 重叠。SoloDock 不创建、改权限、写入、备份或删除 bind source。每次 Compose mutation 都从 filesystem active release 重建并校验 canonical artifact，同时枚举 project/service 的全部候选并对 unmanaged、stale 或 invalid collision fail closed。unregister 默认不移除容器；即使显式移除精确 owned container，也保留 owned/external volume、bind 内容和 network。删除预览同样从 filesystem 生成，稳定合并 active pinned config 与当前 draft 的资源，并标明资源实际存在或仅配置；DELETE 在消费 token 和提交 tombstone 前都重算完整 facts hash。
+
+```toml
+allowed_bind_roots = ["/srv/solodock-data"]
+```
 
 运行后端验证：
 
@@ -79,7 +87,7 @@ npm ci
 npm run dev
 ```
 
-Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。M2 UI 由 Vite 提供，尚未嵌入生产二进制；静态资源嵌入属于 M5。
+Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。M3 UI 由 Vite 提供，尚未嵌入生产二进制；静态资源嵌入属于 M5。
 
 运行前端验证：
 

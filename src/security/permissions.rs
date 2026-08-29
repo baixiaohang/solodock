@@ -60,6 +60,30 @@ pub fn check_private(path: &Path, directory: bool) -> Result<(), PermissionError
     Ok(())
 }
 
+/// Validate every component below a trusted managed root without following a
+/// symlink. This is deliberately repeated at read time because an attacker
+/// with host access can replace an intermediate directory after startup.
+pub fn check_private_tree(
+    root: &Path,
+    target: &Path,
+    target_is_directory: bool,
+) -> Result<(), PermissionError> {
+    let relative = target
+        .strip_prefix(root)
+        .map_err(|_| PermissionError::UnexpectedType(target.to_owned()))?;
+    check_private(root, true)?;
+    let mut current = root.to_owned();
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        check_private(
+            &current,
+            index + 1 != components.len() || target_is_directory,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn set_private_file_mode(path: &Path) -> Result<(), PermissionError> {
     #[cfg(unix)]
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;

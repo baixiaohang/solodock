@@ -1,9 +1,15 @@
-use std::{error::Error, net::SocketAddr, sync::Arc};
+use std::{
+    error::Error,
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicBool},
+};
 
 use solodock::{
     AppState,
+    api::mutations::M3Services,
     app_store::AppStore,
     auth::AuthService,
+    compose::{ComposeCapability, ComposeRunner, FixedComposeRunner},
     config::Config,
     db::Database,
     docker::{
@@ -11,9 +17,11 @@ use solodock::{
         client::BollardReadClient,
         events::DockerEventHub,
         logs::{EmptySecretProvider, SecretRedactor},
+        models::DockerReadApi,
         probe::DockerSupervisor,
         stats::StatsHub,
     },
+    mutation::{AppMutationCoordinator, IdempotencyService},
     security::permissions::ensure_private_directory,
 };
 use tokio::net::TcpListener;
@@ -27,8 +35,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     ensure_private_directory(&config.state_directory)?;
     ensure_private_directory(&config.runtime_directory)?;
-    let app_store = AppStore::initialize(config.apps_directory())?;
+    solodock::compose::cleanup_temporary_directories(&config.runtime_directory)?;
     let database = Database::open(&config.database_path()).await?;
+    let idempotency = IdempotencyService::initialize(database.clone(), &config.state_directory)?;
+    idempotency.interrupt_pending().await?;
+    let app_store = AppStore::initialize_managed(
+        config.apps_directory(),
+        idempotency.integrity_key(),
+        config.allowed_bind_roots.clone(),
+    )?;
+    idempotency
+        .finalize_succeeded_tombstones(&app_store)
+        .await?;
     let recovery = app_store.scan()?;
     database.refresh_app_index(&recovery).await?;
     for issue in &recovery.issues {
@@ -49,6 +67,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let catalog = AppCatalog::from_recovery(&recovery);
     let docker_api = Arc::new(BollardReadClient::production());
+    if let Ok(probe) = docker_api.probe().await {
+        config.validate_docker_root(probe.docker_root_directory.as_deref())?;
+    }
     let shutdown = CancellationToken::new();
     let stream_tasks = TaskTracker::new();
     let supervisor = DockerSupervisor::new();
@@ -57,6 +78,45 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let event_task = event_hub.start(docker_api.clone(), catalog.clone(), shutdown.clone());
     let observer = DockerObserver::new(docker_api.clone(), catalog, supervisor);
     let stats = StatsHub::new(docker_api, shutdown.clone(), stream_tasks.clone());
+    let redactor = SecretRedactor::new(&EmptySecretProvider);
+    let mut known_secrets = Vec::new();
+    for app in &recovery.valid_apps {
+        for revision in [app.draft_revision, app.active_config_revision]
+            .into_iter()
+            .flatten()
+        {
+            if let Ok(loaded) = solodock::app_store::config_revision::load_verified(
+                &app_store.app_directory(app.app_id),
+                revision,
+                &idempotency.integrity_key(),
+            ) {
+                known_secrets.extend(loaded.known_secrets());
+            }
+        }
+    }
+    redactor.replace(known_secrets);
+    let coordinator = AppMutationCoordinator::new(config.runtime_directory.clone())?;
+    let compose: Arc<dyn ComposeRunner> = Arc::new(FixedComposeRunner::new(
+        shutdown.clone(),
+        stream_tasks.clone(),
+        redactor.clone(),
+    ));
+    let compose_capability = ComposeCapability::default();
+    compose_capability.probe(compose.as_ref()).await;
+    let compose_capability_task = compose_capability.start(compose.clone(), shutdown.clone());
+    let m3 = Arc::new(M3Services {
+        store: app_store,
+        database: database.clone(),
+        allowed_bind_roots: config.allowed_bind_roots.clone(),
+        runtime_directory: config.runtime_directory.clone(),
+        idempotency,
+        coordinator,
+        compose,
+        compose_capability,
+        projection_degraded: Arc::new(AtomicBool::new(false)),
+        reconcile_notify: Arc::new(tokio::sync::Notify::new()),
+        publication_lock: Arc::new(tokio::sync::Mutex::new(())),
+    });
 
     let listener = TcpListener::bind(config.listen_address).await?;
     info!(listen_address = %config.listen_address, "SoloDock API listening");
@@ -67,11 +127,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         events: event_hub,
         stats,
         stream_gate: solodock::api::streams::StreamGate::default(),
-        redactor: SecretRedactor::new(&EmptySecretProvider),
+        redactor,
         state_directory: config.state_directory.clone(),
         shutdown: shutdown.clone(),
         stream_tasks: stream_tasks.clone(),
+        m3: Some(m3),
     };
+    let projection_task =
+        solodock::api::mutations::start_projection_reconciler(state.clone(), shutdown.clone());
     {
         let server_shutdown = shutdown.clone();
         let server = axum::serve(
@@ -99,6 +162,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let _ = supervisor_task.await;
         let _ = event_task.await;
+        let _ = compose_capability_task.await;
+        let _ = projection_task.await;
         stream_tasks.wait().await;
     })
     .await

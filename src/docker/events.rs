@@ -153,7 +153,7 @@ fn map_event(catalog: &AppCatalog, raw: RawDockerEvent) -> Option<(Uuid, AppEven
     }
     let app_id = claimed_app_id(&raw.labels)?;
     let app = catalog.get(app_id)?;
-    validate_identity(&raw.labels, app)?;
+    validate_identity(&raw.labels, &app)?;
     let kind = match raw.action.as_str() {
         "create" => EventKind::Created,
         "start" => EventKind::Started,
@@ -258,6 +258,16 @@ mod tests {
             project_name: "solodock-example".into(),
             active_release_id: Some(release_id),
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
+            active_config_revision: None,
+            active_config_sha256: None,
+            discovery_image_ref: None,
+            draft_revision: None,
+            draft_config_sha256: None,
+            desired_state: crate::domain::DesiredState::Stopped,
+            auto_deploy_enabled: false,
+            poll_interval_seconds: 300,
+            last_operation_id: None,
+            draft: None,
             source_updated_at: OffsetDateTime::UNIX_EPOCH,
         };
         let labels = HashMap::from([
@@ -341,7 +351,7 @@ mod tests {
             )
             .is_none()
         );
-        assert_eq!(app_id, catalog.apps()[0].id);
+        assert_eq!(app_id, catalog.snapshot().apps[0].id);
     }
 
     #[tokio::test(start_paused = true)]

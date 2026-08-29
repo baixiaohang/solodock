@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use zeroize::Zeroize;
 
 use super::models::{LogEvent, LogStreamKind};
 
@@ -8,6 +9,7 @@ const MAX_RAW_LINE: usize = 64 * 1024;
 const MAX_MESSAGE: usize = 16 * 1024;
 const OMITTED: &[u8] = b"[line omitted: too long]";
 const REDACTED: &[u8] = b"[REDACTED]";
+const MAX_REDACTED_BYTES: usize = 64 * 1024;
 
 pub trait SecretProvider: Send + Sync {
     fn known_secrets(&self) -> Vec<Vec<u8>>;
@@ -24,7 +26,16 @@ impl SecretProvider for EmptySecretProvider {
 
 #[derive(Clone)]
 pub struct SecretRedactor {
-    patterns: Arc<Vec<Vec<u8>>>,
+    patterns: Arc<RwLock<PatternStore>>,
+}
+
+#[derive(Default)]
+struct PatternStore(Vec<Vec<u8>>);
+
+impl Drop for PatternStore {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl SecretRedactor {
@@ -37,16 +48,56 @@ impl SecretRedactor {
         patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
         patterns.dedup();
         Self {
-            patterns: Arc::new(patterns),
+            patterns: Arc::new(RwLock::new(PatternStore(patterns))),
+        }
+    }
+
+    pub fn replace(&self, mut patterns: Vec<Vec<u8>>) {
+        patterns.retain(|secret| !secret.is_empty());
+        patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        patterns.dedup();
+        let mut current = self
+            .patterns
+            .write()
+            .expect("redactor lock is not poisoned");
+        current.0.zeroize();
+        current.0 = patterns;
+    }
+
+    pub fn extend(&self, patterns: impl IntoIterator<Item = Vec<u8>>) {
+        let mut current = self
+            .patterns
+            .write()
+            .expect("redactor lock is not poisoned");
+        current
+            .0
+            .extend(patterns.into_iter().filter(|secret| !secret.is_empty()));
+        current
+            .0
+            .sort_by_key(|value| std::cmp::Reverse(value.len()));
+        current.0.dedup();
+    }
+
+    /// Returns an operation-local redactor without publishing draft secrets to
+    /// the process-wide active/draft secret set.
+    pub fn with_additional(&self, patterns: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        let mut combined = self
+            .patterns
+            .read()
+            .expect("redactor lock is not poisoned")
+            .0
+            .clone();
+        combined.extend(patterns.into_iter().filter(|secret| !secret.is_empty()));
+        combined.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        combined.dedup();
+        Self {
+            patterns: Arc::new(RwLock::new(PatternStore(combined))),
         }
     }
 
     pub fn redact(&self, input: &[u8]) -> Vec<u8> {
-        let mut output = input.to_vec();
-        for secret in self.patterns.iter() {
-            output = replace_bytes(&output, secret, REDACTED);
-        }
-        output
+        let patterns = self.patterns.read().expect("redactor lock is not poisoned");
+        redact_once(input, &patterns.0, MAX_REDACTED_BYTES)
     }
 }
 
@@ -188,12 +239,16 @@ fn split_timestamp(raw: &[u8]) -> Option<(OffsetDateTime, &[u8])> {
     Some((parsed, &raw[separator + 1..]))
 }
 
-fn replace_bytes(input: &[u8], pattern: &[u8], replacement: &[u8]) -> Vec<u8> {
-    let mut result = Vec::with_capacity(input.len());
+fn redact_once(input: &[u8], patterns: &[Vec<u8>], limit: usize) -> Vec<u8> {
+    let mut result = Vec::with_capacity(input.len().min(limit));
     let mut offset = 0;
-    while offset < input.len() {
-        if input[offset..].starts_with(pattern) {
-            result.extend_from_slice(replacement);
+    while offset < input.len() && result.len() < limit {
+        if let Some(pattern) = patterns
+            .iter()
+            .find(|pattern| input[offset..].starts_with(pattern.as_slice()))
+        {
+            let remaining = limit - result.len();
+            result.extend_from_slice(&REDACTED[..REDACTED.len().min(remaining)]);
             offset += pattern.len();
         } else {
             result.push(input[offset]);
@@ -299,5 +354,26 @@ mod tests {
         let lines = framer.finish();
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0].message, "last line");
+    }
+
+    #[test]
+    fn redaction_is_single_pass_and_output_is_bounded() {
+        let redactor = SecretRedactor::new(&Secrets(vec![
+            b"x".to_vec(),
+            b"xx".to_vec(),
+            b"REDACTED".to_vec(),
+        ]));
+        assert_eq!(redactor.redact(b"xx"), REDACTED);
+        assert_eq!(redactor.redact(b"[REDACTED]"), b"[[REDACTED]]");
+        let output = redactor.redact(&vec![b'x'; MAX_RAW_LINE]);
+        assert!(output.len() <= MAX_REDACTED_BYTES);
+    }
+
+    #[test]
+    fn operation_local_patterns_do_not_pollute_global_set() {
+        let global = SecretRedactor::new(&EmptySecretProvider);
+        let local = global.with_additional([b"preview-only".to_vec()]);
+        assert_eq!(local.redact(b"preview-only"), REDACTED);
+        assert_eq!(global.redact(b"preview-only"), b"preview-only");
     }
 }

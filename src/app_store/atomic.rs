@@ -121,7 +121,7 @@ impl AtomicWriter {
 }
 
 #[cfg(target_os = "linux")]
-fn rename_no_replace(source: &Path, target: &Path) -> Result<(), StoreError> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> Result<(), StoreError> {
     let source =
         CString::new(source.as_os_str().as_bytes()).map_err(|_| StoreError::SymlinkBoundary)?;
     let target =
@@ -147,7 +147,7 @@ fn rename_no_replace(source: &Path, target: &Path) -> Result<(), StoreError> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rename_no_replace(source: &Path, target: &Path) -> Result<(), StoreError> {
+pub(crate) fn rename_no_replace(source: &Path, target: &Path) -> Result<(), StoreError> {
     if target.exists() {
         return Err(StoreError::ReleaseConflict);
     }

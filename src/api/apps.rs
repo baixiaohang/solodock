@@ -79,14 +79,51 @@ pub async fn detail(
     Path(app_id): Path<Uuid>,
     _authenticated: Authenticated,
 ) -> Result<impl IntoResponse, ApiError> {
-    if state.observer.catalog.get(app_id).is_none() {
-        return Err(ApiError::app_not_found(request_id));
-    }
+    let catalog = state
+        .observer
+        .catalog
+        .get(app_id)
+        .ok_or_else(|| ApiError::app_not_found(request_id))?;
     let snapshot = state.observer.snapshot().await;
     let app = snapshot
         .apps
         .into_iter()
         .find(|app| app.id == app_id)
-        .expect("catalog app is in snapshot");
-    Ok(Json(app))
+        .ok_or_else(|| ApiError::app_not_found(request_id))?;
+    let available_actions = if catalog.active_release_id.is_some() {
+        vec!["start", "stop", "restart", "deletion_preview"]
+    } else {
+        vec!["deletion_preview"]
+    };
+    Ok(Json(AppDetailResponse {
+        observation: app,
+        draft: catalog.draft,
+        draft_revision: catalog.draft_revision,
+        draft_config_sha256: catalog.draft_config_sha256,
+        active_config_revision: catalog.active_config_revision,
+        desired_state: catalog.desired_state,
+        deployment_status: if catalog.active_release_id.is_some() {
+            "ACTIVE"
+        } else {
+            "DEPLOY_REQUIRED"
+        },
+        available_actions,
+        compose_available: state.m3.as_ref().is_some_and(|m3| {
+            m3.compose_capability.current() == crate::compose::ComposeStatus::Ready
+        }),
+    }))
+}
+
+#[derive(Serialize)]
+struct AppDetailResponse {
+    #[serde(flatten)]
+    observation: AppObservation,
+    draft: Option<crate::domain::dto::DraftResponse>,
+    draft_revision: Option<Uuid>,
+    draft_config_sha256: Option<String>,
+    active_config_revision: Option<Uuid>,
+    desired_state: crate::domain::DesiredState,
+    deployment_status: &'static str,
+    available_actions: Vec<&'static str>,
+    compose_available: bool,
 }

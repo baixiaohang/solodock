@@ -18,6 +18,8 @@ pub struct ConfigFile {
     pub public_origin: String,
     pub state_directory: PathBuf,
     pub runtime_directory: PathBuf,
+    #[serde(default)]
+    pub allowed_bind_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -26,6 +28,7 @@ pub struct Config {
     pub public_origin: String,
     pub state_directory: PathBuf,
     pub runtime_directory: PathBuf,
+    pub allowed_bind_roots: Vec<PathBuf>,
 }
 
 impl Config {
@@ -57,6 +60,22 @@ impl Config {
     pub fn bootstrap_token_path(&self) -> PathBuf {
         self.runtime_directory.join("bootstrap.token")
     }
+
+    pub fn validate_docker_root(&self, docker_root: Option<&str>) -> Result<(), ConfigError> {
+        let Some(root) = docker_root else {
+            return Ok(());
+        };
+        let root = Path::new(root);
+        if !root.is_absolute()
+            || self
+                .allowed_bind_roots
+                .iter()
+                .any(|allowed| paths_overlap(allowed, root))
+        {
+            return Err(ConfigError::BindRootSensitive);
+        }
+        Ok(())
+    }
 }
 
 impl TryFrom<ConfigFile> for Config {
@@ -76,13 +95,75 @@ impl TryFrom<ConfigFile> for Config {
         let public_origin = normalize_public_origin(&raw.public_origin)?;
         validate_managed_path("state_directory", &raw.state_directory)?;
         validate_managed_path("runtime_directory", &raw.runtime_directory)?;
+        let mut allowed_bind_roots = Vec::with_capacity(raw.allowed_bind_roots.len());
+        for root in &raw.allowed_bind_roots {
+            allowed_bind_roots.push(validate_bind_root(
+                root,
+                &raw.state_directory,
+                &raw.runtime_directory,
+            )?);
+        }
+        allowed_bind_roots.sort();
+        allowed_bind_roots.dedup();
         Ok(Self {
             listen_address,
             public_origin,
             state_directory: raw.state_directory,
             runtime_directory: raw.runtime_directory,
+            allowed_bind_roots,
         })
     }
+}
+
+fn validate_bind_root(
+    root: &Path,
+    state_directory: &Path,
+    runtime_directory: &Path,
+) -> Result<PathBuf, ConfigError> {
+    validate_managed_path("allowed_bind_roots", root)?;
+    const SENSITIVE: [&str; 8] = [
+        "/",
+        "/etc",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/run",
+        "/var/run",
+        "/var/lib/docker",
+    ];
+    if SENSITIVE.iter().any(|path| {
+        let sensitive = Path::new(path);
+        root == sensitive || (sensitive != Path::new("/") && root.starts_with(sensitive))
+    }) || paths_overlap(root, state_directory)
+        || paths_overlap(root, runtime_directory)
+    {
+        return Err(ConfigError::BindRootSensitive);
+    }
+    let mut current = PathBuf::from("/");
+    for component in root.components().skip(1) {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|source| ConfigError::BindRoot {
+            path: root.to_owned(),
+            source,
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ConfigError::BindRootSymlink(root.to_owned()));
+        }
+    }
+    if !fs::metadata(root)
+        .map_err(|source| ConfigError::BindRoot {
+            path: root.to_owned(),
+            source,
+        })?
+        .is_dir()
+    {
+        return Err(ConfigError::BindRootNotDirectory(root.to_owned()));
+    }
+    Ok(root.to_owned())
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 pub fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
@@ -185,6 +266,18 @@ pub enum ConfigError {
     PublicOrigin,
     #[error("{0} must be an absolute normalized path")]
     ManagedPath(&'static str),
+    #[error("allowed bind root is sensitive or overlaps SoloDock state")]
+    BindRootSensitive,
+    #[error("allowed bind root contains a symlink: {0}")]
+    BindRootSymlink(PathBuf),
+    #[error("allowed bind root is not a directory: {0}")]
+    BindRootNotDirectory(PathBuf),
+    #[error("failed to inspect allowed bind root {path}: {source}")]
+    BindRoot {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("configuration file must be owned by root or the current user")]
     ConfigOwner,
     #[error("configuration file must not be group or other writable")]
@@ -206,6 +299,7 @@ mod tests {
             public_origin: "https://Example.COM:443".into(),
             state_directory: "/var/lib/solodock".into(),
             runtime_directory: "/run/solodock".into(),
+            allowed_bind_roots: Vec::new(),
         }
     }
 
@@ -213,6 +307,22 @@ mod tests {
     fn validates_and_normalizes_configuration() {
         let config = Config::try_from(raw()).unwrap();
         assert_eq!(config.public_origin, "https://example.com");
+    }
+
+    #[test]
+    fn rejects_non_default_docker_root_overlapping_bind_allowlist() {
+        let temporary = tempfile::tempdir().unwrap();
+        let allowed = temporary.path().join("shared");
+        fs::create_dir(&allowed).unwrap();
+        let mut value = raw();
+        value.allowed_bind_roots = vec![allowed.clone()];
+        value.state_directory = temporary.path().join("state");
+        value.runtime_directory = temporary.path().join("runtime");
+        let config = Config::try_from(value).unwrap();
+        assert!(matches!(
+            config.validate_docker_root(allowed.join("docker-data").to_str()),
+            Err(ConfigError::BindRootSensitive)
+        ));
     }
 
     #[test]
@@ -275,6 +385,32 @@ mod tests {
         assert!(matches!(
             Config::load_from(file.path()),
             Err(ConfigError::ConfigMode)
+        ));
+    }
+
+    #[test]
+    fn rejects_sensitive_descendants_and_bidirectional_state_overlap() {
+        for root in ["/etc/ssh", "/var/lib/docker/volumes/example"] {
+            let mut value = raw();
+            value.allowed_bind_roots = vec![root.into()];
+            assert!(matches!(
+                Config::try_from(value),
+                Err(ConfigError::BindRootSensitive)
+            ));
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let state = temporary.path().join("state/solodock");
+        let runtime = temporary.path().join("runtime/solodock");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(&runtime).unwrap();
+        let mut value = raw();
+        value.state_directory = state;
+        value.runtime_directory = runtime;
+        value.allowed_bind_roots = vec![temporary.path().to_owned()];
+        assert!(matches!(
+            Config::try_from(value),
+            Err(ConfigError::BindRootSensitive)
         ));
     }
 }

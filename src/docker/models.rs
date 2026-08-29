@@ -174,6 +174,12 @@ pub struct ContainerRecord {
     pub networks: Vec<NetworkProjection>,
 }
 
+#[derive(Clone, Debug)]
+pub struct DockerResource {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ContainerProjection {
     pub id: String,
@@ -334,6 +340,15 @@ impl Default for StatsSample {
 pub trait DockerReadApi: Send + Sync {
     async fn probe(&self) -> Result<ProbeSnapshot, DockerError>;
     async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError>;
+    /// Mutation-only discovery. Unlike the observation list, this must include
+    /// every container claimed by the Compose project/service, including
+    /// unmanaged or malformed candidates, so a CLI action can fail closed.
+    async fn list_compose_app_containers(
+        &self,
+        _project_name: &str,
+    ) -> Result<Vec<ContainerRecord>, DockerError> {
+        self.list_managed_containers().await
+    }
     async fn inspect_container(&self, id: &str) -> Result<ContainerRecord, DockerError>;
     async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError>;
     async fn logs(
@@ -342,6 +357,12 @@ pub trait DockerReadApi: Send + Sync {
         request: LogRequest,
     ) -> Result<DockerStream<LogChunk>, DockerError>;
     async fn stats(&self, id: &str) -> Result<DockerStream<RawStats>, DockerError>;
+    async fn inspect_volume(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
+        Err(DockerError::new(DockerErrorKind::Unavailable))
+    }
+    async fn inspect_network(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
+        Err(DockerError::new(DockerErrorKind::Unavailable))
+    }
 }
 
 pub struct UnavailableDocker;
