@@ -318,7 +318,10 @@ async fn observes_owned_container_on_isolated_daemon() {
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST")
         .expect("SOLODOCK_TEST_DOCKER_HOST must point to the isolated daemon");
     assert!(endpoint.starts_with("tcp://127.0.0.1:") || endpoint.starts_with("tcp://localhost:"));
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+    // Fixture setup is not part of the production five-second unary contract;
+    // allow a busy shared DinD daemon to create this container while another
+    // isolated test is exercising image/Registry I/O.
+    let docker = Docker::connect_with_http(&endpoint, 30, API_DEFAULT_VERSION)
         .unwrap()
         .negotiate_version()
         .await
@@ -1463,15 +1466,25 @@ http {{
     )
     .await;
     docker_cli(&endpoint, &["start", proxy_id.trim()]).await;
-    for _ in 0..50 {
-        if tokio::net::TcpStream::connect("127.0.0.1:5000")
+    let readiness_client = reqwest::Client::new();
+    let mut registry_ready = false;
+    for _ in 0..100 {
+        if readiness_client
+            .get("http://127.0.0.1:5000/v2/")
+            .bearer_auth("fixture-bearer-token")
+            .send()
             .await
-            .is_ok()
+            .is_ok_and(|response| response.status().is_success())
         {
+            registry_ready = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(
+        registry_ready,
+        "Bearer proxy and Registry backend never became ready"
+    );
     let docker_config = tempfile::tempdir().unwrap();
     docker_cli_with_input(
         &endpoint,
