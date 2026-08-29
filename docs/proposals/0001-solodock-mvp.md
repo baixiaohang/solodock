@@ -620,6 +620,8 @@ docs/
 
 测试：轮询错误/退避、相同 digest no-op、繁忙应用合并、安装 smoke test、静态资源服务、资源预算和完整隔离部署/回滚流程。
 
+> Post-MVP note: the signed Registry recheck webhook deferred by this proposal is implemented by M6 in [Proposal 0002](0002-signed-registry-webhooks.md).
+
 ## 16. 测试策略与安全
 
 ### 16.1 分层

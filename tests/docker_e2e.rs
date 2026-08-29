@@ -17,7 +17,10 @@ use axum::{
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     models::{
@@ -29,6 +32,8 @@ use bollard::{
     },
 };
 use futures_util::StreamExt;
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use solodock::docker::{
     client::BollardReadClient,
     models::{DockerReadApi, LogRequest, LogStreamKind},
@@ -53,11 +58,9 @@ use solodock::{
         stats::StatsHub,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
-    registry::{
-        CredentialStore, PollCoordinator, PollObservation, PollOutcome, PollStateStore,
-        RegistryResolver,
-    },
+    registry::{CredentialStore, PollCoordinator, PollStateStore, RegistryResolver},
     router,
+    webhook::{WebhookRateLimiter, WebhookServices, WebhookStore},
 };
 use tempfile::TempDir;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -256,6 +259,7 @@ impl MutationHarness {
             stream_tasks: tasks,
             m3: None,
             m4: None,
+            webhooks: None,
         };
         let m3 = Arc::new(M3Services {
             store: store.clone(),
@@ -315,6 +319,17 @@ impl MutationHarness {
             engine,
             scheduler,
             poller,
+        }));
+        let poller = state.m4.as_ref().unwrap().poller.clone();
+        state.webhooks = Some(Arc::new(WebhookServices {
+            origin: "https://hooks.example.com".into(),
+            authority: "hooks.example.com".into(),
+            store: WebhookStore::new(store.clone(), idempotency.integrity_key()),
+            poll_states: poller.store.clone(),
+            database: state.m3.as_ref().unwrap().database.clone(),
+            notify: poller.notify.clone(),
+            limiter: WebhookRateLimiter::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(16)),
         }));
         let app = router(state.clone());
         Self {
@@ -2183,38 +2198,67 @@ http {{
         .unwrap()
         .parse::<Uuid>()
         .unwrap();
-    let shutdown_metadata = m3.store.read_metadata(shutdown_app).unwrap();
-    let shutdown_generation =
-        solodock::registry::poller::poll_generation(&m3.store, &m4.credentials, &shutdown_metadata)
-            .unwrap();
-    m4.poller
-        .store
-        .publish(
-            shutdown_app,
-            PollObservation {
-                generation: &shutdown_generation,
-                enabled: true,
-                next_check_not_before: Some(time::OffsetDateTime::now_utc()),
-                checked_at: None,
-                success: false,
-                replace_observed_fields: false,
-                source_descriptor_digest: None,
-                etag: None,
-                manifest_digest: None,
-                platform: None,
-                outcome: PollOutcome::Cancelled,
-                error_class: None,
-                error_code: None,
-                transient_failures: 0,
-            },
+    let webhook_key = *b"M6_E2E_WEBHOOK_SECRET_32_BYTES!!";
+    let webhook_secret = URL_SAFE_NO_PAD.encode(webhook_key);
+    let configured = harness
+        .request(
+            "PUT",
+            &format!("/api/v1/apps/{shutdown_app}/webhook"),
+            Some("m6-e2e-webhook-configure"),
+            Some(&json!({"expected_metadata_revision":null,"secret":webhook_secret})),
+        )
+        .await;
+    assert_eq!(configured.status(), StatusCode::OK);
+    assert_eq!(
+        harness.state.redactor.redact(webhook_secret.as_bytes()),
+        b"[REDACTED]"
+    );
+    let webhook_body = br#"{"event":"registry.push"}"#;
+    let webhook_timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let webhook_nonce = URL_SAFE_NO_PAD.encode([4_u8; 16]);
+    let signing_input = solodock::webhook::protocol::signing_input(
+        shutdown_app,
+        webhook_body,
+        webhook_timestamp,
+        &webhook_nonce,
+    );
+    let mut webhook_mac = Hmac::<Sha256>::new_from_slice(&webhook_key).unwrap();
+    webhook_mac.update(signing_input.as_bytes());
+    let webhook_signature = format!("v1={:x}", webhook_mac.finalize().into_bytes());
+    let webhook = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/hooks/v1/apps/{shutdown_app}/registry"))
+                .header(header::HOST, "hooks.example.com")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-solodock-timestamp", webhook_timestamp.to_string())
+                .header("x-solodock-nonce", webhook_nonce)
+                .header("x-solodock-signature", webhook_signature)
+                .body(Body::from(webhook_body.as_slice()))
+                .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(webhook.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        m4.poller
+            .store
+            .get(shutdown_app)
+            .await
+            .unwrap()
+            .unwrap()
+            .webhook_sequence,
+        1
+    );
     pull_gate.push(TestPullAction::Pause);
     let coordinator_task = m4
         .poller
         .start(harness.state.clone(), m3.clone(), m4.clone());
-    m4.poller.notify.notify_one();
+    // No notify is needed: the production coordinator recovers the durable
+    // sequence accepted before it started.
     tokio::time::timeout(Duration::from_secs(30), pull_gate.wait_until_reached())
         .await
         .expect("production coordinator did not dispatch the due app");

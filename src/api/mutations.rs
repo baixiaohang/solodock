@@ -802,6 +802,9 @@ fn collect_secret_inventory(
             );
         }
     }
+    if let Some(webhooks) = state.webhooks.as_ref() {
+        secrets.extend(webhooks.store.all_secret_bytes()?);
+    }
     Ok(secrets)
 }
 
@@ -819,10 +822,25 @@ async fn publish_deletion(
     services: &M3Services,
     app_id: Uuid,
 ) -> DeletionPublication {
-    let outcome = refresh_outcome(state, services).await;
+    let mut outcome = refresh_outcome(state, services).await;
+    let mut can_finalize =
+        outcome.catalog_published && state.observer.catalog.get(app_id).is_none();
+    if can_finalize
+        && let Some(webhooks) = state.webhooks.as_ref()
+        && webhooks
+            .poll_states
+            .remove_app_operational(app_id)
+            .await
+            .is_err()
+    {
+        outcome.warning = Some("WEBHOOK_OPERATIONAL_CLEANUP_FAILED");
+        can_finalize = false;
+        services.projection_degraded.store(true, Ordering::Release);
+        services.reconcile_notify.notify_one();
+    }
     DeletionPublication {
         warning: outcome.warning,
-        can_finalize: outcome.catalog_published && state.observer.catalog.get(app_id).is_none(),
+        can_finalize,
     }
 }
 
@@ -862,20 +880,58 @@ pub fn start_projection_reconciler(
             };
             if services.projection_degraded.load(Ordering::Acquire) {
                 let outcome = refresh_outcome(&state, services).await;
-                if outcome.catalog_published
+                if outcome.catalog_published {
+                    let tombstones = services
+                        .idempotency
+                        .succeeded_app_tombstones(&services.store)
+                        .await;
+                    let mut cleanup_ok = true;
+                    match tombstones {
+                        Ok(tombstones) => {
+                            if let Some(webhooks) = state.webhooks.as_deref() {
+                                for (app_id, _) in tombstones {
+                                    if webhooks
+                                        .poll_states
+                                        .remove_app_operational(app_id)
+                                        .await
+                                        .is_err()
+                                    {
+                                        cleanup_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => cleanup_ok = false,
+                    }
+                    if cleanup_ok
+                        && services
+                            .idempotency
+                            .finalize_succeeded_tombstones(&services.store)
+                            .await
+                            .is_err()
+                    {
+                        cleanup_ok = false;
+                    }
+                    if !cleanup_ok {
+                        services.projection_degraded.store(true, Ordering::Release);
+                        services.reconcile_notify.notify_one();
+                    }
+                }
+                if let Some(m4) = state.m4.as_deref()
                     && services
                         .idempotency
-                        .finalize_succeeded_tombstones(&services.store)
+                        .finalize_succeeded_credential_tombstones(&m4.credentials)
                         .await
                         .is_err()
                 {
                     services.projection_degraded.store(true, Ordering::Release);
                     services.reconcile_notify.notify_one();
                 }
-                if let Some(m4) = state.m4.as_deref()
+                if let Some(webhooks) = state.webhooks.as_deref()
                     && services
                         .idempotency
-                        .finalize_succeeded_credential_tombstones(&m4.credentials)
+                        .finalize_succeeded_webhook_revisions(&webhooks.store)
                         .await
                         .is_err()
                 {
@@ -1843,6 +1899,7 @@ struct DeletionFacts {
     managed_files: Vec<RetainedManagedFile>,
     retained: RetainedResources,
     orphan_warning: bool,
+    webhook_configured: bool,
 }
 
 struct DeletionSnapshot {
@@ -2587,6 +2644,13 @@ async fn canonical_deletion_snapshot(
             managed_files,
             retained,
             orphan_warning: !remove_container,
+            webhook_configured: state
+                .webhooks
+                .as_ref()
+                .map(|services| services.store.status(app_id))
+                .transpose()
+                .map_err(|_| "WEBHOOK_STORE_DEGRADED")?
+                .is_some_and(|status| status.configured || status.degraded),
         },
         app,
         container,

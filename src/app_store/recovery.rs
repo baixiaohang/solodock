@@ -13,7 +13,7 @@ use super::{StoreError, atomic::is_internal_temp_name};
 use crate::{
     compose::{ComposeInput, generate},
     domain::{DesiredState, dto::DraftResponse, validate_runnable_image},
-    security::permissions::check_private,
+    security::permissions::{PermissionError, check_private},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -280,7 +280,7 @@ fn scan_with_mode(
                 continue;
             }
         };
-        match scan_app(
+        let recovered = scan_app(
             &entry.path(),
             &canonical_apps_directory
                 .map(|directory| directory.join(directory_id.to_string()))
@@ -291,8 +291,46 @@ fn scan_with_mode(
             integrity_key,
             allowed_bind_roots,
             mode,
-        )? {
-            Ok(app) => candidates.push(app),
+        )?;
+        match recovered {
+            Ok(app) => {
+                if let Some(key) = integrity_key {
+                    match crate::webhook::store::validate_app_directory(
+                        apps_directory,
+                        &entry.path(),
+                        directory_id,
+                        key,
+                    ) {
+                        Ok(_) => {}
+                        Err(StoreError::ContentInvalid) => {
+                            report.issues.push(RecoveryIssue {
+                                code: "WEBHOOK_CONFIG_INVALID",
+                                app_id: Some(directory_id),
+                            });
+                        }
+                        Err(StoreError::Permission(PermissionError::UnexpectedType(_))) => {
+                            return Err(StoreError::SymlinkBoundary);
+                        }
+                        Err(StoreError::Permission(
+                            error @ (PermissionError::Mode(_) | PermissionError::Owner(_)),
+                        )) => return Err(StoreError::Permission(error)),
+                        Err(StoreError::Permission(PermissionError::Io(error)))
+                        | Err(StoreError::Io(error))
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData
+                            ) =>
+                        {
+                            report.issues.push(RecoveryIssue {
+                                code: "WEBHOOK_CONFIG_INVALID",
+                                app_id: Some(directory_id),
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                candidates.push(app);
+            }
             Err(code) => report.issues.push(RecoveryIssue {
                 code,
                 app_id: Some(directory_id),
@@ -387,11 +425,22 @@ fn validate_managed_tree(app_directory: &Path) -> Result<usize, StoreError> {
             let file_type = entry.file_type()?;
             let is_release_link = directory == app_directory
                 && matches!(entry.file_name().to_str(), Some("active" | "pending"));
+            let is_webhook_artifact = directory == app_directory
+                && matches!(
+                    entry.file_name().to_str(),
+                    Some("webhook.toml" | "webhook-secret-revisions")
+                );
             if file_type.is_symlink() {
                 if is_release_link {
                     continue;
                 }
                 return Err(StoreError::SymlinkBoundary);
+            }
+            // Webhook state has its own complete validator and is an optional
+            // fail-closed substate. Deferring it keeps mode/HMAC/content
+            // damage from removing the otherwise valid app from the catalog.
+            if is_webhook_artifact {
+                continue;
             }
             if file_type.is_dir() {
                 check_private(&path, true)?;

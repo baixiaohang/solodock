@@ -21,6 +21,7 @@ pub struct SystemHealthResponse {
     deployments: DeploymentHealth,
     registry_credentials: CredentialHealth,
     polling: PollingHealth,
+    webhooks: WebhookHealth,
 }
 
 #[derive(Serialize)]
@@ -65,6 +66,13 @@ struct PollingHealth {
     enabled: i64,
     suppressed: i64,
     app_errors: i64,
+}
+
+#[derive(Serialize)]
+struct WebhookHealth {
+    status: &'static str,
+    configured: usize,
+    replay_records: i64,
 }
 
 #[derive(Serialize)]
@@ -142,6 +150,21 @@ pub async fn health(
         || deployment_interrupted > 0
         || deployment_needs_attention > 0;
     let degraded = degraded || poll_snapshot.status == "degraded" || poll_store_degraded;
+    let (webhook_status, webhook_configured, webhook_replays) = match state.webhooks.as_ref() {
+        None => ("disabled", 0, 0),
+        Some(services) if services.origin.is_empty() => match services.store.configured_count() {
+            Ok(configured) => ("disabled", configured, 0),
+            Err(_) => ("degraded", 0, 0),
+        },
+        Some(services) => match (
+            services.store.configured_count(),
+            services.poll_states.webhook_replay_count().await,
+        ) {
+            (Ok(configured), Ok(replays)) => ("ok", configured, replays),
+            _ => ("degraded", 0, 0),
+        },
+    };
+    let degraded = degraded || webhook_status == "degraded";
     Json(SystemHealthResponse {
         status: if degraded { "degraded" } else { "ok" },
         docker,
@@ -185,6 +208,11 @@ pub async fn health(
             enabled: poll_counts.0,
             suppressed: poll_counts.1,
             app_errors: poll_counts.2,
+        },
+        webhooks: WebhookHealth {
+            status: webhook_status,
+            configured: webhook_configured,
+            replay_records: webhook_replays,
         },
     })
 }

@@ -28,7 +28,7 @@ use crate::{
 
 use super::{
     CredentialStore, ImageReference, Platform, PollObservation, PollOutcome, PollResolve,
-    PollStateStore, RegistryError, ResolvedImage,
+    PollState, PollStateStore, RegistryError, ResolvedImage,
 };
 
 const FAILURE_RETRY_SECONDS: u64 = 5;
@@ -78,6 +78,7 @@ struct DueEntry {
     due_unix: i64,
     app_id: Uuid,
     generation: String,
+    webhook_sequence: i64,
 }
 
 impl PollCoordinator {
@@ -130,6 +131,7 @@ impl PollCoordinator {
                 due_unix: OffsetDateTime::now_utc().unix_timestamp(),
                 app_id,
                 generation,
+                webhook_sequence: 0,
             },
         )
         .await
@@ -159,6 +161,7 @@ impl PollCoordinator {
                     inventory_degraded = true;
                     continue;
                 };
+                let current = self.store.get(app.id).await.ok().flatten();
                 if !metadata.auto_deploy_enabled {
                     if self
                         .store
@@ -186,26 +189,58 @@ impl PollCoordinator {
                     {
                         inventory_degraded = true;
                     }
+                    if let Some(current) = current
+                        && current.webhook_sequence > current.webhook_processed_sequence
+                        && self
+                            .store
+                            .mark_webhook_processed(app.id, current.webhook_sequence)
+                            .await
+                            .is_err()
+                    {
+                        inventory_degraded = true;
+                    }
                     continue;
                 }
-                let current = self.store.get(app.id).await.ok().flatten();
-                let raw_due = current
-                    .as_ref()
-                    .filter(|value| value.generation == generation)
-                    .and_then(|value| value.next_check_not_before)
-                    .unwrap_or_else(|| {
-                        now + time::Duration::seconds(i64::from(initial_jitter(
-                            &m3.store,
-                            app.id,
-                            &generation,
-                            metadata.poll_interval_seconds,
-                        )))
-                    });
+                let pending_webhook = current.as_ref().filter(|value| {
+                    value.generation == generation
+                        && value.webhook_sequence > value.webhook_processed_sequence
+                });
+                let raw_due = pending_webhook.map_or_else(
+                    || {
+                        current
+                            .as_ref()
+                            .filter(|value| value.generation == generation)
+                            .and_then(|value| value.next_check_not_before)
+                            .unwrap_or_else(|| {
+                                now + time::Duration::seconds(i64::from(initial_jitter(
+                                    &m3.store,
+                                    app.id,
+                                    &generation,
+                                    metadata.poll_interval_seconds,
+                                )))
+                            })
+                    },
+                    |value| {
+                        let wake_due = now
+                            + time::Duration::seconds(i64::from(webhook_jitter(
+                                app.id,
+                                value.webhook_sequence,
+                            )));
+                        if webhook_must_respect_backoff(value, now) {
+                            value
+                                .next_check_not_before
+                                .map_or(wake_due, |backoff| backoff.max(wake_due))
+                        } else {
+                            wake_due
+                        }
+                    },
+                );
                 let due = clamp_persisted_due(raw_due, now, metadata.poll_interval_seconds);
                 heap.push(Reverse(DueEntry {
                     due_unix: due.unix_timestamp(),
                     app_id: app.id,
                     generation,
+                    webhook_sequence: pending_webhook.map_or(0, |value| value.webhook_sequence),
                 }));
             }
             self.health.due.store(heap.len(), Ordering::Release);
@@ -237,7 +272,20 @@ impl PollCoordinator {
             let results = stream::iter(batch)
                 .map(|due| async {
                     self.health.inflight.fetch_add(1, Ordering::AcqRel);
-                    let result = self.poll_one(&state, &m3, &m4, due).await;
+                    let app_id = due.app_id;
+                    let webhook_sequence = due.webhook_sequence;
+                    let mut result = self.poll_one(&state, &m3, &m4, due).await;
+                    if result.is_ok()
+                        && !self.shutdown.is_cancelled()
+                        && webhook_sequence > 0
+                        && self
+                            .store
+                            .mark_webhook_processed(app_id, webhook_sequence)
+                            .await
+                            .is_err()
+                    {
+                        result = Err(());
+                    }
                     self.health.inflight.fetch_sub(1, Ordering::AcqRel);
                     result
                 })
@@ -782,6 +830,21 @@ impl PollCoordinator {
     }
 }
 
+fn webhook_must_respect_backoff(state: &PollState, now: OffsetDateTime) -> bool {
+    state
+        .next_check_not_before
+        .is_some_and(|deadline| deadline > now)
+        && (state.consecutive_transient_failures > 0
+            || state.last_outcome == PollOutcome::CredentialError)
+}
+
+fn webhook_jitter(app_id: Uuid, sequence: i64) -> u32 {
+    let mut digest = Sha256::new();
+    digest.update(app_id.as_bytes());
+    digest.update(sequence.to_be_bytes());
+    u32::from(digest.finalize()[0] % 6)
+}
+
 async fn wait_after_failed_attempt(shutdown: &CancellationToken) -> bool {
     tokio::select! {
         () = shutdown.cancelled() => false,
@@ -992,5 +1055,40 @@ mod tests {
             clamp_persisted_due(now - time::Duration::hours(1), now, 300),
             now
         );
+    }
+
+    #[test]
+    fn webhook_does_not_bypass_credential_or_transient_backoff() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(10);
+        let mut state = PollState {
+            app_id: Uuid::new_v4(),
+            generation: "generation".into(),
+            enabled: true,
+            consecutive_transient_failures: 0,
+            next_check_not_before: Some(now + time::Duration::minutes(30)),
+            last_checked_at: None,
+            last_success_at: None,
+            last_source_descriptor_digest: None,
+            last_etag: None,
+            last_manifest_digest: None,
+            last_platform: None,
+            last_outcome: PollOutcome::CredentialError,
+            last_error_class: Some("credential".into()),
+            last_error_code: Some("REGISTRY_CREDENTIAL_INVALID".into()),
+            suppressed_target_key: None,
+            suppressed_deployment_id: None,
+            webhook_sequence: 1,
+            webhook_processed_sequence: 0,
+            last_webhook_received_at: Some(now),
+            last_wake_source: Some("webhook".into()),
+            updated_at: now,
+        };
+        assert!(webhook_must_respect_backoff(&state, now));
+        state.last_outcome = PollOutcome::Unchanged;
+        assert!(!webhook_must_respect_backoff(&state, now));
+        state.consecutive_transient_failures = 1;
+        assert!(webhook_must_respect_backoff(&state, now));
+        state.next_check_not_before = Some(now);
+        assert!(!webhook_must_respect_backoff(&state, now));
     }
 }

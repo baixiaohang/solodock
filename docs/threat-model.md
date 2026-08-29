@@ -10,4 +10,6 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 资源防护包括请求/body/stream/log buffer 上限、单一 Compose mutation、最多两个 Registry resolve、poll jitter/backoff、busy coalescing 和失败 target suppression。它不承诺抵御拥有宿主 root、Docker daemon控制权或合法管理员 session 的攻击者，也不提供多租户隔离。
 
+Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
+
 volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。应用级备份/restore、安全更新和 schema兼容由管理员负责。

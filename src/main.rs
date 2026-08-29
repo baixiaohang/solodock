@@ -27,6 +27,7 @@ use solodock::{
     mutation::{AppMutationCoordinator, IdempotencyService},
     registry::{CredentialStore, PollCoordinator, PollStateStore, RegistryResolver},
     security::permissions::ensure_private_directory,
+    webhook::{WebhookRateLimiter, WebhookServices, WebhookStore},
 };
 use tokio::net::TcpListener;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
@@ -62,8 +63,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         idempotency.integrity_key(),
         config.allowed_bind_roots.clone(),
     )?;
+    let webhook_store = WebhookStore::new(app_store.clone(), idempotency.integrity_key());
     idempotency
-        .finalize_succeeded_tombstones(&app_store)
+        .cleanup_webhook_operation_temps(&webhook_store)
         .await?;
     let recovery = app_store.scan()?;
     database.refresh_app_index(&recovery).await?;
@@ -127,6 +129,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let loaded = credential_store.load(credential.id)?;
         known_secrets.push(loaded.secret.expose().as_bytes().to_vec());
     }
+    idempotency
+        .finalize_succeeded_webhook_revisions(&webhook_store)
+        .await?;
+    // Cold start has no prior redactor set to retain. Refuse to listen unless
+    // every persisted webhook revision can be conservatively inventoried.
+    known_secrets.extend(webhook_store.all_secret_bytes()?);
     redactor.replace(known_secrets);
     let coordinator = AppMutationCoordinator::new(config.runtime_directory.clone())?;
     let compose: Arc<dyn ComposeRunner> = Arc::new(FixedComposeRunner::new(
@@ -177,11 +185,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         test_effect_gate: None,
     };
     let scheduler = DeploymentScheduler::new(engine.clone());
-    let poller = PollCoordinator::new(
-        PollStateStore::new(database.clone()),
-        shutdown.clone(),
-        stream_tasks.clone(),
-    );
+    let poll_store = PollStateStore::new(database.clone());
+    // Generic projection pruning is safe only when recovery proved a complete
+    // inventory. Exact succeeded app tombstones below remain authoritative
+    // even while an unrelated app or webhook substate is degraded.
+    if recovery.issues.is_empty() {
+        poll_store
+            .retain_apps(
+                &recovery
+                    .valid_apps
+                    .iter()
+                    .map(|app| app.app_id)
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+    }
+    for (app_id, _) in m3.idempotency.succeeded_app_tombstones(&m3.store).await? {
+        poll_store.remove_app_operational(app_id).await?;
+    }
+    m3.idempotency
+        .finalize_succeeded_tombstones(&m3.store)
+        .await?;
+    let poller = PollCoordinator::new(poll_store, shutdown.clone(), stream_tasks.clone());
     let m4 = Arc::new(M4Services {
         credentials: credential_store,
         ledger,
@@ -189,6 +214,22 @@ async fn main() -> Result<(), Box<dyn Error>> {
         scheduler,
         poller,
     });
+    let webhook_origin = config.webhook_public_origin.clone().unwrap_or_default();
+    let webhook_authority = if webhook_origin.is_empty() {
+        String::new()
+    } else {
+        solodock::config::origin_authority(&webhook_origin)?
+    };
+    let webhooks = Some(Arc::new(WebhookServices {
+        origin: webhook_origin,
+        authority: webhook_authority,
+        store: webhook_store.clone(),
+        poll_states: m4.poller.store.clone(),
+        database: database.clone(),
+        notify: m4.poller.notify.clone(),
+        limiter: WebhookRateLimiter::default(),
+        permits: Arc::new(tokio::sync::Semaphore::new(16)),
+    }));
 
     let listener = TcpListener::bind(config.listen_address).await?;
     info!(listen_address = %config.listen_address, "SoloDock API listening");
@@ -205,6 +246,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         stream_tasks: stream_tasks.clone(),
         m3: Some(m3),
         m4: Some(m4),
+        webhooks,
     };
     let poller_task = {
         let m3 = state.m3.as_ref().expect("M3 services configured").clone();
@@ -283,6 +325,12 @@ fn validate_restore(
     )?;
     if !report.issues.is_empty() {
         return Err("restored application state is degraded".into());
+    }
+    let webhooks = WebhookStore::new(store.clone(), key.clone());
+    for app in &report.valid_apps {
+        if webhooks.status(app.app_id)?.configured {
+            let _secret = webhooks.load_current(app.app_id)?;
+        }
     }
     let credential_root = state_directory.join("registry-credentials");
     if credential_root.exists() {

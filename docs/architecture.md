@@ -8,6 +8,8 @@ SoloDock 是单主机、单管理员、单 service 的容器部署控制面。�
 
 一个进程级 `PollCoordinator` 管理 enabled app 的有界 due heap，Registry resolve 最多并发 2。generation 覆盖 draft、source、credential revision、开关和 interval；在途结果在调度前重新读取 filesystem 与 Docker facts。busy 不排队，相同 active digest 不部署，仅 config 变化标为人工处理，失败 target 会在 SQLite 中抑制到 target/generation 改变。
 
+可选 webhook ingress 只接受独立 hostname 上的固定签名事件。HMAC 验证后，nonce claim、audit 与 per-app wake sequence 在同一 SQLite transaction 提交；sequence 是 bounded coalescing signal，不是消息队列。PollCoordinator 捕获并推进已处理 sequence，inflight 期间的新 sequence 只保留一次 follow-up，Registry 与 Docker 路径没有第二套实现。
+
 ## HTTP 与数据边界
 
 生产 binary 通过 `embed-ui` 编译期嵌入 Vite 产物。`/api/v1/**` 保持认证、Origin/CSRF 与 `no-store`；`/healthz` 仅提供最小存活信息。hashed asset 长缓存，HTML 不缓存，并统一设置 CSP、frame、referrer、MIME 与 permissions 安全 header；API 404 不进入 SPA fallback。

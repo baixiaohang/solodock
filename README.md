@@ -64,6 +64,8 @@ SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为�
 
 Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
 
+可选的签名 Registry recheck webhook 使用独立 `webhook_public_origin`、每应用 write-only HMAC secret、5 分钟 timestamp window 和 durable nonce 防重放。Payload 不携带镜像事实；有效请求只产生 coalesced poll wake，并继续遵守原有自动部署、退避、抑制、drift 和健康门禁。协议与外部 WAF 边界见 [Webhook 运维说明](docs/webhooks.md)。
+
 Deploy/rollback 均返回 `202 Accepted` 和 deployment ID。可在应用页查看 transition timeline；`pending` 表示有尚未 commit 的 candidate 或需要人工重新收敛的中断现场。健康通过前 `active` symlink 不改变。回滚会恢复旧 release 的镜像和 Compose 配置，但不会回退数据库 migration、named volume 或 bind 内容。
 
 每次 draft 更新先完整写入新的 `config-revisions/<uuid>/`，再以 `app.toml` 的原子替换作为 commit point，因此 draft 编辑不会改变正在运行的旧 release 所挂载的内容。生成的 Compose 固定为单一 `app` service，并由 `/usr/bin/docker compose` 的固定参数向量校验/执行；不存在 shell、exec、原始 Compose 编辑器或用户参数。
@@ -103,4 +105,4 @@ npm run build
 
 Node/npm 只用于开发和构建 Web UI。
 
-当前权威说明见 [架构](docs/architecture.md)、[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md) 和 [资源预算](docs/resource-budget.md)。一次性迁移 runbook 位于 [`docs/migrations/`](docs/migrations/)。
+当前权威说明见 [架构](docs/architecture.md)、[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md)、[Webhook](docs/webhooks.md) 和 [资源预算](docs/resource-budget.md)。一次性迁移 runbook 位于 [`docs/migrations/`](docs/migrations/)。
