@@ -6,13 +6,17 @@ pub mod ownership;
 pub mod probe;
 pub mod stats;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app_store::recovery::{RecoveredApp, RecoveryReport};
+use crate::domain::{DesiredState, dto::DraftResponse};
 
 use self::{
     models::{ContainerProjection, ContainerRecord, DockerErrorKind, DockerReadApi, ProbeStatus},
@@ -29,6 +33,14 @@ pub struct AppCatalogEntry {
     pub project_name: String,
     pub active_release_id: Option<Uuid>,
     pub active_image_ref: Option<String>,
+    pub active_config_revision: Option<Uuid>,
+    pub active_config_sha256: Option<String>,
+    pub discovery_image_ref: Option<String>,
+    pub draft_revision: Option<Uuid>,
+    pub draft_config_sha256: Option<String>,
+    pub desired_state: DesiredState,
+    pub poll_interval_seconds: u32,
+    pub draft: Option<DraftResponse>,
 }
 
 impl From<&RecoveredApp> for AppCatalogEntry {
@@ -40,14 +52,27 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             project_name: value.project_name.clone(),
             active_release_id: value.active_release_id,
             active_image_ref: value.active_image_ref.clone(),
+            active_config_revision: value.active_config_revision,
+            active_config_sha256: value.active_config_sha256.clone(),
+            discovery_image_ref: value.discovery_image_ref.clone(),
+            draft_revision: value.draft_revision,
+            draft_config_sha256: value.draft_config_sha256.clone(),
+            desired_state: value.desired_state,
+            poll_interval_seconds: value.poll_interval_seconds,
+            draft: value.draft.clone(),
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct AppCatalog {
-    apps: Arc<Vec<AppCatalogEntry>>,
-    recovery_issues: Arc<HashMap<&'static str, usize>>,
+    snapshot: Arc<RwLock<Arc<CatalogSnapshot>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CatalogSnapshot {
+    pub apps: Vec<AppCatalogEntry>,
+    pub recovery_issues: HashMap<&'static str, usize>,
 }
 
 impl AppCatalog {
@@ -57,27 +82,39 @@ impl AppCatalog {
             *issues.entry(issue.code).or_insert(0) += 1;
         }
         Self {
-            apps: Arc::new(
-                report
+            snapshot: Arc::new(RwLock::new(Arc::new(CatalogSnapshot {
+                apps: report
                     .valid_apps
                     .iter()
                     .map(AppCatalogEntry::from)
                     .collect(),
-            ),
-            recovery_issues: Arc::new(issues),
+                recovery_issues: issues,
+            }))),
         }
     }
 
-    pub fn apps(&self) -> &[AppCatalogEntry] {
-        &self.apps
+    pub fn snapshot(&self) -> Arc<CatalogSnapshot> {
+        self.snapshot
+            .read()
+            .expect("catalog lock is not poisoned")
+            .clone()
     }
 
-    pub fn get(&self, id: Uuid) -> Option<&AppCatalogEntry> {
-        self.apps.iter().find(|app| app.id == id)
+    pub fn replace(&self, report: &RecoveryReport) {
+        let replacement = Self::from_recovery(report).snapshot();
+        *self.snapshot.write().expect("catalog lock is not poisoned") = replacement;
     }
 
-    pub fn recovery_issues(&self) -> &HashMap<&'static str, usize> {
-        &self.recovery_issues
+    pub fn get(&self, id: Uuid) -> Option<AppCatalogEntry> {
+        self.snapshot()
+            .apps
+            .iter()
+            .find(|app| app.id == id)
+            .cloned()
+    }
+
+    pub fn recovery_issues(&self) -> HashMap<&'static str, usize> {
+        self.snapshot().recovery_issues.clone()
     }
 }
 
@@ -134,6 +171,9 @@ pub struct DockerObserver {
 }
 
 impl DockerObserver {
+    pub fn api(&self) -> Arc<dyn DockerReadApi> {
+        self.api.clone()
+    }
     pub fn new(
         api: Arc<dyn DockerReadApi>,
         catalog: AppCatalog,
@@ -159,7 +199,8 @@ impl DockerObserver {
                 observed_at: probe.observed_at,
                 apps: self
                     .catalog
-                    .apps()
+                    .snapshot()
+                    .apps
                     .iter()
                     .map(|app| AppObservation {
                         id: app.id,
@@ -181,7 +222,8 @@ impl DockerObserver {
                 observed_at: OffsetDateTime::now_utc(),
                 apps: self
                     .catalog
-                    .apps()
+                    .snapshot()
+                    .apps
                     .iter()
                     .map(|app| AppObservation {
                         id: app.id,
@@ -231,7 +273,7 @@ impl DockerObserver {
             if is_managed_candidate(&container.labels)
                 && claimed_app_id(&container.labels) == Some(app_id)
             {
-                if validate_identity(&container.labels, app).is_some() {
+                if validate_identity(&container.labels, &app).is_some() {
                     valid.push(container);
                 } else {
                     invalid = true;
@@ -241,7 +283,8 @@ impl DockerObserver {
         let candidate = match valid.len() {
             0 if invalid => return Err(OwnedContainerError::Invalid),
             0 => return Err(OwnedContainerError::Missing),
-            1 => valid.into_iter().next().expect("one candidate"),
+            1 if !invalid => valid.into_iter().next().expect("one candidate"),
+            1 => return Err(OwnedContainerError::Invalid),
             _ => return Err(OwnedContainerError::Ambiguous),
         };
         let inspected =
@@ -252,7 +295,7 @@ impl DockerObserver {
                     DockerErrorKind::ContainerChanged => OwnedContainerError::Changed,
                     kind => OwnedContainerError::Docker(kind),
                 })?;
-        validate_identity(&inspected.labels, app).ok_or(OwnedContainerError::Invalid)?;
+        validate_identity(&inspected.labels, &app).ok_or(OwnedContainerError::Invalid)?;
         Ok(inspected)
     }
 }
@@ -282,7 +325,8 @@ fn associate(
     let mut issues = Vec::new();
     let mut observations = Vec::new();
     let mut considered = vec![false; containers.len()];
-    for app in catalog.apps() {
+    let snapshot = catalog.snapshot();
+    for app in &snapshot.apps {
         let mut valid = Vec::new();
         let mut invalid = Vec::new();
         for (index, container) in containers.iter().enumerate() {
@@ -397,6 +441,16 @@ mod tests {
             project_name: "solodock-example".into(),
             active_release_id: Some(release_id),
             active_image_ref: Some(image.clone()),
+            active_config_revision: None,
+            active_config_sha256: None,
+            discovery_image_ref: None,
+            draft_revision: None,
+            draft_config_sha256: None,
+            desired_state: DesiredState::Stopped,
+            poll_interval_seconds: 300,
+            auto_deploy_enabled: false,
+            last_operation_id: None,
+            draft: None,
             source_updated_at: OffsetDateTime::UNIX_EPOCH,
         };
         let labels = HashMap::from([

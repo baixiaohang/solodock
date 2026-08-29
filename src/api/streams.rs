@@ -12,7 +12,7 @@ use axum::{
 use futures_util::StreamExt;
 use serde::Deserialize;
 use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -40,6 +40,7 @@ pub enum StreamKind {
 #[derive(Clone, Default)]
 pub struct StreamGate {
     counts: Arc<Mutex<GateCounts>>,
+    changed: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -48,6 +49,20 @@ struct GateCounts {
     sessions: HashMap<String, usize>,
     kinds: HashMap<StreamKind, usize>,
     apps: HashMap<(StreamKind, Uuid), usize>,
+    app_cancellations: HashMap<Uuid, CancellationToken>,
+    blocked_apps: HashSet<Uuid>,
+    producers: HashMap<Uuid, usize>,
+}
+
+pub struct ProducerPermit {
+    gate: StreamGate,
+    app_id: Uuid,
+}
+
+pub struct AppDeletionBarrier {
+    gate: StreamGate,
+    app_id: Uuid,
+    committed: bool,
 }
 
 pub struct StreamPermit {
@@ -55,6 +70,7 @@ pub struct StreamPermit {
     session_id: String,
     kind: StreamKind,
     app_id: Uuid,
+    cancellation: CancellationToken,
 }
 
 impl StreamGate {
@@ -73,12 +89,23 @@ impl StreamGate {
         kind: StreamKind,
         app_id: Uuid,
     ) -> Option<StreamPermit> {
+        self.acquire_for(session_id, kind, app_id, &CancellationToken::new())
+    }
+
+    pub fn acquire_for(
+        &self,
+        session_id: String,
+        kind: StreamKind,
+        app_id: Uuid,
+        shutdown: &CancellationToken,
+    ) -> Option<StreamPermit> {
         let (kind_limit, app_limit) = match kind {
             StreamKind::Events => (16, 4),
             StreamKind::Logs | StreamKind::Stats => (8, 2),
         };
         let mut counts = self.counts.lock().expect("stream gate mutex poisoned");
-        if counts.total >= Self::GLOBAL_LIMIT
+        if counts.blocked_apps.contains(&app_id)
+            || counts.total >= Self::GLOBAL_LIMIT
             || counts.sessions.get(&session_id).copied().unwrap_or(0) >= 8
             || counts.kinds.get(&kind).copied().unwrap_or(0) >= kind_limit
             || counts.apps.get(&(kind, app_id)).copied().unwrap_or(0) >= app_limit
@@ -89,13 +116,125 @@ impl StreamGate {
         *counts.sessions.entry(session_id.clone()).or_insert(0) += 1;
         *counts.kinds.entry(kind).or_insert(0) += 1;
         *counts.apps.entry((kind, app_id)).or_insert(0) += 1;
+        let cancellation = counts
+            .app_cancellations
+            .entry(app_id)
+            .or_insert_with(|| shutdown.child_token())
+            .child_token();
         drop(counts);
         Some(StreamPermit {
             gate: self.clone(),
             session_id,
             kind,
             app_id,
+            cancellation,
         })
+    }
+
+    pub fn cancel_app(&self, app_id: Uuid) {
+        let mut counts = self.counts.lock().expect("stream gate mutex poisoned");
+        counts.blocked_apps.insert(app_id);
+        if let Some(token) = counts.app_cancellations.get(&app_id) {
+            token.cancel();
+        }
+    }
+
+    pub fn begin_app_deletion(&self, app_id: Uuid) -> AppDeletionBarrier {
+        self.cancel_app(app_id);
+        AppDeletionBarrier {
+            gate: self.clone(),
+            app_id,
+            committed: false,
+        }
+    }
+
+    pub async fn cancel_app_and_wait(&self, app_id: Uuid, timeout: std::time::Duration) -> bool {
+        self.cancel_app(app_id);
+        let wait = async {
+            loop {
+                let notified = self.changed.notified();
+                let active = {
+                    let counts = self.counts.lock().expect("stream gate mutex poisoned");
+                    counts
+                        .apps
+                        .keys()
+                        .any(|(_, candidate)| *candidate == app_id)
+                        || counts.producers.get(&app_id).copied().unwrap_or(0) > 0
+                };
+                if !active {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    pub fn register_producer(&self, app_id: Uuid) -> ProducerPermit {
+        let mut counts = self.counts.lock().expect("stream gate mutex poisoned");
+        *counts.producers.entry(app_id).or_insert(0) += 1;
+        ProducerPermit {
+            gate: self.clone(),
+            app_id,
+        }
+    }
+}
+
+impl AppDeletionBarrier {
+    pub async fn wait(&self, timeout: std::time::Duration) -> bool {
+        let wait = async {
+            loop {
+                let notified = self.gate.changed.notified();
+                let active = {
+                    let counts = self.gate.counts.lock().expect("stream gate mutex poisoned");
+                    counts
+                        .apps
+                        .keys()
+                        .any(|(_, candidate)| *candidate == self.app_id)
+                        || counts.producers.get(&self.app_id).copied().unwrap_or(0) > 0
+                };
+                if !active {
+                    return;
+                }
+                notified.await;
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    /// Keep the app permanently closed after its filesystem tombstone has
+    /// committed. Before that point Drop rolls the cancellation generation
+    /// back so a failed deletion cannot strand a registered app.
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AppDeletionBarrier {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut counts = self.gate.counts.lock().expect("stream gate mutex poisoned");
+        counts.blocked_apps.remove(&self.app_id);
+        counts.app_cancellations.remove(&self.app_id);
+        drop(counts);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+impl Drop for ProducerPermit {
+    fn drop(&mut self) {
+        let mut counts = self.gate.counts.lock().expect("stream gate mutex poisoned");
+        decrement(&mut counts.producers, &self.app_id);
+        drop(counts);
+        self.gate.changed.notify_waiters();
+    }
+}
+
+impl StreamPermit {
+    fn cancellation(&self) -> CancellationToken {
+        self.cancellation.clone()
     }
 }
 
@@ -106,6 +245,8 @@ impl Drop for StreamPermit {
         decrement(&mut counts.sessions, &self.session_id);
         decrement(&mut counts.kinds, &self.kind);
         decrement(&mut counts.apps, &(self.kind, self.app_id));
+        drop(counts);
+        self.gate.changed.notify_waiters();
     }
 }
 
@@ -145,7 +286,12 @@ pub async fn events(
     }
     let permit = state
         .stream_gate
-        .acquire(authenticated.session.id.clone(), StreamKind::Events, app_id)
+        .acquire_for(
+            authenticated.session.id.clone(),
+            StreamKind::Events,
+            app_id,
+            &state.shutdown,
+        )
         .ok_or_else(|| ApiError::stream_limit(request_id))?;
     ensure_ready(&state, request_id).await?;
     state
@@ -164,7 +310,7 @@ pub async fn events(
         .apps
         .into_iter()
         .find(|app| app.id == app_id)
-        .expect("catalog app exists");
+        .ok_or_else(|| ApiError::app_not_found(request_id))?;
     let snapshot = serde_json::to_string(&snapshot).expect("snapshot serializes");
     let replay = state
         .events
@@ -177,7 +323,7 @@ pub async fn events(
         .await;
     let auth = state.auth.clone();
     let token = authenticated.token;
-    let cancellation = state.shutdown.child_token();
+    let cancellation = permit.cancellation();
     let guard = ConnectionGuard {
         _permit: permit,
         cancellation: cancellation.clone(),
@@ -281,7 +427,12 @@ pub async fn logs(
     }
     let permit = state
         .stream_gate
-        .acquire(authenticated.session.id.clone(), StreamKind::Logs, app_id)
+        .acquire_for(
+            authenticated.session.id.clone(),
+            StreamKind::Logs,
+            app_id,
+            &state.shutdown,
+        )
         .ok_or_else(|| ApiError::stream_limit(request_id))?;
     ensure_ready(&state, request_id).await?;
     let container = state
@@ -301,10 +452,12 @@ pub async fn logs(
         .map_err(|error| ApiError::docker(request_id, error.public_code()))?;
     let (sender, mut receiver) = mpsc::channel(128);
     let (terminal_sender, mut terminal) = watch::channel(None::<&'static str>);
-    let cancellation = state.shutdown.child_token();
+    let cancellation = permit.cancellation();
     let producer_cancellation = cancellation.clone();
     let redactor = state.redactor.clone();
+    let producer_permit = state.stream_gate.register_producer(app_id);
     let producer = state.stream_tasks.spawn(async move {
+        let _producer_permit = producer_permit;
         let mut framer = LogFramer::new(redactor);
         loop {
             tokio::select! {
@@ -401,7 +554,12 @@ pub async fn stats(
     }
     let permit = state
         .stream_gate
-        .acquire(authenticated.session.id.clone(), StreamKind::Stats, app_id)
+        .acquire_for(
+            authenticated.session.id.clone(),
+            StreamKind::Stats,
+            app_id,
+            &state.shutdown,
+        )
         .ok_or_else(|| ApiError::stream_limit(request_id))?;
     ensure_ready(&state, request_id).await?;
     let container = state
@@ -409,10 +567,10 @@ pub async fn stats(
         .owned_container(app_id)
         .await
         .map_err(|error| owned_error(error, request_id))?;
-    let mut subscription = state.stats.subscribe(container.id).await;
+    let mut subscription = state.stats.subscribe(app_id, container.id).await;
     let auth = state.auth.clone();
     let token = authenticated.token;
-    let cancellation = state.shutdown.child_token();
+    let cancellation = permit.cancellation();
     let guard = ConnectionGuard {
         _permit: permit,
         cancellation: cancellation.clone(),
@@ -523,5 +681,86 @@ mod tests {
                 .is_some()
         );
         drop(second);
+    }
+
+    #[test]
+    fn cancelling_an_app_closes_existing_streams_but_not_future_streams() {
+        let gate = StreamGate::default();
+        let shutdown = CancellationToken::new();
+        let app = Uuid::new_v4();
+        let permit = gate
+            .acquire_for("session".into(), StreamKind::Events, app, &shutdown)
+            .unwrap();
+        let old = permit.cancellation();
+        assert!(!old.is_cancelled());
+        gate.cancel_app(app);
+        assert!(old.is_cancelled());
+        assert!(
+            gate.acquire_for("other".into(), StreamKind::Events, app, &shutdown)
+                .is_none()
+        );
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn cancel_wait_observes_the_last_permit_drop() {
+        let gate = StreamGate::default();
+        let app = Uuid::new_v4();
+        let permit = gate
+            .acquire("session".into(), StreamKind::Logs, app)
+            .unwrap();
+        let waiting = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.cancel_app_and_wait(app, std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        drop(permit);
+        assert!(waiting.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancel_wait_observes_detached_producer_completion() {
+        let gate = StreamGate::default();
+        let app = Uuid::new_v4();
+        let producer = gate.register_producer(app);
+        let waiting = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.cancel_app_and_wait(app, std::time::Duration::from_secs(1))
+                    .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(producer);
+        assert!(waiting.await.unwrap());
+    }
+
+    #[test]
+    fn deletion_barrier_rolls_back_until_tombstone_commit() {
+        let gate = StreamGate::default();
+        let shutdown = CancellationToken::new();
+        let app = Uuid::new_v4();
+        {
+            let barrier = gate.begin_app_deletion(app);
+            assert!(
+                gate.acquire_for("blocked".into(), StreamKind::Events, app, &shutdown)
+                    .is_none()
+            );
+            drop(barrier);
+        }
+        assert!(
+            gate.acquire_for("allowed".into(), StreamKind::Events, app, &shutdown)
+                .is_some()
+        );
+
+        gate.begin_app_deletion(app).commit();
+        assert!(
+            gate.acquire_for("closed".into(), StreamKind::Events, app, &shutdown)
+                .is_none()
+        );
     }
 }

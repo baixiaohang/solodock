@@ -10,6 +10,7 @@ use std::{
 use futures_util::StreamExt;
 use tokio::sync::{Mutex, watch};
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use uuid::Uuid;
 
 use super::models::{DockerReadApi, RawStats, StatsSample};
 
@@ -27,14 +28,22 @@ pub struct StatsHub {
 struct StatsHubInner {
     api: Arc<dyn DockerReadApi>,
     entries: Mutex<HashMap<String, Arc<StatsEntry>>>,
+    /// Producer ownership is independent from the subscriber cache. An entry
+    /// removed after the idle grace period remains joinable until its task has
+    /// actually finished.
+    producers: Mutex<Vec<Arc<StatsEntry>>>,
     shutdown: CancellationToken,
     tasks: TaskTracker,
 }
 
 struct StatsEntry {
+    app_id: Uuid,
+    container_id: String,
     sender: watch::Sender<Option<StatsUpdate>>,
     subscribers: AtomicUsize,
     cancellation: CancellationToken,
+    finished: AtomicUsize,
+    finished_notify: tokio::sync::Notify,
 }
 
 pub struct StatsSubscription {
@@ -54,30 +63,31 @@ impl StatsHub {
             inner: Arc::new(StatsHubInner {
                 api,
                 entries: Mutex::new(HashMap::new()),
+                producers: Mutex::new(Vec::new()),
                 shutdown,
                 tasks,
             }),
         }
     }
 
-    pub async fn subscribe(&self, container_id: String) -> StatsSubscription {
+    pub async fn subscribe(&self, app_id: Uuid, container_id: String) -> StatsSubscription {
         let mut entries = self.inner.entries.lock().await;
         let entry = if let Some(entry) = entries.get(&container_id) {
             entry.clone()
         } else {
             let (sender, _) = watch::channel(None);
             let entry = Arc::new(StatsEntry {
+                app_id,
+                container_id: container_id.clone(),
                 sender,
                 subscribers: AtomicUsize::new(0),
                 cancellation: self.inner.shutdown.child_token(),
+                finished: AtomicUsize::new(0),
+                finished_notify: tokio::sync::Notify::new(),
             });
             entries.insert(container_id.clone(), entry.clone());
-            spawn_producer(
-                &self.inner.tasks,
-                self.inner.api.clone(),
-                container_id.clone(),
-                entry.clone(),
-            );
+            self.inner.producers.lock().await.push(entry.clone());
+            spawn_producer(self.inner.clone(), container_id.clone(), entry.clone());
             entry
         };
         entry.subscribers.fetch_add(1, Ordering::SeqCst);
@@ -88,52 +98,125 @@ impl StatsHub {
             container_id,
         }
     }
-}
 
-fn spawn_producer(
-    tasks: &TaskTracker,
-    api: Arc<dyn DockerReadApi>,
-    container_id: String,
-    entry: Arc<StatsEntry>,
-) {
-    tasks.spawn(async move {
-        let mut stream = match api.stats(&container_id).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                entry
-                    .sender
-                    .send_replace(Some(StatsUpdate::Error(error.public_code())));
-                return;
+    pub async fn cancel_and_wait(&self, container_id: &str, timeout: Duration) -> bool {
+        {
+            let mut entries = self.inner.entries.lock().await;
+            entries.remove(container_id);
+        }
+        let entries = self
+            .inner
+            .producers
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.container_id == container_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            entry.cancellation.cancel();
+        }
+        let wait = async {
+            for entry in entries {
+                while entry.finished.load(Ordering::Acquire) == 0 {
+                    let notified = entry.finished_notify.notified();
+                    if entry.finished.load(Ordering::Acquire) != 0 {
+                        break;
+                    }
+                    notified.await;
+                }
             }
         };
-        let mut last_published: Option<Instant> = None;
-        loop {
-            tokio::select! {
-                () = entry.cancellation.cancelled() => break,
-                item = stream.next() => match item {
-                    Some(Ok(raw)) => {
-                        let now = Instant::now();
-                        if last_published.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)) { continue; }
-                        last_published = Some(now);
-                        entry.sender.send_replace(Some(StatsUpdate::Sample(calculate(raw))));
-                    }
-                    Some(Err(error)) => {
-                        entry.sender.send_replace(Some(StatsUpdate::Error(error.public_code())));
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+
+    pub async fn cancel_app_and_wait(&self, app_id: Uuid, timeout: Duration) -> bool {
+        {
+            let mut current = self.inner.entries.lock().await;
+            let ids = current
+                .iter()
+                .filter_map(|(id, entry)| (entry.app_id == app_id).then_some(id.clone()))
+                .collect::<Vec<_>>();
+            for id in ids {
+                current.remove(&id);
+            }
+        }
+        let entries = self
+            .inner
+            .producers
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| entry.app_id == app_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            entry.cancellation.cancel();
+        }
+        let wait = async {
+            for entry in entries {
+                while entry.finished.load(Ordering::Acquire) == 0 {
+                    let notified = entry.finished_notify.notified();
+                    if entry.finished.load(Ordering::Acquire) != 0 {
                         break;
                     }
-                    None => {
-                        entry.sender.send_replace(Some(StatsUpdate::Error("CONTAINER_CHANGED")));
-                        break;
+                    notified.await;
+                }
+            }
+        };
+        tokio::time::timeout(timeout, wait).await.is_ok()
+    }
+}
+
+fn spawn_producer(inner: Arc<StatsHubInner>, container_id: String, entry: Arc<StatsEntry>) {
+    let tasks = inner.tasks.clone();
+    tasks.spawn(async move {
+        let stream = inner.api.stats(&container_id).await;
+        if let Err(error) = &stream {
+            entry
+                .sender
+                .send_replace(Some(StatsUpdate::Error(error.public_code())));
+        }
+        if let Ok(mut stream) = stream {
+            let mut last_published: Option<Instant> = None;
+            loop {
+                tokio::select! {
+                    () = entry.cancellation.cancelled() => break,
+                    item = stream.next() => match item {
+                        Some(Ok(raw)) => {
+                            let now = Instant::now();
+                            if last_published.is_some_and(|last| now.duration_since(last) < Duration::from_secs(1)) { continue; }
+                            last_published = Some(now);
+                            entry.sender.send_replace(Some(StatsUpdate::Sample(calculate(raw))));
+                        }
+                        Some(Err(error)) => {
+                            entry.sender.send_replace(Some(StatsUpdate::Error(error.public_code())));
+                            break;
+                        }
+                        None => {
+                            entry.sender.send_replace(Some(StatsUpdate::Error("CONTAINER_CHANGED")));
+                            break;
+                        }
                     }
                 }
             }
         }
+        let mut producers = inner.producers.lock().await;
+        // Publish completion while the entry is still protected by the join
+        // registry lock. A joiner that observes the entry absent therefore
+        // also observes finished=true.
+        entry.finished.store(1, Ordering::Release);
+        entry.finished_notify.notify_waiters();
+        producers.retain(|candidate| !Arc::ptr_eq(candidate, &entry));
     });
 }
 
 impl Drop for StatsSubscription {
     fn drop(&mut self) {
         if self.entry.subscribers.fetch_sub(1, Ordering::SeqCst) != 1 {
+            return;
+        }
+        if self.entry.cancellation.is_cancelled() {
             return;
         }
         let entry = self.entry.clone();
@@ -305,8 +388,9 @@ mod tests {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let hub = StatsHub::new(api.clone(), shutdown, tasks);
-        let first = hub.subscribe("container".into()).await;
-        let second = hub.subscribe("container".into()).await;
+        let app = Uuid::new_v4();
+        let first = hub.subscribe(app, "container".into()).await;
+        let second = hub.subscribe(app, "container".into()).await;
         tokio::task::yield_now().await;
         assert_eq!(api.0.load(Ordering::SeqCst), 1);
         drop(first);
@@ -314,7 +398,7 @@ mod tests {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(6)).await;
         tokio::task::yield_now().await;
-        let _third = hub.subscribe("container".into()).await;
+        let _third = hub.subscribe(app, "container".into()).await;
         tokio::task::yield_now().await;
         assert_eq!(api.0.load(Ordering::SeqCst), 2);
     }
@@ -325,11 +409,12 @@ mod tests {
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let hub = StatsHub::new(api, shutdown.clone(), tasks.clone());
-        let first = hub.subscribe("container".into()).await;
+        let app = Uuid::new_v4();
+        let first = hub.subscribe(app, "container".into()).await;
         drop(first);
 
         tokio::time::advance(Duration::from_secs(5)).await;
-        let second = hub.subscribe("container".into()).await;
+        let second = hub.subscribe(app, "container".into()).await;
         tokio::task::yield_now().await;
         assert!(!second.entry.cancellation.is_cancelled());
         assert!(
@@ -347,13 +432,50 @@ mod tests {
         tasks.wait().await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn app_join_uses_producer_registry_after_idle_cache_removal() {
+        let api = Arc::new(FakeStatsApi(AtomicUsize::new(0)));
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let hub = StatsHub::new(api, shutdown.clone(), tasks.clone());
+        let app = Uuid::new_v4();
+        let subscription = hub.subscribe(app, "container".into()).await;
+        let entry = subscription.entry.clone();
+        tokio::task::yield_now().await;
+        drop(subscription);
+        tokio::task::yield_now().await;
+
+        // Hold the independent producer registry so the idle cleanup can
+        // remove the cache entry and cancel the task, but the producer cannot
+        // publish its finished state yet.
+        let registry = hub.inner.producers.lock().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(hub.inner.entries.lock().await.is_empty());
+
+        let waiting = {
+            let hub = hub.clone();
+            tokio::spawn(async move { hub.cancel_app_and_wait(app, Duration::from_secs(1)).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(registry);
+        assert!(waiting.await.unwrap());
+        assert_eq!(entry.finished.load(Ordering::Acquire), 1);
+        assert!(hub.inner.producers.lock().await.is_empty());
+
+        shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
+    }
+
     #[tokio::test]
     async fn global_shutdown_collects_pending_producer_and_cleanup() {
         let api = Arc::new(FakeStatsApi(AtomicUsize::new(0)));
         let shutdown = CancellationToken::new();
         let tasks = TaskTracker::new();
         let hub = StatsHub::new(api, shutdown.clone(), tasks.clone());
-        let subscription = hub.subscribe("container".into()).await;
+        let subscription = hub.subscribe(Uuid::new_v4(), "container".into()).await;
         tokio::task::yield_now().await;
         drop(subscription);
         assert!(!tasks.is_empty());
@@ -364,5 +486,24 @@ mod tests {
             .await
             .expect("tracked stats tasks stop after global cancellation");
         assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn app_cancellation_joins_all_container_producers_without_grace_delay() {
+        let api = Arc::new(FakeStatsApi(AtomicUsize::new(0)));
+        let shutdown = CancellationToken::new();
+        let tasks = TaskTracker::new();
+        let hub = StatsHub::new(api, shutdown.clone(), tasks.clone());
+        let app = Uuid::new_v4();
+        let first = hub.subscribe(app, "old-container".into()).await;
+        let replacement = hub.subscribe(app, "replacement-container".into()).await;
+        tokio::task::yield_now().await;
+        assert!(hub.cancel_app_and_wait(app, Duration::from_secs(1)).await);
+        assert!(hub.inner.entries.lock().await.is_empty());
+        drop(first);
+        drop(replacement);
+        shutdown.cancel();
+        tasks.close();
+        tasks.wait().await;
     }
 }

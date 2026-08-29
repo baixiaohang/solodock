@@ -57,4 +57,5 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: docker pull alpine:3.20
+      - run: docker pull nginx:1.27-alpine
       - run: cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture

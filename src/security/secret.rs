@@ -1,10 +1,12 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Zeroize, ZeroizeOnDrop)]
+#[derive(Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(transparent)]
 pub struct SecretValue(String);
 
 impl SecretValue {

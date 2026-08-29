@@ -8,6 +8,10 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::auth::AuthError;
+use crate::{
+    domain::DomainError,
+    mutation::{CoordinatorError, IdempotencyError},
+};
 
 #[derive(Clone, Copy)]
 pub struct RequestId(pub Uuid);
@@ -28,6 +32,9 @@ struct ErrorEnvelope {
 }
 
 impl ApiError {
+    pub fn code_and_status(&self) -> (&'static str, StatusCode) {
+        (self.code, self.status)
+    }
     pub fn new(
         status: StatusCode,
         code: &'static str,
@@ -134,6 +141,99 @@ impl ApiError {
             error.retry_after = Some(3);
         }
         error
+    }
+
+    pub fn domain(error: DomainError, request_id: RequestId) -> Self {
+        let code = match error {
+            DomainError::ConfigQuotaExceeded => "CONFIG_QUOTA_EXCEEDED",
+            DomainError::EnvDuplicate => "ENV_DUPLICATE",
+            DomainError::SecretOperationRequired => "SECRET_OPERATION_REQUIRED",
+            DomainError::FileTargetConflict => "FILE_TARGET_CONFLICT",
+            DomainError::BindDisabled => "BIND_DISABLED",
+            DomainError::BindOutsideAllowedRoot => "BIND_OUTSIDE_ALLOWED_ROOT",
+            DomainError::BindSymlink => "BIND_SYMLINK",
+            DomainError::BindChanged => "BIND_CHANGED",
+            DomainError::BindRwAckRequired => "BIND_RW_ACK_REQUIRED",
+            DomainError::PortConflict => "PORT_CONFLICT",
+            DomainError::FeatureNotAvailable => "FEATURE_NOT_AVAILABLE",
+            DomainError::ConfigInvalid => "CONFIG_INVALID",
+            DomainError::Internal => return Self::internal(request_id),
+        };
+        Self::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            "The application configuration is invalid",
+            request_id,
+        )
+    }
+
+    pub fn idempotency(error: IdempotencyError, request_id: RequestId) -> Self {
+        match error {
+            IdempotencyError::KeyRequired => Self::new(
+                StatusCode::BAD_REQUEST,
+                "IDEMPOTENCY_KEY_REQUIRED",
+                "An idempotency key is required",
+                request_id,
+            ),
+            IdempotencyError::KeyInvalid => Self::new(
+                StatusCode::BAD_REQUEST,
+                "IDEMPOTENCY_KEY_INVALID",
+                "The idempotency key is invalid",
+                request_id,
+            ),
+            IdempotencyError::Reused => Self::new(
+                StatusCode::CONFLICT,
+                "IDEMPOTENCY_KEY_REUSED",
+                "The idempotency key was used for a different request",
+                request_id,
+            ),
+            IdempotencyError::InProgress => Self::new(
+                StatusCode::CONFLICT,
+                "IDEMPOTENCY_IN_PROGRESS",
+                "The operation is in progress",
+                request_id,
+            ),
+            _ => Self::internal(request_id),
+        }
+    }
+
+    pub fn coordinator(error: CoordinatorError, request_id: RequestId) -> Self {
+        match error {
+            CoordinatorError::Busy => Self::new(
+                StatusCode::CONFLICT,
+                "APP_BUSY",
+                "The application is busy",
+                request_id,
+            ),
+            _ => Self::internal(request_id),
+        }
+    }
+
+    pub fn conflict(code: &'static str, request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            code,
+            "The operation conflicts with current application state",
+            request_id,
+        )
+    }
+
+    pub fn compose(code: &'static str, request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            "Docker Compose is unavailable",
+            request_id,
+        )
+    }
+
+    pub fn internal(request_id: RequestId) -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "INTERNAL_ERROR",
+            "An internal error occurred",
+            request_id,
+        )
     }
 
     pub fn from_auth(error_value: AuthError, request_id: RequestId) -> Self {

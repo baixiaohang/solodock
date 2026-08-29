@@ -31,13 +31,18 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return (await response.json()) as T
 }
 
-export async function mutation<T>(path: string, body?: unknown): Promise<T> {
+export async function mutation<T>(
+  path: string,
+  body?: unknown,
+  options: { method?: 'POST' | 'PUT' | 'DELETE'; idempotencyKey?: string } = {},
+): Promise<T> {
   const csrf = readCookie('__Host-solodock_csrf')
   return api<T>(path, {
-    method: 'POST',
+    method: options.method ?? 'POST',
     headers: {
       'Content-Type': 'application/json',
       ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+      ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   })

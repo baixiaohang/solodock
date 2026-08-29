@@ -4,6 +4,7 @@
   import AuthView from './components/AuthView.svelte'
   import Dashboard from './views/Dashboard.svelte'
   import AppDetail from './views/AppDetail.svelte'
+  import NewApp from './views/NewApp.svelte'
 
   let route = window.location.hash
   const updateRoute = () => { route = window.location.hash }
@@ -15,6 +16,7 @@
   })
 
   $: appId = route.match(/^#\/apps\/([0-9a-f-]+)$/)?.[1]
+  $: creating = route === '#/apps/new'
 </script>
 
 <svelte:head><title>SoloDock</title></svelte:head>
@@ -32,7 +34,9 @@
       <button class="ghost" onclick={() => void logout()}>退出</button>
     </nav>
   </header>
-  {#if appId}
+  {#if creating}
+    <NewApp />
+  {:else if appId}
     <AppDetail {appId} />
   {:else}
     <Dashboard />

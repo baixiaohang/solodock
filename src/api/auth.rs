@@ -52,6 +52,26 @@ impl FromRequestParts<AppState> for Authenticated {
     }
 }
 
+pub struct MutationAuthenticated(pub Authenticated);
+
+impl FromRequestParts<AppState> for MutationAuthenticated {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let request_id = parts
+            .extensions
+            .get::<RequestId>()
+            .copied()
+            .unwrap_or(RequestId(uuid::Uuid::nil()));
+        validate_required_origin(state, &parts.headers, request_id)?;
+        validate_csrf(&parts.headers, request_id)?;
+        Ok(Self(Authenticated::from_request_parts(parts, state).await?))
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapRequest {

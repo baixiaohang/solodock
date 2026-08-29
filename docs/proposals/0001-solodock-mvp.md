@@ -200,7 +200,7 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
 
 `active` symlink 是 active release 的唯一权威来源；应用配置文件不重复保存 active release ID。文件系统权威事实先原子提交，再刷新 SQLite 查询投影，不虚构跨存储事务。即使 SQLite 丢失，系统仍必须能扫描应用目录，恢复应用、active release、生成的 Compose 和镜像 digest。数据库丢失后不得重建或伪造管理员、session 或历史审计记录，管理员需要重新 bootstrap。
 
-关键文件写入使用同目录临时文件、文件 `fsync`、原子 rename 和父目录 `fsync`。release 目录创建后保持不可变。
+关键文件写入使用同目录临时文件、文件 `fsync`、原子 rename 和父目录 `fsync`。release 和 config revision 目录创建后保持不可变。draft 更新先发布完整的 `config-revisions/<revision-id>/`，最后原子替换 `app.toml` 使 `draft_revision` 指向新 revision；这一步是 commit point。每个 release 固定引用自己的 config revision，后续 draft 编辑不会改变 active 容器的挂载内容。
 
 ## 7. 宿主存储布局
 
@@ -212,10 +212,12 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
   credentials/<credential-id>.json
   apps/<app-id>/
     app.toml
-    env/public.env
-    secrets/runtime.env
-    files/public/<name>
-    files/secret/<name>
+    config-revisions/<revision-id>/
+      config.toml
+      env/public.env
+      secrets/runtime.env
+      files/public/<name>
+      files/secret/<name>
     releases/<release-id>/
       release.toml
       compose.yaml
@@ -224,6 +226,7 @@ SoloDock 是单个 Rust 进程和单个 Rust crate，不引入内部服务、插
 
 /run/solodock/
   locks/<app-id>.lock
+  compose/<operation-id>/compose.yaml
   docker-config/<operation-id>/config.json
 ```
 
@@ -413,6 +416,19 @@ M2 的 SSE 固定全局上限 24、单 session 8；events 全局 16/单 app 4，
 
 日志先按完整 logical line framing，再以 byte 形式脱敏 SoloDock 已知的受管 secret；跨 Docker chunk 的 secret 仍会替换为 `[REDACTED]`。64 KiB 以上原始行整行省略，正常 message 上限 16 KiB，并移除 NUL 和终端控制序列。应用自行产生、SoloDock 从未持有的 secret 无法可靠识别，系统不对此作虚假保证。
 
+### 11.5 M3 mutation 与 Compose 边界
+
+- `POST /api/v1/apps` 只登记应用并发布 immutable draft revision；不解析 tag、不 pull、不创建 container，也不暗中执行 M4 deploy；
+- 所有持久业务 mutation 使用 16–128 字节安全 ASCII `Idempotency-Key`。SQLite 只保存 key/request 的 HMAC、operation ID、状态和脱敏响应；同 key 不同请求返回冲突；
+- Compose production runner 固定执行 `/usr/bin/docker`，清空继承环境，不读取 `DOCKER_HOST`/context，不使用 shell，显式禁用项目 `.env`，只能产生 validate/start/up/stop/restart/rm 的封闭参数向量；
+- 每次 runtime 操作都从 filesystem `active` symlink 重读 digest-pinned image、release ID 与 verified pinned config revision，重建 canonical Compose，并与持久 `compose.yaml` 逐字校验后才执行。紧邻 CLI spawn 前按 Compose project/service 枚举全部 container；任一 unmanaged、invalid、stale-release 或多候选 collision 都 fail closed。缺少 config pin 或 artifact 不一致时同样 fail closed，不执行 legacy artifact；
+- owned volume/network 与 container 在操作前按精确 ownership 重新 inspect；external resource 必须存在。所有 bind source 在 spawn 前重新验证 allowlist、symlink、device/inode；
+- unregister 默认保留 container。显式 remove 只执行 `compose rm --stop --force app`，永不执行 `down`、`-v/--volumes` 或 `--remove-orphans`，所有 volume、bind 数据和 network 均保留；
+- Docker capability ready 后，`allowed_bind_roots` 与每个 bind source 还必须和 daemon 报告的实际 Docker data-root 做双向 overlap 检查；非默认 data-root 与运行期中间目录 symlink swap 均 fail closed；
+- create/update/delete 先提交 filesystem 权威事实，再整快照替换内存 catalog 并刷新 SQLite 投影。后续投影失败产生稳定 warning 和 degraded health，由受 shutdown 管理的 reconciliation worker 重试；不得把已提交事实误报为回滚。
+- crash 遗留 temp 与未引用 revision 只允许在 HTTP listen 前的 startup recovery 清理；运行期 verified-active、catalog refresh 与 projection reconciliation 使用只读扫描，不能删除并发 writer 正在发布的 artifact。
+- 删除 preview 与 DELETE 在同一 catalog→app 协调锁序内从 filesystem、verified active config 和 exact Docker observation 派生 canonical facts。token 绑定 active+draft 的去重资源清单、实际存在/仅配置 disposition 与完整 facts hash，并在 consume 和 tombstone 前重验；删除 producer barrier 在 tombstone 前失败时必须恢复新的 stream cancellation generation。
+
 ## 12. API 草图
 
 所有持久业务 mutation endpoint 接受 `Idempotency-Key`。认证协议 endpoint 不接受该 header：login 会生成随机 session 和 cookie，bootstrap 已由 singleton credential 与一次性 token 保证至多一次。错误使用统一格式：
@@ -467,7 +483,7 @@ events、logs 和 stats endpoint 都是有界 SSE stream。日志只接受与 se
 
 M2 的所有 `/api/v1/**` read endpoint 都要求有效 session，并设置 `Cache-Control: no-store`。`GET /api/v1/system/health` 在认证后始终返回 `200`，将 Docker、filesystem recovery、state/Docker disk 和 active stream 数分别投影；`GET /api/v1/apps` 与 detail 在 Docker 不可用时仍返回 filesystem app 和 typed drift；`GET /api/v1/system/drift` 在无法完整观察时返回 `complete=false`，不会把未知状态误报为 container missing。
 
-破坏性删除采用两阶段操作。preview 返回精确 project、container、network、自有文件、保留 volume 和保留 bind mount 源目录，并附带短期 confirmation token。删除请求同时提交 token 和应用 slug。默认仅 unregister；移除容器必须显式选择，且仍然保留所有 volume 和 bind mount 数据。
+破坏性删除采用两阶段操作。preview 从 filesystem 权威事实返回精确 project、container、active/draft config、network、自有文件、保留 volume 和保留 bind mount 源目录，资源稳定去重并标明来自 active、draft 或两者以及实际存在/仅配置，随后附带短期 confirmation token。删除请求同时提交 token 和应用 slug，并在消费 token 与 tombstone 前重验完整 preview facts hash。默认仅 unregister；移除容器必须显式选择，且仍然保留所有 volume 和 bind mount 数据。
 
 ## 13. UI 草图
 

@@ -1,10 +1,13 @@
 pub mod api;
 pub mod app_store;
 pub mod auth;
+pub mod compose;
 pub mod config;
 pub mod db;
 pub mod docker;
+pub mod domain;
 pub mod error;
+pub mod mutation;
 pub mod security;
 pub mod system;
 pub mod telemetry;

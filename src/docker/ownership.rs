@@ -27,6 +27,7 @@ pub fn validate_identity(
     (labels.get(MANAGED_LABEL).map(String::as_str) == Some("true")
         && labels.get(SCHEMA_LABEL).map(String::as_str) == Some("1")
         && app_id == app.id
+        && app.active_release_id == Some(release_id)
         && labels.get(PROJECT_LABEL).map(String::as_str) == Some(app.project_name.as_str())
         && labels.get(SERVICE_LABEL).map(String::as_str) == Some("app")
         && labels.get(ONEOFF_LABEL).map(String::as_str) == Some("False"))
@@ -68,6 +69,14 @@ mod tests {
             project_name: "solodock-example".into(),
             active_release_id: Some(release_id),
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
+            active_config_revision: None,
+            active_config_sha256: None,
+            discovery_image_ref: None,
+            draft_revision: None,
+            draft_config_sha256: None,
+            desired_state: crate::domain::DesiredState::Stopped,
+            poll_interval_seconds: 300,
+            draft: None,
         };
         let labels = HashMap::from([
             (MANAGED_LABEL.into(), "true".into()),
@@ -126,5 +135,9 @@ mod tests {
         let mut release = labels;
         release.insert(RELEASE_ID_LABEL.into(), release_id.simple().to_string());
         assert!(validate_identity(&release, &app).is_none());
+
+        let mut stale = release;
+        stale.insert(RELEASE_ID_LABEL.into(), Uuid::new_v4().to_string());
+        assert!(validate_identity(&stale, &app).is_none());
     }
 }

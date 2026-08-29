@@ -17,6 +17,7 @@ pub struct SystemHealthResponse {
     recovery: RecoveryHealth,
     disk: DiskHealth,
     streams: StreamHealth,
+    projection: ProjectionHealth,
 }
 
 #[derive(Serialize)]
@@ -39,6 +40,11 @@ struct StreamHealth {
 }
 
 #[derive(Serialize)]
+struct ProjectionHealth {
+    status: &'static str,
+}
+
+#[derive(Serialize)]
 pub struct DriftResponse {
     complete: bool,
     #[serde(with = "time::serde::rfc3339")]
@@ -58,7 +64,7 @@ pub async fn health(
         .map(Path::new)
         .filter(|path| path.exists())
         .map(disk_probe);
-    let issues = state.observer.catalog.recovery_issues().clone();
+    let issues = state.observer.catalog.recovery_issues();
     let recovery_degraded = !issues.is_empty();
     let disk_degraded = matches!(
         state_disk.status,
@@ -69,7 +75,15 @@ pub async fn health(
             DiskStatus::Warning | DiskStatus::Critical | DiskStatus::Unknown
         )
     });
-    let degraded = docker.status != ProbeStatus::Ready || recovery_degraded || disk_degraded;
+    let projection_degraded = state.m3.as_ref().is_some_and(|services| {
+        services
+            .projection_degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+    });
+    let degraded = docker.status != ProbeStatus::Ready
+        || recovery_degraded
+        || disk_degraded
+        || projection_degraded;
     Json(SystemHealthResponse {
         status: if degraded { "degraded" } else { "ok" },
         docker,
@@ -85,6 +99,13 @@ pub async fn health(
         streams: StreamHealth {
             active: state.stream_gate.active(),
             limit: crate::api::streams::StreamGate::GLOBAL_LIMIT,
+        },
+        projection: ProjectionHealth {
+            status: if projection_degraded {
+                "degraded"
+            } else {
+                "ok"
+            },
         },
     })
 }
