@@ -9,14 +9,74 @@ permissions:
   contents: read
 
 jobs:
-  checks:
+  classify_push:
+    if: github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      merged_pr: ${{ steps.detect.outputs.merged_pr }}
+    steps:
+      - name: Detect a merged pull request commit
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          COMMIT_SHA: ${{ github.sha }}
+          BASE_REF: ${{ github.ref_name }}
+        run: |
+          pulls=$(gh api "/repos/$REPOSITORY/commits/$COMMIT_SHA/pulls")
+          merged_pr=false
+          head_sha=$(jq -r --arg sha "$COMMIT_SHA" --arg base "$BASE_REF" '
+            [.[] | select(
+              .merged_at != null and
+              .merge_commit_sha == $sha and
+              .base.ref == $base
+            )] | first | .head.sha // empty
+          ' <<<"$pulls")
+          if [[ -n $head_sha ]]; then
+            current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
+            runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&head_sha=$head_sha&per_page=100")
+            while read -r run_id; do
+              [[ -n $run_id ]] || continue
+              artifact_id=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts" --jq '
+                [.artifacts[] | select(
+                  .name == "solodock-validated-tree" and
+                  .expired == false
+                )] | first | .id // empty
+              ')
+              [[ -n $artifact_id ]] || continue
+              gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" \
+                >"$RUNNER_TEMP/validated-tree.zip"
+              validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
+              if [[ $validated_tree == "$current_tree" ]]; then
+                merged_pr=true
+                break
+              fi
+            done < <(jq -r --arg head "$head_sha" '
+              .workflow_runs[] |
+              select(.head_sha == $head and .conclusion == "success") |
+              .id
+            ' <<<"$runs")
+          fi
+          echo "merged_pr=$merged_pr" >>"$GITHUB_OUTPUT"
+
+  checks:
+    needs: classify_push
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    env:
+      RUN_QUALITY_CHECKS: ${{ github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: ${{ needs.classify_push.outputs.merged_pr == 'true' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -25,14 +85,19 @@ jobs:
       - run: npm ci
         working-directory: web
       - run: npm run check
+        if: env.RUN_QUALITY_CHECKS == 'true'
         working-directory: web
       - run: npm run test
+        if: env.RUN_QUALITY_CHECKS == 'true'
         working-directory: web
       - run: npm run build
         working-directory: web
       - run: cargo fmt --check
+        if: env.RUN_QUALITY_CHECKS == 'true'
       - run: cargo clippy --all-targets --all-features -- -D warnings
+        if: env.RUN_QUALITY_CHECKS == 'true'
       - run: cargo test --all-targets --all-features -- --test-threads=2
+        if: env.RUN_QUALITY_CHECKS == 'true'
       - run: cargo build --release --locked --features embed-ui
       - run: chmod +x scripts/smoke-embedded-http.sh && scripts/smoke-embedded-http.sh target/release/solodock
       - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/smoke-test.sh && packaging/smoke-test.sh
@@ -56,8 +121,19 @@ jobs:
           path: |
             ${{ runner.temp }}/solodock-package
             ${{ runner.temp }}/resource-report.json
+      - name: Record validated source tree
+        if: github.event_name == 'pull_request'
+        run: git rev-parse 'HEAD^{tree}' >"$RUNNER_TEMP/validated-tree"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'pull_request'
+        with:
+          name: solodock-validated-tree
+          path: ${{ runner.temp }}/validated-tree
+          if-no-files-found: error
 
   docker-e2e:
+    needs: classify_push
+    if: ${{ always() && (github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true') }}
     runs-on: ubuntu-24.04
     services:
       docker:
