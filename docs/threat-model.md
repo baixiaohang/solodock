@@ -16,6 +16,6 @@ Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret
 
 volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。External network 与其成员属于 daemon 共享状态：SoloDock 对成员数量设置上限，在共享 deadline 内完整 inspect 成员 full ID 和有效 DNS names，任何截断或部分成功都 fail closed。Alias 冲突只对已经通过 filesystem/ownership policy 精确确认的旧 container full ID 放行；app label、名称和短 ID 不构成替换权限。
 
-Docker observation 与后续 Compose effect 无法组成跨 API 原子事务，外部 root actor 仍可在两者之间改变网络。系统以 durable marker 后的最后一次 fresh preflight 缩小窗口，并在 effect 后用 `NETWORK_ATTACHMENT_MISMATCH` 与 `NETWORK_ALIAS_MISMATCH` 持续揭示漂移，不宣称消除有宿主 root 权限的并发。应用级备份/restore、安全更新和 schema兼容由管理员负责。
+Docker observation 与后续 Compose effect 无法组成跨 API 原子事务，外部 root actor 仍可在两者之间改变网络。系统以 durable marker 后的最后一次 fresh preflight 缩小窗口，并在 effect 后用 `NETWORK_ATTACHMENT_MISMATCH` 与 `NETWORK_ALIAS_MISMATCH` 持续揭示漂移，不宣称消除有宿主 root 权限的并发。Compose 返回后的首次 container observation 以唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim；具备 Docker daemon/root 权限的主体若在该 marker 前复制全部 canonical labels 替换容器，属于本 threat model 明确排除的主体，系统不提供因果 attestation。`post_container_id` 持久化后 exact full ID 才成为 SSOT，任何不同 ID 的 replacement 均保留现场并 fail closed。应用级备份/restore、安全更新和 schema兼容由管理员负责。
 
 测试如何证明这些边界见 [测试与安全护栏](testing.md)；故障后的人工处置见 [恢复](recovery.md)。

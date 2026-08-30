@@ -400,6 +400,9 @@ fn check_memory_pressure() -> Result<(), PullError> {
 }
 
 fn image_matches_resolved(image: &ImageRecord, resolved: &ResolvedImage) -> bool {
+    let Ok(identity) = resolved.image_identity() else {
+        return false;
+    };
     let Ok(actual_platform) = crate::registry::Platform::canonical(
         &image.os,
         &image.architecture,
@@ -407,9 +410,7 @@ fn image_matches_resolved(image: &ImageRecord, resolved: &ResolvedImage) -> bool
     ) else {
         return false;
     };
-    // Classic image stores expose the config digest as ImageInspect.id. Docker's
-    // containerd image store can expose the selected manifest digest instead.
-    (image.id == resolved.local_image_id || image.id == resolved.manifest_digest)
+    identity.matches_observation(Some(&image.id), image.manifest_descriptor.as_ref())
         && actual_platform == resolved.platform
         && image
             .repo_digests
@@ -421,10 +422,10 @@ fn repo_digest_matches(value: &str, resolved: &ResolvedImage) -> bool {
     let Some((repository, digest)) = value.rsplit_once('@') else {
         return false;
     };
-    // Classic image stores expose the pulled manifest digest here. Docker's
-    // containerd image store can instead synthesize RepoDigests from the local
-    // image target, which is the already verified config digest.
-    if digest != resolved.manifest_digest && digest != resolved.local_image_id {
+    let Ok(identity) = resolved.image_identity() else {
+        return false;
+    };
+    if !identity.matches_engine_image_id(Some(digest)) {
         return false;
     }
     let mut parts = repository.split('/');
@@ -614,6 +615,7 @@ mod tests {
         let (_root, _puller, resolved, _credential) = fixture();
         let image = ImageRecord {
             id: resolved.local_image_id.clone(),
+            manifest_descriptor: None,
             repo_digests: vec![format!("registry.example/app@{}", resolved.manifest_digest)],
             os: "linux".into(),
             architecture: "amd64".into(),
@@ -633,6 +635,7 @@ mod tests {
             format!("docker.io/library/postgres@{}", resolved.manifest_digest);
         let image = ImageRecord {
             id: resolved.local_image_id.clone(),
+            manifest_descriptor: None,
             repo_digests: vec![format!("postgres@{}", resolved.local_image_id)],
             os: "linux".into(),
             architecture: "amd64".into(),
@@ -652,6 +655,7 @@ mod tests {
             format!("docker.io/library/postgres@{}", resolved.manifest_digest);
         let image = ImageRecord {
             id: resolved.manifest_digest.clone(),
+            manifest_descriptor: None,
             repo_digests: vec![format!("postgres@{}", resolved.manifest_digest)],
             os: "linux".into(),
             architecture: "amd64".into(),
@@ -662,10 +666,36 @@ mod tests {
     }
 
     #[test]
+    fn image_verification_requires_present_descriptor_to_match() {
+        let (_root, _puller, resolved, _credential) = fixture();
+        let mut image = ImageRecord {
+            id: resolved.manifest_digest.clone(),
+            manifest_descriptor: Some(crate::registry::ManifestDescriptor {
+                digest: Some(resolved.manifest_digest.clone()),
+                os: Some("linux".into()),
+                architecture: Some("amd64".into()),
+                variant: None,
+            }),
+            repo_digests: vec![format!("registry.example/app@{}", resolved.manifest_digest)],
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            variant: None,
+        };
+        assert!(image_matches_resolved(&image, &resolved));
+
+        image.manifest_descriptor.as_mut().unwrap().digest =
+            Some(format!("sha256:{}", "c".repeat(64)));
+        assert!(!image_matches_resolved(&image, &resolved));
+        image.manifest_descriptor = Some(crate::registry::ManifestDescriptor::default());
+        assert!(!image_matches_resolved(&image, &resolved));
+    }
+
+    #[test]
     fn image_verification_keeps_digest_repository_and_platform_guards() {
         let (_root, _puller, resolved, _credential) = fixture();
         let valid = ImageRecord {
             id: resolved.local_image_id.clone(),
+            manifest_descriptor: None,
             repo_digests: vec![format!("registry.example/app@{}", resolved.local_image_id)],
             os: "linux".into(),
             architecture: "amd64".into(),

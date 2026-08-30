@@ -230,6 +230,7 @@ fn owned_container(id: char, app_id: Uuid, release_id: Uuid, managed: bool) -> C
         finished_at: None,
         configured_image_ref: None,
         image_id: None,
+        manifest_descriptor: None,
         ports: vec![],
         mounts: vec![],
         networks: vec![],
@@ -390,6 +391,8 @@ impl Harness {
             tasks: state.stream_tasks.clone(),
             #[cfg(feature = "docker-e2e")]
             test_effect_gate: None,
+            #[cfg(feature = "docker-e2e")]
+            test_candidate_gate: None,
         };
         let poller = PollCoordinator::new(
             PollStateStore::new(database.clone()),

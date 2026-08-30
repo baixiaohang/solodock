@@ -42,6 +42,8 @@ pub struct DeploymentEngine {
     pub tasks: TaskTracker,
     #[cfg(feature = "docker-e2e")]
     pub test_effect_gate: Option<TestEffectGate>,
+    #[cfg(feature = "docker-e2e")]
+    pub test_candidate_gate: Option<TestEffectGate>,
 }
 
 #[cfg(feature = "docker-e2e")]
@@ -114,26 +116,7 @@ impl DeploymentEngine {
         self.tasks.spawn(async move {
             let _guards = (app_guard, global_guard);
             if let Err(error) = engine.run(&state, &m3, deployment_id).await {
-                let (status, code) = match error {
-                    EngineError::Interrupted => {
-                        (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERRUPTED")
-                    }
-                    EngineError::NeedsAttention(code) => (DeploymentStatus::NeedsAttention, code),
-                    EngineError::Stable(code) => (DeploymentStatus::Failed, code),
-                    EngineError::Internal | EngineError::AlreadyTerminal => {
-                        (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERNAL")
-                    }
-                };
-                let _ = engine
-                    .ledger
-                    .transition(
-                        deployment_id,
-                        DeploymentPhase::Terminal,
-                        status,
-                        "failed",
-                        Some(code),
-                    )
-                    .await;
+                record_terminal_error(&engine.ledger, deployment_id, error).await;
                 m3.reconcile_notify.notify_one();
             }
         });
@@ -321,48 +304,47 @@ impl DeploymentEngine {
             )
             .await;
         if let Err(error) = compose_result {
-            return match error {
-                ComposeError::ValidationFailed
-                | ComposeError::OutputInvalid
-                | ComposeError::UnsafePath => {
-                    match self
-                        .observe_failed_apply(&record, candidate_id, &candidate_release)
-                        .await?
-                    {
-                        FailedApplyObservation::NoEffect => {
-                            self.cleanup_pending(record.app_id, candidate_id)?;
-                            Err(EngineError::Stable(error.public_code()))
-                        }
-                        FailedApplyObservation::Candidate(container) => {
-                            self.ledger
-                                .mark_effect_observed(deployment_id, &container.id)
-                                .await
-                                .map_err(|_| EngineError::Internal)?;
-                            self.rollback_or_fail(
-                                state,
-                                m3,
-                                &record,
-                                active,
-                                candidate_id,
-                                error.public_code(),
-                            )
-                            .await
-                        }
-                    }
+            if matches!(error, ComposeError::Cancelled) {
+                return Err(EngineError::Interrupted);
+            }
+            return match self.observe_failed_apply(&record, candidate_id).await? {
+                FailedApplyObservation::Candidate(container) => {
+                    self.ledger
+                        .mark_effect_observed(deployment_id, &container.id)
+                        .await
+                        .map_err(|_| EngineError::Internal)?;
+                    self.rollback_or_fail(
+                        state,
+                        m3,
+                        &record,
+                        CompensationRequest {
+                            active,
+                            candidate: candidate_id,
+                            container: &container,
+                            code: error.public_code(),
+                        },
+                    )
+                    .await
                 }
-                ComposeError::Unavailable
-                | ComposeError::Incompatible
-                | ComposeError::PermissionDenied
-                | ComposeError::Timeout
-                | ComposeError::Cancelled
-                | ComposeError::UnknownEffect => Err(EngineError::Interrupted),
+                FailedApplyObservation::NoEffect
+                    if matches!(
+                        error,
+                        ComposeError::ValidationFailed
+                            | ComposeError::OutputInvalid
+                            | ComposeError::UnsafePath
+                    ) =>
+                {
+                    self.cleanup_pending(record.app_id, candidate_id)?;
+                    Err(EngineError::Stable(error.public_code()))
+                }
+                FailedApplyObservation::NoEffect => Err(EngineError::Interrupted),
             };
         }
+        self.test_candidate_boundary().await?;
         let candidate = self
-            .observe_candidate(
+            .observe_owned_candidate(
                 record.app_id,
                 candidate_id,
-                &candidate_release,
                 predecessor.as_ref().map(|v| v.id.as_str()),
             )
             .await?;
@@ -370,6 +352,21 @@ impl DeploymentEngine {
             .mark_effect_observed(deployment_id, &candidate.id)
             .await
             .map_err(|_| EngineError::Internal)?;
+        if !candidate_matches_release(&candidate, &candidate_release) {
+            return self
+                .rollback_or_fail(
+                    state,
+                    m3,
+                    &record,
+                    CompensationRequest {
+                        active,
+                        candidate: candidate_id,
+                        container: &candidate,
+                        code: "CANDIDATE_INVALID",
+                    },
+                )
+                .await;
+        }
 
         self.ledger
             .transition(
@@ -386,7 +383,10 @@ impl DeploymentEngine {
             .verify(
                 &candidate.id,
                 candidate_id,
-                &candidate_release.local_image_id,
+                &candidate_release.runnable_image_ref,
+                &candidate_release
+                    .image_identity()
+                    .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?,
                 &loaded.metadata.health,
                 Duration::from_secs(300),
             )
@@ -402,9 +402,12 @@ impl DeploymentEngine {
                         state,
                         m3,
                         &record,
-                        active,
-                        candidate_id,
-                        error.public_code(),
+                        CompensationRequest {
+                            active,
+                            candidate: candidate_id,
+                            container: &candidate,
+                            code: error.public_code(),
+                        },
                     )
                     .await;
             }
@@ -430,10 +433,25 @@ impl DeploymentEngine {
             .map_err(|_| EngineError::Internal)?;
         self.verify_release_links(record.app_id, active, candidate_id)?;
         let final_candidate = self
-            .observe_candidate(record.app_id, candidate_id, &candidate_release, None)
+            .observe_owned_candidate(record.app_id, candidate_id, None)
             .await?;
         if final_candidate.id != candidate.id {
             return Err(EngineError::NeedsAttention("CONTAINER_CHANGED"));
+        }
+        if !candidate_matches_release(&final_candidate, &candidate_release) {
+            return self
+                .rollback_or_fail(
+                    state,
+                    m3,
+                    &record,
+                    CompensationRequest {
+                        active,
+                        candidate: candidate_id,
+                        container: &final_candidate,
+                        code: "CANDIDATE_INVALID",
+                    },
+                )
+                .await;
         }
         let desired = if matches!(
             loaded.metadata.health,
@@ -931,9 +949,7 @@ impl DeploymentEngine {
         let Some(container) = self.schedule_predecessor(record).await? else {
             return Ok(false);
         };
-        if container.configured_image_ref.as_deref() != Some(release.runnable_image_ref.as_str())
-            || container.image_id.as_deref() != Some(release.local_image_id.as_str())
-        {
+        if !candidate_matches_release(&container, release) {
             return Ok(false);
         }
         let loaded = config_revision::load_verified(
@@ -959,11 +975,10 @@ impl DeploymentEngine {
         })
     }
 
-    async fn observe_candidate(
+    async fn observe_owned_candidate(
         &self,
         app_id: Uuid,
         release: Uuid,
-        target: &ReleaseV2,
         old_id: Option<&str>,
     ) -> Result<ContainerRecord, EngineError> {
         let app = minimal_app(app_id, Some(release));
@@ -978,19 +993,11 @@ impl DeploymentEngine {
         let candidate = candidates.into_iter().next().expect("one candidate");
         let identity = validate_syntactic_identity(&candidate.labels, &app)
             .ok_or(EngineError::NeedsAttention("APP_CONTAINER_INVALID"))?;
-        if identity.release_id != release
-            || candidate.configured_image_ref.as_deref() != Some(target.runnable_image_ref.as_str())
-            || candidate.image_id.as_deref() != Some(target.local_image_id.as_str())
-            || old_id == Some(candidate.id.as_str())
-            || !matches!(
-                candidate.status,
-                ContainerStatus::Running
-                    | ContainerStatus::Created
-                    | ContainerStatus::Restarting
-                    | ContainerStatus::Exited
-            )
-        {
-            return Err(EngineError::NeedsAttention("CANDIDATE_INVALID"));
+        if identity.release_id != release {
+            return Err(EngineError::NeedsAttention("APP_CONTAINER_INVALID"));
+        }
+        if old_id == Some(candidate.id.as_str()) {
+            return Err(EngineError::NeedsAttention("CONTAINER_CHANGED"));
         }
         Ok(candidate)
     }
@@ -999,7 +1006,6 @@ impl DeploymentEngine {
         &self,
         record: &DeploymentRecord,
         candidate_id: Uuid,
-        candidate_release: &ReleaseV2,
     ) -> Result<FailedApplyObservation, EngineError> {
         let app = minimal_app(record.app_id, Some(candidate_id));
         let candidates = self
@@ -1032,11 +1038,7 @@ impl DeploymentEngine {
         }
         let identity =
             validate_syntactic_identity(&container.labels, &app).ok_or(EngineError::Interrupted)?;
-        if identity.release_id == candidate_id
-            && container.configured_image_ref.as_deref()
-                == Some(candidate_release.runnable_image_ref.as_str())
-            && container.image_id.as_deref() == Some(candidate_release.local_image_id.as_str())
-        {
+        if identity.release_id == candidate_id {
             return Ok(FailedApplyObservation::Candidate(Box::new(container)));
         }
         Err(EngineError::Interrupted)
@@ -1047,17 +1049,28 @@ impl DeploymentEngine {
         state: &AppState,
         m3: &M3Services,
         record: &DeploymentRecord,
-        active: Option<Uuid>,
-        candidate: Uuid,
-        code: &'static str,
+        request: CompensationRequest<'_>,
     ) -> Result<(), EngineError> {
+        let CompensationRequest {
+            active,
+            candidate,
+            container: candidate_container,
+            code,
+        } = request;
         let candidate_release = self
             .store
             .load_v2_release(record.app_id, candidate)
             .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
-        let candidate_container = self
-            .observe_candidate(record.app_id, candidate, &candidate_release, None)
-            .await?;
+        self.ledger
+            .transition(
+                record.id,
+                DeploymentPhase::RollingBack,
+                DeploymentStatus::Running,
+                "candidate_failed",
+                Some(code),
+            )
+            .await
+            .map_err(|_| EngineError::Internal)?;
         let Some(old_id) = active else {
             self.ledger
                 .mark_rollback_started(record.id, &candidate_container.id)
@@ -1093,7 +1106,7 @@ impl DeploymentEngine {
             .await
             .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
             let final_candidate = self
-                .observe_candidate(record.app_id, candidate, &final_release, None)
+                .observe_owned_candidate(record.app_id, candidate, None)
                 .await?;
             if final_candidate.id != candidate_container.id {
                 return Err(EngineError::Interrupted);
@@ -1102,40 +1115,18 @@ impl DeploymentEngine {
                 crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                     .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
             }
-            self.compose
-                .run(
-                    ComposeAction::Remove,
-                    self.context(record.app_id, candidate),
-                )
-                .await
-                .map_err(|_| EngineError::Interrupted)?;
-            let remaining = self
-                .docker
-                .list_compose_app_containers(&crate::domain::AppMetadata::project_name(
-                    record.app_id,
-                ))
-                .await
-                .map_err(|_| EngineError::Interrupted)?;
-            if !remaining.is_empty() {
-                return Err(EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"));
-            }
-            self.ledger
-                .mark_rollback_observed(record.id, None)
-                .await
-                .map_err(|_| EngineError::Internal)?;
-            self.cleanup_pending(record.app_id, candidate)?;
+            remove_first_deploy_candidate(
+                &self.store,
+                &self.ledger,
+                self.compose.as_ref(),
+                self.docker.as_ref(),
+                record,
+                candidate,
+                self.context(record.app_id, candidate),
+            )
+            .await?;
             return Err(EngineError::Stable(code));
         };
-        self.ledger
-            .transition(
-                record.id,
-                DeploymentPhase::RollingBack,
-                DeploymentStatus::Running,
-                "candidate_failed",
-                Some(code),
-            )
-            .await
-            .map_err(|_| EngineError::Internal)?;
         let old = self
             .store
             .load_v2_release(record.app_id, old_id)
@@ -1188,7 +1179,7 @@ impl DeploymentEngine {
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
         let fresh_candidate = self
-            .observe_candidate(record.app_id, candidate, &final_candidate_release, None)
+            .observe_owned_candidate(record.app_id, candidate, None)
             .await?;
         if fresh_candidate.id != candidate_container.id {
             return Err(EngineError::Interrupted);
@@ -1219,8 +1210,11 @@ impl DeploymentEngine {
                 _ => EngineError::Interrupted,
             })?;
         let container = self
-            .observe_candidate(record.app_id, old_id, &old, None)
+            .observe_owned_candidate(record.app_id, old_id, Some(&fresh_candidate.id))
             .await?;
+        if !candidate_matches_release(&container, &old) {
+            return Err(EngineError::NeedsAttention("ROLLBACK_FAILED"));
+        }
         self.ledger
             .mark_rollback_observed(record.id, Some(&container.id))
             .await
@@ -1239,7 +1233,9 @@ impl DeploymentEngine {
             .verify(
                 &container.id,
                 old_id,
-                &old.local_image_id,
+                &old.runnable_image_ref,
+                &old.image_identity()
+                    .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?,
                 &loaded.metadata.health,
                 Duration::from_secs(300),
             )
@@ -1295,11 +1291,68 @@ impl DeploymentEngine {
         }
         Ok(())
     }
+
+    async fn test_candidate_boundary(&self) -> Result<(), EngineError> {
+        #[cfg(feature = "docker-e2e")]
+        if let Some(gate) = &self.test_candidate_gate {
+            gate.enter(&self.shutdown).await?;
+        }
+        Ok(())
+    }
     fn cleanup_pending(&self, app_id: Uuid, candidate: Uuid) -> Result<(), EngineError> {
         self.store
             .remove_release_link_if(app_id, "pending", candidate)
             .map_err(|_| EngineError::Interrupted)
     }
+}
+
+async fn record_terminal_error(ledger: &DeploymentLedger, deployment_id: Uuid, error: EngineError) {
+    let (status, code) = match error {
+        EngineError::Interrupted => (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERRUPTED"),
+        EngineError::NeedsAttention(code) => (DeploymentStatus::NeedsAttention, code),
+        EngineError::Stable(code) => (DeploymentStatus::Failed, code),
+        EngineError::Internal | EngineError::AlreadyTerminal => {
+            (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERNAL")
+        }
+    };
+    let _ = ledger
+        .transition(
+            deployment_id,
+            DeploymentPhase::Terminal,
+            status,
+            "failed",
+            Some(code),
+        )
+        .await;
+}
+
+async fn remove_first_deploy_candidate(
+    store: &AppStore,
+    ledger: &DeploymentLedger,
+    compose: &dyn ComposeRunner,
+    docker: &dyn DockerReadApi,
+    record: &DeploymentRecord,
+    candidate: Uuid,
+    context: RunContext,
+) -> Result<(), EngineError> {
+    compose
+        .run(ComposeAction::Remove, context)
+        .await
+        .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
+    let remaining = docker
+        .list_compose_app_containers(&crate::domain::AppMetadata::project_name(record.app_id))
+        .await
+        .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
+    if !remaining.is_empty() {
+        return Err(EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"));
+    }
+    ledger
+        .mark_rollback_observed(record.id, None)
+        .await
+        .map_err(|_| EngineError::Internal)?;
+    store
+        .remove_release_link_if(record.app_id, "pending", candidate)
+        .map_err(|_| EngineError::Interrupted)
 }
 
 fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
@@ -1345,6 +1398,24 @@ fn resolved_from_release(value: &ReleaseV2) -> ResolvedImage {
     }
 }
 
+fn candidate_matches_release(container: &ContainerRecord, release: &ReleaseV2) -> bool {
+    let Ok(identity) = release.image_identity() else {
+        return false;
+    };
+    container.configured_image_ref.as_deref() == Some(release.runnable_image_ref.as_str())
+        && identity.matches_observation(
+            container.image_id.as_deref(),
+            container.manifest_descriptor.as_ref(),
+        )
+        && matches!(
+            container.status,
+            ContainerStatus::Running
+                | ContainerStatus::Created
+                | ContainerStatus::Restarting
+                | ContainerStatus::Exited
+        )
+}
+
 #[derive(Debug)]
 enum EngineError {
     Stable(&'static str),
@@ -1357,4 +1428,416 @@ enum EngineError {
 enum FailedApplyObservation {
     NoEffect,
     Candidate(Box<ContainerRecord>),
+}
+
+struct CompensationRequest<'a> {
+    active: Option<Uuid>,
+    candidate: Uuid,
+    container: &'a ContainerRecord,
+    code: &'static str,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    use super::*;
+    use crate::{
+        app_store::atomic::AtomicWriter,
+        compose::ComposeOutput,
+        db::Database,
+        docker::models::{
+            DockerError, DockerErrorKind, DockerStream, HealthStatus, LogChunk, LogRequest,
+            ProbeSnapshot, RawDockerEvent, RawStats,
+        },
+        registry::ManifestDescriptor,
+    };
+
+    fn release() -> ReleaseV2 {
+        let manifest = format!("sha256:{}", "a".repeat(64));
+        ReleaseV2 {
+            schema_version: 2,
+            id: Uuid::new_v4(),
+            app_id: Uuid::new_v4(),
+            config_revision: Uuid::new_v4(),
+            config_sha256: "0".repeat(64),
+            source_image_ref: "registry.example/app:stable".into(),
+            logical_registry: "registry.example".into(),
+            repository: "app".into(),
+            source_tag: "stable".into(),
+            source_descriptor_digest: manifest.clone(),
+            index_digest: None,
+            manifest_digest: manifest.clone(),
+            runnable_image_ref: format!("registry.example/app@{manifest}"),
+            platform_os: "linux".into(),
+            platform_architecture: "amd64".into(),
+            platform_variant: None,
+            local_image_id: format!("sha256:{}", "b".repeat(64)),
+            compose_sha256: "1".repeat(64),
+            credential_ref: None,
+            trigger: ReleaseTrigger::Manual,
+            source_release_id: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            integrity_hmac: "signature".into(),
+        }
+    }
+
+    fn container(release: &ReleaseV2, image_id: String) -> ContainerRecord {
+        ContainerRecord {
+            id: "c".repeat(64),
+            name: "app".into(),
+            labels: HashMap::new(),
+            status: ContainerStatus::Running,
+            health: HealthStatus::None,
+            exit_code: None,
+            restart_count: Some(0),
+            started_at: Some("2026-08-30T00:00:00Z".into()),
+            finished_at: None,
+            configured_image_ref: Some(release.runnable_image_ref.clone()),
+            image_id: Some(image_id),
+            manifest_descriptor: None,
+            ports: Vec::new(),
+            mounts: Vec::new(),
+            networks: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn release_matcher_covers_noop_candidate_health_and_rollback_identity() {
+        let release = release();
+        let classic = container(&release, release.local_image_id.clone());
+        assert!(candidate_matches_release(&classic, &release));
+
+        let mut containerd = container(&release, release.manifest_digest.clone());
+        containerd.manifest_descriptor = Some(ManifestDescriptor {
+            digest: Some(release.manifest_digest.clone()),
+            os: Some("linux".into()),
+            architecture: Some("amd64".into()),
+            variant: None,
+        });
+        assert!(candidate_matches_release(&containerd, &release));
+
+        let mut wrong_descriptor = containerd.clone();
+        wrong_descriptor
+            .manifest_descriptor
+            .as_mut()
+            .unwrap()
+            .digest = Some(format!("sha256:{}", "d".repeat(64)));
+        assert!(!candidate_matches_release(&wrong_descriptor, &release));
+        let mut mutable_ref = containerd.clone();
+        mutable_ref.configured_image_ref = Some("registry.example/app:stable".into());
+        assert!(!candidate_matches_release(&mutable_ref, &release));
+        let mut paused = containerd;
+        paused.status = ContainerStatus::Paused;
+        assert!(!candidate_matches_release(&paused, &release));
+    }
+
+    struct CleanupCompose {
+        fail_remove: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ComposeRunner for CleanupCompose {
+        async fn run(
+            &self,
+            action: ComposeAction,
+            _context: RunContext,
+        ) -> Result<ComposeOutput, ComposeError> {
+            assert_eq!(action, ComposeAction::Remove);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_remove {
+                Err(ComposeError::UnknownEffect)
+            } else {
+                Ok(ComposeOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+    }
+
+    enum CleanupObservation {
+        Error,
+        Containers(Vec<ContainerRecord>),
+    }
+
+    struct CleanupDocker {
+        observation: CleanupObservation,
+        list_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DockerReadApi for CleanupDocker {
+        async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+            Err(DockerError::new(DockerErrorKind::Unavailable))
+        }
+
+        async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+            self.list_compose_app_containers("unused").await
+        }
+
+        async fn list_compose_app_containers(
+            &self,
+            _project_name: &str,
+        ) -> Result<Vec<ContainerRecord>, DockerError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.observation {
+                CleanupObservation::Error => {
+                    Err(DockerError::new(DockerErrorKind::ObservationFailed))
+                }
+                CleanupObservation::Containers(containers) => Ok(containers.clone()),
+            }
+        }
+
+        async fn inspect_container(&self, _id: &str) -> Result<ContainerRecord, DockerError> {
+            Err(DockerError::new(DockerErrorKind::ContainerChanged))
+        }
+
+        async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+
+        async fn logs(
+            &self,
+            _id: &str,
+            _request: LogRequest,
+        ) -> Result<DockerStream<LogChunk>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+
+        async fn stats(&self, _id: &str) -> Result<DockerStream<RawStats>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    struct CleanupFixture {
+        _root: tempfile::TempDir,
+        store: AppStore,
+        ledger: DeploymentLedger,
+        record: DeploymentRecord,
+        candidate: Uuid,
+        context: RunContext,
+    }
+
+    async fn cleanup_fixture() -> CleanupFixture {
+        let root = tempfile::tempdir().unwrap();
+        let apps = root.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = AppStore::initialize_verified(apps, vec![7; 32]).unwrap();
+        let app_id = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let app_directory = store.app_directory(app_id);
+        let releases_directory = app_directory.join("releases");
+        let candidate_directory = releases_directory.join(candidate.to_string());
+        for directory in [
+            app_directory.as_path(),
+            releases_directory.as_path(),
+            candidate_directory.as_path(),
+        ] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        AtomicWriter::switch_release_link(&app_directory, "pending", candidate).unwrap();
+
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let ledger = DeploymentLedger::new(database);
+        let record = ledger
+            .create(
+                Uuid::new_v4(),
+                app_id,
+                DeploymentTrigger::Manual,
+                Uuid::new_v4(),
+                None,
+                None,
+                None,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        ledger
+            .transition(
+                record.id,
+                DeploymentPhase::RollingBack,
+                DeploymentStatus::Running,
+                "candidate_failed",
+                Some("CANDIDATE_INVALID"),
+            )
+            .await
+            .unwrap();
+        ledger
+            .mark_rollback_started(record.id, &"c".repeat(64))
+            .await
+            .unwrap();
+        let context = RunContext {
+            project_name: crate::domain::AppMetadata::project_name(app_id),
+            project_directory: app_directory,
+            compose_file: store.release_compose_path(app_id, candidate),
+            timeout: Duration::from_secs(60),
+            redaction_patterns: Vec::new(),
+        };
+        CleanupFixture {
+            _root: root,
+            store,
+            ledger,
+            record,
+            candidate,
+            context,
+        }
+    }
+
+    fn leftover_candidate() -> ContainerRecord {
+        let release = release();
+        container(&release, release.local_image_id.clone())
+    }
+
+    async fn assert_cleanup_failure(
+        name: &str,
+        fail_remove: bool,
+        observation: CleanupObservation,
+        expected_list_calls: usize,
+    ) {
+        let fixture = cleanup_fixture().await;
+        let compose = CleanupCompose {
+            fail_remove,
+            calls: AtomicUsize::new(0),
+        };
+        let docker = CleanupDocker {
+            observation,
+            list_calls: AtomicUsize::new(0),
+        };
+        let error = remove_first_deploy_candidate(
+            &fixture.store,
+            &fixture.ledger,
+            &compose,
+            &docker,
+            &fixture.record,
+            fixture.candidate,
+            fixture.context,
+        )
+        .await
+        .expect_err(name);
+        assert!(
+            matches!(
+                &error,
+                EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED")
+            ),
+            "{name}: unexpected compensation result"
+        );
+        record_terminal_error(&fixture.ledger, fixture.record.id, error).await;
+
+        let terminal = fixture
+            .ledger
+            .get(fixture.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, DeploymentStatus::NeedsAttention, "{name}");
+        assert_eq!(
+            terminal.error_code.as_deref(),
+            Some("CANDIDATE_CLEANUP_FAILED"),
+            "{name}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .read_release_link(fixture.record.app_id, "pending")
+                .unwrap(),
+            Some(fixture.candidate),
+            "{name}: cleanup failure must retain pending"
+        );
+        assert_eq!(compose.calls.load(Ordering::SeqCst), 1, "{name}");
+        assert_eq!(
+            docker.list_calls.load(Ordering::SeqCst),
+            expected_list_calls,
+            "{name}"
+        );
+        let transitions = fixture.ledger.transitions(fixture.record.id).await.unwrap();
+        assert!(
+            transitions.iter().any(|transition| {
+                transition.result == "candidate_failed"
+                    && transition.code.as_deref() == Some("CANDIDATE_INVALID")
+            }),
+            "{name}: original candidate rejection must remain in history"
+        );
+        let compensation = transitions.last().unwrap();
+        assert_eq!(compensation.phase, DeploymentPhase::Terminal, "{name}");
+        assert_eq!(compensation.result, "failed", "{name}");
+        assert_eq!(
+            compensation.code.as_deref(),
+            Some("CANDIDATE_CLEANUP_FAILED"),
+            "{name}: compensation failure must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_deploy_cleanup_failures_retain_pending_and_never_report_failed() {
+        assert_cleanup_failure(
+            "remove failure",
+            true,
+            CleanupObservation::Containers(Vec::new()),
+            0,
+        )
+        .await;
+        assert_cleanup_failure("observation failure", false, CleanupObservation::Error, 1).await;
+        assert_cleanup_failure(
+            "container remains",
+            false,
+            CleanupObservation::Containers(vec![leftover_candidate()]),
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn first_deploy_cleanup_allows_failed_only_after_observed_absence() {
+        let fixture = cleanup_fixture().await;
+        let compose = CleanupCompose {
+            fail_remove: false,
+            calls: AtomicUsize::new(0),
+        };
+        let docker = CleanupDocker {
+            observation: CleanupObservation::Containers(Vec::new()),
+            list_calls: AtomicUsize::new(0),
+        };
+        remove_first_deploy_candidate(
+            &fixture.store,
+            &fixture.ledger,
+            &compose,
+            &docker,
+            &fixture.record,
+            fixture.candidate,
+            fixture.context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .read_release_link(fixture.record.app_id, "pending")
+                .unwrap(),
+            None
+        );
+        record_terminal_error(
+            &fixture.ledger,
+            fixture.record.id,
+            EngineError::Stable("CANDIDATE_INVALID"),
+        )
+        .await;
+        let terminal = fixture
+            .ledger
+            .get(fixture.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, DeploymentStatus::Failed);
+        assert_eq!(terminal.error_code.as_deref(), Some("CANDIDATE_INVALID"));
+    }
 }

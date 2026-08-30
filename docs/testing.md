@@ -17,6 +17,8 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 Docker/Compose E2E 必须使用隔离 daemon 或显式 test-only endpoint。生产代码固定 `/var/run/docker.sock`；仅 `docker-e2e` feature 可把 runner连接到测试 daemon。
 
+CI 保留 Docker 27 classic image store 的完整 DinD 回归，并保留固定 Docker 29.7.2 focused containerd job 的定义。containerd job 因 focused suite 在 setup、backend 断言和 image pull 成功后出现无界等待而暂时禁用；重新启用前必须为每个场景增加 bounded timeout，并证明失败/超时 cleanup 可收敛。两个 job 的 backend 硬断言仍是启用后的必要条件：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter，不能把两个 job 静默跑成同一存储模式。
+
 每次运行生成唯一 project/run token，并记录所有 container、volume、network 和临时 bind source 的精确 ID。cleanup 前重新 inspect full ID、label 与 run token，finally 只删除本次创建的对象。
 
 测试禁止：
@@ -64,9 +66,13 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 - public/private Bearer auth、exact scope、401/403/TLS taxonomy；
 - parent/child digest、manifest media type和canonical platform；
+- classic image store 的 config ID、containerd image store 的 manifest ID，以及 descriptor present-invalid fail closed；
 - resolve→pull之间tag移动仍运行已解析digest；
-- candidate durable-before-effect、marker后final facts recheck；
+- candidate durable-before-effect；首次 post-effect observation 用唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim，并写入 exact `post_container_id`；
+- pre-marker canonical candidate claim 后的 semantic mismatch 进入确定性补偿；post-marker 不同 full ID 才是 replacement，必须保留 pending/替代容器且不能伪造 `failed`/`rolled_back`；
+- 首次部署的 remove 失败、remove 后 observation 失败或仍有 container 必须保留 pending 和原始 `candidate_failed` history，只能记录 `CANDIDATE_CLEANUP_FAILED`，不能写 `failed`；
 - health failure自动恢复、manual rollback和rollback failure；
+- candidate 创建后的确定性身份拒绝会在首次部署证明移除、在已有 active 时恢复并健康复核旧 release；
 - timeout/shutdown/unknown effect保持interrupted并由fresh exact facts收敛；
 - poll no-op、busy coalescing、backoff、ETag generation隔离和failed-target suppression；
 - production coordinator heap/dispatch、durable webhook wake、cancel和TaskTracker join。

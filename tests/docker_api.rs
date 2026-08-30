@@ -208,6 +208,7 @@ impl Harness {
                 "registry.example/app@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into()
             }),
             image_id: Some(format!("sha256:{}", "c".repeat(64))),
+            manifest_descriptor: None,
             ports: Vec::new(),
             mounts: vec![MountProjection {
                 kind: MountKind::Volume,

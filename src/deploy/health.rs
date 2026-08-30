@@ -9,6 +9,7 @@ use crate::{
         ownership::RELEASE_ID_LABEL,
     },
     domain::HealthPolicy,
+    registry::ImageIdentity,
 };
 
 #[derive(Clone, Debug, Serialize)]
@@ -35,13 +36,21 @@ impl HealthVerifier {
         &self,
         container_id: &str,
         release_id: uuid::Uuid,
-        image_id: &str,
+        configured_image_ref: &str,
+        image_identity: &ImageIdentity,
         policy: &HealthPolicy,
         deadline: Duration,
     ) -> Result<HealthResult, HealthError> {
         let started = tokio::time::Instant::now();
         let first = self
-            .inspect_before(container_id, release_id, image_id, started, deadline)
+            .inspect_before(
+                container_id,
+                release_id,
+                configured_image_ref,
+                image_identity,
+                started,
+                deadline,
+            )
             .await?;
         let baseline_started = first.started_at.clone();
         let baseline_restarts = first.restart_count;
@@ -55,7 +64,14 @@ impl HealthVerifier {
         };
         loop {
             let container = self
-                .inspect_before(container_id, release_id, image_id, started, deadline)
+                .inspect_before(
+                    container_id,
+                    release_id,
+                    configured_image_ref,
+                    image_identity,
+                    started,
+                    deadline,
+                )
                 .await?;
             if container.started_at != baseline_started
                 || container.restart_count != baseline_restarts
@@ -118,7 +134,8 @@ impl HealthVerifier {
         &self,
         id: &str,
         release: uuid::Uuid,
-        image: &str,
+        configured_image_ref: &str,
+        image_identity: &ImageIdentity,
         started: tokio::time::Instant,
         deadline: Duration,
     ) -> Result<crate::docker::models::ContainerRecord, HealthError> {
@@ -127,7 +144,10 @@ impl HealthVerifier {
             .ok_or(HealthError::Timeout)?;
         tokio::select! {
             () = self.shutdown.cancelled() => Err(HealthError::Interrupted),
-            result = tokio::time::timeout(remaining, self.inspect_exact(id, release, image)) => {
+            result = tokio::time::timeout(
+                remaining,
+                self.inspect_exact(id, release, configured_image_ref, image_identity),
+            ) => {
                 result.map_err(|_| HealthError::Timeout)?
             }
         }
@@ -137,7 +157,8 @@ impl HealthVerifier {
         &self,
         id: &str,
         release: uuid::Uuid,
-        image: &str,
+        configured_image_ref: &str,
+        image_identity: &ImageIdentity,
     ) -> Result<crate::docker::models::ContainerRecord, HealthError> {
         let value = self
             .docker
@@ -147,9 +168,15 @@ impl HealthVerifier {
         if value.id != id
             || value.labels.get(RELEASE_ID_LABEL).map(String::as_str)
                 != Some(release.to_string().as_str())
-            || value.image_id.as_deref() != Some(image)
+            || value.configured_image_ref.as_deref() != Some(configured_image_ref)
         {
             return Err(HealthError::Changed);
+        }
+        if !image_identity.matches_observation(
+            value.image_id.as_deref(),
+            value.manifest_descriptor.as_ref(),
+        ) {
+            return Err(HealthError::IdentityMismatch);
         }
         Ok(value)
     }
@@ -171,6 +198,8 @@ pub enum HealthError {
     CompletedNonzero,
     #[error("container identity changed")]
     Changed,
+    #[error("container image identity mismatched")]
+    IdentityMismatch,
     #[error("Docker observation failed")]
     Observation,
     #[error("health verification interrupted")]
@@ -186,6 +215,7 @@ impl HealthError {
             Self::Restarted => "CONTAINER_RESTARTED",
             Self::CompletedNonzero => "COMPLETED_NONZERO",
             Self::Changed => "CONTAINER_CHANGED",
+            Self::IdentityMismatch => "CANDIDATE_INVALID",
             Self::Observation => "DOCKER_OBSERVATION_FAILED",
             Self::Interrupted => "DEPLOYMENT_INTERRUPTED",
         }
@@ -255,12 +285,22 @@ mod tests {
             restart_count: Some(0),
             started_at: Some("stable-start".into()),
             finished_at: None,
-            configured_image_ref: None,
-            image_id: Some("image".into()),
+            configured_image_ref: Some(format!("example/app@sha256:{}", "a".repeat(64))),
+            image_id: Some(format!("sha256:{}", "b".repeat(64))),
+            manifest_descriptor: None,
             ports: Vec::new(),
             mounts: Vec::new(),
             networks: Vec::new(),
         }
+    }
+
+    fn image_identity() -> ImageIdentity {
+        ImageIdentity::new(
+            &format!("sha256:{}", "a".repeat(64)),
+            &format!("sha256:{}", "b".repeat(64)),
+            &crate::registry::Platform::canonical("linux", "amd64", None).unwrap(),
+        )
+        .unwrap()
     }
 
     #[tokio::test(start_paused = true)]
@@ -285,7 +325,8 @@ mod tests {
                 .verify(
                     "container",
                     release,
-                    "image",
+                    &format!("example/app@sha256:{}", "a".repeat(64)),
+                    &image_identity(),
                     &HealthPolicy::Running {
                         stable_window_seconds: 3,
                     },
@@ -301,5 +342,55 @@ mod tests {
         );
         tokio::time::advance(Duration::from_secs(4)).await;
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn exact_health_observation_accepts_both_engine_ids_and_fails_closed_on_descriptor() {
+        let release = uuid::Uuid::new_v4();
+        let config_record = record(release, ContainerStatus::Running);
+        let mut manifest_record = config_record.clone();
+        manifest_record.image_id = Some(format!("sha256:{}", "a".repeat(64)));
+        manifest_record.manifest_descriptor = Some(crate::registry::ManifestDescriptor {
+            digest: Some(format!("sha256:{}", "a".repeat(64))),
+            os: Some("linux".into()),
+            architecture: Some("amd64".into()),
+            variant: None,
+        });
+        let mut wrong_descriptor = manifest_record.clone();
+        wrong_descriptor
+            .manifest_descriptor
+            .as_mut()
+            .unwrap()
+            .digest = Some(format!("sha256:{}", "c".repeat(64)));
+        let verifier = HealthVerifier::new(
+            Arc::new(ScriptedDocker {
+                records: Mutex::new(VecDeque::from([
+                    config_record.clone(),
+                    manifest_record,
+                    wrong_descriptor,
+                ])),
+                last: Mutex::new(None),
+            }),
+            CancellationToken::new(),
+        );
+        let configured = format!("example/app@sha256:{}", "a".repeat(64));
+        assert!(
+            verifier
+                .inspect_exact("container", release, &configured, &image_identity())
+                .await
+                .is_ok()
+        );
+        assert!(
+            verifier
+                .inspect_exact("container", release, &configured, &image_identity())
+                .await
+                .is_ok()
+        );
+        assert!(matches!(
+            verifier
+                .inspect_exact("container", release, &configured, &image_identity())
+                .await,
+            Err(HealthError::IdentityMismatch)
+        ));
     }
 }
