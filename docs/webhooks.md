@@ -1,6 +1,10 @@
 # SoloDock 签名 Registry Recheck Webhook
 
-M6 webhook 只表达“配置的 Registry tag 可能已变化”。它不会接收或信任 repository、tag、digest、Compose 或 Docker action；有效通知只写入 durable poll wake，随后由现有 PollCoordinator 重新读取 filesystem 配置、解析 Registry tag，并复用唯一的 digest deployment/health/rollback 状态机。
+Webhook 只表达“配置的 Registry tag 可能已变化”。它不会接收或信任 repository、tag、digest、Compose 或 Docker action；有效通知只写入 durable poll wake，随后由现有 PollCoordinator 重新读取 filesystem 配置、解析 Registry tag，并复用唯一的 digest deployment/health/rollback 状态机。
+
+## 能力边界
+
+Webhook 是可选增强，不是部署 API。当前不支持 provider-specific payload、unsigned compatibility、直接 deploy action、绕过 auto-deploy policy 的事件、Cosign/Sigstore、Cloudflare 自动配置、通用 import 或多主机编排。完整 deployment 状态与 backoff/suppression 语义见 [部署与回滚](deployments.md)。
 
 ## 入口隔离
 
@@ -30,3 +34,4 @@ solodock-webhook-v1\n<TIMESTAMP>\n<NONCE>\nPOST\n/hooks/v1/apps/<APP_UUID>/regis
 
 `202 Accepted` 仅表示 recheck 已持久接受，不表示存在新 digest 或部署成功。结果应在应用 polling/deployment 页面查看。Webhook 不绕过 auto-deploy disabled、Registry backoff、busy、failed-target suppression、drift、needs-attention 或健康门禁。
 
+管理端 webhook secret 是 write-only immutable revision，并纳入 recovery、redactor、backup 和 app deletion preview。API/幂等/删除共同边界见 [API 与实时流](api-and-streams.md)，secret 与公开入口的信任假设见 [威胁模型](threat-model.md)。
