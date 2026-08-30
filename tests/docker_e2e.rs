@@ -906,14 +906,14 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
     let run_token = Uuid::new_v4();
     let network_name = format!("solodock-e2e-alias-{run_token}");
     let pinned = docker
-        .inspect_image("alpine:3.20")
+        .inspect_image("nginx:1.27-alpine")
         .await
         .unwrap()
         .repo_digests
         .into_iter()
         .flatten()
         .next()
-        .expect("isolated daemon must expose a digest-bearing alpine image");
+        .expect("isolated daemon must expose a digest-bearing nginx image");
     let cancellation = CancellationToken::new();
     let tasks = TaskTracker::new();
     let recording_runner = RecordingComposeRunner::new(FixedComposeRunner::for_test_http(
@@ -949,7 +949,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
             let draft = json!({
                 "slug": format!("e2e-{alias}-{run_token}"),
                 "display_name": alias,
-                "discovery_image_ref": "alpine:3.20",
+                "discovery_image_ref": "nginx:1.27-alpine",
                 "credential_ref": null,
                 "auto_deploy_enabled": false,
                 "poll_interval_seconds": 300,
