@@ -70,6 +70,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - resolve→pull之间tag移动仍运行已解析digest；
 - candidate durable-before-effect；首次 post-effect observation 用唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim，并写入 exact `post_container_id`；
 - pre-marker canonical candidate claim 后的 semantic mismatch 进入确定性补偿；post-marker 不同 full ID 才是 replacement，必须保留 pending/替代容器且不能伪造 `failed`/`rolled_back`；
+- 首次部署的 remove 失败、remove 后 observation 失败或仍有 container 必须保留 pending 和原始 `candidate_failed` history，只能记录 `CANDIDATE_CLEANUP_FAILED`，不能写 `failed`；
 - health failure自动恢复、manual rollback和rollback failure；
 - candidate 创建后的确定性身份拒绝会在首次部署证明移除、在已有 active 时恢复并健康复核旧 release；
 - timeout/shutdown/unknown effect保持interrupted并由fresh exact facts收敛；

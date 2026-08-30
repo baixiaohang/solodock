@@ -116,26 +116,7 @@ impl DeploymentEngine {
         self.tasks.spawn(async move {
             let _guards = (app_guard, global_guard);
             if let Err(error) = engine.run(&state, &m3, deployment_id).await {
-                let (status, code) = match error {
-                    EngineError::Interrupted => {
-                        (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERRUPTED")
-                    }
-                    EngineError::NeedsAttention(code) => (DeploymentStatus::NeedsAttention, code),
-                    EngineError::Stable(code) => (DeploymentStatus::Failed, code),
-                    EngineError::Internal | EngineError::AlreadyTerminal => {
-                        (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERNAL")
-                    }
-                };
-                let _ = engine
-                    .ledger
-                    .transition(
-                        deployment_id,
-                        DeploymentPhase::Terminal,
-                        status,
-                        "failed",
-                        Some(code),
-                    )
-                    .await;
+                record_terminal_error(&engine.ledger, deployment_id, error).await;
                 m3.reconcile_notify.notify_one();
             }
         });
@@ -1134,28 +1115,16 @@ impl DeploymentEngine {
                 crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                     .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
             }
-            self.compose
-                .run(
-                    ComposeAction::Remove,
-                    self.context(record.app_id, candidate),
-                )
-                .await
-                .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
-            let remaining = self
-                .docker
-                .list_compose_app_containers(&crate::domain::AppMetadata::project_name(
-                    record.app_id,
-                ))
-                .await
-                .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
-            if !remaining.is_empty() {
-                return Err(EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"));
-            }
-            self.ledger
-                .mark_rollback_observed(record.id, None)
-                .await
-                .map_err(|_| EngineError::Internal)?;
-            self.cleanup_pending(record.app_id, candidate)?;
+            remove_first_deploy_candidate(
+                &self.store,
+                &self.ledger,
+                self.compose.as_ref(),
+                self.docker.as_ref(),
+                record,
+                candidate,
+                self.context(record.app_id, candidate),
+            )
+            .await?;
             return Err(EngineError::Stable(code));
         };
         let old = self
@@ -1337,6 +1306,55 @@ impl DeploymentEngine {
     }
 }
 
+async fn record_terminal_error(ledger: &DeploymentLedger, deployment_id: Uuid, error: EngineError) {
+    let (status, code) = match error {
+        EngineError::Interrupted => (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERRUPTED"),
+        EngineError::NeedsAttention(code) => (DeploymentStatus::NeedsAttention, code),
+        EngineError::Stable(code) => (DeploymentStatus::Failed, code),
+        EngineError::Internal | EngineError::AlreadyTerminal => {
+            (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERNAL")
+        }
+    };
+    let _ = ledger
+        .transition(
+            deployment_id,
+            DeploymentPhase::Terminal,
+            status,
+            "failed",
+            Some(code),
+        )
+        .await;
+}
+
+async fn remove_first_deploy_candidate(
+    store: &AppStore,
+    ledger: &DeploymentLedger,
+    compose: &dyn ComposeRunner,
+    docker: &dyn DockerReadApi,
+    record: &DeploymentRecord,
+    candidate: Uuid,
+    context: RunContext,
+) -> Result<(), EngineError> {
+    compose
+        .run(ComposeAction::Remove, context)
+        .await
+        .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
+    let remaining = docker
+        .list_compose_app_containers(&crate::domain::AppMetadata::project_name(record.app_id))
+        .await
+        .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
+    if !remaining.is_empty() {
+        return Err(EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"));
+    }
+    ledger
+        .mark_rollback_observed(record.id, None)
+        .await
+        .map_err(|_| EngineError::Internal)?;
+    store
+        .remove_release_link_if(record.app_id, "pending", candidate)
+        .map_err(|_| EngineError::Interrupted)
+}
+
 fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
     AppCatalogEntry {
         id,
@@ -1421,10 +1439,23 @@ struct CompensationRequest<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{
+        collections::HashMap,
+        os::unix::fs::PermissionsExt,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use super::*;
-    use crate::{docker::models::HealthStatus, registry::ManifestDescriptor};
+    use crate::{
+        app_store::atomic::AtomicWriter,
+        compose::ComposeOutput,
+        db::Database,
+        docker::models::{
+            DockerError, DockerErrorKind, DockerStream, HealthStatus, LogChunk, LogRequest,
+            ProbeSnapshot, RawDockerEvent, RawStats,
+        },
+        registry::ManifestDescriptor,
+    };
 
     fn release() -> ReleaseV2 {
         let manifest = format!("sha256:{}", "a".repeat(64));
@@ -1503,5 +1534,310 @@ mod tests {
         let mut paused = containerd;
         paused.status = ContainerStatus::Paused;
         assert!(!candidate_matches_release(&paused, &release));
+    }
+
+    struct CleanupCompose {
+        fail_remove: bool,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ComposeRunner for CleanupCompose {
+        async fn run(
+            &self,
+            action: ComposeAction,
+            _context: RunContext,
+        ) -> Result<ComposeOutput, ComposeError> {
+            assert_eq!(action, ComposeAction::Remove);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_remove {
+                Err(ComposeError::UnknownEffect)
+            } else {
+                Ok(ComposeOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+    }
+
+    enum CleanupObservation {
+        Error,
+        Containers(Vec<ContainerRecord>),
+    }
+
+    struct CleanupDocker {
+        observation: CleanupObservation,
+        list_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DockerReadApi for CleanupDocker {
+        async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+            Err(DockerError::new(DockerErrorKind::Unavailable))
+        }
+
+        async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+            self.list_compose_app_containers("unused").await
+        }
+
+        async fn list_compose_app_containers(
+            &self,
+            _project_name: &str,
+        ) -> Result<Vec<ContainerRecord>, DockerError> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            match &self.observation {
+                CleanupObservation::Error => {
+                    Err(DockerError::new(DockerErrorKind::ObservationFailed))
+                }
+                CleanupObservation::Containers(containers) => Ok(containers.clone()),
+            }
+        }
+
+        async fn inspect_container(&self, _id: &str) -> Result<ContainerRecord, DockerError> {
+            Err(DockerError::new(DockerErrorKind::ContainerChanged))
+        }
+
+        async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+
+        async fn logs(
+            &self,
+            _id: &str,
+            _request: LogRequest,
+        ) -> Result<DockerStream<LogChunk>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+
+        async fn stats(&self, _id: &str) -> Result<DockerStream<RawStats>, DockerError> {
+            Ok(Box::pin(futures_util::stream::empty()))
+        }
+    }
+
+    struct CleanupFixture {
+        _root: tempfile::TempDir,
+        store: AppStore,
+        ledger: DeploymentLedger,
+        record: DeploymentRecord,
+        candidate: Uuid,
+        context: RunContext,
+    }
+
+    async fn cleanup_fixture() -> CleanupFixture {
+        let root = tempfile::tempdir().unwrap();
+        let apps = root.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let store = AppStore::initialize_verified(apps, vec![7; 32]).unwrap();
+        let app_id = Uuid::new_v4();
+        let candidate = Uuid::new_v4();
+        let app_directory = store.app_directory(app_id);
+        let releases_directory = app_directory.join("releases");
+        let candidate_directory = releases_directory.join(candidate.to_string());
+        for directory in [
+            app_directory.as_path(),
+            releases_directory.as_path(),
+            candidate_directory.as_path(),
+        ] {
+            std::fs::create_dir(directory).unwrap();
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        AtomicWriter::switch_release_link(&app_directory, "pending", candidate).unwrap();
+
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let ledger = DeploymentLedger::new(database);
+        let record = ledger
+            .create(
+                Uuid::new_v4(),
+                app_id,
+                DeploymentTrigger::Manual,
+                Uuid::new_v4(),
+                None,
+                None,
+                None,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        ledger
+            .transition(
+                record.id,
+                DeploymentPhase::RollingBack,
+                DeploymentStatus::Running,
+                "candidate_failed",
+                Some("CANDIDATE_INVALID"),
+            )
+            .await
+            .unwrap();
+        ledger
+            .mark_rollback_started(record.id, &"c".repeat(64))
+            .await
+            .unwrap();
+        let context = RunContext {
+            project_name: crate::domain::AppMetadata::project_name(app_id),
+            project_directory: app_directory,
+            compose_file: store.release_compose_path(app_id, candidate),
+            timeout: Duration::from_secs(60),
+            redaction_patterns: Vec::new(),
+        };
+        CleanupFixture {
+            _root: root,
+            store,
+            ledger,
+            record,
+            candidate,
+            context,
+        }
+    }
+
+    fn leftover_candidate() -> ContainerRecord {
+        let release = release();
+        container(&release, release.local_image_id.clone())
+    }
+
+    async fn assert_cleanup_failure(
+        name: &str,
+        fail_remove: bool,
+        observation: CleanupObservation,
+        expected_list_calls: usize,
+    ) {
+        let fixture = cleanup_fixture().await;
+        let compose = CleanupCompose {
+            fail_remove,
+            calls: AtomicUsize::new(0),
+        };
+        let docker = CleanupDocker {
+            observation,
+            list_calls: AtomicUsize::new(0),
+        };
+        let error = remove_first_deploy_candidate(
+            &fixture.store,
+            &fixture.ledger,
+            &compose,
+            &docker,
+            &fixture.record,
+            fixture.candidate,
+            fixture.context,
+        )
+        .await
+        .expect_err(name);
+        assert!(
+            matches!(
+                &error,
+                EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED")
+            ),
+            "{name}: unexpected compensation result"
+        );
+        record_terminal_error(&fixture.ledger, fixture.record.id, error).await;
+
+        let terminal = fixture
+            .ledger
+            .get(fixture.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, DeploymentStatus::NeedsAttention, "{name}");
+        assert_eq!(
+            terminal.error_code.as_deref(),
+            Some("CANDIDATE_CLEANUP_FAILED"),
+            "{name}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .read_release_link(fixture.record.app_id, "pending")
+                .unwrap(),
+            Some(fixture.candidate),
+            "{name}: cleanup failure must retain pending"
+        );
+        assert_eq!(compose.calls.load(Ordering::SeqCst), 1, "{name}");
+        assert_eq!(
+            docker.list_calls.load(Ordering::SeqCst),
+            expected_list_calls,
+            "{name}"
+        );
+        let transitions = fixture.ledger.transitions(fixture.record.id).await.unwrap();
+        assert!(
+            transitions.iter().any(|transition| {
+                transition.result == "candidate_failed"
+                    && transition.code.as_deref() == Some("CANDIDATE_INVALID")
+            }),
+            "{name}: original candidate rejection must remain in history"
+        );
+        let compensation = transitions.last().unwrap();
+        assert_eq!(compensation.phase, DeploymentPhase::Terminal, "{name}");
+        assert_eq!(compensation.result, "failed", "{name}");
+        assert_eq!(
+            compensation.code.as_deref(),
+            Some("CANDIDATE_CLEANUP_FAILED"),
+            "{name}: compensation failure must be recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_deploy_cleanup_failures_retain_pending_and_never_report_failed() {
+        assert_cleanup_failure(
+            "remove failure",
+            true,
+            CleanupObservation::Containers(Vec::new()),
+            0,
+        )
+        .await;
+        assert_cleanup_failure("observation failure", false, CleanupObservation::Error, 1).await;
+        assert_cleanup_failure(
+            "container remains",
+            false,
+            CleanupObservation::Containers(vec![leftover_candidate()]),
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn first_deploy_cleanup_allows_failed_only_after_observed_absence() {
+        let fixture = cleanup_fixture().await;
+        let compose = CleanupCompose {
+            fail_remove: false,
+            calls: AtomicUsize::new(0),
+        };
+        let docker = CleanupDocker {
+            observation: CleanupObservation::Containers(Vec::new()),
+            list_calls: AtomicUsize::new(0),
+        };
+        remove_first_deploy_candidate(
+            &fixture.store,
+            &fixture.ledger,
+            &compose,
+            &docker,
+            &fixture.record,
+            fixture.candidate,
+            fixture.context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .read_release_link(fixture.record.app_id, "pending")
+                .unwrap(),
+            None
+        );
+        record_terminal_error(
+            &fixture.ledger,
+            fixture.record.id,
+            EngineError::Stable("CANDIDATE_INVALID"),
+        )
+        .await;
+        let terminal = fixture
+            .ledger
+            .get(fixture.record.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.status, DeploymentStatus::Failed);
+        assert_eq!(terminal.error_code.as_deref(), Some("CANDIDATE_INVALID"));
     }
 }
