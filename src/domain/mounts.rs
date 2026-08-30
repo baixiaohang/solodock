@@ -52,9 +52,4 @@ const fn default_readonly() -> bool {
     true
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum NetworkInput {
-    OwnedDefault,
-    External { name: String },
-}
+pub use super::networks::NetworkInput;

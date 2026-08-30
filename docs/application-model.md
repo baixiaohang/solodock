@@ -61,7 +61,11 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ### Network
 
-应用可使用 owned default network，也可加入显式存在的 external network。SoloDock 不删除 external network；取消注册或移除容器时也保留 owned network。
+新应用默认创建并挂载由 UUID 派生的 owned default network。配置也可同时加入最多 8 个显式存在的 external network，或关闭 owned default 后仅使用 external network；external-only 模式至少需要一个 attachment。旧 revision 中的 `owned_default` marker 只保留读取兼容，新配置由 `owned_default_network` 布尔值表达运行语义。
+
+每个 external attachment 可为当前唯一 `app` service 配置最多 8 个稳定 alias。Alias 是小写 DNS label，在同一 attachment 内唯一；网络与 alias 都按 canonical 顺序进入 config SHA、release 完整性和 Compose。无 alias 的旧 release 继续使用 Compose networks 短语法，默认布尔值与空 alias 不参与旧 canonical serialization。
+
+External network 必须由管理员预先创建。effect 前的 fresh Docker snapshot 会验证网络存在性、成员 full ID 与有效 DNS names；alias 被无关容器占用、成员观察不完整或发生变化时 fail closed，只有 caller 已精确验证的待替换旧容器 full ID 可被忽略。SoloDock 永不创建、修改或删除 external network；取消注册或移除容器时也保留 owned network。
 
 volume、bind 和受管文件的容器 target path 必须互不冲突。preview 会展示规范化后的 source/target、只读状态以及资源是 owned 还是 external。
 
@@ -85,7 +89,7 @@ start、stop、restart 和 remove 只作用于通过 project/service/app/release
 1. preview 从 fresh filesystem、active/pending/draft config 和精确 Docker observation 生成 canonical facts；
 2. DELETE 提交 confirmation token、slug 和 disposition，并在 token consume 与 tombstone 前重算 facts hash。
 
-preview 合并 active、pending 与 draft 中的文件、volume、bind、network，并区分实际存在与仅配置。已配置或 degraded webhook 会保守提示其 write-only secret 随 app tombstone 永久删除。
+preview 合并 active、pending 与 draft 中的文件、volume、bind、network，并区分实际存在与仅配置。Network fact 带 owned/external kind、排序后的 aliases 和配置 scope；external-only revision 不虚构 owned default network。已配置或 degraded webhook 会保守提示其 write-only secret 随 app tombstone 永久删除。
 
 默认 deletion 只 unregister。显式 remove 也只移除 token 绑定的精确 owned container；所有 volume、bind 内容和 network 继续保留。删除与 stream producer 之间使用可回滚 barrier，只有 filesystem tombstone commit 后才永久阻止该 app 的新流。
 

@@ -30,6 +30,8 @@ curl --fail http://127.0.0.1:8080/healthz
 
 认证后的 `/api/v1/system/health` 分开展示 Docker、恢复、projection、deployment、poll coordinator、磁盘与 credential 状态。`interrupted`、`needs_attention` 或 ownership collision 需要先按 deployment detail 与精确 `docker inspect` 处理，不能 prune、宽泛删除或猜测性重跑。
 
+任何引用 external network 的应用都必须先由管理员创建目标 Docker network。SoloDock 不改变该网络的 driver、IPAM、labels 或生命周期；升级、部署与删除也不会移除它。部署前若报告 `EXTERNAL_NETWORK_NOT_FOUND`、`NETWORK_ALIAS_CONFLICT` 或 `DOCKER_OBSERVATION_FAILED`，应在同一 Docker daemon 上用完整 container ID 检查成员和 `NetworkSettings.Networks.<name>.DNSNames`，解决冲突后重新预检；不要依赖短 ID、容器名或手工放宽 ownership。
+
 ## 自动部署与凭据
 
 自动部署必须由管理员显式确认启用。开关关闭只阻止未来 poll，不取消已经 durable claim 的部署。`config_pending_manual` 表示 digest 未变但 draft 配置变化，需使用 Deploy；`suppressed_failed_target` 表示该 target 已失败/回滚，先检查 health 和数据兼容，再由新 digest/config 或明确人工部署解除。轮换 Registry credential 会改变 generation 并重新进入带 jitter 的轮询。
@@ -45,6 +47,6 @@ sudo systemctl stop solodock.service
 sudo ./packaging/solodock-backup --output /secure/new/solodock-control-plane.tar
 ```
 
-archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它不包含业务 volume、bind 数据、Docker image/container 或 network；每个工作负载必须有独立且验证过 restore 的数据备份。
+archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它保留 immutable revision 中的 network mode 与 aliases，但不包含业务 volume、bind 数据、Docker image/container 或 network；恢复前必须单独重建所需 external network，每个工作负载也必须有独立且验证过 restore 的数据备份。
 
 恢复 archive 或处理 degraded/interrupted 状态前，按 [恢复](recovery.md) 的 fail-closed 流程操作；安全前提见 [威胁模型](threat-model.md)。

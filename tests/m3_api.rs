@@ -575,6 +575,17 @@ fn draft_with_owned_volume(secret: &str, logical_name: &str) -> Value {
     value
 }
 
+fn external_only_draft(secret: &str, alias: &str) -> Value {
+    let mut value = draft(secret);
+    value["owned_default_network"] = json!(false);
+    value["networks"] = json!([{
+        "kind":"external",
+        "name":"shared",
+        "aliases":[alias]
+    }]);
+    value
+}
+
 async fn body(response: axum::response::Response) -> (StatusCode, String) {
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -959,6 +970,90 @@ async fn deletion_facts_ignore_stale_projection_union_active_and_draft_and_detec
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{deleted}");
     assert!(harness.apps.join(app_id).exists());
+}
+
+#[tokio::test]
+async fn external_only_deletion_inventory_preserves_per_revision_alias_facts() {
+    let harness = Harness::new().await;
+    let (_, created) = body(
+        harness
+            .create(
+                Some("m3-create-external-only-facts"),
+                &external_only_draft("secret-a", "postgres"),
+            )
+            .await,
+    )
+    .await;
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let active_revision = created["app"]["config_revision"].as_str().unwrap();
+    harness.publish_active(
+        app_id,
+        Uuid::new_v4(),
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+    let update = json!({
+        "expected_revision":active_revision,
+        "draft":external_only_draft("secret-b", "database")
+    });
+    let (status, updated) = body(
+        harness
+            .mutate(
+                "PUT",
+                &format!("/api/v1/apps/{app_id}/draft"),
+                Some("m3-update-external-only-facts"),
+                &update,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    let catalog = harness.catalog.get(app_id).unwrap();
+    assert_eq!(
+        catalog.active_network_plan.unwrap().external[0].aliases,
+        ["postgres"]
+    );
+    assert_eq!(
+        catalog
+            .draft
+            .unwrap()
+            .networks
+            .into_iter()
+            .find_map(|network| match network {
+                solodock::domain::NetworkInput::External { aliases, .. } => Some(aliases),
+                solodock::domain::NetworkInput::OwnedDefault => None,
+            })
+            .unwrap(),
+        ["database"]
+    );
+
+    let (status, preview) = body(
+        harness
+            .mutate(
+                "POST",
+                &format!("/api/v1/apps/{app_id}/deletion-preview"),
+                None,
+                &json!({"remove_container":false}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+    let networks = preview["retained"]["networks"].as_array().unwrap();
+    assert_eq!(networks.len(), 2);
+    assert!(networks.iter().all(|network| network["kind"] == "external"));
+    assert!(!networks.iter().any(|network| {
+        network["name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("-default"))
+    }));
+    assert!(networks.iter().any(|network| {
+        network["aliases"] == json!(["postgres"]) && network["configured_in"] == "active"
+    }));
+    assert!(networks.iter().any(|network| {
+        network["aliases"] == json!(["database"]) && network["configured_in"] == "draft"
+    }));
 }
 
 #[tokio::test]

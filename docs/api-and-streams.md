@@ -38,13 +38,17 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
 
+Draft 输入包含默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`；旧 payload 缺字段仍解析为 owned default，旧 `owned_default` marker 只用于读取。Draft response 返回解析后的明确布尔值。Compose 预检返回 network mode、attachment 数量、external names/aliases 和 `EXTERNAL_NETWORK_UNMANAGED` warning。
+
+应用详情把依据实际 release identity 选择的 immutable expected network plan 与 Docker actual network name/IP/effective DNS names 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`，Docker 自动附加的额外 DNS names 不算漂移。
+
 `GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
 
 ## 两阶段删除
 
 删除不能只依赖 UI 当前显示。preview 在协调锁内从 fresh filesystem、verified active/pending config、webhook artifact 和 Docker observation生成 canonical facts，并签发短期 confirmation token。
 
-DELETE 提交 token、slug 和是否移除 container；系统在 token consume 前及 filesystem tombstone前重算完整 facts hash。事实变化返回 stale/conflict，不执行删除。默认只 unregister，显式 remove 也只作用于 token 绑定的 exact owned container，并保留所有 volume、bind 内容和 network。
+DELETE 提交 token、slug 和是否移除 container；系统在 token consume 前及 filesystem tombstone前重算完整 facts hash。Network facts 包含 mode 所决定的 owned/external kind、aliases、active/pending/draft scope 和存在性，因此 attachment mode 或 alias 变化会使 token 失效。事实变化返回 stale/conflict，不执行删除。默认只 unregister，显式 remove 也只作用于 token 绑定的 exact owned container，并保留所有 volume、bind 内容和 network。
 
 成功 tombstone 必须先从 catalog 发布移除，再精确 finalize；projection 或 fsync 不确定时保留 tombstone并由 reconciler/startup继续收敛。删除 app 会永久删除其受管 config/secret 与 webhook secret，因此 locked preview 必须明确提示。
 

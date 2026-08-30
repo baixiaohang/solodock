@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::app_store::recovery::{RecoveredApp, RecoveryReport};
-use crate::domain::{DesiredState, dto::DraftResponse};
+use crate::domain::{DesiredState, NetworkPlan, dto::DraftResponse};
 
 use self::{
     models::{ContainerProjection, ContainerRecord, DockerErrorKind, DockerReadApi, ProbeStatus},
@@ -35,9 +35,11 @@ pub struct AppCatalogEntry {
     pub active_image_ref: Option<String>,
     pub active_config_revision: Option<Uuid>,
     pub active_config_sha256: Option<String>,
+    pub active_network_plan: Option<NetworkPlan>,
     pub pending_release_id: Option<Uuid>,
     pub pending_image_ref: Option<String>,
     pub pending_config_revision: Option<Uuid>,
+    pub pending_network_plan: Option<NetworkPlan>,
     pub discovery_image_ref: Option<String>,
     pub draft_revision: Option<Uuid>,
     pub draft_config_sha256: Option<String>,
@@ -58,9 +60,11 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             active_image_ref: value.active_image_ref.clone(),
             active_config_revision: value.active_config_revision,
             active_config_sha256: value.active_config_sha256.clone(),
+            active_network_plan: value.active_network_plan.clone(),
             pending_release_id: value.pending_release_id,
             pending_image_ref: value.pending_image_ref.clone(),
             pending_config_revision: value.pending_config_revision,
+            pending_network_plan: value.pending_network_plan.clone(),
             discovery_image_ref: value.discovery_image_ref.clone(),
             draft_revision: value.draft_revision,
             draft_config_sha256: value.draft_config_sha256.clone(),
@@ -138,6 +142,8 @@ pub enum DriftCode {
     ReleaseIdMismatch,
     ImageRefMismatch,
     DeploymentPending,
+    NetworkAttachmentMismatch,
+    NetworkAliasMismatch,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -161,6 +167,7 @@ pub struct AppObservation {
     pub active_release: Option<ActiveRelease>,
     pub actual_release_id: Option<Uuid>,
     pub actual: Option<ContainerProjection>,
+    pub expected_network_plan: Option<NetworkPlan>,
     pub drift_codes: Vec<DriftCode>,
 }
 
@@ -219,6 +226,7 @@ impl DockerObserver {
                         active_release: active_release(app),
                         actual_release_id: None,
                         actual: None,
+                        expected_network_plan: app.active_network_plan.clone(),
                         drift_codes: vec![DriftCode::DockerUnavailable],
                     })
                     .collect(),
@@ -243,6 +251,7 @@ impl DockerObserver {
                         active_release: active_release(app),
                         actual_release_id: None,
                         actual: None,
+                        expected_network_plan: app.active_network_plan.clone(),
                         drift_codes: vec![DriftCode::DockerUnavailable],
                     })
                     .collect(),
@@ -366,6 +375,7 @@ fn associate(
             }
         }
         let mut actual_release_id = None;
+        let mut expected_network_plan = app.active_network_plan.clone();
         let actual = if valid.len() > 1 {
             codes.push(DriftCode::ContainerAmbiguous);
             for (container, _) in &valid {
@@ -378,6 +388,11 @@ fn associate(
             None
         } else if let Some((container, identity)) = valid.first() {
             actual_release_id = Some(identity.release_id);
+            expected_network_plan = if app.pending_release_id == Some(identity.release_id) {
+                app.pending_network_plan.clone()
+            } else {
+                app.active_network_plan.clone()
+            };
             if app.pending_release_id.is_some() {
                 codes.push(DriftCode::DeploymentPending);
             }
@@ -397,6 +412,30 @@ fn associate(
             }
             if observed_image != container.configured_image_ref.as_deref() {
                 codes.push(DriftCode::ImageRefMismatch);
+            }
+            if let Some(plan) = &expected_network_plan {
+                let expected = plan.expected_networks(app.id);
+                let expected_names = expected
+                    .iter()
+                    .map(|network| network.name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                let actual_names = container
+                    .networks
+                    .iter()
+                    .map(|network| network.name.as_str())
+                    .collect::<std::collections::BTreeSet<_>>();
+                if expected_names != actual_names {
+                    codes.push(DriftCode::NetworkAttachmentMismatch);
+                } else if expected.iter().any(|network| {
+                    network.kind == crate::domain::ExpectedNetworkKind::External
+                        && network.aliases.iter().any(|alias| {
+                            !container.networks.iter().any(|actual| {
+                                actual.name == network.name && actual.aliases.contains(alias)
+                            })
+                        })
+                }) {
+                    codes.push(DriftCode::NetworkAliasMismatch);
+                }
             }
             for code in codes
                 .iter()
@@ -419,6 +458,7 @@ fn associate(
             active_release: active_release(app),
             actual_release_id,
             actual,
+            expected_network_plan,
             drift_codes: codes,
         });
     }
@@ -470,9 +510,11 @@ mod tests {
             active_image_ref: Some(image.clone()),
             active_config_revision: None,
             active_config_sha256: None,
+            active_network_plan: None,
             pending_release_id: None,
             pending_image_ref: None,
             pending_config_revision: None,
+            pending_network_plan: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,
@@ -549,6 +591,87 @@ mod tests {
         assert_eq!(
             label_issues[0].container_id.as_deref(),
             Some(invalid.id.as_str())
+        );
+    }
+
+    fn catalog_with_network_plan(
+        app_id: Uuid,
+        release_id: Uuid,
+        image: String,
+        plan: crate::domain::NetworkPlan,
+    ) -> AppCatalog {
+        AppCatalog::from_recovery(&RecoveryReport {
+            valid_apps: vec![RecoveredApp {
+                app_id,
+                slug: "example".into(),
+                display_name: "Example".into(),
+                project_name: "solodock-example".into(),
+                active_release_id: Some(release_id),
+                active_image_ref: Some(image),
+                active_config_revision: Some(Uuid::new_v4()),
+                active_config_sha256: Some("a".repeat(64)),
+                active_network_plan: Some(plan),
+                pending_release_id: None,
+                pending_image_ref: None,
+                pending_config_revision: None,
+                pending_network_plan: None,
+                discovery_image_ref: None,
+                draft_revision: None,
+                draft_config_sha256: None,
+                desired_state: DesiredState::Running,
+                poll_interval_seconds: 300,
+                auto_deploy_enabled: false,
+                last_operation_id: None,
+                draft: None,
+                source_updated_at: OffsetDateTime::UNIX_EPOCH,
+            }],
+            issues: vec![],
+        })
+    }
+
+    #[test]
+    fn network_drift_requires_exact_attachments_and_expected_alias_subset() {
+        let (_, app_id, release_id, mut container) = fixture();
+        let plan = crate::domain::network_plan(
+            false,
+            &[crate::domain::NetworkInput::External {
+                name: "shared".into(),
+                aliases: vec!["api".into()],
+            }],
+        )
+        .unwrap();
+        let image = container.configured_image_ref.clone().unwrap();
+        container.networks = vec![NetworkProjection {
+            name: "shared".into(),
+            container_ip: Some("172.20.0.2".into()),
+            aliases: vec!["api".into(), "automatic-name".into()],
+        }];
+        let catalog = catalog_with_network_plan(app_id, release_id, image.clone(), plan.clone());
+        let snapshot = associate(&catalog, vec![container.clone()], ProbeStatus::Ready);
+        assert!(
+            !snapshot.apps[0]
+                .drift_codes
+                .contains(&DriftCode::NetworkAliasMismatch)
+        );
+
+        container.networks[0].aliases = vec!["automatic-name".into()];
+        let snapshot = associate(&catalog, vec![container.clone()], ProbeStatus::Ready);
+        assert!(
+            snapshot.apps[0]
+                .drift_codes
+                .contains(&DriftCode::NetworkAliasMismatch)
+        );
+
+        container.networks.push(NetworkProjection {
+            name: "unexpected".into(),
+            container_ip: None,
+            aliases: vec![],
+        });
+        let snapshot = associate(&catalog, vec![container], ProbeStatus::Ready);
+        assert!(
+            snapshot.apps[0]
+                .drift_codes
+                .contains(&DriftCode::NetworkAttachmentMismatch)
         );
     }
 

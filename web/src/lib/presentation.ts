@@ -6,6 +6,8 @@ const driftMessages: Record<string, string> = {
   ACTIVE_RELEASE_MISSING: '缺少活动版本',
   RELEASE_ID_MISMATCH: '运行版本与活动版本不一致',
   IMAGE_REF_MISMATCH: '运行镜像与活动镜像不一致',
+  NETWORK_ATTACHMENT_MISMATCH: '实际网络 attachment 与 immutable release 期望不一致',
+  NETWORK_ALIAS_MISMATCH: '实际网络缺少期望 alias',
 }
 
 export function driftText(code: string): string {

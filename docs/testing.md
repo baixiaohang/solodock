@@ -6,7 +6,7 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 - 单元测试：domain validation、reference/parser、HMAC、redactor、state machine、clock/backoff、path 和 filesystem helper；
 - integration/API：临时目录中的 SQLite、filesystem-first publication、认证、幂等、删除、recovery 与 typed response；
-- frontend：dotenv、write-only retry identity、deployment/poll state、credential 和 destructive preview组件；
+- frontend：dotenv、write-only retry identity、deployment/poll state、credential、结构化 network editor 和 destructive preview组件；
 - embedded/package smoke：production asset、真实 HTTP bootstrap/login/API、installer upgrade、systemd、backup/restore；
 - Registry + Docker E2E：独立 private Bearer Registry 和 Docker-in-Docker daemon，穿过 production HTTP、poll/webhook、scheduler、pull、Compose、health、rollback 和 cleanup 边界；
 - resource harness：production embedded binary、60 秒 idle sample、60 秒 authenticated SSE 和独立 dockerd采样。
@@ -54,6 +54,9 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - project/service/schema/app/release/full ID ownership；
 - unmanaged、stale、multiple、replacement collision在 runner前 fail closed；
 - canonical YAML、`.env` 隔离、固定 argv、禁 shell/exec/pull/build/down/volume removal；
+- owned-only、owned+external、external-only 的 canonical YAML，旧无 alias 短语法逐字节兼容，以及 typed alias 长语法；
+- external network 缺失、无关成员 alias 冲突、精确 predecessor full ID 放行、不完整成员 observation fail closed；
+- active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
 
@@ -70,7 +73,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 ### 删除
 
-- preview合并active/pending/draft和degraded webhook facts；
+- preview合并active/pending/draft和degraded webhook facts，并按 network kind/aliases/scope 保留 external-only 差异；
 - token hash在consume和tombstone前重验；
 - slow resource inventory后再次验证container candidate；
 - stream barrier rollback/commit和producer join；

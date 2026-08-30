@@ -96,7 +96,9 @@ filesystem commit之后才发布内存catalog/redactor和SQLite投影。投影�
 
 Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，禁用隐式 `.env`，不使用shell。它只能生成version/validate/start/recreate/deploy-candidate/stop/restart/remove的封闭argv；不存在build、pull、exec、down、volume remove或用户参数透传。
 
-每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。resource、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。
+每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。统一的 canonical network plan 同时驱动 Compose、resource preflight、runtime drift、删除 facts 和 API projection；active/pending expectation 分别来自各自 immutable config revision，不能由 mutable draft 替代。
+
+Owned network 仅在对应 revision 启用时检查 exact ownership。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。Docker API 与 Compose CLI 之间没有跨调用锁，effect 后 observer 继续以 attachment/alias drift 暴露外部并发变化。
 
 ## 发布与自动化
 

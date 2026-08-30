@@ -294,20 +294,21 @@ impl DeploymentEngine {
         let binds = self
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
-        crate::api::mutations::validate_resources(
-            state,
-            record.app_id,
-            &loaded.metadata,
-            crate::error::RequestId(record.request_id),
-        )
-        .await
-        .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         let final_predecessor = self.schedule_predecessor(&record).await?;
         if final_predecessor.as_ref().map(|value| value.id.as_str())
             != predecessor.as_ref().map(|value| value.id.as_str())
         {
             return Err(EngineError::NeedsAttention("CONTAINER_CHANGED"));
         }
+        crate::api::mutations::validate_resources(
+            state,
+            record.app_id,
+            &loaded.metadata,
+            final_predecessor.as_ref().map(|value| value.id.as_str()),
+            crate::error::RequestId(record.request_id),
+        )
+        .await
+        .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         for identity in &binds {
             crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                 .map_err(|_| EngineError::Stable("BIND_CHANGED"))?;
@@ -1082,10 +1083,11 @@ impl DeploymentEngine {
             let binds = self
                 .validate_runtime_paths_fresh(m3, &loaded.metadata)
                 .await?;
-            crate::api::mutations::validate_resources(
+            crate::api::mutations::validate_resources_for_detach(
                 state,
                 record.app_id,
                 &loaded.metadata,
+                Some(&candidate_container.id),
                 crate::error::RequestId(record.request_id),
             )
             .await
@@ -1185,20 +1187,21 @@ impl DeploymentEngine {
         let binds = self
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
-        crate::api::mutations::validate_resources(
-            state,
-            record.app_id,
-            &loaded.metadata,
-            crate::error::RequestId(record.request_id),
-        )
-        .await
-        .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         let fresh_candidate = self
             .observe_candidate(record.app_id, candidate, &final_candidate_release, None)
             .await?;
         if fresh_candidate.id != candidate_container.id {
             return Err(EngineError::Interrupted);
         }
+        crate::api::mutations::validate_resources(
+            state,
+            record.app_id,
+            &loaded.metadata,
+            Some(&fresh_candidate.id),
+            crate::error::RequestId(record.request_id),
+        )
+        .await
+        .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         for identity in &binds {
             crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                 .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
@@ -1309,9 +1312,11 @@ fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
         active_image_ref: None,
         active_config_revision: None,
         active_config_sha256: None,
+        active_network_plan: None,
         pending_release_id: None,
         pending_image_ref: None,
         pending_config_revision: None,
+        pending_network_plan: None,
         discovery_image_ref: None,
         draft_revision: None,
         draft_config_sha256: None,

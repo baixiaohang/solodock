@@ -4,7 +4,9 @@
   import { parseDotenv } from '../lib/dotenv'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { credentialsForReference } from '../lib/registryReference'
-  import type { AppMutationResponse, DraftInput, RegistryCredential } from '../lib/types'
+  import { networkDraft, networkEditorError } from '../lib/networks'
+  import type { AppMutationResponse, DraftInput, ExternalNetworkAttachment, RegistryCredential } from '../lib/types'
+  import NetworkEditor from '../components/NetworkEditor.svelte'
 
   let slug = $state('')
   let displayName = $state('')
@@ -17,7 +19,8 @@
   let ports = $state('[]')
   let volumes = $state('[]')
   let binds = $state('[]')
-  let networks = $state('[{"kind":"owned_default"}]')
+  let ownedDefaultNetwork = $state(true)
+  let externalNetworks = $state<ExternalNetworkAttachment[]>([])
   let health = $state('{"policy":"running","stable_window_seconds":15}')
   let busy = $state(false)
   let error = $state('')
@@ -25,6 +28,7 @@
   let credentials = $state<RegistryCredential[]>([])
   let credentialRef = $state<string | null>(null)
   let matchingCredentials = $derived(credentialsForReference(credentials, image))
+  let networkError = $derived(networkEditorError({ ownedDefaultNetwork, externalNetworks }))
   $effect(() => {
     if (credentialRef && credentials.length > 0 && !matchingCredentials.some((value) => value.id === credentialRef)) credentialRef = null
   })
@@ -44,7 +48,8 @@
         slug, display_name: displayName, discovery_image_ref: image,
         credential_ref: credentialRef, auto_deploy_enabled: autoDeploy, auto_deploy_acknowledged: autoDeploy, poll_interval_seconds: pollInterval,
         environment: environment(), files: JSON.parse(files), ports: JSON.parse(ports),
-        volumes: JSON.parse(volumes), binds: JSON.parse(binds), networks: JSON.parse(networks),
+        volumes: JSON.parse(volumes), binds: JSON.parse(binds),
+        ...networkDraft({ ownedDefaultNetwork, externalNetworks }),
         health: JSON.parse(health),
       }
       retry = retryIdentity(retry, draft)
@@ -79,9 +84,9 @@
     <label>端口 JSON<textarea bind:value={ports} rows="5"></textarea></label>
     <label>Named volume JSON<textarea bind:value={volumes} rows="5"></textarea></label>
     <label>受限 bind JSON<textarea bind:value={binds} rows="5"></textarea></label>
-    <label>网络 JSON<textarea bind:value={networks} rows="5"></textarea></label>
+    <NetworkEditor bind:ownedDefaultNetwork bind:externalNetworks />
     <label class="wide">健康策略 JSON<textarea bind:value={health} rows="4"></textarea></label>
     <div class="wide notice warning">所有 M3 配置都随首个 immutable draft revision 原子保存；secret 为 write-only，不会在响应中返回。读写 bind 必须显式确认不可随 release 回滚。</div>
-    <div class="wide actions"><button disabled={busy}>{busy ? '注册中…' : '注册应用'}</button><a class="ghost button-link" href="#/">取消</a></div>
+    <div class="wide actions"><button disabled={busy || !!networkError}>{busy ? '注册中…' : '注册应用'}</button><a class="ghost button-link" href="#/">取消</a></div>
   </form>
 </main>

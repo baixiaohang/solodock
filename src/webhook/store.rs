@@ -876,6 +876,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 binds: vec![],
+                owned_default_network: true,
                 networks: vec![],
                 health: HealthPolicy::default(),
             },

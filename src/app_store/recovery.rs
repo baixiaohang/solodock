@@ -12,7 +12,9 @@ use uuid::Uuid;
 use super::{StoreError, atomic::is_internal_temp_name};
 use crate::{
     compose::{ComposeInput, generate},
-    domain::{DesiredState, dto::DraftResponse, validate_runnable_image},
+    domain::{
+        DesiredState, NetworkPlan, dto::DraftResponse, network_plan, validate_runnable_image,
+    },
     security::permissions::{PermissionError, check_private},
 };
 
@@ -26,9 +28,11 @@ pub struct RecoveredApp {
     pub active_image_ref: Option<String>,
     pub active_config_revision: Option<Uuid>,
     pub active_config_sha256: Option<String>,
+    pub active_network_plan: Option<NetworkPlan>,
     pub pending_release_id: Option<Uuid>,
     pub pending_image_ref: Option<String>,
     pub pending_config_revision: Option<Uuid>,
+    pub pending_network_plan: Option<NetworkPlan>,
     pub discovery_image_ref: Option<String>,
     pub draft_revision: Option<Uuid>,
     pub draft_config_sha256: Option<String>,
@@ -627,6 +631,20 @@ fn scan_app(
             Err(error) => return Err(error),
         }
     };
+    let load_network_plan = |revision: Option<Uuid>| -> Result<Option<NetworkPlan>, StoreError> {
+        let Some(revision) = revision else {
+            return Ok(None);
+        };
+        let loaded = load_revision(path, revision, integrity_key)?;
+        network_plan(
+            loaded.metadata.owned_default_network,
+            &loaded.metadata.networks,
+        )
+        .map(Some)
+        .map_err(|_| StoreError::ContentInvalid)
+    };
+    let active_network_plan = load_network_plan(active_config_revision)?;
+    let pending_network_plan = load_network_plan(pending_config_revision)?;
     if let (Some(release_id), Some(image), Some(revision), Some(expected_hash)) = (
         active_release_id,
         active_image_ref.as_deref(),
@@ -666,9 +684,11 @@ fn scan_app(
         active_image_ref,
         active_config_revision,
         active_config_sha256,
+        active_network_plan,
         pending_release_id,
         pending_image_ref,
         pending_config_revision,
+        pending_network_plan,
         discovery_image_ref: header.discovery_image_ref,
         draft_revision: header.draft_revision,
         draft_config_sha256: header.draft_config_sha256,
@@ -1125,6 +1145,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 binds: vec![],
+                owned_default_network: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -1300,6 +1321,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 binds: vec![],
+                owned_default_network: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },

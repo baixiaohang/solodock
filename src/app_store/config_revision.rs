@@ -59,6 +59,7 @@ impl LoadedRevision {
             ports: self.metadata.ports.clone(),
             volumes: self.metadata.volumes.clone(),
             binds: self.metadata.binds.clone(),
+            owned_default_network: self.metadata.owned_default_network,
             networks: self.metadata.networks.clone(),
             health: self.metadata.health.clone(),
         }
@@ -128,6 +129,7 @@ impl LoadedRevision {
             ports: self.metadata.ports.clone(),
             volumes: self.metadata.volumes.clone(),
             binds: self.metadata.binds.clone(),
+            owned_default_network: self.metadata.owned_default_network,
             networks: self.metadata.networks.clone(),
             health: self.metadata.health.clone(),
         }
@@ -424,6 +426,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             binds: Vec::new(),
+            owned_default_network: true,
             networks: Vec::new(),
             health: crate::domain::HealthPolicy::default(),
         };
@@ -465,6 +468,7 @@ mod tests {
             ports: vec![],
             volumes: vec![],
             binds: vec![],
+            owned_default_network: true,
             networks: vec![],
             health: crate::domain::HealthPolicy::default(),
         };

@@ -10,9 +10,11 @@
   import { pollNeedsAttention, pollOutcomeText } from '../lib/pollingState'
   import { writeOnlyRetryIdentity } from '../lib/deploymentState'
   import { encodeWebhookSecret } from '../lib/webhookSecret'
-  import type { AppDetailResponse, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, RegistryCredential, StatsSample, WebhookStatus } from '../lib/types'
+  import { networkDraft, networkEditorError, networkEditorState } from '../lib/networks'
+  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, RegistryCredential, StatsSample, WebhookStatus } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   import DeletionWebhookNotice from '../components/DeletionWebhookNotice.svelte'
+  import NetworkEditor from '../components/NetworkEditor.svelte'
   let { appId }: { appId: string } = $props()
   let app = $state<AppDetailResponse | null>(null)
   let stats = $state<StatsSample | null>(null)
@@ -28,7 +30,7 @@
   let deletionKey = $state('')
   let editing = $state(false)
   let editRetry = $state<RetryIdentity | undefined>()
-  let validation = $state<{ plan: { warnings: string[]; runnable: boolean; ports: number; mounts: number; networks: number }; compose_yaml: string } | null>(null)
+  let validation = $state<{ plan: ComposePlan; compose_yaml: string } | null>(null)
   let editSlug = $state('')
   let editName = $state('')
   let editImage = $state('')
@@ -42,7 +44,8 @@
   let editPorts = $state('[]')
   let editVolumes = $state('[]')
   let editBinds = $state('[]')
-  let editNetworks = $state('[]')
+  let editOwnedDefaultNetwork = $state(true)
+  let editNetworks = $state<ExternalNetworkAttachment[]>([])
   let editHealth = $state('{"policy":"running","stable_window_seconds":15}')
   let credentials = $state<RegistryCredential[]>([])
   let editCredential = $state<string | null>(null)
@@ -53,6 +56,7 @@
   let webhookSaved = $state(false)
   let webhookRetry = $state<RetryIdentity | undefined>()
   let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
+  let editNetworkError = $derived(networkEditorError({ ownedDefaultNetwork: editOwnedDefaultNetwork, externalNetworks: editNetworks }))
   $effect(() => {
     if (editCredential && credentials.length > 0 && !matchingCredentials.some((value) => value.id === editCredential)) editCredential = null
   })
@@ -154,7 +158,10 @@
     editPublicFiles = pretty(app.draft.files.filter((file) => !file.sensitive).map((file) => ({ logical_name: file.logical_name, target_path: file.target_path, content: file.content ?? '' })))
     editSecretFiles = '[]'
     editPorts = pretty(app.draft.ports); editVolumes = pretty(app.draft.volumes)
-    editBinds = pretty(app.draft.binds); editNetworks = pretty(app.draft.networks)
+    editBinds = pretty(app.draft.binds)
+    const networkState = networkEditorState(app.draft.owned_default_network, app.draft.networks)
+    editOwnedDefaultNetwork = networkState.ownedDefaultNetwork
+    editNetworks = networkState.externalNetworks
     editHealth = pretty(app.draft.health); editRetry = undefined; validation = null; editing = true
     editCredential = app.draft.credential_ref
   }
@@ -196,7 +203,7 @@
       ports: jsonArray(editPorts) as unknown as DraftInput['ports'],
       volumes: jsonArray(editVolumes) as unknown as DraftInput['volumes'],
       binds: jsonArray(editBinds) as unknown as DraftInput['binds'],
-      networks: jsonArray(editNetworks) as unknown as DraftInput['networks'],
+      ...networkDraft({ ownedDefaultNetwork: editOwnedDefaultNetwork, externalNetworks: editNetworks }),
       health: JSON.parse(editHealth) as DraftInput['health'],
     }
   }
@@ -270,11 +277,12 @@
           <label class="wide">公开文件 JSON（logical_name、target_path、content）<textarea rows="6" bind:value={editPublicFiles}></textarea></label>
           <label class="wide">Secret 文件操作 JSON（logical_name、target_path、operation=replace/delete、value）<textarea rows="5" bind:value={editSecretFiles} autocomplete="off"></textarea></label>
           <label>端口 JSON<textarea rows="6" bind:value={editPorts}></textarea></label><label>Named volumes JSON<textarea rows="6" bind:value={editVolumes}></textarea></label>
-          <label>受限 bind JSON<textarea rows="6" bind:value={editBinds}></textarea></label><label>网络 JSON<textarea rows="6" bind:value={editNetworks}></textarea></label>
+          <label>受限 bind JSON<textarea rows="6" bind:value={editBinds}></textarea></label>
+          <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:externalNetworks={editNetworks} />
           <label class="wide">健康策略 JSON<textarea rows="5" bind:value={editHealth}></textarea></label>
           <p class="wide notice warning">读写 bind 必须显式设置 acknowledge_non_rollbackable；SoloDock 永不修改或删除其源目录。敏感输入只保留在当前表单内，成功后立即清空。</p>
-          <div class="wide actions"><button type="button" class="ghost" disabled={actionBusy} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy}>发布新 draft revision</button><button type="button" class="ghost" onclick={() => { editSecretReplace = ''; editSecretFiles = '[]'; editing = false }}>取消</button></div>
-          {#if validation}<article class="wide notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络</p>{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
+          <div class="wide actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError}>发布新 draft revision</button><button type="button" class="ghost" onclick={() => { editSecretReplace = ''; editSecretFiles = '[]'; editing = false }}>取消</button></div>
+          {#if validation}<article class="wide notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络 · {validation.plan.network_mode}</p>{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{#if validation.plan.external_networks.length}<p>External network 不由 SoloDock 创建、修改或删除。</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
         </form>
       {/if}
     {:else}
@@ -285,11 +293,11 @@
         <article class="panel wide"><h2>自动部署</h2><dl class="fact-list"><div><dt>状态</dt><dd>{app.draft?.auto_deploy_enabled ? '已启用' : '已禁用'}</dd></div><div><dt>最近结果</dt><dd class:warning={pollNeedsAttention(app.polling)}>{pollOutcomeText(app.polling)}</dd></div><div><dt>最近检查</dt><dd>{app.polling?.last_checked_at ?? '—'}</dd></div><div><dt>下次不早于</dt><dd>{app.polling?.next_check_not_before ?? '—'}</dd></div><div><dt>Manifest</dt><dd><code>{app.polling?.last_manifest_digest ?? '—'}</code></dd></div><div><dt>平台</dt><dd>{app.polling?.last_platform ?? '—'}</dd></div><div><dt>错误</dt><dd>{app.polling?.last_error_code ?? '无'}</dd></div></dl>{#if app.polling?.suppressed_deployment_id}<a href={`#/deployments/${app.polling.suppressed_deployment_id}`}>查看被抑制的失败部署</a>{/if}</article>
         <article class="panel wide"><h2>端口</h2>{#each app.actual?.ports ?? [] as port}<p><code>{port.host_ip}:{port.host_port}</code> → {port.container_port}/{port.protocol}</p>{:else}<p class="muted">无 loopback 端口映射</p>{/each}</article>
         <article class="panel"><h2>挂载</h2>{#each app.actual?.mounts ?? [] as mount}<p><span class="tag">{mount.kind}</span> {mount.destination} · {mount.read_only ? '只读' : '读写'}</p>{:else}<p class="muted">无挂载</p>{/each}</article>
-        <article class="panel"><h2>网络</h2>{#each app.actual?.networks ?? [] as network}<p>{network.name} · <code>{network.container_ip ?? '—'}</code></p>{:else}<p class="muted">无网络信息</p>{/each}</article>
+        <article class="panel wide"><h2>网络</h2><div class="network-comparison"><section><h3>期望</h3>{#if app.expected_network_plan}<p><span class="tag">{app.expected_network_plan.mode}</span></p>{#if app.expected_network_plan.owned_default_network}<p>应用专属 default network</p>{/if}{#each app.expected_network_plan.external as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{:else}<p class="muted">没有可关联的 immutable release 网络期望</p>{/if}</section><section><h3>实际</h3>{#each app.actual?.networks ?? [] as network}<p><code>{network.name}</code> · {network.container_ip ?? '—'}{network.aliases.length ? ` · DNS: ${network.aliases.join(', ')}` : ''}</p>{:else}<p class="muted">无网络信息</p>{/each}</section></div></article>
       </section>
     {/if}
   {/if}
   {#if deletionDialog}
-    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><DeletionWebhookNotice configured={deletion?.webhook_configured ?? false} /><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>Pending release：</strong><code>{deletion.pending_release_id ?? '无'}</code></p><p><strong>Pending config：</strong><code>{deletion.pending_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
+    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><DeletionWebhookNotice configured={deletion?.webhook_configured ?? false} /><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>Pending release：</strong><code>{deletion.pending_release_id ?? '无'}</code></p><p><strong>Pending config：</strong><code>{deletion.pending_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => `${retainedFact(item.name, item.configured_in, item.exists)} · ${item.kind}${item.aliases.length ? ` · aliases: ${item.aliases.join(', ')}` : ''}`).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
   {/if}
 </main>
