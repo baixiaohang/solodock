@@ -17,6 +17,8 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 Docker/Compose E2E 必须使用隔离 daemon 或显式 test-only endpoint。生产代码固定 `/var/run/docker.sock`；仅 `docker-e2e` feature 可把 runner连接到测试 daemon。
 
+CI 保留 Docker 27 classic image store 的完整 DinD 回归，并使用固定 Docker 29.7.2 镜像运行 focused containerd deployment。两个 job 都在测试前读取 `docker info` 并硬断言 backend：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter；backend 不符时直接失败，不能把两个 job 静默跑成同一存储模式。
+
 每次运行生成唯一 project/run token，并记录所有 container、volume、network 和临时 bind source 的精确 ID。cleanup 前重新 inspect full ID、label 与 run token，finally 只删除本次创建的对象。
 
 测试禁止：
@@ -64,9 +66,11 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 - public/private Bearer auth、exact scope、401/403/TLS taxonomy；
 - parent/child digest、manifest media type和canonical platform；
+- classic image store 的 config ID、containerd image store 的 manifest ID，以及 descriptor present-invalid fail closed；
 - resolve→pull之间tag移动仍运行已解析digest；
 - candidate durable-before-effect、marker后final facts recheck；
 - health failure自动恢复、manual rollback和rollback failure；
+- candidate 创建后的确定性身份拒绝会在首次部署证明移除、在已有 active 时恢复并健康复核旧 release；
 - timeout/shutdown/unknown effect保持interrupted并由fresh exact facts收敛；
 - poll no-op、busy coalescing、backoff、ETag generation隔离和failed-target suppression；
 - production coordinator heap/dispatch、durable webhook wake、cancel和TaskTracker join。

@@ -75,6 +75,12 @@ pub struct ResolvedImage {
     pub local_image_id: String,
 }
 
+impl ResolvedImage {
+    pub fn image_identity(&self) -> Result<super::ImageIdentity, RegistryError> {
+        super::ImageIdentity::new(&self.manifest_digest, &self.local_image_id, &self.platform)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum PollResolve {
     NotModified,

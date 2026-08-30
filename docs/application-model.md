@@ -16,7 +16,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 <canonical-registry>/<repository>@sha256:<manifest-digest>
 ```
 
-多平台镜像同时记录 source descriptor、可选 index digest、选中的 OS/architecture/variant、manifest digest 和本地 image ID。应用可引用一个 logical registry 精确匹配的 write-only Registry credential；credential 生命周期见 [部署与回滚](deployments.md)。
+多平台镜像同时记录 source descriptor、可选 index digest、选中的 OS/architecture/variant、manifest digest 和 image config digest。历史 v2 release 仍以 `local_image_id` 键序列化 config digest，以保持 HMAC 和存量文件兼容。Docker Engine 的 image/container observation 可能以 config digest 或选中的 manifest digest 表示 image ID；SoloDock 用同一身份对象匹配两者。旧/classic daemon 未返回 manifest descriptor 时回退到该 digest 集合；descriptor 一旦存在，其 digest 和 canonical platform 必须完整匹配，缺字段、格式错误或值不符都 fail closed。应用可引用一个 logical registry 精确匹配的 write-only Registry credential；credential 生命周期见 [部署与回滚](deployments.md)。
 
 ## 环境变量
 

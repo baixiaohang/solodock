@@ -546,6 +546,7 @@ mod tests {
             finished_at: None,
             configured_image_ref: Some(image),
             image_id: None,
+            manifest_descriptor: None,
             ports: Vec::new(),
             mounts: Vec::new(),
             networks: Vec::new(),

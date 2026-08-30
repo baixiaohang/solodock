@@ -320,6 +320,22 @@ impl AppStore {
     }
 }
 
+impl ReleaseV2 {
+    pub fn image_identity(
+        &self,
+    ) -> Result<crate::registry::ImageIdentity, crate::registry::RegistryError> {
+        crate::registry::ImageIdentity::new(
+            &self.manifest_digest,
+            &self.local_image_id,
+            &crate::registry::Platform {
+                os: self.platform_os.clone(),
+                architecture: self.platform_architecture.clone(),
+                variant: self.platform_variant.clone(),
+            },
+        )
+    }
+}
+
 pub(crate) fn sign(release: &ReleaseV2, key: &[u8]) -> String {
     let mut canonical = release.clone();
     canonical.integrity_hmac.clear();
@@ -339,6 +355,51 @@ mod tests {
         domain::{DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy},
         registry::Platform,
     };
+
+    #[test]
+    fn serialized_v2_release_keeps_local_image_id_hmac_compatibility() {
+        let manifest = format!("sha256:{}", "a".repeat(64));
+        let mut release = ReleaseV2 {
+            schema_version: 2,
+            id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
+            app_id: Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
+            config_revision: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
+            config_sha256: "0".repeat(64),
+            source_image_ref: "registry.example/app:stable".into(),
+            logical_registry: "registry.example".into(),
+            repository: "app".into(),
+            source_tag: "stable".into(),
+            source_descriptor_digest: manifest.clone(),
+            index_digest: None,
+            manifest_digest: manifest.clone(),
+            runnable_image_ref: format!("registry.example/app@{manifest}"),
+            platform_os: "linux".into(),
+            platform_architecture: "amd64".into(),
+            platform_variant: None,
+            local_image_id: format!("sha256:{}", "b".repeat(64)),
+            compose_sha256: "1".repeat(64),
+            credential_ref: None,
+            trigger: ReleaseTrigger::Manual,
+            source_release_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            integrity_hmac: String::new(),
+        };
+        let key = b"existing-v2-release-key";
+        release.integrity_hmac = sign(&release, key);
+        assert_eq!(
+            release.integrity_hmac,
+            "ee4bd01647c57c37f9820e695f3bf6e3c5b383bd7e321269d66cb8ee46790402"
+        );
+        let serialized = toml::to_string(&release).unwrap();
+        assert!(serialized.contains("local_image_id = "));
+
+        let parsed: ReleaseV2 = toml::from_str(&serialized).unwrap();
+        assert_eq!(sign(&parsed, key), parsed.integrity_hmac);
+        assert_eq!(toml::to_string(&parsed).unwrap(), serialized);
+        let identity = parsed.image_identity().unwrap();
+        assert!(identity.matches_engine_image_id(Some(&parsed.local_image_id)));
+        assert!(identity.matches_engine_image_id(Some(&parsed.manifest_digest)));
+    }
 
     #[test]
     fn active_visible_finalizer_repairs_desired_state_and_pending_cleanup() {

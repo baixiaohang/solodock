@@ -183,6 +183,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         tasks: stream_tasks.clone(),
         #[cfg(feature = "docker-e2e")]
         test_effect_gate: None,
+        #[cfg(feature = "docker-e2e")]
+        test_candidate_gate: None,
     };
     let scheduler = DeploymentScheduler::new(engine.clone());
     let poll_store = PollStateStore::new(database.clone());

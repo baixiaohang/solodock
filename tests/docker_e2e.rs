@@ -221,7 +221,7 @@ impl ComposeRunner for RecordingComposeRunner {
 
 impl MutationHarness {
     async fn new(endpoint: String, bind_root: std::path::PathBuf) -> Self {
-        Self::new_with_components(endpoint, bind_root, None, None, None).await
+        Self::new_with_components(endpoint, bind_root, None, None, None, None).await
     }
 
     async fn new_with_test_gates(
@@ -229,8 +229,17 @@ impl MutationHarness {
         bind_root: std::path::PathBuf,
         pull_gate: Option<TestPullGate>,
         effect_gate: Option<TestEffectGate>,
+        candidate_gate: Option<TestEffectGate>,
     ) -> Self {
-        Self::new_with_components(endpoint, bind_root, pull_gate, effect_gate, None).await
+        Self::new_with_components(
+            endpoint,
+            bind_root,
+            pull_gate,
+            effect_gate,
+            candidate_gate,
+            None,
+        )
+        .await
     }
 
     async fn new_with_compose(
@@ -238,7 +247,7 @@ impl MutationHarness {
         bind_root: std::path::PathBuf,
         compose: Arc<dyn ComposeRunner>,
     ) -> Self {
-        Self::new_with_components(endpoint, bind_root, None, None, Some(compose)).await
+        Self::new_with_components(endpoint, bind_root, None, None, None, Some(compose)).await
     }
 
     async fn new_with_components(
@@ -246,6 +255,7 @@ impl MutationHarness {
         bind_root: std::path::PathBuf,
         pull_gate: Option<TestPullGate>,
         effect_gate: Option<TestEffectGate>,
+        candidate_gate: Option<TestEffectGate>,
         compose: Option<Arc<dyn ComposeRunner>>,
     ) -> Self {
         let root = tempfile::tempdir().unwrap();
@@ -365,6 +375,7 @@ impl MutationHarness {
             shutdown: state.shutdown.clone(),
             tasks: state.stream_tasks.clone(),
             test_effect_gate: effect_gate,
+            test_candidate_gate: candidate_gate,
         };
         let scheduler = DeploymentScheduler::new(engine.clone());
         let poller = PollCoordinator::new(
@@ -2176,6 +2187,7 @@ http {{
         bind_root.clone(),
         Some(pull_gate.clone()),
         Some(effect_gate.clone()),
+        None,
     )
     .await;
     let resource_sampler = ProcessPeakSampler::start(std::process::id());
@@ -2836,6 +2848,215 @@ http {{
         .await
         .unwrap();
     let _ = std::fs::remove_dir_all(bind_root);
+}
+
+#[tokio::test]
+#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
+async fn containerd_postgres_deployment_identity_and_noop() {
+    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
+        return;
+    }
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let harness = MutationHarness::new(endpoint, std::env::temp_dir()).await;
+    let create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("containerd-postgres-create-0001"),
+            Some(&json!({
+                "slug":"containerd-postgres",
+                "display_name":"Containerd PostgreSQL",
+                "discovery_image_ref":"postgres:16-alpine",
+                "credential_ref":null,
+                "auto_deploy_enabled":false,
+                "poll_interval_seconds":300,
+                "environment":{
+                    "public":[],
+                    "secrets":[{
+                        "key":"POSTGRES_PASSWORD",
+                        "operation":"replace",
+                        "value":"containerd-e2e-password"
+                    }]
+                },
+                "files":[],
+                "ports":[],
+                "volumes":[{
+                    "kind":"owned",
+                    "logical_name":"data",
+                    "target_path":"/var/lib/postgresql/data"
+                }],
+                "binds":[],
+                "networks":[{"kind":"owned_default"}],
+                "health":{"policy":"running","stable_window_seconds":5}
+            })),
+        )
+        .await;
+    let create_status = create.status();
+    let create = MutationHarness::json(create).await;
+    assert_eq!(create_status, StatusCode::CREATED, "{create}");
+    let app_id = create["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    let first = schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0001").await;
+    let first = wait_for_deployment(&harness, first).await;
+    assert_eq!(first["status"], "succeeded", "{first}");
+    let manifest = first["manifest_digest"].as_str().unwrap();
+    let detail = app_detail(&harness, app_id).await;
+    let container_id = detail["actual"]["id"].as_str().unwrap();
+    let inspected = docker.inspect_container(container_id, None).await.unwrap();
+    assert_eq!(inspected.image.as_deref(), Some(manifest));
+    let descriptor = inspected
+        .image_manifest_descriptor
+        .expect("containerd image store must expose the selected manifest descriptor");
+    assert_eq!(descriptor.digest.as_deref(), Some(manifest));
+    let platform = descriptor
+        .platform
+        .expect("descriptor platform is required");
+    assert_eq!(platform.os.as_deref(), Some("linux"));
+    assert_eq!(platform.architecture.as_deref(), Some("amd64"));
+
+    let repeated = schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0002").await;
+    let repeated = wait_for_deployment(&harness, repeated).await;
+    assert_eq!(repeated["status"], "no_op", "{repeated}");
+
+    remove_owned_container(&docker, container_id, app_id).await;
+    let volume = format!("solodock-{}-data", app_id.simple());
+    assert_eq!(
+        docker
+            .inspect_volume(&volume)
+            .await
+            .unwrap()
+            .labels
+            .get(APP_ID_LABEL),
+        Some(&app_id.to_string())
+    );
+    docker
+        .remove_volume(
+            &volume,
+            None::<bollard::query_parameters::RemoveVolumeOptions>,
+        )
+        .await
+        .unwrap();
+    let network = format!("solodock-{}-default", app_id.simple());
+    docker.remove_network(&network).await.unwrap();
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    harness.state.stream_tasks.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
+async fn containerd_owned_candidate_mismatch_is_removed_before_failed() {
+    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
+        return;
+    }
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+    let harness = MutationHarness::new_with_test_gates(
+        endpoint,
+        std::env::temp_dir(),
+        None,
+        None,
+        Some(candidate_gate.clone()),
+    )
+    .await;
+    let create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("containerd-compensation-create-0001"),
+            Some(&json!({
+                "slug":"containerd-compensation",
+                "display_name":"Containerd compensation",
+                "discovery_image_ref":"alpine:3.20",
+                "credential_ref":null,
+                "auto_deploy_enabled":false,
+                "poll_interval_seconds":300,
+                "environment":{"public":[],"secrets":[]},
+                "files":[],
+                "ports":[],
+                "volumes":[],
+                "binds":[],
+                "networks":[{"kind":"owned_default"}],
+                "health":{"policy":"completed"}
+            })),
+        )
+        .await;
+    let create_status = create.status();
+    let create = MutationHarness::json(create).await;
+    assert_eq!(create_status, StatusCode::CREATED, "{create}");
+    let app_id = create["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let deployment =
+        schedule_from_current(&harness, app_id, "containerd-compensation-deploy-0001").await;
+    candidate_gate.wait_until_reached().await;
+
+    let project = format!("solodock-{}", app_id.simple());
+    let original = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers(&project)
+        .await
+        .unwrap();
+    assert_eq!(original.len(), 1);
+    let labels = original[0].labels.clone();
+    remove_owned_container(&docker, &original[0].id, app_id).await;
+    let replacement = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-containerd-mismatch-{}", Uuid::new_v4()))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec!["sleep".into(), "300".into()]),
+                labels: Some(labels),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker.start_container(&replacement.id, None).await.unwrap();
+    candidate_gate.resume();
+
+    let failed = wait_for_deployment(&harness, deployment).await;
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert_eq!(failed["error_code"], "CANDIDATE_INVALID", "{failed}");
+    assert!(app_detail(&harness, app_id).await["pending_release_id"].is_null());
+    assert!(
+        harness
+            .state
+            .observer
+            .api()
+            .list_compose_app_containers(&project)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let network = format!("solodock-{}-default", app_id.simple());
+    docker.remove_network(&network).await.unwrap();
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    harness.state.stream_tasks.wait().await;
 }
 
 async fn docker_cli(endpoint: &str, args: &[&str]) -> String {

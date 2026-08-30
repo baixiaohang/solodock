@@ -15,6 +15,8 @@ use futures_util::StreamExt;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
+use crate::registry::ManifestDescriptor;
+
 use super::{
     models::{
         ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerReadApi,
@@ -421,6 +423,7 @@ impl DockerReadApi for BollardReadClient {
             id: image
                 .id
                 .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?,
+            manifest_descriptor: project_manifest_descriptor(image.descriptor),
             repo_digests: image.repo_digests.unwrap_or_default(),
             os: image.os.unwrap_or_default(),
             architecture: image.architecture.unwrap_or_default(),
@@ -459,6 +462,7 @@ fn network_member_signature(
 }
 
 fn project_inspect(inspect: ContainerInspectResponse) -> ContainerRecord {
+    let manifest_descriptor = project_manifest_descriptor(inspect.image_manifest_descriptor);
     let state = inspect.state.unwrap_or_default();
     let config = inspect.config.unwrap_or_default();
     let network_settings = inspect.network_settings.unwrap_or_default();
@@ -557,10 +561,25 @@ fn project_inspect(inspect: ContainerInspectResponse) -> ContainerRecord {
         finished_at: state.finished_at.filter(|value| nonzero_time(value)),
         configured_image_ref: config.image,
         image_id: inspect.image,
+        manifest_descriptor,
         ports,
         mounts,
         networks,
     }
+}
+
+fn project_manifest_descriptor(
+    descriptor: Option<bollard::models::OciDescriptor>,
+) -> Option<ManifestDescriptor> {
+    descriptor.map(|value| {
+        let platform = value.platform.unwrap_or_default();
+        ManifestDescriptor {
+            digest: value.digest,
+            os: platform.os,
+            architecture: platform.architecture,
+            variant: platform.variant,
+        }
+    })
 }
 
 fn project_stats(stats: ContainerStatsResponse) -> RawStats {
@@ -712,6 +731,38 @@ mod tests {
             projected.networks[0].aliases,
             ["api", "example-app-1", "short-id"]
         );
+    }
+
+    #[test]
+    fn descriptor_projection_preserves_present_invalid_and_absent_states() {
+        let inspect: ContainerInspectResponse = serde_json::from_value(serde_json::json!({
+            "Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Config": { "Labels": {}, "Image": "example@sha256:manifest" },
+            "State": { "Status": "running" },
+            "ImageManifestDescriptor": {
+                "digest": "sha256:manifest",
+                "platform": { "os": "linux", "architecture": "amd64" }
+            }
+        }))
+        .unwrap();
+        let projected = project_inspect(inspect);
+        assert_eq!(
+            projected.manifest_descriptor,
+            Some(ManifestDescriptor {
+                digest: Some("sha256:manifest".into()),
+                os: Some("linux".into()),
+                architecture: Some("amd64".into()),
+                variant: None,
+            })
+        );
+
+        let malformed = project_manifest_descriptor(Some(bollard::models::OciDescriptor {
+            digest: None,
+            platform: None,
+            ..Default::default()
+        }));
+        assert_eq!(malformed, Some(ManifestDescriptor::default()));
+        assert_eq!(project_manifest_descriptor(None), None);
     }
 
     #[test]

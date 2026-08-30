@@ -3190,6 +3190,7 @@ mod tests {
             finished_at: None,
             configured_image_ref: None,
             image_id: None,
+            manifest_descriptor: None,
             ports: vec![],
             mounts: vec![],
             networks: vec![],

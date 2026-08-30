@@ -7,6 +7,8 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::registry::ManifestDescriptor;
+
 pub type DockerStream<T> = Pin<Box<dyn Stream<Item = Result<T, DockerError>> + Send>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -170,6 +172,7 @@ pub struct ContainerRecord {
     pub finished_at: Option<String>,
     pub configured_image_ref: Option<String>,
     pub image_id: Option<String>,
+    pub manifest_descriptor: Option<ManifestDescriptor>,
     pub ports: Vec<PortProjection>,
     pub mounts: Vec<MountProjection>,
     pub networks: Vec<NetworkProjection>,
@@ -197,6 +200,7 @@ pub struct NetworkSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImageRecord {
     pub id: String,
+    pub manifest_descriptor: Option<ManifestDescriptor>,
     pub repo_digests: Vec<String>,
     pub os: String,
     pub architecture: String,
