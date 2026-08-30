@@ -16,6 +16,8 @@ pub struct ConfigFile {
     pub schema_version: u32,
     pub listen_address: String,
     pub public_origin: String,
+    #[serde(default)]
+    pub webhook_public_origin: Option<String>,
     pub state_directory: PathBuf,
     pub runtime_directory: PathBuf,
     #[serde(default)]
@@ -26,6 +28,7 @@ pub struct ConfigFile {
 pub struct Config {
     pub listen_address: SocketAddr,
     pub public_origin: String,
+    pub webhook_public_origin: Option<String>,
     pub state_directory: PathBuf,
     pub runtime_directory: PathBuf,
     pub allowed_bind_roots: Vec<PathBuf>,
@@ -93,6 +96,14 @@ impl TryFrom<ConfigFile> for Config {
             return Err(ConfigError::NonLoopback(listen_address));
         }
         let public_origin = normalize_public_origin(&raw.public_origin)?;
+        let webhook_public_origin = raw
+            .webhook_public_origin
+            .as_deref()
+            .map(normalize_public_origin)
+            .transpose()?;
+        if webhook_public_origin.as_ref() == Some(&public_origin) {
+            return Err(ConfigError::WebhookOriginConflict);
+        }
         validate_managed_path("state_directory", &raw.state_directory)?;
         validate_managed_path("runtime_directory", &raw.runtime_directory)?;
         let mut allowed_bind_roots = Vec::with_capacity(raw.allowed_bind_roots.len());
@@ -108,6 +119,7 @@ impl TryFrom<ConfigFile> for Config {
         Ok(Self {
             listen_address,
             public_origin,
+            webhook_public_origin,
             state_directory: raw.state_directory,
             runtime_directory: raw.runtime_directory,
             allowed_bind_roots,
@@ -190,6 +202,20 @@ pub fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
     })
 }
 
+pub fn origin_authority(origin: &str) -> Result<String, ConfigError> {
+    let parsed = Url::parse(origin).map_err(|_| ConfigError::PublicOrigin)?;
+    let host = parsed.host_str().ok_or(ConfigError::PublicOrigin)?;
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_ascii_lowercase()
+    };
+    Ok(match parsed.port() {
+        Some(port) if port != 443 => format!("{host}:{port}"),
+        _ => host,
+    })
+}
+
 fn validate_managed_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
     if !path.is_absolute()
         || !is_lexically_normal(path)
@@ -264,6 +290,8 @@ pub enum ConfigError {
     NonLoopback(SocketAddr),
     #[error("public_origin must be a canonical HTTPS origin")]
     PublicOrigin,
+    #[error("webhook_public_origin must use a different authority from public_origin")]
+    WebhookOriginConflict,
     #[error("{0} must be an absolute normalized path")]
     ManagedPath(&'static str),
     #[error("allowed bind root is sensitive or overlaps SoloDock state")]
@@ -297,6 +325,7 @@ mod tests {
             schema_version: 1,
             listen_address: "127.0.0.1:8080".into(),
             public_origin: "https://Example.COM:443".into(),
+            webhook_public_origin: None,
             state_directory: "/var/lib/solodock".into(),
             runtime_directory: "/run/solodock".into(),
             allowed_bind_roots: Vec::new(),
@@ -307,6 +336,27 @@ mod tests {
     fn validates_and_normalizes_configuration() {
         let config = Config::try_from(raw()).unwrap();
         assert_eq!(config.public_origin, "https://example.com");
+    }
+
+    #[test]
+    fn webhook_origin_is_optional_canonical_and_separate() {
+        let mut value = raw();
+        value.webhook_public_origin = Some("https://Hooks.Example.COM:443".into());
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(
+            config.webhook_public_origin.as_deref(),
+            Some("https://hooks.example.com")
+        );
+        assert_eq!(
+            origin_authority(config.webhook_public_origin.as_deref().unwrap()).unwrap(),
+            "hooks.example.com"
+        );
+        let mut value = raw();
+        value.webhook_public_origin = Some("https://example.com".into());
+        assert!(matches!(
+            Config::try_from(value),
+            Err(ConfigError::WebhookOriginConflict)
+        ));
     }
 
     #[test]

@@ -250,6 +250,7 @@ impl Harness {
             stream_tasks: stream_tasks.clone(),
             m3: None,
             m4: None,
+            webhooks: None,
         };
         Self {
             _root: root,

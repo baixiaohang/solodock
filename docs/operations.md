@@ -16,6 +16,8 @@ installer 使用 versioned directory 和原子 symlink，默认不启动服务�
 
 服务只监听 loopback，`public_origin` 必须是 HTTPS。Cloudflare Tunnel/WAF、访问白名单和 TLS 是外部前置条件，不由 SoloDock 配置。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
 
+启用 webhook 时还需设置不同 authority 的 `webhook_public_origin`，并在外部 WAF 只放行精确 POST path。签名、timestamp/nonce、重试和 202 语义见 [Webhook 说明](webhooks.md)。
+
 首次启动从 `/run/solodock/bootstrap.token` 完成一次性 bootstrap。日常查看：
 
 ```bash
@@ -41,4 +43,4 @@ sudo systemctl stop solodock.service
 sudo ./packaging/solodock-backup --output /secure/new/solodock-control-plane.tar
 ```
 
-archive 含应用和 Registry secret，必须按高敏数据限制读取并另行加密。它不包含业务 volume、bind 数据、Docker image/container 或 network；每个工作负载必须有独立且验证过 restore 的数据备份。
+archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它不包含业务 volume、bind 数据、Docker image/container 或 network；每个工作负载必须有独立且验证过 restore 的数据备份。

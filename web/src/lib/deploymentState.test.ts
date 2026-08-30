@@ -24,4 +24,15 @@ describe('deployment state', () => {
     expect(replay.key).toBe(first.key)
     expect(JSON.stringify(first)).not.toContain(secret)
   })
+
+  it('never stores a webhook secret in its retry identity', async () => {
+    const secret = 'webhook-retry-secret-canary'
+    const identity = await writeOnlyRetryIdentity(
+      undefined,
+      { expected_metadata_revision: 'revision' },
+      secret,
+    )
+    expect(JSON.stringify(identity)).not.toContain(secret)
+    expect(identity.fingerprint).toContain('secretSha256')
+  })
 })

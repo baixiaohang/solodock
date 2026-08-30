@@ -11,12 +11,14 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use solodock::{
     AppState,
-    api::mutations::M3Services,
+    api::{deployments::M4Services, mutations::M3Services},
     app_store::{AppStore, config_revision},
     auth::AuthService,
     compose::{
@@ -24,6 +26,9 @@ use solodock::{
         generate,
     },
     db::Database,
+    deploy::{
+        DeploymentEngine, DeploymentLedger, DeploymentScheduler, FixedImagePuller, HealthVerifier,
+    },
     docker::{
         AppCatalog, DockerObserver,
         models::{
@@ -38,9 +43,13 @@ use solodock::{
         probe::DockerSupervisor,
     },
     mutation::{AppMutationCoordinator, IdempotencyService},
+    registry::{CredentialStore, PollCoordinator, PollStateStore, RegistryResolver},
     router,
+    security::secret::SecretValue,
+    webhook::{WebhookRateLimiter, WebhookServices, WebhookStore},
 };
 use tempfile::TempDir;
+use tokio_util::task::TaskTracker;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -337,7 +346,7 @@ impl Harness {
         );
         let catalog = AppCatalog::default();
         state.observer = DockerObserver::new(
-            docker,
+            docker.clone(),
             catalog.clone(),
             DockerSupervisor::from_snapshot(ready_probe()),
         );
@@ -347,12 +356,62 @@ impl Harness {
             allowed_bind_roots: Vec::new(),
             runtime_directory: runtime_directory.clone(),
             idempotency: idempotency.clone(),
-            coordinator: AppMutationCoordinator::new(runtime_directory).unwrap(),
+            coordinator: AppMutationCoordinator::new(runtime_directory.clone()).unwrap(),
             compose,
             compose_capability: capability,
             projection_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             reconcile_notify: Arc::new(tokio::sync::Notify::new()),
             publication_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }));
+        let credentials = CredentialStore::initialize(
+            state_directory.join("registry-credentials"),
+            idempotency.integrity_key(),
+        )
+        .unwrap();
+        let ledger = DeploymentLedger::new(database.clone());
+        let puller = FixedImagePuller::new(
+            state_directory.clone(),
+            runtime_directory.join("pull"),
+            docker.clone(),
+            state.shutdown.clone(),
+            state.stream_tasks.clone(),
+        )
+        .unwrap();
+        let engine = DeploymentEngine {
+            store: store.clone(),
+            credentials: credentials.clone(),
+            resolver: RegistryResolver::production().unwrap(),
+            ledger: ledger.clone(),
+            puller: Arc::new(puller),
+            compose: state.m3.as_ref().unwrap().compose.clone(),
+            docker,
+            health: HealthVerifier::new(state.observer.api(), state.shutdown.clone()),
+            shutdown: state.shutdown.clone(),
+            tasks: state.stream_tasks.clone(),
+            #[cfg(feature = "docker-e2e")]
+            test_effect_gate: None,
+        };
+        let poller = PollCoordinator::new(
+            PollStateStore::new(database.clone()),
+            state.shutdown.clone(),
+            TaskTracker::new(),
+        );
+        state.m4 = Some(Arc::new(M4Services {
+            credentials,
+            ledger,
+            scheduler: DeploymentScheduler::new(engine.clone()),
+            engine,
+            poller: poller.clone(),
+        }));
+        state.webhooks = Some(Arc::new(WebhookServices {
+            origin: "https://hooks.example.com".into(),
+            authority: "hooks.example.com".into(),
+            store: WebhookStore::new(store.clone(), idempotency.integrity_key()),
+            poll_states: poller.store.clone(),
+            database: database.clone(),
+            notify: poller.notify.clone(),
+            limiter: WebhookRateLimiter::default(),
+            permits: Arc::new(tokio::sync::Semaphore::new(16)),
         }));
         let app = router(state.clone());
         Self {
@@ -699,7 +758,69 @@ async fn unregister_is_two_stage_data_preserving_and_idempotently_replayed() {
     .await;
     let created: Value = serde_json::from_str(&created).unwrap();
     let app_id = created["app"]["id"].as_str().unwrap();
+    let app_uuid = app_id.parse::<Uuid>().unwrap();
     let revision = created["app"]["config_revision"].as_str().unwrap();
+    let webhooks = harness.state.webhooks.as_ref().unwrap();
+    let secret = SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".to_owned());
+    let hook_metadata = webhooks
+        .store
+        .configure(app_uuid, None, Uuid::new_v4(), &secret)
+        .unwrap();
+    let hook_revision = hook_metadata.secret_revision.unwrap();
+    webhooks
+        .poll_states
+        .accept_webhook(
+            app_uuid,
+            hook_revision,
+            &[7; 32],
+            Uuid::new_v4(),
+            "deletion-generation",
+            true,
+        )
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(
+        harness
+            .apps
+            .join(app_id)
+            .join("webhook-secret-revisions")
+            .join(hook_revision.to_string()),
+    )
+    .unwrap();
+    let missing_revision_status = webhooks.store.status(app_uuid).unwrap();
+    assert!(missing_revision_status.configured);
+    assert!(missing_revision_status.degraded);
+    assert_eq!(
+        missing_revision_status.metadata_revision,
+        Some(hook_metadata.metadata_revision)
+    );
+    let (status, missing_revision_preview) = body(
+        harness
+            .mutate(
+                "POST",
+                &format!("/api/v1/apps/{app_id}/deletion-preview"),
+                None,
+                &json!({"remove_container":false}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let missing_revision_preview: Value = serde_json::from_str(&missing_revision_preview).unwrap();
+    assert_eq!(missing_revision_preview["webhook_configured"], true);
+    webhooks
+        .store
+        .configure(
+            app_uuid,
+            Some(hook_metadata.metadata_revision),
+            Uuid::new_v4(),
+            &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".to_owned()),
+        )
+        .unwrap();
+    std::fs::write(harness.apps.join(app_id).join("webhook.toml"), "corrupt").unwrap();
+    let degraded_status = webhooks.store.status(app_uuid).unwrap();
+    assert!(!degraded_status.configured);
+    assert!(degraded_status.degraded);
     let (status, preview) = body(
         harness
             .mutate(
@@ -713,6 +834,7 @@ async fn unregister_is_two_stage_data_preserving_and_idempotently_replayed() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let preview: Value = serde_json::from_str(&preview).unwrap();
+    assert_eq!(preview["webhook_configured"], true);
     let request = json!({
         "confirmation_token": preview["confirmation_token"],
         "slug": "example",
@@ -728,6 +850,11 @@ async fn unregister_is_two_stage_data_preserving_and_idempotently_replayed() {
     assert_eq!(deleted["container_removed"], false);
     assert_eq!(deleted["orphan_warning"], true);
     assert!(!harness.apps.join(app_id).exists());
+    assert!(webhooks.poll_states.get(app_uuid).await.unwrap().is_none());
+    assert_eq!(
+        webhooks.poll_states.webhook_replay_count().await.unwrap(),
+        0
+    );
 
     let (status, replayed) =
         body(harness.mutate("DELETE", &route, Some(key), &request).await).await;
@@ -1500,4 +1627,352 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
             .unwrap()
             .contains("settings")
     );
+}
+
+#[tokio::test]
+async fn signed_webhook_is_host_isolated_write_only_and_durably_coalesced() {
+    fn signed_request(
+        app_id: Uuid,
+        host: &'static str,
+        raw: &'static [u8],
+        timestamp: i64,
+        nonce_byte: u8,
+        secret: &[u8],
+    ) -> Request<Body> {
+        let nonce = URL_SAFE_NO_PAD.encode([nonce_byte; 16]);
+        let input = solodock::webhook::protocol::signing_input(app_id, raw, timestamp, &nonce);
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(input.as_bytes());
+        Request::builder()
+            .method("POST")
+            .uri(format!("/hooks/v1/apps/{app_id}/registry"))
+            .header(header::HOST, host)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-solodock-timestamp", timestamp.to_string())
+            .header("x-solodock-nonce", nonce)
+            .header(
+                "x-solodock-signature",
+                format!("v1={:x}", mac.finalize().into_bytes()),
+            )
+            .body(Body::from(raw))
+            .unwrap()
+    }
+
+    let harness = Harness::new().await;
+    let mut candidate = draft("application-secret");
+    candidate["auto_deploy_enabled"] = json!(true);
+    candidate["auto_deploy_acknowledged"] = json!(true);
+    let (status, created) =
+        body(harness.create(Some("m6-create-hook-app"), &candidate).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id: Uuid = serde_json::from_str::<Value>(&created).unwrap()["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let secret_bytes = *b"M6_SECRET_CANARY_32_BYTES_VALUE!";
+    let secret = URL_SAFE_NO_PAD.encode(secret_bytes);
+    let configured = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/webhook"),
+            Some("m6-webhook-configure"),
+            &json!({"expected_metadata_revision":null,"secret":secret}),
+        )
+        .await;
+    let (status, configured_body) = body(configured).await;
+    assert_eq!(status, StatusCode::OK, "{configured_body}");
+    assert!(!configured_body.contains(&secret));
+    let configured: Value = serde_json::from_str(&configured_body).unwrap();
+
+    let raw = br#"{"event":"registry.push"}"#;
+    let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+    let hidden = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "solodock.example.com",
+            raw,
+            timestamp,
+            9,
+            &secret_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+    assert_eq!(hidden.headers()[header::CACHE_CONTROL], "no-store");
+    let accepted = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            raw,
+            timestamp,
+            9,
+            &secret_bytes,
+        ))
+        .await
+        .unwrap();
+    let (status, accepted_body) = body(accepted).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{accepted_body}");
+    assert!(!accepted_body.contains(&secret));
+    let replay = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            raw,
+            timestamp,
+            9,
+            &secret_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let wrong_schema = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            br#"{"event":"untrusted.push"}"#,
+            timestamp,
+            10,
+            &secret_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_schema.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let hook_cannot_serve_ui = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/healthz")
+                .header(header::HOST, "hooks.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(hook_cannot_serve_ui.status(), StatusCode::NOT_FOUND);
+
+    let rotated_bytes = *b"M6_ROTATED_CANARY_32_BYTES_VALUE";
+    let rotated = URL_SAFE_NO_PAD.encode(rotated_bytes);
+    let response = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/webhook"),
+            Some("m6-webhook-rotate"),
+            &json!({
+                "expected_metadata_revision": configured["metadata_revision"],
+                "secret": rotated,
+            }),
+        )
+        .await;
+    let (status, rotated_body) = body(response).await;
+    assert_eq!(status, StatusCode::OK, "{rotated_body}");
+    assert!(!rotated_body.contains(&rotated));
+    let rotated_status: Value = serde_json::from_str(&rotated_body).unwrap();
+    let old_secret = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            raw,
+            timestamp,
+            11,
+            &secret_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(old_secret.status(), StatusCode::UNAUTHORIZED);
+    let new_secret = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            raw,
+            timestamp,
+            12,
+            &rotated_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(new_secret.status(), StatusCode::ACCEPTED);
+    let revoked = harness
+        .mutate(
+            "DELETE",
+            &format!("/api/v1/apps/{app_id}/webhook"),
+            Some("m6-webhook-revoke"),
+            &json!({"expected_metadata_revision":rotated_status["metadata_revision"]}),
+        )
+        .await;
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let after_revoke = harness
+        .app
+        .clone()
+        .oneshot(signed_request(
+            app_id,
+            "hooks.example.com",
+            raw,
+            timestamp,
+            13,
+            &rotated_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(after_revoke.status(), StatusCode::UNAUTHORIZED);
+    let poll = harness
+        .state
+        .m4
+        .as_ref()
+        .unwrap()
+        .poller
+        .store
+        .get(app_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(poll.webhook_sequence, 2);
+    assert_eq!(poll.webhook_processed_sequence, 0);
+}
+
+#[tokio::test]
+async fn webhook_final_secret_check_serializes_with_rotate_revoke_and_delete() {
+    fn signed_request(app_id: Uuid, nonce_byte: u8, secret: &[u8]) -> Request<Body> {
+        let raw = br#"{"event":"registry.push"}"#;
+        let timestamp = time::OffsetDateTime::now_utc().unix_timestamp();
+        let nonce = URL_SAFE_NO_PAD.encode([nonce_byte; 16]);
+        let input = solodock::webhook::protocol::signing_input(app_id, raw, timestamp, &nonce);
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(input.as_bytes());
+        Request::builder()
+            .method("POST")
+            .uri(format!("/hooks/v1/apps/{app_id}/registry"))
+            .header(header::HOST, "hooks.example.com")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-solodock-timestamp", timestamp.to_string())
+            .header("x-solodock-nonce", nonce)
+            .header(
+                "x-solodock-signature",
+                format!("v1={:x}", mac.finalize().into_bytes()),
+            )
+            .body(Body::from(raw.as_slice()))
+            .unwrap()
+    }
+
+    let harness = Harness::new().await;
+    let mut candidate = draft("application-secret");
+    candidate["auto_deploy_enabled"] = json!(true);
+    candidate["auto_deploy_acknowledged"] = json!(true);
+    let (_, created) = body(
+        harness
+            .create(Some("m6-create-hook-order-app"), &candidate)
+            .await,
+    )
+    .await;
+    let app_id: Uuid = serde_json::from_str::<Value>(&created).unwrap()["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let webhooks = harness.state.webhooks.as_ref().unwrap();
+    let first_raw = *b"M6_ORDER_FIRST_SECRET_32_BYTES!!";
+    let first = SecretValue::new(URL_SAFE_NO_PAD.encode(first_raw));
+    let first_metadata = webhooks
+        .store
+        .configure(app_id, None, Uuid::new_v4(), &first)
+        .unwrap();
+
+    let catalog_guard = harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .coordinator
+        .catalog_lock()
+        .await;
+    let old_request = tokio::spawn(
+        harness
+            .app
+            .clone()
+            .oneshot(signed_request(app_id, 31, &first_raw)),
+    );
+    tokio::task::yield_now().await;
+    let second_raw = *b"M6_ORDER_SECOND_SECRET_32_BYTE!!";
+    let second = SecretValue::new(URL_SAFE_NO_PAD.encode(second_raw));
+    let second_metadata = webhooks
+        .store
+        .configure(
+            app_id,
+            Some(first_metadata.metadata_revision),
+            Uuid::new_v4(),
+            &second,
+        )
+        .unwrap();
+    drop(catalog_guard);
+    assert_eq!(
+        old_request.await.unwrap().unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let catalog_guard = harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .coordinator
+        .catalog_lock()
+        .await;
+    let revoked_request = tokio::spawn(harness.app.clone().oneshot(signed_request(
+        app_id,
+        32,
+        &second_raw,
+    )));
+    tokio::task::yield_now().await;
+    webhooks
+        .store
+        .revoke(app_id, second_metadata.metadata_revision, Uuid::new_v4())
+        .unwrap();
+    drop(catalog_guard);
+    assert_eq!(
+        revoked_request.await.unwrap().unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    let third_raw = *b"M6_ORDER_THIRD_SECRET_32_BYTES!!";
+    let third = SecretValue::new(URL_SAFE_NO_PAD.encode(third_raw));
+    webhooks
+        .store
+        .configure(app_id, None, Uuid::new_v4(), &third)
+        .unwrap();
+    let catalog_guard = harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .coordinator
+        .catalog_lock()
+        .await;
+    let deleted_request = tokio::spawn(
+        harness
+            .app
+            .clone()
+            .oneshot(signed_request(app_id, 33, &third_raw)),
+    );
+    tokio::task::yield_now().await;
+    harness.store.tombstone(app_id, Uuid::new_v4()).unwrap();
+    drop(catalog_guard);
+    assert_eq!(
+        deleted_request.await.unwrap().unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(webhooks.poll_states.get(app_id).await.unwrap().is_none());
 }

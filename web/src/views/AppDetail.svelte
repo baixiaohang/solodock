@@ -8,8 +8,11 @@
   import { credentialsForReference } from '../lib/registryReference'
   import { canConfirmDeletion } from '../lib/deletionState'
   import { pollNeedsAttention, pollOutcomeText } from '../lib/pollingState'
-  import type { AppDetailResponse, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, RegistryCredential, StatsSample } from '../lib/types'
+  import { writeOnlyRetryIdentity } from '../lib/deploymentState'
+  import { encodeWebhookSecret } from '../lib/webhookSecret'
+  import type { AppDetailResponse, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, RegistryCredential, StatsSample, WebhookStatus } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
+  import DeletionWebhookNotice from '../components/DeletionWebhookNotice.svelte'
   let { appId }: { appId: string } = $props()
   let app = $state<AppDetailResponse | null>(null)
   let stats = $state<StatsSample | null>(null)
@@ -45,6 +48,10 @@
   let editCredential = $state<string | null>(null)
   let deployments = $state<Deployment[]>([])
   let deployRetry = $state<RetryIdentity | undefined>()
+  let webhook = $state<WebhookStatus | null>(null)
+  let webhookSecret = $state('')
+  let webhookSaved = $state(false)
+  let webhookRetry = $state<RetryIdentity | undefined>()
   let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
   $effect(() => {
     if (editCredential && credentials.length > 0 && !matchingCredentials.some((value) => value.id === editCredential)) editCredential = null
@@ -53,16 +60,49 @@
   onMount(() => {
     void load()
     const source = openSse(`/api/v1/apps/${appId}/stats`, { stats: (event) => { stats = JSON.parse(event.data) as StatsSample } })
-    return () => source.close()
+    return () => { source.close(); webhookSecret = ''; webhookRetry = undefined }
   })
 
   async function load() {
-    const [loadedApp, page, loadedCredentials] = await Promise.all([
+    const [loadedApp, page, loadedCredentials, loadedWebhook] = await Promise.all([
       api<AppDetailResponse>(`/api/v1/apps/${appId}`),
       api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
       api<RegistryCredential[]>('/api/v1/registry-credentials'),
+      api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`).catch(() => null),
     ])
-    app = loadedApp; deployments = page.items; credentials = loadedCredentials
+    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook
+  }
+
+  function prepareWebhookSecret() {
+    const bytes = crypto.getRandomValues(new Uint8Array(32))
+    webhookSecret = encodeWebhookSecret(bytes)
+    webhookSaved = false; webhookRetry = undefined
+  }
+
+  async function saveWebhook() {
+    if (!webhook || !webhookSecret || !webhookSaved) return
+    const request = { expected_metadata_revision: webhook.configured ? webhook.metadata_revision : null, secret: webhookSecret }
+    webhookRetry = await writeOnlyRetryIdentity(
+      webhookRetry,
+      { expected_metadata_revision: request.expected_metadata_revision },
+      webhookSecret,
+    )
+    actionBusy = true; error = ''
+    try {
+      webhook = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'PUT', idempotencyKey: webhookRetry.key })
+      webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
+    } catch { error = 'Webhook 配置保存失败；网络结果不明确时会复用同一 secret 和幂等键。' } finally { actionBusy = false }
+  }
+
+  async function revokeWebhook() {
+    if (!webhook?.configured || !webhook.metadata_revision || !window.confirm('撤销后旧 webhook secret 立即失效；周期轮询和已 claim 部署不受影响。继续？')) return
+    const request = { expected_metadata_revision: webhook.metadata_revision }
+    webhookRetry = retryIdentity(webhookRetry, request)
+    actionBusy = true; error = ''
+    try {
+      webhook = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'DELETE', idempotencyKey: webhookRetry.key })
+      webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
+    } catch { error = 'Webhook 撤销失败；请刷新状态后重试。' } finally { actionBusy = false }
   }
 
   async function lifecycle(action: 'start' | 'stop' | 'restart') {
@@ -215,6 +255,7 @@
         <article class="panel"><h2>环境变量</h2>{#each app.draft?.public_environment ?? [] as entry}<p><code>{entry.key}</code> = {entry.value}</p>{/each}{#each app.draft?.secret_keys ?? [] as key}<p><code>{key}</code> · <span class="tag">write-only</span></p>{/each}</article>
         <article class="panel"><h2>资源</h2><p>{app.draft?.ports.length ?? 0} 个端口</p><p>{app.draft?.volumes.length ?? 0} 个 named volume</p><p>{app.draft?.binds.length ?? 0} 个受限 bind</p><p>{app.draft?.networks.length ?? 0} 个附加网络</p><p>{app.draft?.files.length ?? 0} 个托管文件</p></article>
         <article class="panel wide"><h2>编辑策略</h2><p class="muted">更新必须提交完整配置、携带当前 revision，并对每个既有 secret 显式选择 keep/replace/delete。Secret 内容永不回显。</p><button onclick={startEditing}>编辑完整配置…</button></article>
+        {#if webhook}<article class="panel wide"><h2>Registry recheck webhook</h2><p><span class="tag">{webhook.degraded ? '配置损坏：请生成新 secret 修复' : webhook.configured ? '已配置' : '未配置'}</span> · {webhook.algorithm}</p><p><code>{webhook.public_origin}{webhook.public_path}</code></p><p class="muted">Webhook 只触发一次 durable Registry recheck；不会信任 payload 中的镜像信息，也不会绕过自动部署、退避、drift 或健康门禁。</p>{#if webhookSecret}<p class="notice warning">这是 secret 唯一一次显示机会，请保存到 CI secret store：<code>{webhookSecret}</code></p><label class="checkbox"><input type="checkbox" bind:checked={webhookSaved} /> 我已安全保存该 secret</label><div class="actions"><button disabled={actionBusy || !webhookSaved} onclick={() => void saveWebhook()}>{webhook.configured ? '确认轮换' : '确认配置'}</button><button class="ghost" onclick={() => { webhookSecret = ''; webhookSaved = false; webhookRetry = undefined }}>取消</button></div>{:else}<div class="actions"><button disabled={actionBusy} onclick={prepareWebhookSecret}>{webhook.configured ? '生成轮换 secret' : '生成 webhook secret'}</button>{#if webhook.configured}<button class="danger" disabled={actionBusy} onclick={() => void revokeWebhook()}>撤销 webhook</button>{/if}</div>{/if}</article>{/if}
       </section>
       {#if editing}
         <form class="panel form-grid" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
@@ -249,6 +290,6 @@
     {/if}
   {/if}
   {#if deletionDialog}
-    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>Pending release：</strong><code>{deletion.pending_release_id ?? '无'}</code></p><p><strong>Pending config：</strong><code>{deletion.pending_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
+    <div class="modal-backdrop" role="presentation"><div class="modal" role="dialog" aria-modal="true" aria-label="确认取消登记"><h2>确认取消登记</h2><p class="notice warning">默认只取消登记，容器、named volume、bind 内容和网络全部保留。{deletion?.orphan_warning ? '现有容器将成为 orphan。' : ''}</p><DeletionWebhookNotice configured={deletion?.webhook_configured ?? false} /><label class="checkbox"><input type="checkbox" bind:checked={removeContainer} disabled={deletion !== null} /> 同时移除精确 owned container（数据资源仍保留）</label>{#if deletion}<section class="deletion-preview"><p><strong>Compose project：</strong><code>{deletion.project_name}</code></p><p><strong>Active release：</strong><code>{deletion.active_release_id ?? '无'}</code></p><p><strong>Active config：</strong><code>{deletion.active_config_revision ?? '无'}</code></p><p><strong>Pending release：</strong><code>{deletion.pending_release_id ?? '无'}</code></p><p><strong>Pending config：</strong><code>{deletion.pending_config_revision ?? '无'}</code></p><p><strong>预览过期：</strong>{deletion.expires_at}</p><p><strong>容器：</strong>{deletion.container_ids.length ? deletion.container_ids.join(', ') : '无'}</p><p><strong>托管文件：</strong>{deletion.managed_files.length ? deletion.managed_files.map((file) => `${file.logical_name} · ${file.configured_in}`).join(', ') : '无'}</p><p><strong>保留 owned volumes：</strong>{deletion.retained.owned_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 external volumes：</strong>{deletion.retained.external_volumes.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p><p><strong>保留 bind：</strong>{deletion.retained.binds.map((bind) => `${retainedFact(bind.source, bind.configured_in, bind.exists)} (${bind.readonly ? 'ro' : 'rw'})`).join(', ') || '无'}</p><p><strong>保留网络：</strong>{deletion.retained.networks.map((item) => retainedFact(item.name, item.configured_in, item.exists)).join(', ') || '无'}</p></section><label>输入 <code>{deletion.slug}</code> 确认<input bind:value={confirmationSlug} autocomplete="off" /></label><div class="actions"><button class="danger" disabled={actionBusy || confirmationSlug !== deletion.slug || Date.parse(deletion.expires_at) <= Date.now()} onclick={() => void confirmDeletion()}>确认取消登记</button><button class="ghost" onclick={() => { deletion = null; deletionDialog = false; confirmationSlug = '' }}>取消</button></div>{:else}<div class="actions"><button class="danger" disabled={actionBusy} onclick={() => void previewDeletion()}>生成精确删除预览</button><button class="ghost" onclick={() => { deletionDialog = false }}>取消</button></div>{/if}</div></div>
   {/if}
 </main>

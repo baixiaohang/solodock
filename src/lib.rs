@@ -13,6 +13,7 @@ pub mod registry;
 pub mod security;
 pub mod system;
 pub mod telemetry;
+pub mod webhook;
 
 pub use api::{AppState, router};
 

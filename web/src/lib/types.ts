@@ -36,6 +36,7 @@ export interface SystemHealth {
   deployments: { active: number; interrupted: number; needs_attention: number; limit: number }
   registry_credentials: { status: 'ok' | 'degraded' | 'unavailable'; count: number }
   polling: { coordinator: { status: 'running' | 'degraded' | 'stopped'; due: number; inflight: number }; store_status: 'ok' | 'degraded'; enabled: number; suppressed: number; app_errors: number }
+  webhooks: { status: 'ok' | 'degraded' | 'disabled'; configured: number; replay_records: number }
 }
 
 export interface ActiveRelease { id: string; image_ref: string }
@@ -141,8 +142,21 @@ export interface DeletionPreviewResponse {
     networks: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
   }
   orphan_warning: boolean
+  webhook_configured: boolean
   confirmation_token: string
   expires_at: string
+}
+
+export interface WebhookStatus {
+  configured: boolean
+  degraded: boolean
+  metadata_revision: string | null
+  secret_revision: string | null
+  algorithm: 'hmac-sha256-v1'
+  public_origin: string
+  public_path: string
+  created_at: string | null
+  rotated_at: string | null
 }
 
 export type ConfiguredScope = 'active' | 'pending' | 'draft' | 'active_and_pending' | 'active_and_draft' | 'pending_and_draft' | 'active_pending_and_draft'

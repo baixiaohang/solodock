@@ -163,33 +163,50 @@ impl IdempotencyService {
         &self,
         store: &crate::app_store::AppStore,
     ) -> Result<(), IdempotencyError> {
-        let rows = sqlx::query(
-            "SELECT route,operation_id FROM idempotency_records WHERE status='succeeded' AND route LIKE '/api/v1/apps/%' LIMIT 100",
-        )
-        .fetch_all(self.database.pool())
-        .await?;
-        for row in rows {
-            let route: String = row.get(0);
-            let Some(app_text) = route.strip_prefix("/api/v1/apps/") else {
-                continue;
-            };
-            if app_text.contains('/') {
-                continue;
-            }
-            let Ok(app_id) = app_text.parse::<Uuid>() else {
-                continue;
-            };
-            let Ok(operation_id) = row.get::<String, _>(1).parse::<Uuid>() else {
-                continue;
-            };
-            let path = store.tombstone_path(app_id, operation_id);
-            match fs::symlink_metadata(&path) {
-                Ok(_) => store.finalize_tombstone(app_id, operation_id)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
+        for (app_id, operation_id) in self.succeeded_app_tombstones(store).await? {
+            store.finalize_tombstone(app_id, operation_id)?;
         }
         Ok(())
+    }
+
+    pub async fn succeeded_app_tombstones(
+        &self,
+        store: &crate::app_store::AppStore,
+    ) -> Result<Vec<(Uuid, Uuid)>, IdempotencyError> {
+        let mut succeeded = Vec::new();
+        for (app_id, operation_id) in store.tombstones()? {
+            let route = format!("/api/v1/apps/{app_id}");
+            let row = sqlx::query("SELECT status,response_status,response_body FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                .bind(route)
+                .bind(operation_id.to_string())
+                .fetch_optional(self.database.pool())
+                .await?;
+            let Some(row) = row else {
+                return Err(IdempotencyError::RecordInvalid);
+            };
+            let status: String = row.get(0);
+            if matches!(status.as_str(), "pending" | "interrupted") {
+                continue;
+            }
+            let response_status: Option<i64> = row.get(1);
+            let response_body: Option<String> = row.get(2);
+            let valid = status == "succeeded"
+                && response_status == Some(200)
+                && response_body
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .is_some_and(|value| {
+                        value.get("app_id").and_then(|value| value.as_str())
+                            == Some(app_id.to_string().as_str())
+                            && value.get("unregistered").and_then(|value| value.as_bool())
+                                == Some(true)
+                    });
+            if !valid {
+                return Err(IdempotencyError::RecordInvalid);
+            }
+            succeeded.push((app_id, operation_id));
+        }
+        Ok(succeeded)
     }
 
     /// Finalizes credential tombstones only after the exact deletion response
@@ -230,6 +247,52 @@ impl IdempotencyService {
                         return Err(IdempotencyError::RecordInvalid);
                     }
                     store.finalize_tombstone(credential_id, operation_id)?;
+                }
+                _ => return Err(IdempotencyError::RecordInvalid),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn finalize_succeeded_webhook_revisions(
+        &self,
+        store: &crate::webhook::WebhookStore,
+    ) -> Result<(), IdempotencyError> {
+        for (app_id, operation_id) in store.pending_cleanup()? {
+            let route = format!("/api/v1/apps/{app_id}/webhook");
+            let row = sqlx::query("SELECT status,response_status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                .bind(route)
+                .bind(operation_id.to_string())
+                .fetch_optional(self.database.pool())
+                .await?;
+            match row.map(|row| (row.get::<String, _>(0), row.get::<Option<i64>, _>(1))) {
+                Some((status, Some(200))) if status == "succeeded" => {
+                    store.discard_operation_temp(app_id, operation_id)?;
+                    store.cleanup_unreferenced(app_id)?;
+                }
+                Some((status, _)) if matches!(status.as_str(), "pending" | "interrupted") => {}
+                _ => return Err(IdempotencyError::RecordInvalid),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn cleanup_webhook_operation_temps(
+        &self,
+        store: &crate::webhook::WebhookStore,
+    ) -> Result<(), IdempotencyError> {
+        for (app_id, operation_id) in store.operation_temps()? {
+            let route = format!("/api/v1/apps/{app_id}/webhook");
+            let row = sqlx::query("SELECT status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                .bind(route)
+                .bind(operation_id.to_string())
+                .fetch_optional(self.database.pool())
+                .await?;
+            match row.map(|row| row.get::<String, _>(0)) {
+                Some(status)
+                    if matches!(status.as_str(), "interrupted" | "failed" | "succeeded") =>
+                {
+                    store.discard_operation_temp(app_id, operation_id)?;
                 }
                 _ => return Err(IdempotencyError::RecordInvalid),
             }
@@ -567,11 +630,60 @@ impl From<sqlx::Error> for IdempotencyError {
 mod deployment_tests {
     use super::*;
     use crate::{
+        app_store::AppStore,
         deploy::ScheduledResolvedTarget,
         registry::{CredentialStore, Platform, ResolvedImage},
         security::secret::SecretValue,
+        webhook::WebhookStore,
     };
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn startup_discards_only_ledger_owned_webhook_operation_temps() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database, root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let app = Uuid::new_v4();
+        let app_directory = apps.app_directory(app);
+        let revisions = app_directory.join("webhook-secret-revisions");
+        std::fs::create_dir(&app_directory).unwrap();
+        std::fs::set_permissions(&app_directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::create_dir(&revisions).unwrap();
+        std::fs::set_permissions(&revisions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let route = format!("/api/v1/apps/{app}/webhook");
+        let key = "webhook-temp-key";
+        let operation = match service
+            .claim(&route, key, b"fingerprint", Uuid::new_v4())
+            .await
+            .unwrap()
+        {
+            ClaimResult::New(value) => value,
+            _ => unreachable!(),
+        };
+        service
+            .mark_interrupted(&route, key, Uuid::new_v4())
+            .await
+            .unwrap();
+        let temporary = revisions.join(format!(".solodock-webhook-tmp-{}", operation.simple()));
+        std::fs::create_dir(&temporary).unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let partial = temporary.join("secret");
+        std::fs::write(&partial, b"partial").unwrap();
+        std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let webhooks = WebhookStore::new(apps, service.integrity_key());
+
+        service
+            .cleanup_webhook_operation_temps(&webhooks)
+            .await
+            .unwrap();
+        assert!(!temporary.exists());
+    }
 
     #[tokio::test]
     async fn deployment_claim_is_atomic_with_unique_nonterminal_row() {

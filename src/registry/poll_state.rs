@@ -80,6 +80,11 @@ pub struct PollState {
     pub last_error_code: Option<String>,
     pub suppressed_target_key: Option<String>,
     pub suppressed_deployment_id: Option<Uuid>,
+    pub webhook_sequence: i64,
+    pub webhook_processed_sequence: i64,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub last_webhook_received_at: Option<OffsetDateTime>,
+    pub last_wake_source: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
 }
@@ -182,6 +187,18 @@ impl PollStateStore {
                     .await?;
             }
         }
+        let replay_apps = sqlx::query("SELECT DISTINCT app_id FROM webhook_replays")
+            .fetch_all(&mut *transaction)
+            .await?;
+        for row in replay_apps {
+            let id: String = row.get(0);
+            if !ids.contains(&id) {
+                sqlx::query("DELETE FROM webhook_replays WHERE app_id=?")
+                    .bind(id)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -227,6 +244,119 @@ impl PollStateStore {
             row.get::<Option<i64>, _>(2).unwrap_or(0),
         ))
     }
+
+    pub async fn accept_webhook(
+        &self,
+        app_id: Uuid,
+        secret_revision: Uuid,
+        nonce_sha256: &[u8],
+        request_id: Uuid,
+        generation: &str,
+        enabled: bool,
+    ) -> Result<WebhookAccept, PollStateError> {
+        let now = OffsetDateTime::now_utc();
+        let expires = now + time::Duration::minutes(10);
+        let now_text = format_time(now)?;
+        let mut tx = self.database.pool().begin().await?;
+        sqlx::query("DELETE FROM webhook_replays WHERE rowid IN (SELECT rowid FROM webhook_replays WHERE expires_at < ? ORDER BY expires_at LIMIT 100)")
+            .bind(&now_text)
+            .execute(&mut *tx)
+            .await?;
+        let inserted = sqlx::query("INSERT OR IGNORE INTO webhook_replays (app_id,secret_revision,nonce_sha256,received_at,expires_at,request_id) VALUES (?,?,?,?,?,?)")
+            .bind(app_id.to_string())
+            .bind(secret_revision.to_string())
+            .bind(nonce_sha256)
+            .bind(&now_text)
+            .bind(format_time(expires)?)
+            .bind(request_id.to_string())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if inserted == 0 {
+            tx.rollback().await?;
+            return Ok(WebhookAccept::Replay);
+        }
+        let action = if enabled {
+            let previous: Option<(i64, i64)> = sqlx::query_as(
+                "SELECT webhook_sequence,webhook_processed_sequence FROM poll_states WHERE app_id=?",
+            )
+            .bind(app_id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?;
+            sqlx::query("INSERT INTO poll_states (app_id,generation,enabled,last_outcome,updated_at,webhook_sequence,last_webhook_received_at,last_wake_source) VALUES (?,?,1,'scheduled',?,1,?,'webhook') ON CONFLICT(app_id) DO UPDATE SET consecutive_transient_failures=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.consecutive_transient_failures ELSE 0 END,next_check_not_before=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.next_check_not_before ELSE NULL END,last_checked_at=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_checked_at ELSE NULL END,last_success_at=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_success_at ELSE NULL END,last_source_descriptor_digest=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_source_descriptor_digest ELSE NULL END,last_etag=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_etag ELSE NULL END,last_manifest_digest=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_manifest_digest ELSE NULL END,last_platform=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_platform ELSE NULL END,last_error_class=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_error_class ELSE NULL END,last_error_code=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_error_code ELSE NULL END,suppressed_target_key=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.suppressed_target_key ELSE NULL END,suppressed_deployment_id=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.suppressed_deployment_id ELSE NULL END,generation=excluded.generation,enabled=1,last_outcome=CASE WHEN poll_states.generation=excluded.generation THEN poll_states.last_outcome ELSE 'scheduled' END,webhook_sequence=poll_states.webhook_sequence+1,last_webhook_received_at=excluded.last_webhook_received_at,last_wake_source='webhook',updated_at=excluded.updated_at")
+                .bind(app_id.to_string())
+                .bind(generation)
+                .bind(&now_text)
+                .bind(&now_text)
+                .execute(&mut *tx)
+                .await?;
+            if previous.is_some_and(|(sequence, processed)| sequence > processed) {
+                WebhookAccept::Coalesced
+            } else {
+                WebhookAccept::Accepted
+            }
+        } else {
+            WebhookAccept::IgnoredDisabled
+        };
+        let audit_action = match action {
+            WebhookAccept::Accepted => "registry_recheck_requested",
+            WebhookAccept::Coalesced => "registry_recheck_coalesced",
+            WebhookAccept::IgnoredDisabled => "registry_recheck_ignored_disabled",
+            WebhookAccept::Replay => unreachable!(),
+        };
+        sqlx::query("INSERT INTO audit_events (actor,request_id,action,target_type,target_id,result,redacted_metadata,created_at) VALUES ('webhook',?,?,'app',?,'accepted','{}',?)")
+            .bind(request_id.to_string())
+            .bind(audit_action)
+            .bind(app_id.to_string())
+            .bind(&now_text)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(action)
+    }
+
+    pub async fn mark_webhook_processed(
+        &self,
+        app_id: Uuid,
+        captured: i64,
+    ) -> Result<(), PollStateError> {
+        sqlx::query("UPDATE poll_states SET webhook_processed_sequence=MIN(webhook_sequence,MAX(webhook_processed_sequence,?)),last_wake_source=CASE WHEN webhook_sequence>? THEN 'webhook' ELSE last_wake_source END,updated_at=? WHERE app_id=?")
+            .bind(captured)
+            .bind(captured)
+            .bind(format_time(OffsetDateTime::now_utc())?)
+            .bind(app_id.to_string())
+            .execute(self.database.pool())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn webhook_replay_count(&self) -> Result<i64, PollStateError> {
+        Ok(sqlx::query_scalar("SELECT COUNT(*) FROM webhook_replays")
+            .fetch_one(self.database.pool())
+            .await?)
+    }
+
+    pub async fn remove_app_operational(&self, app_id: Uuid) -> Result<(), PollStateError> {
+        let mut transaction = self.database.pool().begin().await?;
+        sqlx::query("DELETE FROM webhook_replays WHERE app_id=?")
+            .bind(app_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM poll_states WHERE app_id=?")
+            .bind(app_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WebhookAccept {
+    Accepted,
+    Coalesced,
+    IgnoredDisabled,
+    Replay,
 }
 
 fn optional_time(value: Option<OffsetDateTime>) -> Result<Option<String>, DbError> {
@@ -267,6 +397,10 @@ fn parse_state(row: sqlx::sqlite::SqliteRow) -> Result<PollState, PollStateError
             .get::<Option<String>, _>("suppressed_deployment_id")
             .map(|value| value.parse().map_err(|_| PollStateError::Corrupt))
             .transpose()?,
+        webhook_sequence: row.get("webhook_sequence"),
+        webhook_processed_sequence: row.get("webhook_processed_sequence"),
+        last_webhook_received_at: parse_optional(row.get("last_webhook_received_at"))?,
+        last_wake_source: row.get("last_wake_source"),
         updated_at: parse_time(&row.get::<String, _>("updated_at"))?,
     })
 }
@@ -386,5 +520,160 @@ mod tests {
         assert!(state.last_source_descriptor_digest.is_none());
         assert!(state.last_manifest_digest.is_none());
         assert!(state.last_platform.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_nonce_wake_and_audit_commit_atomically_and_coalesce() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let store = PollStateStore::new(database.clone());
+        let app = Uuid::new_v4();
+        let revision = Uuid::new_v4();
+        store
+            .publish(
+                app,
+                PollObservation {
+                    generation: "old-generation",
+                    enabled: true,
+                    next_check_not_before: None,
+                    checked_at: Some(OffsetDateTime::now_utc()),
+                    success: true,
+                    replace_observed_fields: true,
+                    source_descriptor_digest: Some("sha256:old"),
+                    etag: Some("old-etag"),
+                    manifest_digest: Some("sha256:old"),
+                    platform: Some("linux/amd64"),
+                    outcome: PollOutcome::Unchanged,
+                    error_class: None,
+                    error_code: None,
+                    transient_failures: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .suppress(app, "old-target", Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .accept_webhook(app, revision, &[1; 32], Uuid::new_v4(), "generation", true)
+                .await
+                .unwrap(),
+            WebhookAccept::Accepted
+        );
+        assert_eq!(
+            store
+                .accept_webhook(app, revision, &[2; 32], Uuid::new_v4(), "generation", true)
+                .await
+                .unwrap(),
+            WebhookAccept::Coalesced
+        );
+        assert_eq!(
+            store
+                .accept_webhook(app, revision, &[1; 32], Uuid::new_v4(), "generation", true)
+                .await
+                .unwrap(),
+            WebhookAccept::Replay
+        );
+        let state = store.get(app).await.unwrap().unwrap();
+        assert_eq!(state.generation, "generation");
+        assert!(state.last_etag.is_none());
+        assert!(state.last_manifest_digest.is_none());
+        assert!(state.suppressed_target_key.is_none());
+        assert_eq!(
+            (state.webhook_sequence, state.webhook_processed_sequence),
+            (2, 0)
+        );
+        store.mark_webhook_processed(app, 1).await.unwrap();
+        let state = store.get(app).await.unwrap().unwrap();
+        assert_eq!(
+            (state.webhook_sequence, state.webhook_processed_sequence),
+            (2, 1)
+        );
+        assert_eq!(database.audit_count().await.unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn disabled_webhook_is_audited_without_pending_wake() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let store = PollStateStore::new(database.clone());
+        let app = Uuid::new_v4();
+        assert_eq!(
+            store
+                .accept_webhook(
+                    app,
+                    Uuid::new_v4(),
+                    &[3; 32],
+                    Uuid::new_v4(),
+                    "generation",
+                    false
+                )
+                .await
+                .unwrap(),
+            WebhookAccept::IgnoredDisabled
+        );
+        assert!(store.get(app).await.unwrap().is_none());
+        assert_eq!(database.audit_count().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_preserves_same_generation_credential_backoff() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let store = PollStateStore::new(database);
+        let app = Uuid::new_v4();
+        let deadline = OffsetDateTime::now_utc() + time::Duration::minutes(30);
+        store
+            .publish(
+                app,
+                PollObservation {
+                    generation: "generation",
+                    enabled: true,
+                    next_check_not_before: Some(deadline),
+                    checked_at: Some(OffsetDateTime::now_utc()),
+                    success: false,
+                    replace_observed_fields: false,
+                    source_descriptor_digest: None,
+                    etag: None,
+                    manifest_digest: None,
+                    platform: None,
+                    outcome: PollOutcome::CredentialError,
+                    error_class: Some("credential"),
+                    error_code: Some("REGISTRY_CREDENTIAL_INVALID"),
+                    transient_failures: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .accept_webhook(
+                app,
+                Uuid::new_v4(),
+                &[4; 32],
+                Uuid::new_v4(),
+                "generation",
+                true,
+            )
+            .await
+            .unwrap();
+        let state = store.get(app).await.unwrap().unwrap();
+        assert_eq!(state.last_outcome, PollOutcome::CredentialError);
+        assert_eq!(
+            state.last_error_code.as_deref(),
+            Some("REGISTRY_CREDENTIAL_INVALID")
+        );
+        assert_eq!(state.next_check_not_before, Some(deadline));
+        assert_eq!(state.webhook_sequence, 1);
     }
 }

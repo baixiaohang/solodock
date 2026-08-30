@@ -6,6 +6,7 @@ pub mod middleware;
 pub mod mutations;
 pub mod streams;
 pub mod system;
+pub mod webhooks;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -44,6 +45,7 @@ pub struct AppState {
     pub stream_tasks: TaskTracker,
     pub m3: Option<Arc<mutations::M3Services>>,
     pub m4: Option<Arc<deployments::M4Services>>,
+    pub webhooks: Option<Arc<crate::webhook::WebhookServices>>,
 }
 
 impl AppState {
@@ -69,6 +71,7 @@ impl AppState {
             stream_tasks,
             m3: None,
             m4: None,
+            webhooks: None,
         }
     }
 }
@@ -119,6 +122,22 @@ pub fn router(state: AppState) -> Router {
             post(deployments::rollback),
         )
         .layer(DefaultBodyLimit::max(16 * 1024));
+    let webhook_admin = Router::new()
+        .route(
+            "/api/v1/apps/{id}/webhook",
+            get(webhooks::status)
+                .put(webhooks::configure)
+                .delete(webhooks::revoke),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024));
+    let public_webhook = Router::new()
+        .route(
+            "/hooks/v1/apps/{id}/registry",
+            post(crate::webhook::ingress::receive),
+        )
+        .layer(DefaultBodyLimit::max(
+            crate::webhook::protocol::MAX_BODY_BYTES,
+        ));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/api/v1/me", get(auth::me))
@@ -138,8 +157,14 @@ pub fn router(state: AppState) -> Router {
         .merge(lifecycle_mutations)
         .merge(delete_mutations)
         .merge(m4_mutations)
+        .merge(webhook_admin)
+        .merge(public_webhook)
         .fallback(assets::serve)
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(axum_middleware::from_fn_with_state(
+            state,
+            middleware::host_isolation,
+        ))
         .layer(axum_middleware::from_fn(middleware::request_context))
 }
 

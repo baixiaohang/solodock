@@ -296,6 +296,41 @@ impl AppStore {
         sync_directory(&self.apps_directory.join(".trash"))?;
         Ok(())
     }
+
+    /// Enumerates only canonical, internally consistent application tombstones.
+    /// Unknown entries fail closed so recovery never broad-deletes state.
+    pub fn tombstones(&self) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
+        let trash = self.apps_directory.join(".trash");
+        let entries = match fs::read_dir(&trash) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut result = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| StoreError::ContentInvalid)?;
+            if name.len() != 73 || name.as_bytes().get(36) != Some(&b'-') {
+                return Err(StoreError::ContentInvalid);
+            }
+            let app_id = name[..36]
+                .parse::<Uuid>()
+                .map_err(|_| StoreError::ContentInvalid)?;
+            let operation_id = name[37..]
+                .parse::<Uuid>()
+                .map_err(|_| StoreError::ContentInvalid)?;
+            if name != format!("{app_id}-{operation_id}") {
+                return Err(StoreError::ContentInvalid);
+            }
+            self.read_tombstone_metadata(app_id, operation_id)?;
+            result.push((app_id, operation_id));
+        }
+        result.sort_unstable();
+        Ok(result)
+    }
 }
 
 #[derive(serde::Deserialize)]

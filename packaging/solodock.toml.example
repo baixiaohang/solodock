@@ -1,6 +1,8 @@
 schema_version = 1
 listen_address = "127.0.0.1:8080"
 public_origin = "https://solodock.example.com"
+# Optional dedicated public hostname for signed Registry recheck webhooks.
+# webhook_public_origin = "https://solodock-hooks.example.com"
 state_directory = "/var/lib/solodock"
 runtime_directory = "/run/solodock"
 allowed_bind_roots = []

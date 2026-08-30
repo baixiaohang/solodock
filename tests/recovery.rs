@@ -11,6 +11,8 @@ use solodock::{
         DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy, normalize_draft,
     },
     registry::{Platform, ResolvedImage},
+    security::secret::SecretValue,
+    webhook::WebhookStore,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
@@ -162,12 +164,17 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     store.set_pending(app_id, pending).unwrap();
     let report = store.scan_read_only().unwrap();
     assert!(report.issues.is_empty(), "{:?}", report.issues);
+    let webhook_secret = SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".to_owned());
+    let webhook_store = WebhookStore::new(store.clone(), key.clone());
+    webhook_store
+        .configure(app_id, None, Uuid::new_v4(), &webhook_secret)
+        .unwrap();
 
     let config = config_directory.join("config.toml");
     fs::write(
         &config,
         format!(
-            "schema_version=1\nlisten_address='127.0.0.1:8080'\npublic_origin='https://solodock.example.invalid'\nstate_directory='{}'\nruntime_directory='/run/solodock'\nallowed_bind_roots=[]\n",
+            "schema_version=1\nlisten_address='127.0.0.1:8080'\npublic_origin='https://solodock.example.invalid'\nwebhook_public_origin='https://hooks.example.invalid'\nstate_directory='{}'\nruntime_directory='/run/solodock'\nallowed_bind_roots=[]\n",
             state.display()
         ),
     )
@@ -213,5 +220,16 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     assert_eq!(
         fs::read_link(restored_app.join("pending")).unwrap(),
         std::path::PathBuf::from(format!("releases/{pending}"))
+    );
+    let restored_store =
+        AppStore::initialize_managed(restored.join("var/lib/solodock/apps"), key.clone(), vec![])
+            .unwrap();
+    let restored_webhook = WebhookStore::new(restored_store, key);
+    assert!(
+        restored_webhook
+            .load_current(app_id)
+            .unwrap()
+            .secret
+            .constant_time_eq(webhook_secret.expose())
     );
 }
