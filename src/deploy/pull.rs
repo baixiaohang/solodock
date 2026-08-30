@@ -19,7 +19,7 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
-    docker::models::DockerReadApi,
+    docker::models::{DockerReadApi, ImageRecord},
     registry::{LoadedCredential, ResolvedImage},
 };
 
@@ -355,16 +355,7 @@ impl ImagePuller for FixedImagePuller {
             };
             command_result?;
             let image = self.docker.inspect_image(&resolved.runnable_image_ref).await.map_err(|_| PullError::VerificationFailed)?;
-            let actual_platform = crate::registry::Platform::canonical(
-                &image.os,
-                &image.architecture,
-                image.variant.as_deref(),
-            )
-            .map_err(|_| PullError::VerificationFailed)?;
-            if image.id != resolved.local_image_id || actual_platform != resolved.platform {
-                return Err(PullError::VerificationFailed);
-            }
-            if !image.repo_digests.iter().any(|value| repo_digest_matches(value, resolved)) { return Err(PullError::VerificationFailed); }
+            if !image_matches_resolved(&image, resolved) { return Err(PullError::VerificationFailed); }
             Ok(())
         }.await;
         let cleanup = self
@@ -408,11 +399,30 @@ fn check_memory_pressure() -> Result<(), PullError> {
     Ok(())
 }
 
+fn image_matches_resolved(image: &ImageRecord, resolved: &ResolvedImage) -> bool {
+    let Ok(actual_platform) = crate::registry::Platform::canonical(
+        &image.os,
+        &image.architecture,
+        image.variant.as_deref(),
+    ) else {
+        return false;
+    };
+    image.id == resolved.local_image_id
+        && actual_platform == resolved.platform
+        && image
+            .repo_digests
+            .iter()
+            .any(|value| repo_digest_matches(value, resolved))
+}
+
 fn repo_digest_matches(value: &str, resolved: &ResolvedImage) -> bool {
     let Some((repository, digest)) = value.rsplit_once('@') else {
         return false;
     };
-    if digest != resolved.manifest_digest {
+    // Classic image stores expose the pulled manifest digest here. Docker's
+    // containerd image store can instead synthesize RepoDigests from the local
+    // image target, which is the already verified config digest.
+    if digest != resolved.manifest_digest && digest != resolved.local_image_id {
         return false;
     }
     let mut parts = repository.split('/');
@@ -595,6 +605,74 @@ mod tests {
                     .exists()
             );
         }
+    }
+
+    #[test]
+    fn image_verification_accepts_classic_manifest_repo_digest() {
+        let (_root, _puller, resolved, _credential) = fixture();
+        let image = ImageRecord {
+            id: resolved.local_image_id.clone(),
+            repo_digests: vec![format!("registry.example/app@{}", resolved.manifest_digest)],
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            variant: None,
+        };
+
+        assert!(image_matches_resolved(&image, &resolved));
+    }
+
+    #[test]
+    fn image_verification_accepts_containerd_config_repo_digest() {
+        let (_root, _puller, mut resolved, _credential) = fixture();
+        resolved.source_image_ref = "docker.io/library/postgres:16-alpine".into();
+        resolved.logical_registry = "docker.io".into();
+        resolved.repository = "library/postgres".into();
+        resolved.runnable_image_ref =
+            format!("docker.io/library/postgres@{}", resolved.manifest_digest);
+        let image = ImageRecord {
+            id: resolved.local_image_id.clone(),
+            repo_digests: vec![format!("postgres@{}", resolved.local_image_id)],
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            variant: None,
+        };
+
+        assert!(image_matches_resolved(&image, &resolved));
+    }
+
+    #[test]
+    fn image_verification_keeps_digest_repository_and_platform_guards() {
+        let (_root, _puller, resolved, _credential) = fixture();
+        let valid = ImageRecord {
+            id: resolved.local_image_id.clone(),
+            repo_digests: vec![format!("registry.example/app@{}", resolved.local_image_id)],
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            variant: None,
+        };
+
+        let mut wrong_id = valid.clone();
+        wrong_id.id = format!("sha256:{}", "c".repeat(64));
+        assert!(!image_matches_resolved(&wrong_id, &resolved));
+
+        let mut wrong_repository = valid.clone();
+        wrong_repository.repo_digests = vec![format!(
+            "registry.example/other@{}",
+            resolved.local_image_id
+        )];
+        assert!(!image_matches_resolved(&wrong_repository, &resolved));
+
+        let mut wrong_digest = valid.clone();
+        wrong_digest.repo_digests = vec![format!("registry.example/app@sha256:{}", "c".repeat(64))];
+        assert!(!image_matches_resolved(&wrong_digest, &resolved));
+
+        let mut tag_only = valid.clone();
+        tag_only.repo_digests = vec!["registry.example/app:stable".into()];
+        assert!(!image_matches_resolved(&tag_only, &resolved));
+
+        let mut wrong_platform = valid;
+        wrong_platform.architecture = "arm64".into();
+        assert!(!image_matches_resolved(&wrong_platform, &resolved));
     }
 
     #[test]
