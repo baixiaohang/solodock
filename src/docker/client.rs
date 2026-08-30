@@ -19,14 +19,16 @@ use super::{
     models::{
         ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerReadApi,
         DockerResource, DockerStream, HealthStatus, ImageRecord, LogChunk, LogRequest,
-        LogStreamKind, MountKind, MountProjection, NetworkProjection, PortProjection,
-        ProbeSnapshot, ProbeStatus, RawDockerEvent, RawStats,
+        LogStreamKind, MountKind, MountProjection, NetworkMember, NetworkProjection,
+        NetworkSnapshot, PortProjection, ProbeSnapshot, ProbeStatus, RawDockerEvent, RawStats,
     },
     ownership::{MANAGED_LABEL, valid_container_id},
 };
 
 const SOCKET_PATH: &str = "/var/run/docker.sock";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_NETWORK_MEMBERS: usize = 256;
+const NETWORK_MEMBER_CONCURRENCY: usize = 8;
 
 #[derive(Clone)]
 pub struct BollardReadClient {
@@ -328,6 +330,87 @@ impl DockerReadApi for BollardReadClient {
         }
     }
 
+    async fn inspect_network_snapshot(
+        &self,
+        name: &str,
+    ) -> Result<Option<NetworkSnapshot>, DockerError> {
+        let operation = async {
+            let docker = self.client().await?;
+            let inspected = match docker.inspect_network(name, None).await {
+                Ok(value) => value,
+                Err(error) if is_not_found(&error) => return Ok(None),
+                Err(error) => return Err(classify(&error, false)),
+            };
+            let observed_name = inspected.name.unwrap_or_default();
+            if observed_name != name {
+                return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+            }
+            let network_id = inspected
+                .id
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?;
+            let labels = inspected.labels.unwrap_or_default();
+            let expected_members =
+                network_member_signature(inspected.containers.unwrap_or_default())?;
+            let member_ids = expected_members
+                .iter()
+                .map(|(container_id, _)| container_id.clone())
+                .collect::<Vec<_>>();
+            let client = self.clone();
+            let mut members = futures_util::stream::iter(member_ids.into_iter().map(|id| {
+                let client = client.clone();
+                let network_name = observed_name.clone();
+                async move {
+                    let container = client
+                        .inspect_container(&id)
+                        .await
+                        .map_err(|_| DockerError::new(DockerErrorKind::ObservationFailed))?;
+                    if container.id != id {
+                        return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+                    }
+                    let attachment = container
+                        .networks
+                        .into_iter()
+                        .find(|network| network.name == network_name)
+                        .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?;
+                    Ok(NetworkMember {
+                        container_id: id,
+                        dns_names: attachment.aliases,
+                    })
+                }
+            }))
+            .buffer_unordered(NETWORK_MEMBER_CONCURRENCY)
+            .collect::<Vec<Result<NetworkMember, DockerError>>>()
+            .await;
+            let mut complete = Vec::with_capacity(members.len());
+            for member in members.drain(..) {
+                complete.push(member?);
+            }
+            complete.sort_by(|left, right| left.container_id.cmp(&right.container_id));
+            let confirmed = docker
+                .inspect_network(name, None)
+                .await
+                .map_err(|_| DockerError::new(DockerErrorKind::ObservationFailed))?;
+            let confirmed_members =
+                network_member_signature(confirmed.containers.unwrap_or_default())?;
+            if confirmed.name.as_deref() != Some(name)
+                || confirmed.id.as_deref() != Some(network_id.as_str())
+                || confirmed.labels.unwrap_or_default() != labels
+                || confirmed_members != expected_members
+            {
+                return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+            }
+            Ok(Some(NetworkSnapshot {
+                name: observed_name,
+                labels,
+                members: complete,
+            }))
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, operation)
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::ObservationFailed))?
+    }
+
     async fn inspect_image(&self, reference: &str) -> Result<ImageRecord, DockerError> {
         let docker = self.client().await?;
         let image = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_image(reference))
@@ -352,6 +435,27 @@ async fn with_list_deadline<T>(
     tokio::time::timeout(REQUEST_TIMEOUT, operation)
         .await
         .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
+}
+
+fn network_member_signature(
+    containers: HashMap<String, bollard::models::EndpointResource>,
+) -> Result<Vec<(String, String)>, DockerError> {
+    if containers.len() > MAX_NETWORK_MEMBERS {
+        return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+    }
+    let mut signature = Vec::with_capacity(containers.len());
+    for (container_id, endpoint) in containers {
+        let endpoint_id = endpoint
+            .endpoint_id
+            .filter(|value| valid_container_id(value))
+            .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?;
+        if !valid_container_id(&container_id) {
+            return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+        }
+        signature.push((container_id, endpoint_id));
+    }
+    signature.sort();
+    Ok(signature)
 }
 
 fn project_inspect(inspect: ContainerInspectResponse) -> ContainerRecord {
@@ -409,22 +513,36 @@ fn project_inspect(inspect: ContainerInspectResponse) -> ContainerRecord {
             })
         })
         .collect();
-    let networks = network_settings
+    let container_name = inspect
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .trim_start_matches('/')
+        .to_owned();
+    let mut networks = network_settings
         .networks
         .unwrap_or_default()
         .into_iter()
-        .map(|(name, value)| NetworkProjection {
-            name,
-            container_ip: value.ip_address.filter(|value| !value.is_empty()),
+        .map(|(name, value)| {
+            let mut aliases = value.dns_names.unwrap_or_default();
+            aliases.extend(value.aliases.unwrap_or_default());
+            if !container_name.is_empty() {
+                aliases.push(container_name.clone());
+            }
+            aliases.retain(|value| !value.is_empty());
+            aliases.sort();
+            aliases.dedup();
+            NetworkProjection {
+                name,
+                container_ip: value.ip_address.filter(|value| !value.is_empty()),
+                aliases,
+            }
         })
-        .collect();
+        .collect::<Vec<_>>();
+    networks.sort_by(|left, right| left.name.cmp(&right.name));
     ContainerRecord {
         id: inspect.id.unwrap_or_default(),
-        name: inspect
-            .name
-            .unwrap_or_default()
-            .trim_start_matches('/')
-            .to_owned(),
+        name: container_name,
         labels: config.labels.unwrap_or_default(),
         status: map_status(state.status.map(|value| value.to_string()).as_deref()),
         health: map_health(
@@ -568,6 +686,61 @@ mod tests {
         assert!(!api_at_least_1_41("garbage"));
         assert_eq!(map_status(Some("future")), ContainerStatus::Unknown);
         assert_eq!(map_health(Some("future")), HealthStatus::Unknown);
+    }
+
+    #[test]
+    fn container_projection_reports_sorted_effective_dns_names() {
+        let inspect: ContainerInspectResponse = serde_json::from_value(serde_json::json!({
+            "Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "Name": "/example-app-1",
+            "Config": { "Labels": {}, "Image": "example:latest" },
+            "State": { "Status": "running" },
+            "NetworkSettings": {
+                "Networks": {
+                    "shared": {
+                        "IPAddress": "172.20.0.2",
+                        "Aliases": ["api", "example-app-1"],
+                        "DNSNames": ["short-id", "api"]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let projected = project_inspect(inspect);
+        assert_eq!(projected.networks[0].name, "shared");
+        assert_eq!(
+            projected.networks[0].aliases,
+            ["api", "example-app-1", "short-id"]
+        );
+    }
+
+    #[test]
+    fn network_member_signature_tracks_endpoint_reconnects_and_rejects_missing_identity() {
+        let container_id = "a".repeat(64);
+        let first = network_member_signature(HashMap::from([(
+            container_id.clone(),
+            bollard::models::EndpointResource {
+                endpoint_id: Some("b".repeat(64)),
+                ..Default::default()
+            },
+        )]))
+        .unwrap();
+        let reconnected = network_member_signature(HashMap::from([(
+            container_id.clone(),
+            bollard::models::EndpointResource {
+                endpoint_id: Some("c".repeat(64)),
+                ..Default::default()
+            },
+        )]))
+        .unwrap();
+        assert_ne!(first, reconnected);
+        assert!(
+            network_member_signature(HashMap::from([(
+                container_id,
+                bollard::models::EndpointResource::default(),
+            )]))
+            .is_err()
+        );
     }
 
     #[tokio::test(start_paused = true)]

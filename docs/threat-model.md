@@ -14,6 +14,8 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
 
-volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。应用级备份/restore、安全更新和 schema兼容由管理员负责。
+volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。External network 与其成员属于 daemon 共享状态：SoloDock 对成员数量设置上限，在共享 deadline 内完整 inspect 成员 full ID 和有效 DNS names，任何截断或部分成功都 fail closed。Alias 冲突只对已经通过 filesystem/ownership policy 精确确认的旧 container full ID 放行；app label、名称和短 ID 不构成替换权限。
+
+Docker observation 与后续 Compose effect 无法组成跨 API 原子事务，外部 root actor 仍可在两者之间改变网络。系统以 durable marker 后的最后一次 fresh preflight 缩小窗口，并在 effect 后用 `NETWORK_ATTACHMENT_MISMATCH` 与 `NETWORK_ALIAS_MISMATCH` 持续揭示漂移，不宣称消除有宿主 root 权限的并发。应用级备份/restore、安全更新和 schema兼容由管理员负责。
 
 测试如何证明这些边界见 [测试与安全护栏](testing.md)；故障后的人工处置见 [恢复](recovery.md)。

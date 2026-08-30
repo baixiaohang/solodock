@@ -54,7 +54,26 @@ export interface ContainerProjection {
   image_id: string | null
   ports: Array<{ container_port: number; protocol: string; host_ip: string; host_port: number }>
   mounts: Array<{ kind: string; source: string | null; destination: string; read_only: boolean }>
-  networks: Array<{ name: string; container_ip: string | null }>
+  networks: Array<{ name: string; container_ip: string | null; aliases: string[] }>
+}
+
+export type NetworkMode = 'owned_only' | 'owned_and_external' | 'external_only'
+export interface ExternalNetworkAttachment { name: string; aliases: string[] }
+export interface NetworkPlan {
+  owned_default_network: boolean
+  mode: NetworkMode
+  external: ExternalNetworkAttachment[]
+}
+export interface ComposePlan {
+  service: 'app'
+  image_ref: string
+  runnable: boolean
+  ports: number
+  mounts: number
+  networks: number
+  network_mode: NetworkMode
+  external_networks: ExternalNetworkAttachment[]
+  warnings: string[]
 }
 
 export interface AppObservation {
@@ -64,6 +83,7 @@ export interface AppObservation {
   active_release: ActiveRelease | null
   actual_release_id: string | null
   actual: ContainerProjection | null
+  expected_network_plan: NetworkPlan | null
   drift_codes: string[]
 }
 
@@ -114,7 +134,8 @@ export interface DraftInput {
     | { kind: 'external'; name: string; target_path: string }
   >
   binds: Array<{ source: string; target_path: string; readonly: boolean; acknowledge_non_rollbackable: boolean }>
-  networks: Array<{ kind: 'owned_default' } | { kind: 'external'; name: string }>
+  owned_default_network: boolean
+  networks: Array<{ kind: 'owned_default' } | { kind: 'external'; name: string; aliases?: string[] }>
   health:
     | { policy: 'running'; stable_window_seconds: number }
     | { policy: 'completed' }
@@ -139,7 +160,7 @@ export interface DeletionPreviewResponse {
     owned_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
     external_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
     binds: Array<{ source: string; readonly: boolean; configured_in: ConfiguredScope; exists: boolean }>
-    networks: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
+    networks: Array<{ name: string; kind: 'owned_default' | 'external'; aliases: string[]; configured_in: ConfiguredScope; exists: boolean }>
   }
   orphan_warning: boolean
   webhook_configured: boolean
@@ -172,6 +193,7 @@ export interface DraftResponse {
   ports: DraftInput['ports']
   volumes: DraftInput['volumes']
   binds: DraftInput['binds']
+  owned_default_network: boolean
   networks: DraftInput['networks']
   health: DraftInput['health']
 }

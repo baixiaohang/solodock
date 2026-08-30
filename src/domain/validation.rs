@@ -31,6 +31,11 @@ pub struct ConfigMetadata {
     pub ports: Vec<PortInput>,
     pub volumes: Vec<VolumeInput>,
     pub binds: Vec<BindMountInput>,
+    #[serde(
+        default = "default_owned_default_network",
+        skip_serializing_if = "is_true"
+    )]
+    pub owned_default_network: bool,
     pub networks: Vec<NetworkInput>,
     pub health: HealthPolicy,
     pub config_sha256: String,
@@ -59,6 +64,7 @@ pub struct NormalizedDraft {
     pub ports: Vec<PortInput>,
     pub volumes: Vec<VolumeInput>,
     pub binds: Vec<BindMountInput>,
+    pub owned_default_network: bool,
     pub networks: Vec<NetworkInput>,
     pub health: HealthPolicy,
     pub metadata: ConfigMetadata,
@@ -114,8 +120,7 @@ pub fn normalize_draft(
     validate_binds(&binds, allowed_bind_roots)?;
     binds.sort_by(|left, right| left.target_path.cmp(&right.target_path));
     let mut networks = input.networks;
-    validate_networks(&networks)?;
-    networks.sort_by_key(network_sort_key);
+    normalize_networks(input.owned_default_network, &mut networks)?;
     validate_health(&input.health)?;
     validate_mount_target_conflicts(&files, &volumes, &binds)?;
 
@@ -152,6 +157,7 @@ pub fn normalize_draft(
         ports: ports.clone(),
         volumes: volumes.clone(),
         binds: binds.clone(),
+        owned_default_network: input.owned_default_network,
         networks: networks.clone(),
         health: input.health.clone(),
         config_sha256: String::new(),
@@ -175,6 +181,7 @@ pub fn normalize_draft(
         ports,
         volumes,
         binds,
+        owned_default_network: input.owned_default_network,
         networks,
         health: input.health,
         metadata,
@@ -573,29 +580,6 @@ fn validate_volumes(volumes: &[VolumeInput]) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn validate_networks(networks: &[NetworkInput]) -> Result<(), DomainError> {
-    if networks.len() > 8 {
-        return Err(DomainError::ConfigQuotaExceeded);
-    }
-    let mut names = HashSet::new();
-    let mut owned = 0;
-    for network in networks {
-        match network {
-            NetworkInput::OwnedDefault => owned += 1,
-            NetworkInput::External { name } => {
-                validate_docker_name(name)?;
-                if !names.insert(name.clone()) {
-                    return Err(DomainError::ConfigInvalid);
-                }
-            }
-        }
-    }
-    if owned > 1 {
-        return Err(DomainError::ConfigInvalid);
-    }
-    Ok(())
-}
-
 fn validate_docker_name(value: &str) -> Result<(), DomainError> {
     validate_text(value)?;
     if value.is_empty()
@@ -866,11 +850,8 @@ fn volume_sort_key(value: &VolumeInput) -> String {
     }
 }
 
-fn network_sort_key(value: &NetworkInput) -> String {
-    match value {
-        NetworkInput::OwnedDefault => "0".into(),
-        NetworkInput::External { name } => format!("1:{name}"),
-    }
+const fn is_true(value: &bool) -> bool {
+    *value
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
@@ -941,6 +922,7 @@ mod tests {
             ports: Vec::new(),
             volumes: Vec::new(),
             binds: Vec::new(),
+            owned_default_network: true,
             networks: vec![NetworkInput::OwnedDefault],
             health: HealthPolicy::Running {
                 stable_window_seconds: 15,
@@ -1116,10 +1098,51 @@ mod tests {
             ports: normalized.ports,
             volumes: normalized.volumes,
             binds: normalized.binds,
+            owned_default_network: normalized.owned_default_network,
             networks: normalized.networks,
             health: normalized.health,
         })
         .unwrap();
         assert!(!response.contains("file-secret"));
+    }
+
+    #[test]
+    fn legacy_network_defaults_keep_canonical_config_bytes_and_hash() {
+        let legacy_external = r#"{"kind":"external","name":"shared"}"#;
+        let parsed: NetworkInput = serde_json::from_str(legacy_external).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), legacy_external);
+
+        let mut value = input();
+        value.networks.push(NetworkInput::External {
+            name: "shared".into(),
+            aliases: Vec::new(),
+        });
+        let normalized = normalize_draft(value, &ExistingSecrets::default(), b"key", &[]).unwrap();
+        let metadata_json = serde_json::to_string(&normalized.metadata).unwrap();
+        assert!(!metadata_json.contains("owned_default_network"));
+        assert!(!metadata_json.contains("aliases"));
+        let legacy_fixture = include_str!("../../tests/fixtures/legacy-config-v1.toml");
+        assert_eq!(
+            toml::to_string(&normalized.metadata).unwrap(),
+            legacy_fixture
+        );
+        let loaded: ConfigMetadata = toml::from_str(legacy_fixture).unwrap();
+        assert!(loaded.owned_default_network);
+        assert!(matches!(
+            &loaded.networks[1],
+            NetworkInput::External { aliases, .. } if aliases.is_empty()
+        ));
+        verify_config_integrity(
+            &loaded,
+            &[],
+            &BTreeMap::new(),
+            &ExistingSecrets::default(),
+            b"key",
+        )
+        .unwrap();
+        assert_eq!(
+            normalized.metadata.config_sha256,
+            "739d53e83e08600fb6fa610333ffcd35e6e40e88ff97aa8bae406d43901d90c4"
+        );
     }
 }

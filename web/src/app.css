@@ -233,3 +233,10 @@ button.danger, .danger { background: #a83c43; color: white; }
 .checkbox { grid-template-columns: auto 1fr !important; align-items: center; }
 .checkbox input { width: auto; }
 @media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } .form-grid .wide { grid-column: auto; } }
+.network-editor { display: grid; gap: 1rem; margin: 0; padding: 1rem; border: 1px solid #29424d; border-radius: .75rem; }
+.network-editor legend { color: #eaf2f4; font-weight: 700; }
+.network-attachment { display: grid; gap: .8rem; padding: 1rem; border: 1px solid #1c3540; border-radius: .7rem; background: #07151b; }
+.network-row, .alias-row { display: grid; grid-template-columns: 1fr auto; gap: .75rem; align-items: end; }
+.alias-list { display: grid; gap: .65rem; }
+.network-comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+@media (max-width: 700px) { .network-row, .alias-row, .network-comparison { grid-template-columns: 1fr; } }

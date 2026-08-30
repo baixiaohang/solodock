@@ -1,0 +1,25 @@
+schema_version = 1
+public_env_keys = []
+secret_keys = []
+files = []
+ports = []
+volumes = []
+binds = []
+config_sha256 = "739d53e83e08600fb6fa610333ffcd35e6e40e88ff97aa8bae406d43901d90c4"
+
+[secret_hmacs]
+
+[public_file_sha256s]
+
+[secret_file_hmacs]
+
+[[networks]]
+kind = "owned_default"
+
+[[networks]]
+kind = "external"
+name = "shared"
+
+[health]
+policy = "running"
+stable_window_seconds = 15

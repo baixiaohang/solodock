@@ -39,10 +39,16 @@ pub struct DraftInput {
     pub volumes: Vec<VolumeInput>,
     #[serde(default)]
     pub binds: Vec<BindMountInput>,
+    #[serde(default = "default_owned_default_network")]
+    pub owned_default_network: bool,
     #[serde(default)]
     pub networks: Vec<NetworkInput>,
     #[serde(default)]
     pub health: HealthPolicy,
+}
+
+pub const fn default_owned_default_network() -> bool {
+    true
 }
 
 pub const fn default_poll_interval() -> u32 {

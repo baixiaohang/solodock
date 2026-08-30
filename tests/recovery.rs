@@ -100,6 +100,7 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
             ports: vec![],
             volumes: vec![],
             binds: vec![],
+            owned_default_network: true,
             networks: vec![],
             health: HealthPolicy::default(),
         },

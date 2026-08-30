@@ -563,7 +563,19 @@ pub async fn validate(
     let bind_identities = validate_runtime_paths(&state, services, &draft.metadata)
         .await
         .map_err(|code| ApiError::conflict(code, request_id))?;
-    validate_resources(&state, app_id, &draft.metadata, request_id).await?;
+    let app_container = mutation_container_policy(&state, &app, true)
+        .await
+        .map_err(|code| ApiError::conflict(code, request_id))?;
+    validate_resources(
+        &state,
+        app_id,
+        &draft.metadata,
+        app_container
+            .as_ref()
+            .map(|container| container.id.as_str()),
+        request_id,
+    )
+    .await?;
     for identity in &bind_identities {
         crate::domain::revalidate_bind_identity(identity, &services.allowed_bind_roots)
             .map_err(|error| ApiError::domain(error, request_id))?;
@@ -1392,10 +1404,6 @@ async fn lifecycle(
         )
         .await;
     }
-    if let Err(error) = validate_resources(state, app_id, &active_metadata, request_id).await {
-        let (code, status) = error.code_and_status();
-        return finish_error(services, &route, raw_key, code, status, request_id).await;
-    }
     let allow_pending = matches!(action, LifecycleAction::Stop);
     let current = mutation_container_policy(state, &app, allow_pending).await;
     let expected_container_id = current
@@ -1408,6 +1416,19 @@ async fn lifecycle(
         .ok()
         .and_then(|value| value.as_ref())
         .and_then(|container| container.started_at.clone());
+    if let Err(error) = validate_lifecycle_resources(
+        state,
+        app_id,
+        &active_metadata,
+        expected_container_id.as_deref(),
+        action,
+        request_id,
+    )
+    .await
+    {
+        let (code, status) = error.code_and_status();
+        return finish_error(services, &route, raw_key, code, status, request_id).await;
+    }
     let (mut compose_action, observed) = match (action, current) {
         (LifecycleAction::Start, Ok(Some(container)))
             if container.status == ContainerStatus::Running =>
@@ -1540,7 +1561,16 @@ async fn lifecycle(
                 .await;
             }
         };
-        if let Err(error) = validate_resources(state, app_id, &active_metadata, request_id).await {
+        if let Err(error) = validate_lifecycle_resources(
+            state,
+            app_id,
+            &active_metadata,
+            expected_container_id.as_deref(),
+            action,
+            request_id,
+        )
+        .await
+        {
             let (code, status) = error.code_and_status();
             return finish_error(services, &route, raw_key, code, status, request_id).await;
         }
@@ -1596,6 +1626,21 @@ async fn lifecycle(
             };
         if final_container.as_ref().map(|value| value.id.as_str())
             != expected_container_id.as_deref()
+        {
+            return interrupt_internal(services, &route, raw_key, request_id).await;
+        }
+        if validate_lifecycle_resources(
+            state,
+            app_id,
+            &final_active.loaded.metadata,
+            final_container
+                .as_ref()
+                .map(|container| container.id.as_str()),
+            action,
+            request_id,
+        )
+        .await
+        .is_err()
         {
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
@@ -1860,7 +1905,23 @@ struct RetainedResources {
     owned_volumes: Vec<RetainedNamedResource>,
     external_volumes: Vec<RetainedNamedResource>,
     binds: Vec<RetainedBind>,
-    networks: Vec<RetainedNamedResource>,
+    networks: Vec<RetainedNetwork>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+enum RetainedNetworkKind {
+    OwnedDefault,
+    External,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RetainedNetwork {
+    name: String,
+    kind: RetainedNetworkKind,
+    aliases: Vec<String>,
+    configured_in: String,
+    exists: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2751,9 +2812,11 @@ async fn retained_resources_inner(
     draft: &crate::domain::ConfigMetadata,
     containers: &[String],
 ) -> Result<RetainedResources, &'static str> {
+    type ScopePresence = (bool, bool, bool);
+    type NetworkFactKey = (String, RetainedNetworkKind, Vec<String>);
     let mut owned: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
     let mut external: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
-    let mut networks: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
+    let mut networks: BTreeMap<NetworkFactKey, ScopePresence> = BTreeMap::new();
     let mut binds: BTreeMap<String, (bool, bool, bool, bool)> = BTreeMap::new();
     for (metadata, is_active) in active
         .into_iter()
@@ -2776,17 +2839,25 @@ async fn retained_resources_inner(
                 _ => entry.2 = true,
             }
         }
-        let default = networks
-            .entry(format!("solodock-{}-default", app_id.simple()))
-            .or_default();
-        match is_active {
-            0 => default.0 = true,
-            1 => default.1 = true,
-            _ => default.2 = true,
+        if metadata.owned_default_network {
+            let default = networks
+                .entry((
+                    format!("solodock-{}-default", app_id.simple()),
+                    RetainedNetworkKind::OwnedDefault,
+                    Vec::new(),
+                ))
+                .or_default();
+            match is_active {
+                0 => default.0 = true,
+                1 => default.1 = true,
+                _ => default.2 = true,
+            }
         }
         for network in &metadata.networks {
-            if let crate::domain::NetworkInput::External { name } = network {
-                let entry = networks.entry(name.clone()).or_default();
+            if let crate::domain::NetworkInput::External { name, aliases } = network {
+                let entry = networks
+                    .entry((name.clone(), RetainedNetworkKind::External, aliases.clone()))
+                    .or_default();
                 match is_active {
                     0 => entry.0 = true,
                     1 => entry.1 = true,
@@ -2838,7 +2909,7 @@ async fn retained_resources_inner(
         });
     }
     let mut retained_networks = Vec::new();
-    for (name, (active, pending, draft)) in networks {
+    for ((name, kind, aliases), (active, pending, draft)) in networks {
         let exists = state
             .observer
             .api
@@ -2846,8 +2917,10 @@ async fn retained_resources_inner(
             .await
             .map_err(|error| error.public_code())?
             .is_some();
-        retained_networks.push(RetainedNamedResource {
+        retained_networks.push(RetainedNetwork {
             name,
+            kind,
+            aliases,
             configured_in: configured_scope(active, pending, draft),
             exists,
         });
@@ -2903,11 +2976,75 @@ pub(crate) async fn validate_resources(
     state: &AppState,
     app_id: Uuid,
     metadata: &crate::domain::ConfigMetadata,
+    allowed_replaceable_container_id: Option<&str>,
+    request_id: RequestId,
+) -> Result<(), ApiError> {
+    validate_resources_with_options(
+        state,
+        app_id,
+        metadata,
+        allowed_replaceable_container_id,
+        true,
+        request_id,
+    )
+    .await
+}
+
+pub(crate) async fn validate_resources_for_detach(
+    state: &AppState,
+    app_id: Uuid,
+    metadata: &crate::domain::ConfigMetadata,
+    allowed_replaceable_container_id: Option<&str>,
+    request_id: RequestId,
+) -> Result<(), ApiError> {
+    validate_resources_with_options(
+        state,
+        app_id,
+        metadata,
+        allowed_replaceable_container_id,
+        false,
+        request_id,
+    )
+    .await
+}
+
+async fn validate_lifecycle_resources(
+    state: &AppState,
+    app_id: Uuid,
+    metadata: &crate::domain::ConfigMetadata,
+    allowed_replaceable_container_id: Option<&str>,
+    action: LifecycleAction,
+    request_id: RequestId,
+) -> Result<(), ApiError> {
+    validate_resources_with_options(
+        state,
+        app_id,
+        metadata,
+        allowed_replaceable_container_id,
+        !matches!(action, LifecycleAction::Stop),
+        request_id,
+    )
+    .await
+}
+
+async fn validate_resources_with_options(
+    state: &AppState,
+    app_id: Uuid,
+    metadata: &crate::domain::ConfigMetadata,
+    allowed_replaceable_container_id: Option<&str>,
+    check_alias_conflicts: bool,
     request_id: RequestId,
 ) -> Result<(), ApiError> {
     match tokio::time::timeout(
         Duration::from_secs(5),
-        validate_resources_inner(state, app_id, metadata, request_id),
+        validate_resources_inner(
+            state,
+            app_id,
+            metadata,
+            allowed_replaceable_container_id,
+            check_alias_conflicts,
+            request_id,
+        ),
     )
     .await
     {
@@ -2920,6 +3057,8 @@ async fn validate_resources_inner(
     state: &AppState,
     app_id: Uuid,
     metadata: &crate::domain::ConfigMetadata,
+    allowed_replaceable_container_id: Option<&str>,
+    check_alias_conflicts: bool,
     request_id: RequestId,
 ) -> Result<(), ApiError> {
     let expected = crate::compose::generate::resource_labels(app_id);
@@ -2952,28 +3091,59 @@ async fn validate_resources_inner(
             }
         }
     }
-    let owned_name = format!("solodock-{}-default", app_id.simple());
-    if let Some(resource) = state
-        .observer
-        .api
-        .inspect_network(&owned_name)
-        .await
-        .map_err(|error| ApiError::docker(request_id, error.public_code()))?
-        && (resource.name != owned_name || !has_exact_ownership(&resource.labels, &expected))
-    {
-        return Err(ApiError::conflict("NETWORK_OWNERSHIP_CONFLICT", request_id));
+    let plan = crate::domain::network_plan(metadata.owned_default_network, &metadata.networks)
+        .map_err(|error| ApiError::domain(error, request_id))?;
+    if plan.owned_default_network {
+        let owned_name = format!("solodock-{}-default", app_id.simple());
+        if let Some(resource) = state
+            .observer
+            .api
+            .inspect_network(&owned_name)
+            .await
+            .map_err(|error| ApiError::docker(request_id, error.public_code()))?
+            && (resource.name != owned_name || !has_exact_ownership(&resource.labels, &expected))
+        {
+            return Err(ApiError::conflict("NETWORK_OWNERSHIP_CONFLICT", request_id));
+        }
     }
-    for network in &metadata.networks {
-        if let crate::domain::NetworkInput::External { name } = network
-            && state
+    if allowed_replaceable_container_id
+        .is_some_and(|id| !crate::docker::ownership::valid_container_id(id))
+    {
+        return Err(ApiError::conflict("CONTAINER_CHANGED", request_id));
+    }
+    for network in &plan.external {
+        if !check_alias_conflicts || network.aliases.is_empty() {
+            let Some(resource) = state
                 .observer
                 .api
-                .inspect_network(name)
+                .inspect_network(&network.name)
                 .await
                 .map_err(|error| ApiError::docker(request_id, error.public_code()))?
-                .is_none()
-        {
-            return Err(ApiError::conflict("EXTERNAL_NETWORK_NOT_FOUND", request_id));
+            else {
+                return Err(ApiError::conflict("EXTERNAL_NETWORK_NOT_FOUND", request_id));
+            };
+            if resource.name != network.name {
+                return Err(ApiError::docker(request_id, "DOCKER_OBSERVATION_FAILED"));
+            }
+            continue;
+        }
+        let snapshot = state
+            .observer
+            .api
+            .inspect_network_snapshot(&network.name)
+            .await
+            .map_err(|error| ApiError::docker(request_id, error.public_code()))?
+            .ok_or_else(|| ApiError::conflict("EXTERNAL_NETWORK_NOT_FOUND", request_id))?;
+        if snapshot.name != network.name {
+            return Err(ApiError::docker(request_id, "DOCKER_OBSERVATION_FAILED"));
+        }
+        for alias in &network.aliases {
+            if snapshot.members.iter().any(|member| {
+                member.container_id.as_str() != allowed_replaceable_container_id.unwrap_or("")
+                    && member.dns_names.iter().any(|name| name == alias)
+            }) {
+                return Err(ApiError::conflict("NETWORK_ALIAS_CONFLICT", request_id));
+            }
         }
     }
     Ok(())
@@ -3191,9 +3361,11 @@ mod tests {
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
             active_config_revision: None,
             active_config_sha256: None,
+            active_network_plan: None,
             pending_release_id: None,
             pending_image_ref: None,
             pending_config_revision: None,
+            pending_network_plan: None,
             discovery_image_ref: None,
             draft_revision: None,
             draft_config_sha256: None,
@@ -3284,6 +3456,285 @@ mod tests {
         }
     }
 
+    struct NetworkFactsDocker {
+        snapshot: Result<Option<crate::docker::models::NetworkSnapshot>, DockerError>,
+    }
+
+    struct DetachNetworkFactsDocker {
+        exists: bool,
+        reported_name: Option<String>,
+    }
+
+    #[async_trait]
+    impl DockerReadApi for NetworkFactsDocker {
+        async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+            unreachable!()
+        }
+        async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+            unreachable!()
+        }
+        async fn inspect_container(&self, _: &str) -> Result<ContainerRecord, DockerError> {
+            unreachable!()
+        }
+        async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+            unreachable!()
+        }
+        async fn logs(
+            &self,
+            _: &str,
+            _: LogRequest,
+        ) -> Result<DockerStream<LogChunk>, DockerError> {
+            unreachable!()
+        }
+        async fn stats(&self, _: &str) -> Result<DockerStream<RawStats>, DockerError> {
+            unreachable!()
+        }
+        async fn inspect_network(&self, _: &str) -> Result<Option<DockerResource>, DockerError> {
+            panic!("external-only preflight must not inspect the owned default network")
+        }
+        async fn inspect_network_snapshot(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::docker::models::NetworkSnapshot>, DockerError> {
+            self.snapshot.clone()
+        }
+    }
+
+    #[async_trait]
+    impl DockerReadApi for DetachNetworkFactsDocker {
+        async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+            unreachable!()
+        }
+        async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+            unreachable!()
+        }
+        async fn inspect_container(&self, _: &str) -> Result<ContainerRecord, DockerError> {
+            unreachable!()
+        }
+        async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+            unreachable!()
+        }
+        async fn logs(
+            &self,
+            _: &str,
+            _: LogRequest,
+        ) -> Result<DockerStream<LogChunk>, DockerError> {
+            unreachable!()
+        }
+        async fn stats(&self, _: &str) -> Result<DockerStream<RawStats>, DockerError> {
+            unreachable!()
+        }
+        async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
+            Ok(self.exists.then(|| DockerResource {
+                name: self.reported_name.clone().unwrap_or_else(|| name.into()),
+                labels: HashMap::new(),
+            }))
+        }
+        async fn inspect_network_snapshot(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::docker::models::NetworkSnapshot>, DockerError> {
+            panic!("detach preflight must not inspect aliases")
+        }
+    }
+
+    async fn network_preflight_state(
+        snapshot: Result<Option<crate::docker::models::NetworkSnapshot>, DockerError>,
+    ) -> AppState {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.keep();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&path.join("state.sqlite3")).await.unwrap();
+        let auth = AuthService::new(database, path.join("bootstrap.token"));
+        let mut state = AppState::control_plane(auth, "https://example.com".into(), path);
+        state.observer = DockerObserver::new(
+            Arc::new(NetworkFactsDocker { snapshot }),
+            AppCatalog::default(),
+            DockerSupervisor::new(),
+        );
+        state
+    }
+
+    async fn network_detach_state(exists: bool) -> AppState {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.keep();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&path.join("state.sqlite3")).await.unwrap();
+        let auth = AuthService::new(database, path.join("bootstrap.token"));
+        let mut state = AppState::control_plane(auth, "https://example.com".into(), path);
+        state.observer = DockerObserver::new(
+            Arc::new(DetachNetworkFactsDocker {
+                exists,
+                reported_name: None,
+            }),
+            AppCatalog::default(),
+            DockerSupervisor::new(),
+        );
+        state
+    }
+
+    fn external_only_metadata() -> crate::domain::ConfigMetadata {
+        crate::domain::ConfigMetadata {
+            schema_version: 1,
+            public_env_keys: vec![],
+            secret_keys: vec![],
+            secret_hmacs: Default::default(),
+            files: vec![],
+            public_file_sha256s: Default::default(),
+            secret_file_hmacs: Default::default(),
+            ports: vec![],
+            volumes: vec![],
+            binds: vec![],
+            owned_default_network: false,
+            networks: vec![crate::domain::NetworkInput::External {
+                name: "shared".into(),
+                aliases: vec!["postgres".into()],
+            }],
+            health: crate::domain::HealthPolicy::default(),
+            config_sha256: "0".repeat(64),
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_preflight_fails_closed_and_only_ignores_exact_allowed_full_id() {
+        let occupied_id = "b".repeat(64);
+        let snapshot = crate::docker::models::NetworkSnapshot {
+            name: "shared".into(),
+            labels: HashMap::new(),
+            members: vec![crate::docker::models::NetworkMember {
+                container_id: occupied_id.clone(),
+                dns_names: vec!["postgres".into()],
+            }],
+        };
+        let state = network_preflight_state(Ok(Some(snapshot))).await;
+        let app_id = Uuid::new_v4();
+        let request_id = RequestId(Uuid::new_v4());
+        let conflict =
+            validate_resources(&state, app_id, &external_only_metadata(), None, request_id)
+                .await
+                .unwrap_err();
+        assert_eq!(conflict.code_and_status().0, "NETWORK_ALIAS_CONFLICT");
+        assert!(
+            validate_resources(
+                &state,
+                app_id,
+                &external_only_metadata(),
+                Some(&occupied_id),
+                request_id,
+            )
+            .await
+            .is_ok()
+        );
+        let short_id = &occupied_id[..12];
+        let changed = validate_resources(
+            &state,
+            app_id,
+            &external_only_metadata(),
+            Some(short_id),
+            request_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(changed.code_and_status().0, "CONTAINER_CHANGED");
+    }
+
+    #[tokio::test]
+    async fn external_network_missing_and_incomplete_observation_are_distinct() {
+        let request_id = RequestId(Uuid::new_v4());
+        let missing = network_preflight_state(Ok(None)).await;
+        let error = validate_resources(
+            &missing,
+            Uuid::new_v4(),
+            &external_only_metadata(),
+            None,
+            request_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code_and_status().0, "EXTERNAL_NETWORK_NOT_FOUND");
+
+        let incomplete = network_preflight_state(Err(DockerError::new(
+            crate::docker::models::DockerErrorKind::ObservationFailed,
+        )))
+        .await;
+        let error = validate_resources(
+            &incomplete,
+            Uuid::new_v4(),
+            &external_only_metadata(),
+            None,
+            request_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code_and_status().0, "DOCKER_OBSERVATION_FAILED");
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_detach_ignores_new_alias_conflicts_but_requires_network() {
+        let request_id = RequestId(Uuid::new_v4());
+        let state = network_detach_state(true).await;
+        assert!(
+            validate_resources_for_detach(
+                &state,
+                Uuid::new_v4(),
+                &external_only_metadata(),
+                Some(&"b".repeat(64)),
+                request_id,
+            )
+            .await
+            .is_ok()
+        );
+
+        let missing = network_detach_state(false).await;
+        let error = validate_resources_for_detach(
+            &missing,
+            Uuid::new_v4(),
+            &external_only_metadata(),
+            None,
+            request_id,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code_and_status().0, "EXTERNAL_NETWORK_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn external_network_without_aliases_checks_existence_without_member_snapshot() {
+        let request_id = RequestId(Uuid::new_v4());
+        let mut metadata = external_only_metadata();
+        let crate::domain::NetworkInput::External { aliases, .. } = &mut metadata.networks[0]
+        else {
+            unreachable!()
+        };
+        aliases.clear();
+
+        let state = network_detach_state(true).await;
+        assert!(
+            validate_resources(&state, Uuid::new_v4(), &metadata, None, request_id)
+                .await
+                .is_ok()
+        );
+        let missing = network_detach_state(false).await;
+        let error = validate_resources(&missing, Uuid::new_v4(), &metadata, None, request_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code_and_status().0, "EXTERNAL_NETWORK_NOT_FOUND");
+
+        let mut mismatched = network_detach_state(true).await;
+        mismatched.observer = DockerObserver::new(
+            Arc::new(DetachNetworkFactsDocker {
+                exists: true,
+                reported_name: Some("different-network".into()),
+            }),
+            AppCatalog::default(),
+            DockerSupervisor::new(),
+        );
+        let error = validate_resources(&mismatched, Uuid::new_v4(), &metadata, None, request_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code_and_status().0, "DOCKER_OBSERVATION_FAILED");
+    }
+
     #[tokio::test]
     async fn resource_preflight_has_one_deadline_for_twenty_four_inspects() {
         let root = tempfile::tempdir().unwrap();
@@ -3315,9 +3766,11 @@ mod tests {
                 })
                 .collect(),
             binds: vec![],
+            owned_default_network: true,
             networks: (0..8)
                 .map(|index| crate::domain::NetworkInput::External {
                     name: format!("network-{index}"),
+                    aliases: vec![],
                 })
                 .collect(),
             health: crate::domain::HealthPolicy::default(),
@@ -3325,9 +3778,15 @@ mod tests {
         };
         let started = tokio::time::Instant::now();
         assert!(
-            validate_resources(&state, Uuid::new_v4(), &metadata, RequestId(Uuid::new_v4()))
-                .await
-                .is_err()
+            validate_resources(
+                &state,
+                Uuid::new_v4(),
+                &metadata,
+                None,
+                RequestId(Uuid::new_v4()),
+            )
+            .await
+            .is_err()
         );
         assert!(started.elapsed() < Duration::from_secs(6));
     }

@@ -16,10 +16,36 @@ pub struct Service {
     pub env_file: Vec<EnvFile>,
     pub volumes: Vec<ServiceMount>,
     pub ports: Vec<ServicePort>,
-    pub networks: Vec<String>,
+    pub networks: ServiceNetworks,
     pub restart: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub enum ServiceNetworks {
+    Short(Vec<String>),
+    Long(BTreeMap<String, ServiceNetworkAttachment>),
+}
+
+impl ServiceNetworks {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Short(value) => value.len(),
+            Self::Long(value) => value.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct ServiceNetworkAttachment {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

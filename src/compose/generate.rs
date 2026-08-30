@@ -6,7 +6,10 @@ use uuid::Uuid;
 use super::model::*;
 use crate::{
     docker::ownership::{APP_ID_LABEL, MANAGED_LABEL, RELEASE_ID_LABEL, SCHEMA_LABEL},
-    domain::{HealthPolicy, HttpClient, NetworkInput, NormalizedDraft, PortProtocol, VolumeInput},
+    domain::{
+        ExternalNetworkAttachment, HealthPolicy, HttpClient, NetworkMode, NormalizedDraft,
+        PortProtocol, VolumeInput, network_plan,
+    },
 };
 
 pub struct ComposeInput<'a> {
@@ -25,6 +28,8 @@ pub struct ComposePlan {
     pub ports: usize,
     pub mounts: usize,
     pub networks: usize,
+    pub network_mode: NetworkMode,
+    pub external_networks: Vec<ExternalNetworkAttachment>,
     pub warnings: Vec<&'static str>,
 }
 
@@ -104,31 +109,54 @@ pub fn generate(
     }
     mounts.sort_by(|left, right| left.target.cmp(&right.target));
 
+    let network_plan = network_plan(input.draft.owned_default_network, &input.draft.networks)
+        .expect("normalized drafts always contain a valid network plan");
     let mut networks = BTreeMap::new();
-    let default_name = format!("{resource_prefix}-default");
-    networks.insert(
-        "default".into(),
-        NetworkDefinition {
-            external: false,
-            name: default_name,
-            labels: resource_ownership,
-        },
-    );
-    let mut service_networks = vec!["default".into()];
-    for (index, network) in input.draft.networks.iter().enumerate() {
-        if let NetworkInput::External { name } = network {
-            let key = format!("solodock-network-{index}");
-            networks.insert(
-                key.clone(),
-                NetworkDefinition {
-                    external: true,
-                    name: literal(name),
-                    labels: BTreeMap::new(),
+    let mut service_network_keys = Vec::new();
+    if network_plan.owned_default_network {
+        networks.insert(
+            "default".into(),
+            NetworkDefinition {
+                external: false,
+                name: format!("{resource_prefix}-default"),
+                labels: resource_ownership,
+            },
+        );
+        service_network_keys.push("default".to_owned());
+    }
+    for network in &network_plan.external {
+        let key = format!("solodock-network-{}", network.source_index);
+        networks.insert(
+            key.clone(),
+            NetworkDefinition {
+                external: true,
+                name: literal(&network.name),
+                labels: BTreeMap::new(),
+            },
+        );
+        service_network_keys.push(key);
+    }
+    let service_networks = if network_plan
+        .external
+        .iter()
+        .all(|network| network.aliases.is_empty())
+    {
+        ServiceNetworks::Short(service_network_keys)
+    } else {
+        let mut attachments = BTreeMap::new();
+        if network_plan.owned_default_network {
+            attachments.insert("default".into(), ServiceNetworkAttachment::default());
+        }
+        for network in &network_plan.external {
+            attachments.insert(
+                format!("solodock-network-{}", network.source_index),
+                ServiceNetworkAttachment {
+                    aliases: network.aliases.clone(),
                 },
             );
-            service_networks.push(key);
         }
-    }
+        ServiceNetworks::Long(attachments)
+    };
 
     let ports = input
         .draft
@@ -200,6 +228,9 @@ pub fn generate(
     if matches!(input.draft.health, HealthPolicy::Healthy { http: Some(_) }) {
         warnings.push("HEALTHCHECK_CLIENT_REQUIRED");
     }
+    if !network_plan.external.is_empty() {
+        warnings.push("EXTERNAL_NETWORK_UNMANAGED");
+    }
     Ok((
         yaml,
         ComposePlan {
@@ -209,6 +240,8 @@ pub fn generate(
             ports: port_count,
             mounts: mount_count,
             networks: network_count,
+            network_mode: network_plan.mode,
+            external_networks: network_plan.external,
             warnings,
         },
     ))
@@ -304,6 +337,35 @@ fn health(policy: &HealthPolicy) -> (String, Option<Healthcheck>) {
 mod tests {
     use super::*;
 
+    fn network_draft(
+        owned_default_network: bool,
+        networks: Vec<crate::domain::NetworkInput>,
+    ) -> crate::domain::NormalizedDraft {
+        crate::domain::normalize_draft(
+            crate::domain::DraftInput {
+                slug: "example".into(),
+                display_name: "Example".into(),
+                discovery_image_ref: "registry.example/app:stable".into(),
+                credential_ref: None,
+                auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
+                poll_interval_seconds: 300,
+                environment: crate::domain::EnvironmentInput::default(),
+                files: vec![],
+                ports: vec![],
+                volumes: vec![],
+                binds: vec![],
+                owned_default_network,
+                networks,
+                health: crate::domain::HealthPolicy::default(),
+            },
+            &crate::domain::ExistingSecrets::default(),
+            b"key",
+            &[],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn generated_yaml_is_single_service_and_never_contains_secret_material() {
         let draft = crate::domain::normalize_draft(
@@ -328,6 +390,7 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 binds: vec![],
+                owned_default_network: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -381,6 +444,7 @@ mod tests {
                 },
             ],
             binds: vec![],
+            owned_default_network: true,
             networks: vec![],
             health: crate::domain::HealthPolicy::default(),
         };
@@ -407,5 +471,70 @@ mod tests {
         assert!(yaml.contains("source: solodock-volume-0"));
         assert!(yaml.contains("source: solodock-volume-1"));
         assert_eq!(yaml.matches("customer-data").count(), 1);
+    }
+
+    #[test]
+    fn network_modes_and_aliases_use_typed_deterministic_compose() {
+        let app_id = Uuid::nil();
+        let draft = network_draft(
+            false,
+            vec![crate::domain::NetworkInput::External {
+                name: "shared".into(),
+                aliases: vec!["server".into(), "api".into()],
+            }],
+        );
+        let input = ComposeInput {
+            app_id,
+            release_id: Uuid::nil(),
+            image_ref: &draft.discovery_image_ref,
+            revision_directory: Path::new("/var/lib/solodock/apps/revision"),
+            draft: &draft,
+        };
+        let (first, plan) = generate(input, true).unwrap();
+        let (second, _) = generate(
+            ComposeInput {
+                app_id,
+                release_id: Uuid::nil(),
+                image_ref: &draft.discovery_image_ref,
+                revision_directory: Path::new("/var/lib/solodock/apps/revision"),
+                draft: &draft,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(plan.network_mode, crate::domain::NetworkMode::ExternalOnly);
+        assert!(!first.contains("solodock-00000000000000000000000000000000-default"));
+        assert!(first.contains("aliases:\n        - api\n        - server"));
+        assert!(plan.warnings.contains(&"EXTERNAL_NETWORK_UNMANAGED"));
+    }
+
+    #[test]
+    fn legacy_owned_external_without_aliases_keeps_exact_short_yaml() {
+        let draft = network_draft(
+            true,
+            vec![
+                crate::domain::NetworkInput::OwnedDefault,
+                crate::domain::NetworkInput::External {
+                    name: "shared".into(),
+                    aliases: vec![],
+                },
+            ],
+        );
+        let (yaml, _) = generate(
+            ComposeInput {
+                app_id: Uuid::nil(),
+                release_id: Uuid::nil(),
+                image_ref: &draft.discovery_image_ref,
+                revision_directory: Path::new("/var/lib/solodock/apps/revision"),
+                draft: &draft,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            yaml,
+            "services:\n  app:\n    image: registry.example/app:stable\n    labels:\n      com.solodock.app-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.managed: 'true'\n      com.solodock.release-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.schema-version: '1'\n    env_file:\n    - path: /var/lib/solodock/apps/revision/env/public.env\n      required: true\n    - path: /var/lib/solodock/apps/revision/secrets/runtime.env\n      required: true\n    volumes: []\n    ports: []\n    networks:\n    - default\n    - solodock-network-1\n    restart: unless-stopped\nvolumes: {}\nnetworks:\n  default:\n    name: solodock-00000000000000000000000000000000-default\n    labels:\n      com.solodock.app-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.managed: 'true'\n      com.solodock.project-name: solodock-00000000000000000000000000000000\n      com.solodock.schema-version: '1'\n  solodock-network-1:\n    external: true\n    name: shared\n"
+        );
     }
 }

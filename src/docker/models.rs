@@ -154,6 +154,7 @@ pub struct MountProjection {
 pub struct NetworkProjection {
     pub name: String,
     pub container_ip: Option<String>,
+    pub aliases: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -178,6 +179,19 @@ pub struct ContainerRecord {
 pub struct DockerResource {
     pub name: String,
     pub labels: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkMember {
+    pub container_id: String,
+    pub dns_names: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NetworkSnapshot {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    pub members: Vec<NetworkMember>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -370,6 +384,12 @@ pub trait DockerReadApi: Send + Sync {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
     async fn inspect_network(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
+        Err(DockerError::new(DockerErrorKind::Unavailable))
+    }
+    async fn inspect_network_snapshot(
+        &self,
+        _name: &str,
+    ) -> Result<Option<NetworkSnapshot>, DockerError> {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
     async fn inspect_image(&self, _reference: &str) -> Result<ImageRecord, DockerError> {
