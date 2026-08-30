@@ -102,7 +102,7 @@ Owned network 仅在对应 revision 启用时检查 exact ownership。External n
 
 ## 发布与自动化
 
-manual、poll和rollback进入同一个deployment engine。candidate在Docker effect前落盘并设置`pending`；Compose 后先持久化由 full ID 和 canonical labels 证明的 exact owned effect，再校验 configured digest reference、config/manifest identity、可用的 manifest descriptor、status 与 health。通过健康门禁后才切换`active`。unknown/ambiguous/replaced effect保持`interrupted`或`needs_attention`；exact owned candidate 的确定性拒绝统一进入移除或旧 active 恢复补偿，只有补偿结果被重新观察证明后才写`failed`或`rolled_back`。
+manual、poll和rollback进入同一个deployment engine。candidate在Docker effect前落盘并设置`pending`；Compose 后的首次 observation 是 ownership claim boundary：唯一非 predecessor full ID 与全套 canonical project/service/app/schema/candidate-release labels 足以证明 exact owned effect，worker 立即把该 ID 持久化为 `post_container_id`，再校验 configured digest reference、config/manifest identity、可用的 manifest descriptor、status 与 health。marker 持久化后该 exact ID 是补偿、health、commit/rollback 的 SSOT；此后不同 full ID 才属于 uncertain replacement，必须保留 pending/现场并进入`interrupted`或`needs_attention`，禁止 stop/remove。exact owned candidate 的确定性拒绝统一进入移除或旧 active 恢复补偿，只有补偿结果被重新观察证明后才写`failed`或`rolled_back`。
 
 webhook HMAC验证后，把nonce claim、audit和per-app wake sequence在一个SQLite transaction提交。sequence只是bounded coalescing signal；PollCoordinator仍会重新读取filesystem、Registry和Docker事实。完整状态语义见 [部署与回滚](deployments.md) 和 [Webhook](webhooks.md)。
 

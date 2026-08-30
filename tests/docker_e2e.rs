@@ -2954,7 +2954,7 @@ async fn containerd_postgres_deployment_identity_and_noop() {
 
 #[tokio::test]
 #[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
-async fn containerd_owned_candidate_mismatch_is_removed_before_failed() {
+async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed() {
     if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
         return;
     }
@@ -3018,7 +3018,11 @@ async fn containerd_owned_candidate_mismatch_is_removed_before_failed() {
     assert_eq!(original.len(), 1);
     let labels = original[0].labels.clone();
     remove_owned_container(&docker, &original[0].id, app_id).await;
-    let replacement = docker
+    // This is still before post_container_id exists. A unique non-predecessor
+    // full ID with all canonical candidate labels is the ownership claim; the
+    // deliberately wrong configured image is then a deterministic semantic
+    // mismatch that must be compensated.
+    let pre_marker_claim = docker
         .create_container(
             Some(
                 CreateContainerOptionsBuilder::default()
@@ -3034,7 +3038,10 @@ async fn containerd_owned_candidate_mismatch_is_removed_before_failed() {
         )
         .await
         .unwrap();
-    docker.start_container(&replacement.id, None).await.unwrap();
+    docker
+        .start_container(&pre_marker_claim.id, None)
+        .await
+        .unwrap();
     candidate_gate.resume();
 
     let failed = wait_for_deployment(&harness, deployment).await;
@@ -3052,6 +3059,157 @@ async fn containerd_owned_candidate_mismatch_is_removed_before_failed() {
             .is_empty()
     );
 
+    let network = format!("solodock-{}-default", app_id.simple());
+    docker.remove_network(&network).await.unwrap();
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    harness.state.stream_tasks.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
+async fn containerd_post_marker_full_id_replacement_is_preserved() {
+    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
+        return;
+    }
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let effect_gate = TestEffectGate::new([TestEffectAction::Continue, TestEffectAction::Pause]);
+    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+    let harness = MutationHarness::new_with_test_gates(
+        endpoint,
+        std::env::temp_dir(),
+        None,
+        Some(effect_gate.clone()),
+        Some(candidate_gate.clone()),
+    )
+    .await;
+    let create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("containerd-post-marker-create-0001"),
+            Some(&json!({
+                "slug":"containerd-post-marker",
+                "display_name":"Containerd post marker",
+                "discovery_image_ref":"alpine:3.20",
+                "credential_ref":null,
+                "auto_deploy_enabled":false,
+                "poll_interval_seconds":300,
+                "environment":{"public":[],"secrets":[]},
+                "files":[],
+                "ports":[],
+                "volumes":[],
+                "binds":[],
+                "networks":[{"kind":"owned_default"}],
+                "health":{"policy":"completed"}
+            })),
+        )
+        .await;
+    let create_status = create.status();
+    let create = MutationHarness::json(create).await;
+    assert_eq!(create_status, StatusCode::CREATED, "{create}");
+    let app_id = create["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let deployment =
+        schedule_from_current(&harness, app_id, "containerd-post-marker-deploy-0001").await;
+    candidate_gate.wait_until_reached().await;
+
+    let project = format!("solodock-{}", app_id.simple());
+    let original = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers(&project)
+        .await
+        .unwrap();
+    assert_eq!(original.len(), 1);
+    let labels = original[0].labels.clone();
+    remove_owned_container(&docker, &original[0].id, app_id).await;
+    let claimed = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-containerd-claimed-{}", Uuid::new_v4()))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec!["sleep".into(), "300".into()]),
+                labels: Some(labels.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker.start_container(&claimed.id, None).await.unwrap();
+    candidate_gate.resume();
+
+    // The worker has now persisted claimed.id as post_container_id and entered
+    // deterministic compensation. Replacing it after that marker must never
+    // authorize cleanup of the different full ID.
+    effect_gate.wait_until_reached().await;
+    remove_owned_container(&docker, &claimed.id, app_id).await;
+    let post_marker_replacement = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!(
+                        "solodock-containerd-post-marker-{}",
+                        Uuid::new_v4()
+                    ))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec!["sleep".into(), "300".into()]),
+                labels: Some(labels),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    docker
+        .start_container(&post_marker_replacement.id, None)
+        .await
+        .unwrap();
+    effect_gate.resume();
+
+    let interrupted = wait_for_deployment(&harness, deployment).await;
+    assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+    assert_eq!(
+        interrupted["error_code"], "DEPLOYMENT_INTERRUPTED",
+        "{interrupted}"
+    );
+    assert!(app_detail(&harness, app_id).await["pending_release_id"].is_string());
+    let remaining = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers(&project)
+        .await
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, post_marker_replacement.id);
+    assert!(
+        docker
+            .inspect_container(&post_marker_replacement.id, None)
+            .await
+            .unwrap()
+            .state
+            .and_then(|state| state.running)
+            .unwrap_or(false),
+        "post-marker replacement must remain running"
+    );
+
+    remove_owned_container(&docker, &post_marker_replacement.id, app_id).await;
     let network = format!("solodock-{}-default", app_id.simple());
     docker.remove_network(&network).await.unwrap();
     harness.state.shutdown.cancel();
