@@ -1,5 +1,7 @@
 # SoloDock 威胁模型
 
+本模型以 [产品范围](product-scope.md) 的单主机、单管理员边界为前提。接口配额与日志脱敏行为见 [API 与实时流](api-and-streams.md)，容器资源限制见 [应用模型](application-model.md)。
+
 ## 信任边界
 
 SoloDock 假定唯一管理员和宿主 OS 可信；Registry、镜像、容器输出、Docker/Compose 输出、浏览器输入和反向代理输入均不可信。Docker socket 和 `docker` group 在效果上等同宿主 root，因此 Web 身份认证、loopback 监听、固定动作与 systemd hardening 是纵深防御，不是对恶意宿主管理员的隔离。
@@ -13,3 +15,5 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
 
 volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。应用级备份/restore、安全更新和 schema兼容由管理员负责。
+
+测试如何证明这些边界见 [测试与安全护栏](testing.md)；故障后的人工处置见 [恢复](recovery.md)。

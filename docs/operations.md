@@ -1,5 +1,7 @@
 # SoloDock 运维
 
+生产边界先见 [产品范围](product-scope.md)；应用资源、部署状态和 system health 语义分别见 [应用模型](application-model.md)、[部署与回滚](deployments.md) 和 [API 与实时流](api-and-streams.md)。
+
 ## 安装与升级
 
 生产目标为 Ubuntu 24.04、Docker Engine 和 Docker Compose v2.24+。先构建 Web 与嵌入式 binary：
@@ -44,3 +46,5 @@ sudo ./packaging/solodock-backup --output /secure/new/solodock-control-plane.tar
 ```
 
 archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它不包含业务 volume、bind 数据、Docker image/container 或 network；每个工作负载必须有独立且验证过 restore 的数据备份。
+
+恢复 archive 或处理 degraded/interrupted 状态前，按 [恢复](recovery.md) 的 fail-closed 流程操作；安全前提见 [威胁模型](threat-model.md)。

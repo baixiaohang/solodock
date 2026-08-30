@@ -1,10 +1,12 @@
 # SoloDock 资源预算
 
+本文件保存预算、测量方法和实测基线；功能级隔离场景与破坏性测试护栏见 [测试与安全护栏](testing.md)。
+
 资源 harness 为 [`scripts/measure-resources.sh`](../scripts/measure-resources.sh)。它使用 `embed-ui` release binary、私有临时 state/config 和 exact PID，生成 JSON，并在失败时只终止本次进程。CI 的共享 runner仅使用 512 MiB idle RSS 宽上限防退化；它不等价于腾讯云真实 2C4G 测量。
 
 目标预算：idle RSS 40–100 MiB、idle CPU通常低于 1%、达到 stream gate代表性负载的 RSS增量 10–40 MiB、pull/Compose期间 SoloDock瞬时 100–300 MiB。Docker daemon解压/镜像内存必须单列。binary、UI 与 control-plane metadata 目标为数十 MiB，metadata 不含 image layer和业务数据且低于 100 MiB。
 
-M6 webhook ingress 固定为 1 KiB body、16 concurrent、bounded global/per-app rate buckets 和每应用一个 coalesced wake sequence；资源验收继续使用 M5 的 control-plane/DinD 上限，并增加 burst 后 replay rows、rate map 与 inflight permit 回落的回归，不把通知数量转换为内存队列。
+Webhook ingress 固定为 1 KiB body、16 concurrent、bounded global/per-app rate buckets 和每应用一个 coalesced wake sequence；资源验收沿用 control-plane/DinD 上限，并覆盖 burst 后 replay rows、rate map 与 inflight permit 回落，不把通知数量转换为内存队列。
 
 每次正式验收需记录 kernel、CPU/memory cgroup limit、Rust/Node版本、commit、warm-up/采样窗口、binary size、RSS/CPU/FD/task、Docker daemon峰值以及是否 DinD。CI 产出三份机器可读报告：`resource-report.json` 使用 production embedded binary 完成 60 秒 warm-up 与 60 秒 idle CPU 采样；`docker-e2e-resource-report.json` 在完整 private Registry/DinD 自动部署、健康失败恢复、人工回滚与数据 canary 场景中，将 8 条 authenticated SSE（4 events、2 logs、2 stats）保持 60 秒，并在窗口末端记录 stream 增量、control-plane 峰值和 metadata 大小；`docker-daemon-resource-report.json` 从外层隔离 DinD 容器内按 process name 定位 `dockerd` 并持续读取其 `/proc/<pid>/status`，单独记录 daemon RSS 峰值。JSON 显式记录 `stream_hold_seconds` 与采样时点；本地定向调试可通过 `SOLODOCK_E2E_STREAM_HOLD_SECONDS=1..60` 缩短，但正式默认与 CI 不设置该变量，固定为 60 秒。它们仍是“本地/CI实测，不代表腾讯云实测”。不得设置可能在恢复阶段杀进程的 `MemoryMax`。
 

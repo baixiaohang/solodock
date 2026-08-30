@@ -5,7 +5,7 @@ SoloDock 是面向个人 Docker 工作负载的轻量级单机容器部署控制
 > [!WARNING]
 > SoloDock 是单主机 MVP。Docker socket 等同宿主 root；部署前必须完成独立业务数据备份和访问面硬化。
 
-SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时回滚。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
+SoloDock 提供聚焦的 Web 界面，用不可变镜像 digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时恢复旧 release。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
 
 本仓库是私有项目，未授予公开使用、复制或分发许可。
 
@@ -13,9 +13,9 @@ SoloDock 将提供聚焦的 Web 界面，用不可变镜像 Digest 部署预构�
 
 - Rust stable（edition 2024），包含 `rustfmt` 和 `clippy`
 - Node.js 24 和 npm
-- 计划中的生产环境为 Ubuntu 24.04、Docker Engine 和 Docker Compose v2.24+
+- 生产目标环境为 Ubuntu 24.04、Docker Engine 和 Docker Compose v2.24+
 
-M2 通过固定的 `/var/run/docker.sock` 只读观察 Docker Engine，不接受 `DOCKER_HOST`、TCP endpoint 或自定义 socket 配置。访问 Docker socket（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。Docker 不可用时认证控制面仍会启动，应用目录和系统健康 API 返回 degraded 状态；logs、stats 和 events stream 会在建立响应前返回稳定的 `503`。
+生产 Docker observer 通过固定的 `/var/run/docker.sock` 观察 Docker Engine，不接受 `DOCKER_HOST`、TCP endpoint 或自定义 socket 配置。访问 Docker socket（包括通过 `docker` group）在效果上等同宿主 root 权限，不能把它视为安全边界。Docker 不可用时认证控制面仍会启动，应用目录和系统健康 API 返回 degraded 状态；logs、stats 和 events stream 会在建立响应前返回稳定的 `503`。
 
 ## 配置与后端开发
 
@@ -105,4 +105,12 @@ npm run build
 
 Node/npm 只用于开发和构建 Web UI。
 
-当前权威说明见 [架构](docs/architecture.md)、[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md)、[Webhook](docs/webhooks.md) 和 [资源预算](docs/resource-budget.md)。一次性迁移 runbook 位于 [`docs/migrations/`](docs/migrations/)。
+## 文档
+
+- 产品与配置：[产品范围](docs/product-scope.md)、[应用模型](docs/application-model.md)；
+- 系统与发布：[架构](docs/architecture.md)、[部署与回滚](docs/deployments.md)、[API 与实时流](docs/api-and-streams.md)；
+- 生产运行：[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md)、[资源预算](docs/resource-budget.md)；
+- 专题与验收：[Webhook](docs/webhooks.md)、[测试与安全护栏](docs/testing.md)；
+- 一次性迁移 runbook：[`docs/migrations/`](docs/migrations/)。
+
+这些专题文档描述当前实现。历史设计与交付计划由 Git 保留，不作为当前行为的事实来源。

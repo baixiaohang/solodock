@@ -1,19 +1,109 @@
 # SoloDock 当前架构
 
-SoloDock 是单主机、单管理员、单 service 的容器部署控制面。应用、不可变 config revision、Registry credential metadata/secret revision 和 release 位于私有文件系统；`active` symlink 是 active release 的唯一事实。Docker daemon 是容器实际状态的事实源，Registry 是 tag 当前指向的事实源。SQLite 保存认证、审计、幂等、部署 ledger 与可丢失的 polling operational state，不反向覆盖文件系统事实。
+SoloDock 是单主机、单管理员、单 service 的容器部署控制面。它保持单 Rust 进程、单 crate 和单一 Docker mutation路径，不引入内部微服务、通用 workflow engine 或第二套 Compose 规范。
 
-## 发布与自动部署
+```text
+Browser
+  -> external Tunnel / WAF / TLS
+  -> loopback SoloDock process
+       |-- REST + bounded SSE + embedded UI
+       |-- private filesystem app/release/credential/secret store
+       |-- SQLite auth/audit/idempotency/deployment/poll ledger
+       |-- Docker Engine API for observation
+       |-- fixed docker compose CLI for exact mutation
+       `-- OCI Registry client for tag-to-digest resolution
+```
 
-所有 manual、rollback 和 poll trigger 进入同一 `DeploymentScheduler` 与 `DeploymentEngine`。tag 仅用于 Registry resolve；调度行原子保存本机平台的 manifest digest，随后 candidate release 在任何 Docker effect 前落盘并设置 `pending`。固定 Compose runner 只运行 digest-pinned 单 service；精确容器通过健康门禁后才切换 `active`。未知 effect 保持 `interrupted`，确定性失败才恢复旧 active。
+产品能力和非目标见 [产品范围](product-scope.md)，具体配置资源见 [应用模型](application-model.md)。
 
-一个进程级 `PollCoordinator` 管理 enabled app 的有界 due heap，Registry resolve 最多并发 2。generation 覆盖 draft、source、credential revision、开关和 interval；在途结果在调度前重新读取 filesystem 与 Docker facts。busy 不排队，相同 active digest 不部署，仅 config 变化标为人工处理，失败 target 会在 SQLite 中抑制到 target/generation 改变。
+## 组件职责
 
-可选 webhook ingress 只接受独立 hostname 上的固定签名事件。HMAC 验证后，nonce claim、audit 与 per-app wake sequence 在同一 SQLite transaction 提交；sequence 是 bounded coalescing signal，不是消息队列。PollCoordinator 捕获并推进已处理 sequence，inflight 期间的新 sequence 只保留一次 follow-up，Registry 与 Docker 路径没有第二套实现。
+- Axum API：认证、typed DTO、mutation 协调、SSE 与嵌入式前端；
+- app store：应用 metadata、immutable config revision、release、active/pending link、webhook secret；
+- SQLite：认证、session、audit、幂等、deployment transition、poll/replay operational state；
+- Docker observer：固定 socket上的 capability、list/inspect/events/logs/stats 和 ownership；
+- Compose adapter：从 typed config生成canonical单 service YAML，并以固定参数向量执行封闭动作；
+- Registry adapter：canonical reference、Bearer auth、manifest/digest/platform resolve；
+- deployment engine：manual、poll和rollback的唯一调度/执行状态机；
+- PollCoordinator：有界due heap、backoff、coalescing和durable webhook wake；
+- projection/reconciliation：从filesystem全量事实刷新catalog、redactor和SQLite查询投影。
 
-## HTTP 与数据边界
+生产 binary 使用 `embed-ui` 编译期嵌入 Vite产物，不运行 Node服务。hashed asset可长缓存，HTML不缓存；`/api/**`和`/hooks/**`不会进入SPA fallback。接口边界见 [API 与实时流](api-and-streams.md)。
 
-生产 binary 通过 `embed-ui` 编译期嵌入 Vite 产物。`/api/v1/**` 保持认证、Origin/CSRF 与 `no-store`；`/healthz` 仅提供最小存活信息。hashed asset 长缓存，HTML 不缓存，并统一设置 CSP、frame、referrer、MIME 与 permissions 安全 header；API 404 不进入 SPA fallback。
+## 唯一事实来源
 
-取消注册和移除容器均保留 named/external volume、bind 内容和 network。bind 默认禁用，只能使用管理员 allowlist 的严格子目录，并在每次 Docker effect 前重新验证路径和 Docker data-root。
+| 事实 | 权威来源 |
+| --- | --- |
+| app metadata、draft config、managed files、credential引用 | 私有文件系统 |
+| Registry/webhook/app secret原值 | 专用权限受限文件 |
+| immutable release、digest、platform、canonical Compose | 私有文件系统 |
+| active/pending release | app目录中的canonical symlink |
+| container实际状态、full ID、image和resource存在性 | Docker daemon |
+| tag当前指向 | Registry；调度后以release manifest digest为准 |
+| 管理员、session、audit、幂等、deployment执行和poll/replay状态 | SQLite |
+| catalog/redactor/查询索引 | 从上述事实派生的可重建投影 |
 
-另见 [运维](operations.md)、[恢复](recovery.md) 与 [威胁模型](threat-model.md)。
+任何SQLite投影都不能反向覆盖filesystem事实。SQLite丢失后可以从文件恢复app/release查询事实，但不能伪造管理员、session、audit或deployment历史；必须重新bootstrap。
+
+## 持久化布局
+
+默认根目录如下；权限、HMAC和canonical entry由startup/recovery验证：
+
+```text
+/etc/solodock/config.toml
+
+/var/lib/solodock/
+  state.sqlite3
+  secrets/idempotency.key
+  registry-credentials/<credential-id>/
+    credential.toml
+    secret-revisions/<revision-id>/token
+  registry-credentials/.trash/<credential-id>-<operation-id>/
+  apps/<app-id>/
+    app.toml
+    webhook.toml
+    webhook-secret-revisions/<revision-id>/
+    config-revisions/<revision-id>/
+      config.toml
+      env/
+      files/
+    releases/<release-id>/
+      release.toml
+      compose.yaml
+    active -> releases/<release-id>
+    pending -> releases/<release-id>
+
+/run/solodock/
+  bootstrap.token
+  locks/<app-id>.lock
+  compose/<operation-id>/
+  docker-config/<deployment-id>/config.json
+```
+
+具体文件名可能随兼容 migration演进；调用者不得绕过store或recovery直接编辑这些artifact。
+
+## Filesystem-first publication
+
+config revision和release先在同一父目录内写入operation-owned temp，完成file `fsync`、atomic rename和parent `fsync`后才可引用。app metadata或`active`/`pending`link是相应可见事实的commit point。
+
+filesystem commit之后才发布内存catalog/redactor和SQLite投影。投影失败不能把已经提交的事实误报为回滚；系统标记degraded并由shutdown-aware reconciler重试。redactor只有在完整读取所有app、active/pending/draft、Registry credential和webhook secret后才允许destructive replace，不完整时保留旧pattern或拒绝冷启动。
+
+破坏性recovery cleanup只在HTTP listen前运行。运行期verified loader、catalog refresh和reconciler使用read-only scan，不能删除另一个writer正在发布的temp或尚未被旧metadata引用的新revision。
+
+## Docker 与 Compose 边界
+
+生产观察固定连接 `/var/run/docker.sock`，不读取 `DOCKER_HOST`。Docker unavailable时认证控制面仍可启动，catalog和health显示degraded；需要Docker的stream或mutation在effect前失败。
+
+Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，禁用隐式 `.env`，不使用shell。它只能生成version/validate/start/recreate/deploy-candidate/stop/restart/remove的封闭argv；不存在build、pull、exec、down、volume remove或用户参数透传。
+
+每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。resource、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。
+
+## 发布与自动化
+
+manual、poll和rollback进入同一个deployment engine。candidate在Docker effect前落盘并设置`pending`，通过健康门禁后才切换`active`。unknown effect保持`interrupted`，只有已经证明的确定性失败才允许自动恢复。
+
+webhook HMAC验证后，把nonce claim、audit和per-app wake sequence在一个SQLite transaction提交。sequence只是bounded coalescing signal；PollCoordinator仍会重新读取filesystem、Registry和Docker事实。完整状态语义见 [部署与回滚](deployments.md) 和 [Webhook](webhooks.md)。
+
+## 数据与恢复边界
+
+unregister/remove/delete保留named/external volume、bind内容和network。业务数据不属于control-plane backup，release rollback也不回滚数据migration。安装、备份和故障处置分别见 [运维](operations.md)、[恢复](recovery.md) 和 [威胁模型](threat-model.md)。
