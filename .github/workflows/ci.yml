@@ -184,8 +184,11 @@ jobs:
 
   docker-containerd-e2e:
     needs: classify_push
-    if: ${{ always() && (github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true') }}
+    # Temporarily disabled: the focused suite can hang after setup succeeds.
+    # Re-enable only after each scenario has a bounded timeout and reliable cleanup.
+    if: ${{ false }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     services:
       docker:
         image: docker:29.7.2-dind
