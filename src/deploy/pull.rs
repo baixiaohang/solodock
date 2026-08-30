@@ -407,7 +407,9 @@ fn image_matches_resolved(image: &ImageRecord, resolved: &ResolvedImage) -> bool
     ) else {
         return false;
     };
-    image.id == resolved.local_image_id
+    // Classic image stores expose the config digest as ImageInspect.id. Docker's
+    // containerd image store can expose the selected manifest digest instead.
+    (image.id == resolved.local_image_id || image.id == resolved.manifest_digest)
         && actual_platform == resolved.platform
         && image
             .repo_digests
@@ -632,6 +634,25 @@ mod tests {
         let image = ImageRecord {
             id: resolved.local_image_id.clone(),
             repo_digests: vec![format!("postgres@{}", resolved.local_image_id)],
+            os: "linux".into(),
+            architecture: "amd64".into(),
+            variant: None,
+        };
+
+        assert!(image_matches_resolved(&image, &resolved));
+    }
+
+    #[test]
+    fn image_verification_accepts_containerd_manifest_image_id() {
+        let (_root, _puller, mut resolved, _credential) = fixture();
+        resolved.source_image_ref = "docker.io/library/postgres:16-alpine".into();
+        resolved.logical_registry = "docker.io".into();
+        resolved.repository = "library/postgres".into();
+        resolved.runnable_image_ref =
+            format!("docker.io/library/postgres@{}", resolved.manifest_digest);
+        let image = ImageRecord {
+            id: resolved.manifest_digest.clone(),
+            repo_digests: vec![format!("postgres@{}", resolved.manifest_digest)],
             os: "linux".into(),
             architecture: "amd64".into(),
             variant: None,
