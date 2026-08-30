@@ -3112,16 +3112,18 @@ async fn validate_resources_inner(
         return Err(ApiError::conflict("CONTAINER_CHANGED", request_id));
     }
     for network in &plan.external {
-        if !check_alias_conflicts {
-            if state
+        if !check_alias_conflicts || network.aliases.is_empty() {
+            let Some(resource) = state
                 .observer
                 .api
                 .inspect_network(&network.name)
                 .await
                 .map_err(|error| ApiError::docker(request_id, error.public_code()))?
-                .is_none()
-            {
+            else {
                 return Err(ApiError::conflict("EXTERNAL_NETWORK_NOT_FOUND", request_id));
+            };
+            if resource.name != network.name {
+                return Err(ApiError::docker(request_id, "DOCKER_OBSERVATION_FAILED"));
             }
             continue;
         }
@@ -3460,6 +3462,7 @@ mod tests {
 
     struct DetachNetworkFactsDocker {
         exists: bool,
+        reported_name: Option<String>,
     }
 
     #[async_trait]
@@ -3523,7 +3526,7 @@ mod tests {
         }
         async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
             Ok(self.exists.then(|| DockerResource {
-                name: name.into(),
+                name: self.reported_name.clone().unwrap_or_else(|| name.into()),
                 labels: HashMap::new(),
             }))
         }
@@ -3560,7 +3563,10 @@ mod tests {
         let auth = AuthService::new(database, path.join("bootstrap.token"));
         let mut state = AppState::control_plane(auth, "https://example.com".into(), path);
         state.observer = DockerObserver::new(
-            Arc::new(DetachNetworkFactsDocker { exists }),
+            Arc::new(DetachNetworkFactsDocker {
+                exists,
+                reported_name: None,
+            }),
             AppCatalog::default(),
             DockerSupervisor::new(),
         );
@@ -3690,6 +3696,43 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code_and_status().0, "EXTERNAL_NETWORK_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn external_network_without_aliases_checks_existence_without_member_snapshot() {
+        let request_id = RequestId(Uuid::new_v4());
+        let mut metadata = external_only_metadata();
+        let crate::domain::NetworkInput::External { aliases, .. } = &mut metadata.networks[0]
+        else {
+            unreachable!()
+        };
+        aliases.clear();
+
+        let state = network_detach_state(true).await;
+        assert!(
+            validate_resources(&state, Uuid::new_v4(), &metadata, None, request_id)
+                .await
+                .is_ok()
+        );
+        let missing = network_detach_state(false).await;
+        let error = validate_resources(&missing, Uuid::new_v4(), &metadata, None, request_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code_and_status().0, "EXTERNAL_NETWORK_NOT_FOUND");
+
+        let mut mismatched = network_detach_state(true).await;
+        mismatched.observer = DockerObserver::new(
+            Arc::new(DetachNetworkFactsDocker {
+                exists: true,
+                reported_name: Some("different-network".into()),
+            }),
+            AppCatalog::default(),
+            DockerSupervisor::new(),
+        );
+        let error = validate_resources(&mismatched, Uuid::new_v4(), &metadata, None, request_id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code_and_status().0, "DOCKER_OBSERVATION_FAILED");
     }
 
     #[tokio::test]

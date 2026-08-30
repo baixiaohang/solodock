@@ -679,7 +679,9 @@ async fn exact_container_removal_preserves_volume_data_and_network() {
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST")
         .expect("SOLODOCK_TEST_DOCKER_HOST must point to the isolated daemon");
     assert!(endpoint.starts_with("tcp://127.0.0.1:") || endpoint.starts_with("tcp://localhost:"));
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+    // Fixture creation is outside the production five-second unary contract;
+    // allow concurrent DinD tests enough time to allocate the canary container.
+    let docker = Docker::connect_with_http(&endpoint, 30, API_DEFAULT_VERSION)
         .unwrap()
         .negotiate_version()
         .await
