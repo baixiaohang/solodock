@@ -54,6 +54,7 @@ impl AppStore {
     }
 
     pub fn scan(&self) -> Result<recovery::RecoveryReport, StoreError> {
+        config_revision::normalize_managed_file_permissions(&self.apps_directory)?;
         recovery::scan_with_options(
             &self.apps_directory,
             self.integrity_key.as_deref().map(Vec::as_slice),
@@ -357,6 +358,8 @@ pub enum StoreError {
     RevisionStale,
     #[error("managed store content is invalid")]
     ContentInvalid,
+    #[error("managed file permission is invalid")]
+    ManagedFilePermissionInvalid,
 }
 
 fn read_metadata(directory: &Path) -> Result<AppMetadata, StoreError> {

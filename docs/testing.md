@@ -17,7 +17,7 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 Docker/Compose E2E 必须使用隔离 daemon 或显式 test-only endpoint。生产代码固定 `/var/run/docker.sock`；仅 `docker-e2e` feature 可把 runner连接到测试 daemon。
 
-CI 同时运行 Docker 27 classic image store 的完整 DinD 回归和固定 Docker 29.7.2 的 focused containerd job。两个 job 都有 backend 硬断言：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter，不能把两个 job 静默跑成同一存储模式。三个 `containerd_` 场景均受场景总 deadline、deployment/gate deadline 和 shutdown deadline 约束；成功、失败、panic 或超时后都按 exact app/project/full ID 和 ownership label 清理本场景 container、network 与已声明 volume，job 级 timeout 只作最后保险。
+CI 同时运行 Docker 27 classic image store 的完整 DinD 回归和固定 Docker 29.7.2 的 focused containerd job。两个 job 都有 backend 硬断言：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter，不能把两个 job 静默跑成同一存储模式。classic DinD job 把 workspace 下的专用 fixture root 以同一绝对路径挂入 daemon service；managed-file bind source 必须位于该 root，不能依赖 daemon 看不到的 runner 临时路径，也不能挂载生产 Docker socket。三个 `containerd_` 场景均受场景总 deadline、deployment/gate deadline 和 shutdown deadline 约束；成功、失败、panic 或超时后都按 exact app/project/full ID 和 ownership label 清理本场景 container、network 与已声明 volume，job 级 timeout 只作最后保险。
 
 每次运行生成唯一 project/run token，并记录所有 container、volume、network 和临时 bind source 的精确 ID。cleanup 前重新 inspect full ID、label 与 run token，finally 只删除本次创建的对象。
 
@@ -48,6 +48,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - runtime read-only scan不删除并发 writer artifact；
 - startup-only cleanup只处理 canonical、ledger-owned artifact；
 - active/pending canonical symlink、mode/owner、HMAC、config/release/Compose验证；
+- public/secret managed leaf 精确 `0444`、ancestor 保持 `0700`，restrictive umask 下发布 mode 不收窄；startup 仅迁移 canonical legacy `0400`/`0600`，runtime scan 不改权限，unsafe drift fail closed；
 - SQLite 丢失后的可重建事实和不可伪造的认证/audit历史；
 - backup/restore拒绝 escaping link、hard link、special file和不兼容 state。
 
@@ -63,6 +64,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
+- 固定非 root image 同时读取 public/secret managed file，首次部署、第二 revision、manual rollback 和 strict recovery 成功，restart count 不增长且容器写入 readonly mount 失败；
 - external-only 不生成、检查或展示 owned bridge identity。
 
 ### Registry 与 deployment

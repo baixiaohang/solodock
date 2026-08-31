@@ -4,7 +4,8 @@ use solodock::{
     app_store::{AppStore, releases::ReleaseTrigger},
     db::Database,
     domain::{
-        DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy, normalize_draft,
+        DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy,
+        ManagedFileContent, ManagedFileInput, PublicFileContent, SecretOperation, normalize_draft,
     },
     registry::{Platform, ResolvedImage},
     security::secret::SecretValue,
@@ -139,7 +140,26 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
             environment: EnvironmentInput::default(),
-            files: vec![],
+            files: vec![
+                ManagedFileInput {
+                    logical_name: "public-config".into(),
+                    target_path: "/app/config".into(),
+                    sensitive: false,
+                    readonly: true,
+                    content: ManagedFileContent::Public(PublicFileContent {
+                        content: "include=/app/secret".into(),
+                    }),
+                },
+                ManagedFileInput {
+                    logical_name: "secret-config".into(),
+                    target_path: "/app/secret".into(),
+                    sensitive: true,
+                    readonly: true,
+                    content: ManagedFileContent::Secret(SecretOperation::Replace {
+                        value: "restore-secret-canary".into(),
+                    }),
+                },
+            ],
             ports: vec![],
             volumes: vec![],
             binds: vec![],
@@ -257,6 +277,21 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     let restored_app = restored
         .join("var/lib/solodock/apps")
         .join(app_id.to_string());
+    for path in [
+        restored_app
+            .join("config-revisions")
+            .join(revision.to_string())
+            .join("files/public/public-config"),
+        restored_app
+            .join("config-revisions")
+            .join(revision.to_string())
+            .join("files/secret/secret-config"),
+    ] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
     assert_eq!(
         fs::read_link(restored_app.join("active")).unwrap(),
         std::path::PathBuf::from(format!("releases/{active}"))

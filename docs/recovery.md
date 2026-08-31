@@ -4,14 +4,14 @@
 
 ## 离线恢复
 
-只支持服务停止后的离线恢复。先校验 archive 旁的 SHA-256 文件，在私有临时目录解包并拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；restore helper 会在交付 staging 前调用同 package binary 的只读 recovery validator，复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入，修正 `solodock:solodock` ownership 与 `0700/0600` mode，最后启动并检查 journal、`/healthz` 和认证 system health。
+只支持服务停止后的离线恢复。先校验 archive 旁的 SHA-256 文件，在私有临时目录解包并拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；restore helper 会在私有 staging 中把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，再调用同 package binary 严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。`0644`、owner drift、symlink 或特殊文件不会被自动修复。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
 
 binary、config 和 state 必须来自兼容的一组备份。SQLite migration 是 forward-only；迁移后仅回滚 binary 不安全。
 
 ## 故障分类
 
 - SQLite 丢失：filesystem 可重建 app/release 查询事实，但管理员、session、audit、deployment history 不会被伪造，需要重新 bootstrap。
-- filesystem degraded：停止 mutation，保留旧 redactor patterns；修复 owner/mode、缺失 revision 或 symlink boundary 后重启/等待 projection reconciler。不要手工编辑 HMAC release。
+- filesystem degraded：停止 mutation，保留旧 redactor patterns；核对 owner/mode、缺失 revision 或 symlink boundary 后重启。启动恢复只会把 canonical managed leaf 的已知 legacy `0400`/`0600` 改为 `0444`；运行期 projection scan 严格只读，其他漂移需要管理员在离线备份后修复。不要递归把所有 state file 改成 `0600`，也不要手工编辑 HMAC release。
 - Docker drift：用 exact project/service/full container ID 检查 unmanaged、stale 或 multiple candidate。网络 expectation 必须从实际 container release ID 对应的 active/pending immutable config revision 读取，不能拿当前 draft 覆盖；`NETWORK_ATTACHMENT_MISMATCH` 检查 network name 集，`NETWORK_ALIAS_MISMATCH` 检查期望 alias 是否为实际有效 DNS names 的子集。先备份业务数据，再明确选择人工修复；禁止通配 cleanup、`docker compose down -v`、`docker volume rm`。
 - bridge drift：以应用详情中的 `solodock-<slug>-default` / `sd-<slug>` 为期望，核对 network ownership、driver 和 `Options.com.docker.network.bridge.name`。SoloDock 对不一致资源 fail closed 且不会自动删除；修复后重建 network 仍使用相同 bridge identity。
 - deployment `interrupted`/`needs_attention`：依据 pending/active/actual exact facts从 detail 重试或人工回滚；未知 effect 不猜测性删除。

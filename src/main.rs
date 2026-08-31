@@ -314,6 +314,7 @@ fn validate_restore(
     }
     let apps_directory = state_directory.join("apps");
     check_private_tree(state_directory, &apps_directory, true)?;
+    solodock::app_store::config_revision::normalize_managed_file_permissions(&apps_directory)?;
     let store = AppStore::initialize_managed(
         apps_directory,
         key.clone(),

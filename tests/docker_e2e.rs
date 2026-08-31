@@ -263,7 +263,17 @@ impl MutationHarness {
         candidate_gate: Option<TestEffectGate>,
         compose: Option<Arc<dyn ComposeRunner>>,
     ) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = match std::env::var_os("SOLODOCK_E2E_SHARED_FIXTURE_ROOT") {
+            Some(shared) => {
+                let shared = std::path::PathBuf::from(shared);
+                std::fs::create_dir_all(&shared).unwrap();
+                tempfile::Builder::new()
+                    .prefix("solodock-e2e-")
+                    .tempdir_in(shared)
+                    .unwrap()
+            }
+            None => tempfile::tempdir().unwrap(),
+        };
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = root.path().join("state");
         let runtime_directory = root.path().join("runtime");
@@ -2005,6 +2015,307 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
 
 #[tokio::test]
 #[ignore = "requires a dedicated Docker-in-Docker daemon, Registry access, and docker compose CLI"]
+async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollback() {
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let shared_root = std::env::var("SOLODOCK_E2E_SHARED_FIXTURE_ROOT")
+        .expect("SOLODOCK_E2E_SHARED_FIXTURE_ROOT must be shared with the isolated daemon");
+    assert!(std::path::Path::new(&shared_root).is_absolute());
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let image = "nginxinc/nginx-unprivileged:1.27-alpine";
+    let image_user = docker
+        .inspect_image(image)
+        .await
+        .unwrap()
+        .config
+        .and_then(|config| config.user)
+        .unwrap_or_default();
+    assert!(
+        !matches!(image_user.as_str(), "" | "0" | "root"),
+        "managed-file E2E image must declare a non-root user"
+    );
+    let effect_gate = TestEffectGate::new([
+        TestEffectAction::Continue,
+        TestEffectAction::Pause,
+        TestEffectAction::Continue,
+        TestEffectAction::Continue,
+        TestEffectAction::Continue,
+    ]);
+    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+    let cancellation = CancellationToken::new();
+    let tasks = TaskTracker::new();
+    let recording_runner = RecordingComposeRunner::new(FixedComposeRunner::for_test_http(
+        cancellation,
+        tasks,
+        SecretRedactor::new(&EmptySecretProvider),
+        endpoint.clone(),
+    ));
+    let harness = MutationHarness::new_with_components(
+        endpoint.clone(),
+        std::path::PathBuf::from(&shared_root),
+        None,
+        Some(effect_gate.clone()),
+        Some(candidate_gate.clone()),
+        Some(Arc::new(recording_runner.clone())),
+    )
+    .await;
+    let draft = |public_value: &str, secret_value: &str| {
+        json!({
+            "slug":"nrfiles",
+            "display_name":"Non-root managed files",
+            "discovery_image_ref":image,
+            "credential_ref":null,
+            "auto_deploy_enabled":false,
+            "poll_interval_seconds":300,
+            "environment":{"public":[],"secrets":[]},
+            "files":[
+                {
+                    "logical_name":"public-config",
+                    "target_path":"/etc/nginx/conf.d/default.conf",
+                    "sensitive":false,
+                    "readonly":true,
+                    "content":format!("server {{ listen 8080; include /etc/nginx/secret.conf; location / {{ return 200 '{public_value}'; }} }}")
+                },
+                {
+                    "logical_name":"secret-config",
+                    "target_path":"/etc/nginx/secret.conf",
+                    "sensitive":true,
+                    "readonly":true,
+                    "operation":"replace",
+                    "value":format!("add_header X-Solodock-Secret '{secret_value}';")
+                }
+            ],
+            "ports":[],
+            "volumes":[],
+            "binds":[],
+            "networks":[{"kind":"owned_default"}],
+            "health":{"policy":"running","stable_window_seconds":5}
+        })
+    };
+    let create = harness
+        .request(
+            "POST",
+            "/api/v1/apps",
+            Some("managed-files-create-0001"),
+            Some(&draft("first", "first-secret")),
+        )
+        .await;
+    let create_status = create.status();
+    let create = MutationHarness::json(create).await;
+    assert_eq!(create_status, StatusCode::CREATED, "{create}");
+    let app_id = create["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+
+    let first_revision = harness.store.read_metadata(app_id).unwrap().draft_revision;
+    let first_secret = harness
+        .store
+        .app_directory(app_id)
+        .join("config-revisions")
+        .join(first_revision.to_string())
+        .join("files/secret/secret-config");
+    recording_runner.reset();
+
+    let first_attempt = schedule_from_current(&harness, app_id, "managed-files-deploy-0001").await;
+    candidate_gate.wait_until_reached().await;
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    candidate_gate.resume();
+    let first_attempt = wait_for_deployment(&harness, first_attempt).await;
+    assert_eq!(
+        first_attempt["status"], "needs_attention",
+        "{first_attempt}"
+    );
+    assert_eq!(
+        first_attempt["error_code"],
+        "MANAGED_FILE_PERMISSION_INVALID"
+    );
+    assert_eq!(recording_runner.calls(), 1);
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let pending_attempt =
+        schedule_from_current(&harness, app_id, "managed-files-deploy-0002").await;
+    effect_gate.wait_until_reached().await;
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    effect_gate.resume();
+    let pending_attempt = wait_for_deployment(&harness, pending_attempt).await;
+    assert_eq!(
+        pending_attempt["status"], "needs_attention",
+        "{pending_attempt}"
+    );
+    assert_eq!(
+        pending_attempt["error_code"],
+        "MANAGED_FILE_PERMISSION_INVALID"
+    );
+    assert_eq!(
+        recording_runner.calls(),
+        1,
+        "pending resume drift must fail before a second Compose effect"
+    );
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let first_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0003").await;
+    let first = wait_for_deployment(&harness, first_id).await;
+    assert_eq!(first["status"], "succeeded", "{first}");
+    let first_release = first["candidate_release_id"].as_str().unwrap().to_owned();
+    assert_eq!(recording_runner.calls(), 2);
+
+    let current = app_detail(&harness, app_id).await;
+    update_draft(
+        &harness,
+        app_id,
+        current["draft_revision"].as_str().unwrap(),
+        draft("second", "second-secret"),
+        "managed-files-update-0001",
+    )
+    .await;
+    let second_revision = harness.store.read_metadata(app_id).unwrap().draft_revision;
+    let second_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0004").await;
+    let second = wait_for_deployment(&harness, second_id).await;
+    assert_eq!(second["status"], "succeeded", "{second}");
+
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let calls_before_invalid_rollback = recording_runner.calls();
+    let current = app_detail(&harness, app_id).await;
+    let invalid_rollback = harness
+        .request(
+            "POST",
+            &format!("/api/v1/deployments/{first_id}/rollback"),
+            Some("managed-files-rollback-invalid-0001"),
+            Some(&json!({
+                "expected_active_release_id":current["active_release"]["id"],
+                "expected_pending_release_id":current["pending_release_id"],
+                "expected_actual_release_id":current["actual_release_id"],
+                "expected_actual_container_id":current["actual"]["id"],
+                "acknowledge_non_rollbackable_data":true
+            })),
+        )
+        .await;
+    let invalid_rollback_status = invalid_rollback.status();
+    let invalid_rollback = MutationHarness::json(invalid_rollback).await;
+    assert_eq!(
+        invalid_rollback_status,
+        StatusCode::ACCEPTED,
+        "{invalid_rollback}"
+    );
+    let invalid_rollback = wait_for_deployment(
+        &harness,
+        invalid_rollback["deployment_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(invalid_rollback["status"], "failed", "{invalid_rollback}");
+    assert_eq!(
+        invalid_rollback["error_code"],
+        "MANAGED_FILE_PERMISSION_INVALID"
+    );
+    assert_eq!(recording_runner.calls(), calls_before_invalid_rollback);
+    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+    let current = app_detail(&harness, app_id).await;
+    let rollback = harness
+        .request(
+            "POST",
+            &format!("/api/v1/deployments/{first_id}/rollback"),
+            Some("managed-files-rollback-0001"),
+            Some(&json!({
+                "expected_active_release_id":current["active_release"]["id"],
+                "expected_pending_release_id":current["pending_release_id"],
+                "expected_actual_release_id":current["actual_release_id"],
+                "expected_actual_container_id":current["actual"]["id"],
+                "acknowledge_non_rollbackable_data":true
+            })),
+        )
+        .await;
+    let rollback_status = rollback.status();
+    let rollback = MutationHarness::json(rollback).await;
+    assert_eq!(rollback_status, StatusCode::ACCEPTED, "{rollback}");
+    let rollback = wait_for_deployment(
+        &harness,
+        rollback["deployment_id"].as_str().unwrap().parse().unwrap(),
+    )
+    .await;
+    assert_eq!(rollback["status"], "succeeded", "{rollback}");
+    assert_eq!(
+        app_detail(&harness, app_id).await["active_release"]["id"],
+        first_release
+    );
+
+    let report = harness.store.scan_read_only().unwrap();
+    assert!(report.issues.is_empty(), "{:?}", report.issues);
+    assert_eq!(report.valid_apps.len(), 1);
+    for revision in [first_revision, second_revision] {
+        let directory = harness
+            .store
+            .app_directory(app_id)
+            .join("config-revisions")
+            .join(revision.to_string());
+        for leaf in [
+            directory.join("files/public/public-config"),
+            directory.join("files/secret/secret-config"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(leaf).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    let containers = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers("solodock-nrfiles")
+        .await
+        .unwrap();
+    assert_eq!(containers.len(), 1);
+    let container = docker
+        .inspect_container(&containers[0].id, None)
+        .await
+        .unwrap();
+    assert_eq!(container.restart_count, Some(0));
+    assert_eq!(
+        container
+            .config
+            .as_ref()
+            .and_then(|config| config.user.clone()),
+        Some(image_user)
+    );
+    docker_cli(
+        &endpoint,
+        &[
+            "exec",
+            &containers[0].id,
+            "sh",
+            "-c",
+            "cat /etc/nginx/conf.d/default.conf /etc/nginx/secret.conf >/dev/null && ! printf x >>/etc/nginx/secret.conf",
+        ],
+    )
+    .await;
+
+    remove_owned_container(&docker, &containers[0].id, app_id).await;
+    docker
+        .remove_network("solodock-nrfiles-default")
+        .await
+        .unwrap();
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    harness.state.stream_tasks.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a dedicated Docker-in-Docker daemon, Registry access, and docker compose CLI"]
 async fn production_m5_polling_digest_deploy_auto_rollback_and_manual_rollback() {
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
     let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
@@ -3504,10 +3815,10 @@ async fn schedule_from_current(harness: &MutationHarness, app_id: Uuid, key: &st
             Some(key),
             Some(&json!({
                 "expected_draft_revision":current["draft_revision"],
-                "expected_active_release_id":current["active_release"]["id"].as_str(),
+                "expected_active_release_id":current["active_release"]["id"],
                 "expected_pending_release_id":current["pending_release_id"],
                 "expected_actual_release_id":current["actual_release_id"],
-                "expected_actual_container_id":current["actual"]["id"].as_str(),
+                "expected_actual_container_id":current["actual"]["id"],
                 "acknowledge_non_rollbackable_data":true
             })),
         )

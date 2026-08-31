@@ -145,6 +145,7 @@ jobs:
           - 5000:5000
         options: >-
           --privileged
+          --volume ${{ github.workspace }}:${{ github.workspace }}
           --health-cmd "docker info"
           --health-interval 5s
           --health-timeout 3s
@@ -152,6 +153,7 @@ jobs:
     env:
       DOCKER_HOST: tcp://127.0.0.1:2375
       SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_E2E_SHARED_FIXTURE_ROOT: ${{ github.workspace }}/.solodock-e2e-fixtures
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -165,6 +167,7 @@ jobs:
           fi
       - run: docker pull alpine:3.20
       - run: docker pull nginx:1.27-alpine
+      - run: docker pull nginxinc/nginx-unprivileged:1.27-alpine
       - run: docker pull registry:2
       - name: Run isolated Docker E2E with separate daemon sampling
         env:

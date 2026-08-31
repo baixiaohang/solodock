@@ -72,6 +72,8 @@ Deploy/rollback 均返回 `202 Accepted` 和 deployment ID。可在应用页查�
 
 每次 draft 更新先完整写入新的 `config-revisions/<uuid>/`，再以 `app.toml` 的原子替换作为 commit point，因此 draft 编辑不会改变正在运行的旧 release 所挂载的内容。生成的 Compose 固定为单一 `app` service，并由 `/usr/bin/docker compose` 的固定参数向量校验/执行；不存在 shell、exec、原始 Compose 编辑器或用户参数。
 
+显式挂入容器的 public/secret managed file leaf 固定为 `0444 solodock:solodock`，支持镜像内任意常见非 root UID/GID 读取；宿主 state、应用与 revision ancestor 仍为 `0700`，Compose mount 继续 `read_only: true`。启动会在 listen 前把 canonical legacy `0400/0600` leaf 收敛到 `0444`，运行期权限漂移则在 Compose effect 前以 `MANAGED_FILE_PERMISSION_INVALID` fail closed。
+
 `allowed_bind_roots` 默认是空列表，即禁用 host bind mount。授权根必须是既有、无 symlink 的安全绝对目录；应用只能使用其严格子目录，并且授权根不得与 Docker daemon 报告的实际 data-root 重叠。SoloDock 不创建、改权限、写入、备份或删除 bind source。每次 Compose mutation 都从 filesystem active release 重建并校验 canonical artifact，同时枚举 project/service 的全部候选并对 unmanaged、stale 或 invalid collision fail closed。unregister 默认不移除容器；即使显式移除精确 owned container，也保留 owned/external volume、bind 内容和 network。删除预览同样从 filesystem 生成，稳定合并 active pinned config 与当前 draft 的资源，并标明资源实际存在或仅配置；DELETE 在消费 token 和提交 tombstone 前都重算完整 facts hash。
 
 ```toml

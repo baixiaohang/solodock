@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::{
     api::{AppState, mutations::M3Services},
-    app_store::config_revision,
+    app_store::{StoreError, config_revision},
     docker::ownership::validate_syntactic_identity,
     mutation::{ClaimResult, IdempotencyError},
 };
@@ -57,6 +57,8 @@ pub enum ScheduleError {
     Docker(&'static str),
     #[error("application configuration is invalid")]
     ConfigInvalid,
+    #[error("managed file permission is invalid")]
+    ManagedFilePermissionInvalid,
     #[error("idempotency failed")]
     Idempotency(#[from] IdempotencyError),
     #[error("deployment scheduling failed")]
@@ -153,7 +155,10 @@ impl DeploymentScheduler {
                 .integrity_key()
                 .map_err(|_| ScheduleError::Internal)?,
         )
-        .map_err(|_| ScheduleError::ConfigInvalid)?;
+        .map_err(|error| match error {
+            StoreError::ManagedFilePermissionInvalid => ScheduleError::ManagedFilePermissionInvalid,
+            _ => ScheduleError::ConfigInvalid,
+        })?;
         if (!draft.metadata.volumes.is_empty() || !draft.metadata.binds.is_empty())
             && !command.facts.acknowledge_non_rollbackable_data
         {

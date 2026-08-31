@@ -617,6 +617,74 @@ async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
 }
 
 #[tokio::test]
+async fn deployment_preflight_reports_managed_file_permission_drift_before_compose() {
+    let harness = Harness::new().await;
+    let mut candidate = draft("managed-secret-canary");
+    candidate["files"] = json!([
+        {
+            "logical_name":"public-config",
+            "target_path":"/app/public",
+            "sensitive":false,
+            "readonly":true,
+            "content":"public-canary"
+        },
+        {
+            "logical_name":"secret-config",
+            "target_path":"/app/secret",
+            "sensitive":true,
+            "readonly":true,
+            "operation":"replace",
+            "value":"managed-file-secret-canary"
+        }
+    ]);
+    let (status, created) = body(
+        harness
+            .create(Some("managed-file-drift-create"), &candidate)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id = created["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse::<Uuid>()
+        .unwrap();
+    let revision = harness.store.read_metadata(app_id).unwrap().draft_revision;
+    let drifted = harness
+        .store
+        .app_directory(app_id)
+        .join("config-revisions")
+        .join(revision.to_string())
+        .join("files/secret/secret-config");
+    fs::set_permissions(&drifted, fs::Permissions::from_mode(0o600)).unwrap();
+    harness.compose_actions.lock().unwrap().clear();
+
+    let response = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/deployments"),
+            Some("managed-file-drift-deploy"),
+            &json!({
+                "expected_draft_revision":revision,
+                "expected_active_release_id":null,
+                "expected_pending_release_id":null,
+                "expected_actual_release_id":null,
+                "expected_actual_container_id":null,
+                "acknowledge_non_rollbackable_data":false
+            }),
+        )
+        .await;
+    let (status, response) = body(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    let response: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(response["code"], "MANAGED_FILE_PERMISSION_INVALID");
+    assert!(!response.to_string().contains("secret-config"));
+    assert!(!response.to_string().contains(drifted.to_str().unwrap()));
+    assert!(harness.compose_actions.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn slug_is_short_unique_and_absent_from_mutable_draft() {
     let harness = Harness::new().await;
     let mut invalid = draft("secret");
