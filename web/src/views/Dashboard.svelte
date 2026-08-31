@@ -29,20 +29,31 @@
 </script>
 
 <main class="page-shell">
-  <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>应用控制台</h1><p class="muted">管理 digest-pinned release、部署健康门禁与安全生命周期操作。</p></div><div class="actions"><a class="ghost button-link" href="#/credentials">Registry credentials</a><a class="button-link" href="#/apps/new">注册应用</a><button class="ghost" onclick={() => void load()}>刷新</button></div></div>
+  <div class="page-heading"><div><p class="eyebrow">OVERVIEW</p><h1>应用控制台</h1><p class="muted">管理 digest-pinned release、部署健康门禁与安全生命周期操作。</p></div><div class="actions"><a class="button-link" href="#/apps/new">注册应用</a><button class="ghost" onclick={() => void load()}>刷新</button></div></div>
   {#if error}<p class="notice danger">{error}</p>{/if}
   {#if health}<SystemBar {health} />{/if}
-  {#if apps?.docker_status !== 'ready'}<p class="notice warning">Docker 当前不可用，仍可查看已恢复的应用目录；容器状态将在 daemon 恢复后自动更新。</p>{/if}
-  <section class="app-grid" aria-label="应用列表">
-    {#each apps?.apps ?? [] as app}
-      <a class="app-card" href={`#/apps/${app.id}`}>
-        <div class="card-top"><div><h2>{app.display_name}</h2><code>{app.slug}</code></div><span class:healthy={app.actual?.health === 'healthy'} class="state-pill">{app.actual?.status ?? 'unavailable'}</span></div>
-        <dl class="metrics"><div><dt>CPU</dt><dd>{stats[app.id]?.cpu_percent?.toFixed(1) ?? '—'}%</dd></div><div><dt>内存</dt><dd>{formatBytes(stats[app.id]?.memory_usage_bytes ?? null)}</dd></div></dl>
-        <div class="image-row"><span>活动</span><code>{shortRef(app.active_release?.image_ref)}</code><span>实际</span><code>{shortRef(app.actual?.image_ref)}</code></div>
-        {#if app.drift_codes.length}<div class="drifts">{#each app.drift_codes as code}<span title={driftText(code)}>{driftText(code)}</span>{/each}</div>{:else}<p class="aligned">期望与实际一致</p>{/if}
-      </a>
+  {#if apps && apps.docker_status !== 'ready'}<p class="notice warning">Docker 当前不可用，仍可查看已恢复的应用目录；容器状态将在 daemon 恢复后自动更新。</p>{/if}
+  <section class="app-list-panel" aria-label="应用列表">
+    {#if (apps?.apps.length ?? 0) > 0}
+      <div class="table-scroll">
+        <table class="app-table">
+          <thead><tr><th scope="col">应用</th><th scope="col">状态</th><th scope="col">CPU</th><th scope="col">内存</th><th scope="col">活动镜像</th><th scope="col">Drift</th></tr></thead>
+          <tbody>
+            {#each apps?.apps ?? [] as app}
+              <tr>
+                <td data-label="应用"><a class="app-name" href={`#/apps/${app.id}`}>{app.display_name}<code>{app.slug}</code></a></td>
+                <td data-label="状态"><span class:healthy={app.actual?.health === 'healthy'} class="state-pill">{app.actual?.status ?? 'unavailable'}</span></td>
+                <td data-label="CPU" class="metric-value">{stats[app.id]?.cpu_percent?.toFixed(1) ?? '—'}%</td>
+                <td data-label="内存" class="metric-value">{formatBytes(stats[app.id]?.memory_usage_bytes ?? null)}</td>
+                <td data-label="活动镜像"><code class="truncate" title={app.active_release?.image_ref ?? ''}>{shortRef(app.active_release?.image_ref)}</code></td>
+                <td data-label="Drift">{#if app.drift_codes.length}<div class="drifts">{#each app.drift_codes as code}<span title={driftText(code)}>{driftText(code)}</span>{/each}</div>{:else}<span class="aligned">期望与实际一致</span>{/if}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
     {:else}
       <div class="empty"><h2>尚无应用</h2><p>先注册应用配置，再从 draft tag 解析具体平台 digest 并部署。</p><a class="button-link" href="#/apps/new">注册第一个应用</a></div>
-    {/each}
+    {/if}
   </section>
 </main>
