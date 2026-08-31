@@ -38,6 +38,13 @@ pub async fn serve(method: Method, uri: Uri, headers: HeaderMap) -> Response {
             ("index.html", "no-cache")
         } else if requested.starts_with("assets/") {
             (requested, "public, max-age=31536000, immutable")
+        } else if requested
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .contains('.')
+        {
+            (requested, "no-cache")
         } else if !requested
             .rsplit('/')
             .next()
@@ -195,6 +202,15 @@ mod tests {
                 .status(),
             StatusCode::OK
         );
+        let favicon = serve(
+            Method::GET,
+            "/favicon.svg".parse().unwrap(),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(favicon.status(), StatusCode::OK);
+        assert_eq!(favicon.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(favicon.headers()[header::CACHE_CONTROL], "no-cache");
         assert_eq!(
             serve(
                 Method::GET,

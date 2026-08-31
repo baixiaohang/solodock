@@ -36,6 +36,11 @@ done
 
 curl --fail --silent "http://127.0.0.1:$port/" >"$fixture/index"
 grep -q '<div id="app"></div>' "$fixture/index"
+grep -q 'href="/favicon.svg"' "$fixture/index"
+curl --fail --silent -D "$fixture/favicon.headers" \
+  "http://127.0.0.1:$port/favicon.svg" >"$fixture/favicon.svg"
+grep -qi '^content-type: image/svg+xml' "$fixture/favicon.headers"
+grep -q '<svg' "$fixture/favicon.svg"
 asset=$(grep -oE '/assets/[^" ]+\.js' "$fixture/index" | head -n 1)
 [[ -n $asset ]]
 curl --fail --silent "http://127.0.0.1:$port$asset" >/dev/null
