@@ -419,16 +419,7 @@ impl DockerReadApi for BollardReadClient {
             .await
             .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
             .map_err(|error| classify(&error, true))?;
-        Ok(ImageRecord {
-            id: image
-                .id
-                .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?,
-            manifest_descriptor: project_manifest_descriptor(image.descriptor),
-            repo_digests: image.repo_digests.unwrap_or_default(),
-            os: image.os.unwrap_or_default(),
-            architecture: image.architecture.unwrap_or_default(),
-            variant: image.variant,
-        })
+        project_image_inspect(image)
     }
 }
 
@@ -579,6 +570,31 @@ fn project_manifest_descriptor(
             architecture: platform.architecture,
             variant: platform.variant,
         }
+    })
+}
+
+fn project_image_inspect(image: bollard::models::ImageInspect) -> Result<ImageRecord, DockerError> {
+    let os = image.os;
+    let architecture = image.architecture;
+    let variant = image.variant;
+    let manifest_descriptor = image.descriptor.map(|value| {
+        let platform = value.platform.unwrap_or_default();
+        ManifestDescriptor {
+            digest: value.digest,
+            os: platform.os.or_else(|| os.clone()),
+            architecture: platform.architecture.or_else(|| architecture.clone()),
+            variant: platform.variant.or_else(|| variant.clone()),
+        }
+    });
+    Ok(ImageRecord {
+        id: image
+            .id
+            .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?,
+        manifest_descriptor,
+        repo_digests: image.repo_digests.unwrap_or_default(),
+        os: os.unwrap_or_default(),
+        architecture: architecture.unwrap_or_default(),
+        variant,
     })
 }
 
@@ -763,6 +779,104 @@ mod tests {
         }));
         assert_eq!(malformed, Some(ManifestDescriptor::default()));
         assert_eq!(project_manifest_descriptor(None), None);
+    }
+
+    fn image_inspect(value: serde_json::Value) -> ImageRecord {
+        project_image_inspect(serde_json::from_value(value).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn image_inspect_projection_completes_docker_29_descriptor_from_same_response() {
+        let projected = image_inspect(serde_json::json!({
+            "Id": "sha256:config",
+            "RepoDigests": ["postgres@sha256:manifest"],
+            "Os": "linux",
+            "Architecture": "amd64",
+            "Variant": "v3",
+            "Descriptor": { "digest": "sha256:manifest" }
+        }));
+
+        assert_eq!(projected.os, "linux");
+        assert_eq!(projected.architecture, "amd64");
+        assert_eq!(projected.variant.as_deref(), Some("v3"));
+        assert_eq!(
+            projected.manifest_descriptor,
+            Some(ManifestDescriptor {
+                digest: Some("sha256:manifest".into()),
+                os: Some("linux".into()),
+                architecture: Some("amd64".into()),
+                variant: Some("v3".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn image_inspect_projection_preserves_absent_descriptor() {
+        let projected = image_inspect(serde_json::json!({
+            "Id": "sha256:config",
+            "Os": "linux",
+            "Architecture": "amd64"
+        }));
+
+        assert_eq!(projected.manifest_descriptor, None);
+    }
+
+    #[test]
+    fn image_inspect_projection_only_completes_missing_platform_fields() {
+        let complete = image_inspect(serde_json::json!({
+            "Id": "sha256:config",
+            "Os": "windows",
+            "Architecture": "arm64",
+            "Variant": "v9",
+            "Descriptor": {
+                "digest": "sha256:manifest",
+                "platform": { "os": "linux", "architecture": "amd64", "variant": "v3" }
+            }
+        }));
+        assert_eq!(
+            complete.manifest_descriptor,
+            Some(ManifestDescriptor {
+                digest: Some("sha256:manifest".into()),
+                os: Some("linux".into()),
+                architecture: Some("amd64".into()),
+                variant: Some("v3".into()),
+            })
+        );
+
+        let partial = image_inspect(serde_json::json!({
+            "Id": "sha256:config",
+            "Os": "linux",
+            "Architecture": "amd64",
+            "Variant": "v8",
+            "Descriptor": {
+                "digest": "sha256:manifest",
+                "platform": { "os": "freebsd", "variant": "v7" }
+            }
+        }));
+        assert_eq!(
+            partial.manifest_descriptor,
+            Some(ManifestDescriptor {
+                digest: Some("sha256:manifest".into()),
+                os: Some("freebsd".into()),
+                architecture: Some("amd64".into()),
+                variant: Some("v7".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn image_inspect_projection_does_not_invent_digest_or_missing_top_level_platform() {
+        let projected = image_inspect(serde_json::json!({
+            "Id": "sha256:config",
+            "Descriptor": {}
+        }));
+
+        assert_eq!(projected.os, "");
+        assert_eq!(projected.architecture, "");
+        assert_eq!(
+            projected.manifest_descriptor,
+            Some(ManifestDescriptor::default())
+        );
     }
 
     #[test]

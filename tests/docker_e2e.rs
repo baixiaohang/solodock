@@ -3,6 +3,7 @@
 use std::{
     collections::HashMap,
     os::unix::fs::PermissionsExt,
+    panic::AssertUnwindSafe,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -29,10 +30,11 @@ use bollard::{
         NetworkCreateRequest, NetworkingConfig, VolumeCreateRequest,
     },
     query_parameters::{
-        CreateContainerOptionsBuilder, RemoveContainerOptionsBuilder, WaitContainerOptionsBuilder,
+        CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
+        WaitContainerOptionsBuilder,
     },
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use solodock::docker::{
@@ -70,6 +72,10 @@ use tempfile::TempDir;
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const CONTAINERD_SCENARIO_TIMEOUT: Duration = Duration::from_secs(240);
+const CONTAINERD_GATE_TIMEOUT: Duration = Duration::from_secs(30);
+const CONTAINERD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Outcome {
     listed: bool,
@@ -2851,136 +2857,27 @@ http {{
 }
 
 #[tokio::test]
-#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
-async fn containerd_postgres_deployment_identity_and_noop() {
-    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
-        return;
-    }
-    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
-        .unwrap()
-        .negotiate_version()
-        .await
-        .unwrap();
-    let harness = MutationHarness::new(endpoint, std::env::temp_dir()).await;
-    let create = harness
-        .request(
-            "POST",
-            "/api/v1/apps",
-            Some("containerd-postgres-create-0001"),
-            Some(&json!({
-                "slug":"containerd-postgres",
-                "display_name":"Containerd PostgreSQL",
-                "discovery_image_ref":"postgres:16-alpine",
-                "credential_ref":null,
-                "auto_deploy_enabled":false,
-                "poll_interval_seconds":300,
-                "environment":{
-                    "public":[],
-                    "secrets":[{
-                        "key":"POSTGRES_PASSWORD",
-                        "operation":"replace",
-                        "value":"containerd-e2e-password"
-                    }]
-                },
-                "files":[],
-                "ports":[],
-                "volumes":[{
-                    "kind":"owned",
-                    "logical_name":"data",
-                    "target_path":"/var/lib/postgresql/data"
-                }],
-                "binds":[],
-                "networks":[{"kind":"owned_default"}],
-                "health":{"policy":"running","stable_window_seconds":5}
-            })),
-        )
-        .await;
-    let create_status = create.status();
-    let create = MutationHarness::json(create).await;
-    assert_eq!(create_status, StatusCode::CREATED, "{create}");
-    let app_id = create["app"]["id"]
-        .as_str()
-        .unwrap()
-        .parse::<Uuid>()
-        .unwrap();
-
-    let first = schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0001").await;
-    let first = wait_for_deployment(&harness, first).await;
-    assert_eq!(first["status"], "succeeded", "{first}");
-    let manifest = first["manifest_digest"].as_str().unwrap();
-    let detail = app_detail(&harness, app_id).await;
-    let container_id = detail["actual"]["id"].as_str().unwrap();
-    let inspected = docker.inspect_container(container_id, None).await.unwrap();
-    assert_eq!(inspected.image.as_deref(), Some(manifest));
-    let descriptor = inspected
-        .image_manifest_descriptor
-        .expect("containerd image store must expose the selected manifest descriptor");
-    assert_eq!(descriptor.digest.as_deref(), Some(manifest));
-    let platform = descriptor
-        .platform
-        .expect("descriptor platform is required");
-    assert_eq!(platform.os.as_deref(), Some("linux"));
-    assert_eq!(platform.architecture.as_deref(), Some("amd64"));
-
-    let repeated = schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0002").await;
-    let repeated = wait_for_deployment(&harness, repeated).await;
-    assert_eq!(repeated["status"], "no_op", "{repeated}");
-
-    remove_owned_container(&docker, container_id, app_id).await;
-    let volume = format!("solodock-{}-data", app_id.simple());
-    assert_eq!(
-        docker
-            .inspect_volume(&volume)
-            .await
-            .unwrap()
-            .labels
-            .get(APP_ID_LABEL),
-        Some(&app_id.to_string())
-    );
-    docker
-        .remove_volume(
-            &volume,
-            None::<bollard::query_parameters::RemoveVolumeOptions>,
-        )
-        .await
-        .unwrap();
-    let network = format!("solodock-{}-default", app_id.simple());
-    docker.remove_network(&network).await.unwrap();
-    harness.state.shutdown.cancel();
-    harness.state.stream_tasks.close();
-    harness.state.stream_tasks.wait().await;
-}
-
-#[tokio::test]
-#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
-async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed() {
-    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
-        return;
-    }
-    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
-        .unwrap()
-        .negotiate_version()
-        .await
-        .unwrap();
-    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+#[ignore = "requires a dedicated Docker-in-Docker daemon"]
+async fn deterministic_pull_failure_publishes_cleared_pending() {
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST")
+        .expect("SOLODOCK_TEST_DOCKER_HOST must point to the isolated daemon");
+    let pull_gate = TestPullGate::new([TestPullAction::FailVerification]);
     let harness = MutationHarness::new_with_test_gates(
         endpoint,
         std::env::temp_dir(),
+        Some(pull_gate),
         None,
         None,
-        Some(candidate_gate.clone()),
     )
     .await;
     let create = harness
         .request(
             "POST",
             "/api/v1/apps",
-            Some("containerd-compensation-create-0001"),
+            Some("pull-failure-create-0001"),
             Some(&json!({
-                "slug":"containerd-compensation",
-                "display_name":"Containerd compensation",
+                "slug":"pull-failure-projection",
+                "display_name":"Pull failure projection",
                 "discovery_image_ref":"alpine:3.20",
                 "credential_ref":null,
                 "auto_deploy_enabled":false,
@@ -3003,51 +2900,21 @@ async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed
         .unwrap()
         .parse::<Uuid>()
         .unwrap();
-    let deployment =
-        schedule_from_current(&harness, app_id, "containerd-compensation-deploy-0001").await;
-    candidate_gate.wait_until_reached().await;
 
-    let project = format!("solodock-{}", app_id.simple());
-    let original = harness
-        .state
-        .observer
-        .api()
-        .list_compose_app_containers(&project)
-        .await
-        .unwrap();
-    assert_eq!(original.len(), 1);
-    let labels = original[0].labels.clone();
-    remove_owned_container(&docker, &original[0].id, app_id).await;
-    // This is still before post_container_id exists. A unique non-predecessor
-    // full ID with all canonical candidate labels is the ownership claim; the
-    // deliberately wrong configured image is then a deterministic semantic
-    // mismatch that must be compensated.
-    let pre_marker_claim = docker
-        .create_container(
-            Some(
-                CreateContainerOptionsBuilder::default()
-                    .name(&format!("solodock-containerd-mismatch-{}", Uuid::new_v4()))
-                    .build(),
-            ),
-            ContainerCreateBody {
-                image: Some("alpine:3.20".into()),
-                cmd: Some(vec!["sleep".into(), "300".into()]),
-                labels: Some(labels),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    docker
-        .start_container(&pre_marker_claim.id, None)
-        .await
-        .unwrap();
-    candidate_gate.resume();
-
+    let deployment = schedule_from_current(&harness, app_id, "pull-failure-deploy-0001").await;
     let failed = wait_for_deployment(&harness, deployment).await;
     assert_eq!(failed["status"], "failed", "{failed}");
-    assert_eq!(failed["error_code"], "CANDIDATE_INVALID", "{failed}");
-    assert!(app_detail(&harness, app_id).await["pending_release_id"].is_null());
+    assert_eq!(
+        failed["error_code"], "IMAGE_VERIFICATION_FAILED",
+        "{failed}"
+    );
+
+    let detail = app_detail(&harness, app_id).await;
+    assert!(detail["pending_release_id"].is_null(), "{detail}");
+    assert!(detail["active_release"].is_null(), "{detail}");
+    assert!(detail["actual_release_id"].is_null(), "{detail}");
+    assert_eq!(detail["deployment_status"], "DEPLOY_REQUIRED", "{detail}");
+    let project = format!("solodock-{}", app_id.simple());
     assert!(
         harness
             .state
@@ -3059,11 +2926,296 @@ async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed
             .is_empty()
     );
 
-    let network = format!("solodock-{}-default", app_id.simple());
-    docker.remove_network(&network).await.unwrap();
     harness.state.shutdown.cancel();
     harness.state.stream_tasks.close();
     harness.state.stream_tasks.wait().await;
+}
+
+#[tokio::test]
+#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
+async fn containerd_postgres_deployment_identity_and_noop() {
+    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + CONTAINERD_SCENARIO_TIMEOUT;
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = tokio::time::timeout_at(deadline, async {
+        Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+            .unwrap()
+            .negotiate_version()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("containerd daemon connection exceeded the scenario deadline");
+    let harness = tokio::time::timeout_at(
+        deadline,
+        MutationHarness::new(endpoint, std::env::temp_dir()),
+    )
+    .await
+    .expect("containerd harness setup exceeded the scenario deadline");
+    let mut cleanup_app_id = None;
+    let outcome = tokio::time::timeout_at(
+        deadline,
+        AssertUnwindSafe(async {
+            assert_containerd_daemon(&docker).await;
+            let raw_tag_inspect = docker.inspect_image("postgres:16-alpine").await.unwrap();
+            assert_eq!(raw_tag_inspect.os.as_deref(), Some("linux"));
+            assert_eq!(raw_tag_inspect.architecture.as_deref(), Some("amd64"));
+            let raw_tag_descriptor = raw_tag_inspect
+                .descriptor
+                .expect("Docker 29 containerd ImageInspect must expose Descriptor");
+            assert!(raw_tag_descriptor.digest.is_some());
+            assert!(
+                raw_tag_descriptor.platform.is_none(),
+                "Issue #21 reproduction requires raw ImageInspect.Descriptor.platform to be absent"
+            );
+
+            let create = harness
+                .request(
+                    "POST",
+                    "/api/v1/apps",
+                    Some("containerd-postgres-create-0001"),
+                    Some(&json!({
+                        "slug":"containerd-postgres",
+                        "display_name":"Containerd PostgreSQL",
+                        "discovery_image_ref":"postgres:16-alpine",
+                        "credential_ref":null,
+                        "auto_deploy_enabled":false,
+                        "poll_interval_seconds":300,
+                        "environment":{
+                            "public":[],
+                            "secrets":[{
+                                "key":"POSTGRES_PASSWORD",
+                                "operation":"replace",
+                                "value":"containerd-e2e-password"
+                            }]
+                        },
+                        "files":[],
+                        "ports":[],
+                        "volumes":[{
+                            "kind":"owned",
+                            "logical_name":"data",
+                            "target_path":"/var/lib/postgresql/data"
+                        }],
+                        "binds":[],
+                        "networks":[{"kind":"owned_default"}],
+                        "health":{"policy":"running","stable_window_seconds":5}
+                    })),
+                )
+                .await;
+            let create_status = create.status();
+            let create = MutationHarness::json(create).await;
+            assert_eq!(create_status, StatusCode::CREATED, "{create}");
+            let app_id = create["app"]["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap();
+            cleanup_app_id = Some(app_id);
+
+            let first =
+                schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0001").await;
+            let first = wait_for_deployment(&harness, first).await;
+            assert_eq!(first["status"], "succeeded", "{first}");
+            let manifest = first["manifest_digest"].as_str().unwrap();
+            let raw_digest_inspect = docker.inspect_image(manifest).await.unwrap();
+            assert_eq!(raw_digest_inspect.os.as_deref(), Some("linux"));
+            assert_eq!(raw_digest_inspect.architecture.as_deref(), Some("amd64"));
+            let raw_digest_descriptor = raw_digest_inspect
+                .descriptor
+                .expect("digest ImageInspect must expose Descriptor");
+            assert_eq!(raw_digest_descriptor.digest.as_deref(), Some(manifest));
+            assert!(raw_digest_descriptor.platform.is_none());
+
+            let detail = app_detail(&harness, app_id).await;
+            assert!(detail["pending_release_id"].is_null(), "{detail}");
+            assert_eq!(
+                detail["actual_release_id"], detail["active_release"]["id"],
+                "{detail}"
+            );
+            let container_id = detail["actual"]["id"].as_str().unwrap().to_owned();
+            let inspected = docker.inspect_container(&container_id, None).await.unwrap();
+            assert_eq!(inspected.image.as_deref(), Some(manifest));
+            let descriptor = inspected
+                .image_manifest_descriptor
+                .expect("containerd image store must expose the selected manifest descriptor");
+            assert_eq!(descriptor.digest.as_deref(), Some(manifest));
+            let platform = descriptor
+                .platform
+                .expect("container descriptor platform is required");
+            assert_eq!(platform.os.as_deref(), Some("linux"));
+            assert_eq!(platform.architecture.as_deref(), Some("amd64"));
+
+            let repeated =
+                schedule_from_current(&harness, app_id, "containerd-postgres-deploy-0002").await;
+            let repeated = wait_for_deployment(&harness, repeated).await;
+            assert_eq!(repeated["status"], "no_op", "{repeated}");
+            let repeated_detail = app_detail(&harness, app_id).await;
+            assert!(repeated_detail["pending_release_id"].is_null());
+            assert_eq!(repeated_detail["actual"]["id"], container_id);
+        })
+        .catch_unwind(),
+    )
+    .await;
+
+    let shutdown_finished = shutdown_containerd_harness(&harness).await;
+    if let Some(app_id) = cleanup_app_id {
+        cleanup_containerd_app(&docker, app_id, &["data"]).await;
+    }
+    assert!(
+        shutdown_finished,
+        "containerd scenario tasks did not stop before the shutdown deadline"
+    );
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("containerd PostgreSQL scenario exceeded its total deadline"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker 29 with the containerd image store and docker compose CLI"]
+async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed() {
+    if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + CONTAINERD_SCENARIO_TIMEOUT;
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = tokio::time::timeout_at(deadline, async {
+        Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+            .unwrap()
+            .negotiate_version()
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("containerd daemon connection exceeded the scenario deadline");
+    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+    let harness = tokio::time::timeout_at(
+        deadline,
+        MutationHarness::new_with_test_gates(
+            endpoint,
+            std::env::temp_dir(),
+            None,
+            None,
+            Some(candidate_gate.clone()),
+        ),
+    )
+    .await
+    .expect("containerd harness setup exceeded the scenario deadline");
+    let mut cleanup_app_id = None;
+    let outcome = tokio::time::timeout_at(
+        deadline,
+        AssertUnwindSafe(async {
+            assert_containerd_daemon(&docker).await;
+            let create = harness
+                .request(
+                    "POST",
+                    "/api/v1/apps",
+                    Some("containerd-compensation-create-0001"),
+                    Some(&json!({
+                        "slug":"containerd-compensation",
+                        "display_name":"Containerd compensation",
+                        "discovery_image_ref":"alpine:3.20",
+                        "credential_ref":null,
+                        "auto_deploy_enabled":false,
+                        "poll_interval_seconds":300,
+                        "environment":{"public":[],"secrets":[]},
+                        "files":[],
+                        "ports":[],
+                        "volumes":[],
+                        "binds":[],
+                        "networks":[{"kind":"owned_default"}],
+                        "health":{"policy":"completed"}
+                    })),
+                )
+                .await;
+            let create_status = create.status();
+            let create = MutationHarness::json(create).await;
+            assert_eq!(create_status, StatusCode::CREATED, "{create}");
+            let app_id = create["app"]["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap();
+            cleanup_app_id = Some(app_id);
+            let deployment =
+                schedule_from_current(&harness, app_id, "containerd-compensation-deploy-0001")
+                    .await;
+            tokio::time::timeout(CONTAINERD_GATE_TIMEOUT, candidate_gate.wait_until_reached())
+                .await
+                .expect("candidate gate was not reached before its deadline");
+
+            let project = format!("solodock-{}", app_id.simple());
+            let original = harness
+                .state
+                .observer
+                .api()
+                .list_compose_app_containers(&project)
+                .await
+                .unwrap();
+            assert_eq!(original.len(), 1);
+            let labels = original[0].labels.clone();
+            remove_owned_container(&docker, &original[0].id, app_id).await;
+            // This is still before post_container_id exists. A unique non-predecessor
+            // full ID with all canonical candidate labels is the ownership claim; the
+            // deliberately wrong configured image is then a deterministic semantic
+            // mismatch that must be compensated.
+            let pre_marker_claim = docker
+                .create_container(
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(&format!("solodock-containerd-mismatch-{}", Uuid::new_v4()))
+                            .build(),
+                    ),
+                    ContainerCreateBody {
+                        image: Some("alpine:3.20".into()),
+                        cmd: Some(vec!["sleep".into(), "300".into()]),
+                        labels: Some(labels),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            docker
+                .start_container(&pre_marker_claim.id, None)
+                .await
+                .unwrap();
+            candidate_gate.resume();
+
+            let failed = wait_for_deployment(&harness, deployment).await;
+            assert_eq!(failed["status"], "failed", "{failed}");
+            assert_eq!(failed["error_code"], "CANDIDATE_INVALID", "{failed}");
+            assert!(app_detail(&harness, app_id).await["pending_release_id"].is_null());
+            assert!(
+                harness
+                    .state
+                    .observer
+                    .api()
+                    .list_compose_app_containers(&project)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .catch_unwind(),
+    )
+    .await;
+
+    let shutdown_finished = shutdown_containerd_harness(&harness).await;
+    if let Some(app_id) = cleanup_app_id {
+        cleanup_containerd_app(&docker, app_id, &[]).await;
+    }
+    assert!(
+        shutdown_finished,
+        "containerd scenario tasks did not stop before the shutdown deadline"
+    );
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("containerd pre-marker scenario exceeded its total deadline"),
+    }
 }
 
 #[tokio::test]
@@ -3072,149 +3224,179 @@ async fn containerd_post_marker_full_id_replacement_is_preserved() {
     if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref() != Ok("1") {
         return;
     }
+    let deadline = tokio::time::Instant::now() + CONTAINERD_SCENARIO_TIMEOUT;
     let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
-    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
-        .unwrap()
-        .negotiate_version()
-        .await
-        .unwrap();
-    let effect_gate = TestEffectGate::new([TestEffectAction::Continue, TestEffectAction::Pause]);
-    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
-    let harness = MutationHarness::new_with_test_gates(
-        endpoint,
-        std::env::temp_dir(),
-        None,
-        Some(effect_gate.clone()),
-        Some(candidate_gate.clone()),
-    )
-    .await;
-    let create = harness
-        .request(
-            "POST",
-            "/api/v1/apps",
-            Some("containerd-post-marker-create-0001"),
-            Some(&json!({
-                "slug":"containerd-post-marker",
-                "display_name":"Containerd post marker",
-                "discovery_image_ref":"alpine:3.20",
-                "credential_ref":null,
-                "auto_deploy_enabled":false,
-                "poll_interval_seconds":300,
-                "environment":{"public":[],"secrets":[]},
-                "files":[],
-                "ports":[],
-                "volumes":[],
-                "binds":[],
-                "networks":[{"kind":"owned_default"}],
-                "health":{"policy":"completed"}
-            })),
-        )
-        .await;
-    let create_status = create.status();
-    let create = MutationHarness::json(create).await;
-    assert_eq!(create_status, StatusCode::CREATED, "{create}");
-    let app_id = create["app"]["id"]
-        .as_str()
-        .unwrap()
-        .parse::<Uuid>()
-        .unwrap();
-    let deployment =
-        schedule_from_current(&harness, app_id, "containerd-post-marker-deploy-0001").await;
-    candidate_gate.wait_until_reached().await;
-
-    let project = format!("solodock-{}", app_id.simple());
-    let original = harness
-        .state
-        .observer
-        .api()
-        .list_compose_app_containers(&project)
-        .await
-        .unwrap();
-    assert_eq!(original.len(), 1);
-    let labels = original[0].labels.clone();
-    remove_owned_container(&docker, &original[0].id, app_id).await;
-    let claimed = docker
-        .create_container(
-            Some(
-                CreateContainerOptionsBuilder::default()
-                    .name(&format!("solodock-containerd-claimed-{}", Uuid::new_v4()))
-                    .build(),
-            ),
-            ContainerCreateBody {
-                image: Some("alpine:3.20".into()),
-                cmd: Some(vec!["sleep".into(), "300".into()]),
-                labels: Some(labels.clone()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    docker.start_container(&claimed.id, None).await.unwrap();
-    candidate_gate.resume();
-
-    // The worker has now persisted claimed.id as post_container_id and entered
-    // deterministic compensation. Replacing it after that marker must never
-    // authorize cleanup of the different full ID.
-    effect_gate.wait_until_reached().await;
-    remove_owned_container(&docker, &claimed.id, app_id).await;
-    let post_marker_replacement = docker
-        .create_container(
-            Some(
-                CreateContainerOptionsBuilder::default()
-                    .name(&format!(
-                        "solodock-containerd-post-marker-{}",
-                        Uuid::new_v4()
-                    ))
-                    .build(),
-            ),
-            ContainerCreateBody {
-                image: Some("alpine:3.20".into()),
-                cmd: Some(vec!["sleep".into(), "300".into()]),
-                labels: Some(labels),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-    docker
-        .start_container(&post_marker_replacement.id, None)
-        .await
-        .unwrap();
-    effect_gate.resume();
-
-    let interrupted = wait_for_deployment(&harness, deployment).await;
-    assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
-    assert_eq!(
-        interrupted["error_code"], "DEPLOYMENT_INTERRUPTED",
-        "{interrupted}"
-    );
-    assert!(app_detail(&harness, app_id).await["pending_release_id"].is_string());
-    let remaining = harness
-        .state
-        .observer
-        .api()
-        .list_compose_app_containers(&project)
-        .await
-        .unwrap();
-    assert_eq!(remaining.len(), 1);
-    assert_eq!(remaining[0].id, post_marker_replacement.id);
-    assert!(
-        docker
-            .inspect_container(&post_marker_replacement.id, None)
+    let docker = tokio::time::timeout_at(deadline, async {
+        Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+            .unwrap()
+            .negotiate_version()
             .await
             .unwrap()
-            .state
-            .and_then(|state| state.running)
-            .unwrap_or(false),
-        "post-marker replacement must remain running"
-    );
+    })
+    .await
+    .expect("containerd daemon connection exceeded the scenario deadline");
+    let effect_gate = TestEffectGate::new([TestEffectAction::Continue, TestEffectAction::Pause]);
+    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
+    let harness = tokio::time::timeout_at(
+        deadline,
+        MutationHarness::new_with_test_gates(
+            endpoint,
+            std::env::temp_dir(),
+            None,
+            Some(effect_gate.clone()),
+            Some(candidate_gate.clone()),
+        ),
+    )
+    .await
+    .expect("containerd harness setup exceeded the scenario deadline");
+    let mut cleanup_app_id = None;
+    let outcome = tokio::time::timeout_at(
+        deadline,
+        AssertUnwindSafe(async {
+            assert_containerd_daemon(&docker).await;
+            let create = harness
+                .request(
+                    "POST",
+                    "/api/v1/apps",
+                    Some("containerd-post-marker-create-0001"),
+                    Some(&json!({
+                        "slug":"containerd-post-marker",
+                        "display_name":"Containerd post marker",
+                        "discovery_image_ref":"alpine:3.20",
+                        "credential_ref":null,
+                        "auto_deploy_enabled":false,
+                        "poll_interval_seconds":300,
+                        "environment":{"public":[],"secrets":[]},
+                        "files":[],
+                        "ports":[],
+                        "volumes":[],
+                        "binds":[],
+                        "networks":[{"kind":"owned_default"}],
+                        "health":{"policy":"completed"}
+                    })),
+                )
+                .await;
+            let create_status = create.status();
+            let create = MutationHarness::json(create).await;
+            assert_eq!(create_status, StatusCode::CREATED, "{create}");
+            let app_id = create["app"]["id"]
+                .as_str()
+                .unwrap()
+                .parse::<Uuid>()
+                .unwrap();
+            cleanup_app_id = Some(app_id);
+            let deployment =
+                schedule_from_current(&harness, app_id, "containerd-post-marker-deploy-0001").await;
+            tokio::time::timeout(CONTAINERD_GATE_TIMEOUT, candidate_gate.wait_until_reached())
+                .await
+                .expect("candidate gate was not reached before its deadline");
 
-    remove_owned_container(&docker, &post_marker_replacement.id, app_id).await;
-    let network = format!("solodock-{}-default", app_id.simple());
-    docker.remove_network(&network).await.unwrap();
-    harness.state.shutdown.cancel();
-    harness.state.stream_tasks.close();
-    harness.state.stream_tasks.wait().await;
+            let project = format!("solodock-{}", app_id.simple());
+            let original = harness
+                .state
+                .observer
+                .api()
+                .list_compose_app_containers(&project)
+                .await
+                .unwrap();
+            assert_eq!(original.len(), 1);
+            let labels = original[0].labels.clone();
+            remove_owned_container(&docker, &original[0].id, app_id).await;
+            let claimed = docker
+                .create_container(
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(&format!("solodock-containerd-claimed-{}", Uuid::new_v4()))
+                            .build(),
+                    ),
+                    ContainerCreateBody {
+                        image: Some("alpine:3.20".into()),
+                        cmd: Some(vec!["sleep".into(), "300".into()]),
+                        labels: Some(labels.clone()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            docker.start_container(&claimed.id, None).await.unwrap();
+            candidate_gate.resume();
+
+            // The worker has now persisted claimed.id as post_container_id and entered
+            // deterministic compensation. Replacing it after that marker must never
+            // authorize cleanup of the different full ID.
+            tokio::time::timeout(CONTAINERD_GATE_TIMEOUT, effect_gate.wait_until_reached())
+                .await
+                .expect("effect gate was not reached before its deadline");
+            remove_owned_container(&docker, &claimed.id, app_id).await;
+            let post_marker_replacement = docker
+                .create_container(
+                    Some(
+                        CreateContainerOptionsBuilder::default()
+                            .name(&format!(
+                                "solodock-containerd-post-marker-{}",
+                                Uuid::new_v4()
+                            ))
+                            .build(),
+                    ),
+                    ContainerCreateBody {
+                        image: Some("alpine:3.20".into()),
+                        cmd: Some(vec!["sleep".into(), "300".into()]),
+                        labels: Some(labels),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            docker
+                .start_container(&post_marker_replacement.id, None)
+                .await
+                .unwrap();
+            effect_gate.resume();
+
+            let interrupted = wait_for_deployment(&harness, deployment).await;
+            assert_eq!(interrupted["status"], "interrupted", "{interrupted}");
+            assert_eq!(
+                interrupted["error_code"], "DEPLOYMENT_INTERRUPTED",
+                "{interrupted}"
+            );
+            assert!(app_detail(&harness, app_id).await["pending_release_id"].is_string());
+            let remaining = harness
+                .state
+                .observer
+                .api()
+                .list_compose_app_containers(&project)
+                .await
+                .unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, post_marker_replacement.id);
+            assert!(
+                docker
+                    .inspect_container(&post_marker_replacement.id, None)
+                    .await
+                    .unwrap()
+                    .state
+                    .and_then(|state| state.running)
+                    .unwrap_or(false),
+                "post-marker replacement must remain running"
+            );
+        })
+        .catch_unwind(),
+    )
+    .await;
+
+    let shutdown_finished = shutdown_containerd_harness(&harness).await;
+    if let Some(app_id) = cleanup_app_id {
+        cleanup_containerd_app(&docker, app_id, &[]).await;
+    }
+    assert!(
+        shutdown_finished,
+        "containerd scenario tasks did not stop before the shutdown deadline"
+    );
+    match outcome {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!("containerd post-marker scenario exceeded its total deadline"),
+    }
 }
 
 async fn docker_cli(endpoint: &str, args: &[&str]) -> String {
@@ -3331,6 +3513,108 @@ async fn wait_for_deployment(harness: &MutationHarness, id: Uuid) -> Value {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     panic!("deployment {id} did not become terminal")
+}
+
+async fn assert_containerd_daemon(docker: &Docker) {
+    let version = docker.version().await.unwrap();
+    assert_eq!(version.version.as_deref(), Some("29.7.2"));
+    let driver_status = docker
+        .info()
+        .await
+        .unwrap()
+        .driver_status
+        .unwrap_or_default();
+    assert!(
+        driver_status
+            .iter()
+            .flatten()
+            .any(|value| value.contains("io.containerd.snapshotter.v1")),
+        "expected io.containerd.snapshotter.v1, got {driver_status:?}"
+    );
+}
+
+async fn shutdown_containerd_harness(harness: &MutationHarness) -> bool {
+    harness.state.shutdown.cancel();
+    harness.state.stream_tasks.close();
+    tokio::time::timeout(
+        CONTAINERD_SHUTDOWN_TIMEOUT,
+        harness.state.stream_tasks.wait(),
+    )
+    .await
+    .is_ok()
+}
+
+async fn cleanup_containerd_app(docker: &Docker, app_id: Uuid, owned_volumes: &[&str]) {
+    let project = format!("solodock-{}", app_id.simple());
+    let filters = HashMap::from([(
+        "label".to_string(),
+        vec![
+            format!("{APP_ID_LABEL}={app_id}"),
+            format!("{PROJECT_LABEL}={project}"),
+        ],
+    )]);
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::default()
+                .all(true)
+                .filters(&filters)
+                .build(),
+        ))
+        .await
+        .unwrap();
+    for container in containers {
+        let container_id = container.id.expect("listed container must have a full ID");
+        remove_owned_container(docker, &container_id, app_id).await;
+    }
+
+    let network = format!("{project}-default");
+    match docker.inspect_network(&network, None).await {
+        Ok(inspected) => {
+            assert_eq!(inspected.name.as_deref(), Some(network.as_str()));
+            assert_eq!(
+                inspected
+                    .labels
+                    .as_ref()
+                    .and_then(|labels| labels.get(PROJECT_LABEL)),
+                Some(&project)
+            );
+            docker.remove_network(&network).await.unwrap();
+        }
+        Err(error) if docker_error_is_not_found(&error) => {}
+        Err(error) => panic!("inspect exact test network {network}: {error}"),
+    }
+
+    for logical_name in owned_volumes {
+        let volume = format!("solodock-{}-{logical_name}", app_id.simple());
+        match docker.inspect_volume(&volume).await {
+            Ok(inspected) => {
+                assert_eq!(inspected.name, volume);
+                assert_eq!(
+                    inspected.labels.get(APP_ID_LABEL),
+                    Some(&app_id.to_string())
+                );
+                docker
+                    .remove_volume(
+                        &volume,
+                        None::<bollard::query_parameters::RemoveVolumeOptions>,
+                    )
+                    .await
+                    .unwrap();
+            }
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(error) => panic!("inspect exact test volume {volume}: {error}"),
+        }
+    }
+}
+
+fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
 }
 
 async fn update_draft(

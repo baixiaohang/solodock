@@ -116,6 +116,7 @@ impl DeploymentEngine {
         self.tasks.spawn(async move {
             let _guards = (app_guard, global_guard);
             if let Err(error) = engine.run(&state, &m3, deployment_id).await {
+                let _ = crate::api::mutations::refresh(&state, &m3).await;
                 record_terminal_error(&engine.ledger, deployment_id, error).await;
                 m3.reconcile_notify.notify_one();
             }

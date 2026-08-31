@@ -16,7 +16,7 @@ pull 只在 `/run/solodock/docker-config/<deployment-id>/config.json` 创建 ope
 2. 按 OCI Distribution Bearer challenge 获取精确 `repository:<repo>:pull` scope；
 3. 校验响应 media type、header/body digest、manifest/index descriptor 和本机 canonical platform；
 4. 记录 source descriptor、index/manifest digest 和 OS/architecture/variant；
-5. 只执行 digest-pinned pull，并用 canonical repository digest、config/manifest image identity、可用的 manifest descriptor 和 platform 复核结果；
+5. 只执行 digest-pinned pull；Docker adapter 先把原始 `ImageInspect` 投影为 effective observation，其中 descriptor 的缺失平台字段只能由同一响应的顶层平台补齐，再用 canonical repository digest、config/manifest image identity、有效 manifest descriptor 和顶层 platform 复核结果；
 6. 在任何 Docker effect 前写入 immutable release、canonical Compose 并设置 `pending`。
 
 tag 在 resolve 之后移动不会改变已经调度的 candidate。SoloDock 当前不验证 Cosign/Sigstore 签名，因此可信 Registry 或账户被攻陷仍属于供应链风险。
@@ -48,6 +48,8 @@ deployment ledger 的终态为：
 最后一个 Docker await 完成后直接调用固定 Compose action。unmanaged、stale、replacement、multiple candidate 或 resource drift 都不会进入 runner。
 
 Compose 后的首次 observation 是 ownership claim boundary：唯一非 predecessor full container ID 与全套 canonical project/service/app/schema/candidate-release labels 足以证明 owned candidate，并立即把 exact ID 作为 `post_container_id` 写入 ledger；configured digest reference、config/manifest image identity、可用的 manifest descriptor、platform、status 和 health 属于后续 release validity。首次 marker 前，即使 Docker daemon/root 主体复制全部 canonical labels 重建容器，当前信任模型仍会 claim 该唯一容器；这种具备 daemon 控制权的行为不在 threat model 内，系统不提供 Compose effect 因果 attestation。
+
+上述 `ImageInspect` 补全只属于 pull 后的 adapter normalization；candidate、health、no-op、failed apply 和 rollback 读取的 `ContainerInspect.ImageManifestDescriptor` 不使用顶层 fallback，继续要求 descriptor 自身的 digest 与 canonical platform 完整匹配。
 
 `post_container_id` 持久化后，该 exact full ID 成为补偿、health、commit/rollback 的 SSOT。后续观察到不同 full ID 才定义为 uncertain replacement：保留 pending 与现场，进入 `interrupted` 或 `needs_attention`，禁止 stop/remove。这样 deterministic semantic mismatch 不会丢失安全补偿句柄，同时 marker 后 replacement 不会被猜测性清理。
 

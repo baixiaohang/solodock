@@ -57,6 +57,7 @@ pub enum TestPullAction {
     Continue,
     Pause,
     Interrupt,
+    FailVerification,
 }
 
 #[cfg(feature = "docker-e2e")]
@@ -108,6 +109,7 @@ impl TestPullGate {
         match action {
             TestPullAction::Continue => Ok(()),
             TestPullAction::Interrupt => Err(PullError::Interrupted),
+            TestPullAction::FailVerification => Err(PullError::VerificationFailed),
             TestPullAction::Pause => {
                 self.reached.add_permits(1);
                 tokio::select! {
@@ -668,7 +670,7 @@ mod tests {
     #[test]
     fn image_verification_requires_present_descriptor_to_match() {
         let (_root, _puller, resolved, _credential) = fixture();
-        let mut image = ImageRecord {
+        let image = ImageRecord {
             id: resolved.manifest_digest.clone(),
             manifest_descriptor: Some(crate::registry::ManifestDescriptor {
                 digest: Some(resolved.manifest_digest.clone()),
@@ -683,11 +685,40 @@ mod tests {
         };
         assert!(image_matches_resolved(&image, &resolved));
 
-        image.manifest_descriptor.as_mut().unwrap().digest =
+        let mut wrong_digest = image.clone();
+        wrong_digest.manifest_descriptor.as_mut().unwrap().digest =
             Some(format!("sha256:{}", "c".repeat(64)));
-        assert!(!image_matches_resolved(&image, &resolved));
-        image.manifest_descriptor = Some(crate::registry::ManifestDescriptor::default());
-        assert!(!image_matches_resolved(&image, &resolved));
+        assert!(!image_matches_resolved(&wrong_digest, &resolved));
+
+        let mut conflicting_descriptor = image.clone();
+        conflicting_descriptor
+            .manifest_descriptor
+            .as_mut()
+            .unwrap()
+            .architecture = Some("arm64".into());
+        assert!(!image_matches_resolved(&conflicting_descriptor, &resolved));
+
+        let mut incomplete_descriptor = image.clone();
+        incomplete_descriptor
+            .manifest_descriptor
+            .as_mut()
+            .unwrap()
+            .architecture = None;
+        assert!(!image_matches_resolved(&incomplete_descriptor, &resolved));
+
+        let mut missing_top_level_platform = image.clone();
+        missing_top_level_platform.architecture.clear();
+        assert!(!image_matches_resolved(
+            &missing_top_level_platform,
+            &resolved
+        ));
+
+        let mut invalid_top_level_platform = image;
+        invalid_top_level_platform.os = "plan9".into();
+        assert!(!image_matches_resolved(
+            &invalid_top_level_platform,
+            &resolved
+        ));
     }
 
     #[test]
