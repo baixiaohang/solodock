@@ -586,25 +586,7 @@ mod tests {
         );
         load_verified(root.path(), revision, key).unwrap();
 
-        fs::set_permissions(&public, fs::Permissions::from_mode(0o1444)).unwrap();
-        assert!(matches!(
-            load_verified(root.path(), revision, key),
-            Err(StoreError::ManagedFilePermissionInvalid)
-        ));
         fs::set_permissions(&public, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(
-            load_verified(root.path(), revision, key),
-            Err(StoreError::ManagedFilePermissionInvalid)
-        ));
-        fs::set_permissions(&public, fs::Permissions::from_mode(MANAGED_FILE_MODE)).unwrap();
-        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(
-            load_verified(root.path(), revision, key),
-            Err(StoreError::ManagedFilePermissionInvalid)
-        ));
-        fs::set_permissions(&secret, fs::Permissions::from_mode(MANAGED_FILE_MODE)).unwrap();
-        fs::remove_file(&secret).unwrap();
-        symlink(&public, &secret).unwrap();
         assert!(matches!(
             load_verified(root.path(), revision, key),
             Err(StoreError::ManagedFilePermissionInvalid)

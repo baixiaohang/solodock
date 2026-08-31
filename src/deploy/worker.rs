@@ -263,9 +263,7 @@ impl DeploymentEngine {
         let final_release = self
             .store
             .load_v2_release(record.app_id, candidate_id)
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
         if final_release != candidate_release {
             return Err(EngineError::NeedsAttention("RELEASE_INVALID"));
         }
@@ -276,9 +274,7 @@ impl DeploymentEngine {
                 .integrity_key()
                 .map_err(|_| EngineError::Internal)?,
         )
-        .map_err(|error| {
-            managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-        })?;
+        .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
         let binds = self
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
@@ -525,14 +521,8 @@ impl DeploymentEngine {
             )
             .await
             .map_err(|error| EngineError::Stable(error.public_code()))?;
-        let old = match active {
-            Some(active_id) => {
-                optional_noop_release(self.store.load_v2_release(record.app_id, active_id))?
-            }
-            None => None,
-        };
         if let Some(active_id) = active
-            && let Some(old) = old
+            && let Ok(old) = self.store.load_v2_release(record.app_id, active_id)
             && old.manifest_digest == resolved.manifest_digest
             && old.config_revision == metadata.draft_revision
             && old.config_sha256 == metadata.draft_config_sha256
@@ -548,9 +538,7 @@ impl DeploymentEngine {
                     .integrity_key()
                     .map_err(|_| EngineError::Internal)?,
             )
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::Stable("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
             let desired = if matches!(
                 loaded.metadata.health,
                 crate::domain::HealthPolicy::Completed
@@ -616,9 +604,7 @@ impl DeploymentEngine {
                 ReleaseTrigger::Manual,
                 None,
             )
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::Stable("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
         Ok((resolved, candidate_id, release))
     }
 
@@ -634,9 +620,7 @@ impl DeploymentEngine {
         let release = self
             .store
             .load_v2_release(record.app_id, target)
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::Stable("ROLLBACK_TARGET_INVALID"))
-            })?;
+            .map_err(|_| EngineError::Stable("ROLLBACK_TARGET_INVALID"))?;
         let resolved = resolved_from_release(&release);
         self.ledger
             .resolved(
@@ -721,14 +705,8 @@ impl DeploymentEngine {
                 .clone()
                 .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?,
         };
-        let old = match active {
-            Some(active_id) => {
-                optional_noop_release(self.store.load_v2_release(record.app_id, active_id))?
-            }
-            None => None,
-        };
         if let Some(active_id) = active
-            && let Some(old) = old
+            && let Ok(old) = self.store.load_v2_release(record.app_id, active_id)
             && old.manifest_digest == resolved.manifest_digest
         {
             if old.config_revision != metadata.draft_revision
@@ -789,9 +767,7 @@ impl DeploymentEngine {
                 ReleaseTrigger::Poll,
                 None,
             )
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::Stable("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
         Ok((resolved, candidate_id, release))
     }
 
@@ -803,12 +779,7 @@ impl DeploymentEngine {
         let release = self
             .store
             .load_v2_release(record.app_id, pending)
-            .map_err(|error| {
-                managed_file_permission_or(
-                    error,
-                    EngineError::NeedsAttention("PENDING_RELEASE_INVALID"),
-                )
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("PENDING_RELEASE_INVALID"))?;
         if release.config_revision != record.requested_revision {
             return Err(EngineError::Stable("DEPLOYMENT_FACTS_CHANGED"));
         }
@@ -919,9 +890,7 @@ impl DeploymentEngine {
         }
         self.store
             .load_v2_release(app_id, pending)
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
         Ok(())
     }
 
@@ -991,9 +960,7 @@ impl DeploymentEngine {
                 .integrity_key()
                 .map_err(|_| EngineError::Internal)?,
         )
-        .map_err(|error| {
-            managed_file_permission_or(error, EngineError::Stable("RELEASE_INVALID"))
-        })?;
+        .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
         Ok(match loaded.metadata.health {
             crate::domain::HealthPolicy::Completed => {
                 container.status == ContainerStatus::Exited && container.exit_code == Some(0)
@@ -1098,9 +1065,7 @@ impl DeploymentEngine {
         let candidate_release = self
             .store
             .load_v2_release(record.app_id, candidate)
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
         self.ledger
             .transition(
                 record.id,
@@ -1121,12 +1086,7 @@ impl DeploymentEngine {
             let final_release = self
                 .store
                 .load_v2_release(record.app_id, candidate)
-                .map_err(|error| {
-                    managed_file_permission_or(
-                        error,
-                        EngineError::NeedsAttention("RELEASE_INVALID"),
-                    )
-                })?;
+                .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
             if final_release != candidate_release {
                 return Err(EngineError::NeedsAttention("RELEASE_INVALID"));
             }
@@ -1137,9 +1097,7 @@ impl DeploymentEngine {
                     .integrity_key()
                     .map_err(|_| EngineError::Internal)?,
             )
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
             let binds = self
                 .validate_runtime_paths_fresh(m3, &loaded.metadata)
                 .await?;
@@ -1177,12 +1135,7 @@ impl DeploymentEngine {
         let old = self
             .store
             .load_v2_release(record.app_id, old_id)
-            .map_err(|error| {
-                managed_file_permission_or(
-                    error,
-                    EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"),
-                )
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?;
         let old_image = ImageReference::parse(&old.source_image_ref)
             .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?;
         let old_credential = self.load_credential_ref(old.credential_ref, &old_image)?;
@@ -1211,18 +1164,11 @@ impl DeploymentEngine {
         let final_old = self
             .store
             .load_v2_release(record.app_id, old_id)
-            .map_err(|error| {
-                managed_file_permission_or(
-                    error,
-                    EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"),
-                )
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?;
         let final_candidate_release = self
             .store
             .load_v2_release(record.app_id, candidate)
-            .map_err(|error| {
-                managed_file_permission_or(error, EngineError::NeedsAttention("RELEASE_INVALID"))
-            })?;
+            .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?;
         if final_old != old || final_candidate_release != candidate_release {
             return Err(EngineError::NeedsAttention("RELEASE_INVALID"));
         }
@@ -1233,12 +1179,7 @@ impl DeploymentEngine {
                 .integrity_key()
                 .map_err(|_| EngineError::Internal)?,
         )
-        .map_err(|error| {
-            managed_file_permission_or(
-                error,
-                EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"),
-            )
-        })?;
+        .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?;
         let binds = self
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
@@ -1502,38 +1443,6 @@ enum EngineError {
     AlreadyTerminal,
 }
 
-fn managed_file_permission_or(
-    error: crate::app_store::StoreError,
-    otherwise: EngineError,
-) -> EngineError {
-    if matches!(
-        error,
-        crate::app_store::StoreError::ManagedFilePermissionInvalid
-    ) {
-        match otherwise {
-            EngineError::Stable(_) => EngineError::Stable("MANAGED_FILE_PERMISSION_INVALID"),
-            EngineError::NeedsAttention(_) => {
-                EngineError::NeedsAttention("MANAGED_FILE_PERMISSION_INVALID")
-            }
-            other => other,
-        }
-    } else {
-        otherwise
-    }
-}
-
-fn optional_noop_release(
-    result: Result<ReleaseV2, crate::app_store::StoreError>,
-) -> Result<Option<ReleaseV2>, EngineError> {
-    match result {
-        Ok(release) => Ok(Some(release)),
-        Err(crate::app_store::StoreError::ManagedFilePermissionInvalid) => {
-            Err(EngineError::Stable("MANAGED_FILE_PERMISSION_INVALID"))
-        }
-        Err(_) => Ok(None),
-    }
-}
-
 enum FailedApplyObservation {
     NoEffect,
     Candidate(Box<ContainerRecord>),
@@ -1555,34 +1464,6 @@ mod tests {
     };
 
     use super::*;
-
-    #[test]
-    fn managed_file_permission_mapping_preserves_effect_classification_and_noop_errors() {
-        assert!(matches!(
-            managed_file_permission_or(
-                crate::app_store::StoreError::ManagedFilePermissionInvalid,
-                EngineError::Stable("RELEASE_INVALID"),
-            ),
-            EngineError::Stable("MANAGED_FILE_PERMISSION_INVALID")
-        ));
-        assert!(matches!(
-            managed_file_permission_or(
-                crate::app_store::StoreError::ManagedFilePermissionInvalid,
-                EngineError::NeedsAttention("RELEASE_INVALID"),
-            ),
-            EngineError::NeedsAttention("MANAGED_FILE_PERMISSION_INVALID")
-        ));
-        assert!(matches!(
-            optional_noop_release(Err(
-                crate::app_store::StoreError::ManagedFilePermissionInvalid
-            )),
-            Err(EngineError::Stable("MANAGED_FILE_PERMISSION_INVALID"))
-        ));
-        assert!(matches!(
-            optional_noop_release(Err(crate::app_store::StoreError::ContentInvalid)),
-            Ok(None)
-        ));
-    }
     use crate::{
         app_store::atomic::AtomicWriter,
         compose::ComposeOutput,

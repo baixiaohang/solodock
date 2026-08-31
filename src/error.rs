@@ -218,15 +218,6 @@ impl ApiError {
         )
     }
 
-    pub fn managed_file_permission(request_id: RequestId) -> Self {
-        Self::new(
-            StatusCode::CONFLICT,
-            "MANAGED_FILE_PERMISSION_INVALID",
-            "A managed file permission is invalid",
-            request_id,
-        )
-    }
-
     pub fn compose(code: &'static str, request_id: RequestId) -> Self {
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,

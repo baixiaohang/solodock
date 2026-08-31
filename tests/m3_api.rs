@@ -678,7 +678,7 @@ async fn deployment_preflight_reports_managed_file_permission_drift_before_compo
     let (status, response) = body(response).await;
     assert_eq!(status, StatusCode::CONFLICT, "{response}");
     let response: Value = serde_json::from_str(&response).unwrap();
-    assert_eq!(response["code"], "MANAGED_FILE_PERMISSION_INVALID");
+    assert_eq!(response["code"], "APP_CONFIG_INVALID");
     assert!(!response.to_string().contains("secret-config"));
     assert!(!response.to_string().contains(drifted.to_str().unwrap()));
     assert!(harness.compose_actions.lock().unwrap().is_empty());

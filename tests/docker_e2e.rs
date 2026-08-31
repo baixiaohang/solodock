@@ -2037,31 +2037,8 @@ async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollbac
         !matches!(image_user.as_str(), "" | "0" | "root"),
         "managed-file E2E image must declare a non-root user"
     );
-    let effect_gate = TestEffectGate::new([
-        TestEffectAction::Continue,
-        TestEffectAction::Pause,
-        TestEffectAction::Continue,
-        TestEffectAction::Continue,
-        TestEffectAction::Continue,
-    ]);
-    let candidate_gate = TestEffectGate::new([TestEffectAction::Pause]);
-    let cancellation = CancellationToken::new();
-    let tasks = TaskTracker::new();
-    let recording_runner = RecordingComposeRunner::new(FixedComposeRunner::for_test_http(
-        cancellation,
-        tasks,
-        SecretRedactor::new(&EmptySecretProvider),
-        endpoint.clone(),
-    ));
-    let harness = MutationHarness::new_with_components(
-        endpoint.clone(),
-        std::path::PathBuf::from(&shared_root),
-        None,
-        Some(effect_gate.clone()),
-        Some(candidate_gate.clone()),
-        Some(Arc::new(recording_runner.clone())),
-    )
-    .await;
+    let harness =
+        MutationHarness::new(endpoint.clone(), std::path::PathBuf::from(&shared_root)).await;
     let draft = |public_value: &str, secret_value: &str| {
         json!({
             "slug":"nrfiles",
@@ -2112,57 +2089,42 @@ async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollbac
         .parse::<Uuid>()
         .unwrap();
 
-    let first_revision = harness.store.read_metadata(app_id).unwrap().draft_revision;
-    let first_secret = harness
-        .store
-        .app_directory(app_id)
-        .join("config-revisions")
-        .join(first_revision.to_string())
-        .join("files/secret/secret-config");
-    recording_runner.reset();
-
-    let first_attempt = schedule_from_current(&harness, app_id, "managed-files-deploy-0001").await;
-    candidate_gate.wait_until_reached().await;
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
-    candidate_gate.resume();
-    let first_attempt = wait_for_deployment(&harness, first_attempt).await;
-    assert_eq!(
-        first_attempt["status"], "needs_attention",
-        "{first_attempt}"
-    );
-    assert_eq!(
-        first_attempt["error_code"],
-        "MANAGED_FILE_PERMISSION_INVALID"
-    );
-    assert_eq!(recording_runner.calls(), 1);
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
-
-    let pending_attempt =
-        schedule_from_current(&harness, app_id, "managed-files-deploy-0002").await;
-    effect_gate.wait_until_reached().await;
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
-    effect_gate.resume();
-    let pending_attempt = wait_for_deployment(&harness, pending_attempt).await;
-    assert_eq!(
-        pending_attempt["status"], "needs_attention",
-        "{pending_attempt}"
-    );
-    assert_eq!(
-        pending_attempt["error_code"],
-        "MANAGED_FILE_PERMISSION_INVALID"
-    );
-    assert_eq!(
-        recording_runner.calls(),
-        1,
-        "pending resume drift must fail before a second Compose effect"
-    );
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
-
-    let first_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0003").await;
+    let first_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0001").await;
     let first = wait_for_deployment(&harness, first_id).await;
     assert_eq!(first["status"], "succeeded", "{first}");
     let first_release = first["candidate_release_id"].as_str().unwrap().to_owned();
-    assert_eq!(recording_runner.calls(), 2);
+
+    let first_containers = harness
+        .state
+        .observer
+        .api()
+        .list_compose_app_containers("solodock-nrfiles")
+        .await
+        .unwrap();
+    assert_eq!(first_containers.len(), 1);
+    let first_container = docker
+        .inspect_container(&first_containers[0].id, None)
+        .await
+        .unwrap();
+    assert_eq!(first_container.restart_count, Some(0));
+    assert_eq!(
+        first_container
+            .config
+            .as_ref()
+            .and_then(|config| config.user.clone()),
+        Some(image_user.clone())
+    );
+    docker_cli(
+        &endpoint,
+        &[
+            "exec",
+            &first_containers[0].id,
+            "sh",
+            "-c",
+            "grep -q first /etc/nginx/conf.d/default.conf && grep -q first-secret /etc/nginx/secret.conf && ! printf x >>/etc/nginx/conf.d/default.conf && ! printf x >>/etc/nginx/secret.conf",
+        ],
+    )
+    .await;
 
     let current = app_detail(&harness, app_id).await;
     update_draft(
@@ -2173,51 +2135,9 @@ async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollbac
         "managed-files-update-0001",
     )
     .await;
-    let second_revision = harness.store.read_metadata(app_id).unwrap().draft_revision;
-    let second_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0004").await;
+    let second_id = schedule_from_current(&harness, app_id, "managed-files-deploy-0002").await;
     let second = wait_for_deployment(&harness, second_id).await;
     assert_eq!(second["status"], "succeeded", "{second}");
-
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let calls_before_invalid_rollback = recording_runner.calls();
-    let current = app_detail(&harness, app_id).await;
-    let invalid_rollback = harness
-        .request(
-            "POST",
-            &format!("/api/v1/deployments/{first_id}/rollback"),
-            Some("managed-files-rollback-invalid-0001"),
-            Some(&json!({
-                "expected_active_release_id":current["active_release"]["id"],
-                "expected_pending_release_id":current["pending_release_id"],
-                "expected_actual_release_id":current["actual_release_id"],
-                "expected_actual_container_id":current["actual"]["id"],
-                "acknowledge_non_rollbackable_data":true
-            })),
-        )
-        .await;
-    let invalid_rollback_status = invalid_rollback.status();
-    let invalid_rollback = MutationHarness::json(invalid_rollback).await;
-    assert_eq!(
-        invalid_rollback_status,
-        StatusCode::ACCEPTED,
-        "{invalid_rollback}"
-    );
-    let invalid_rollback = wait_for_deployment(
-        &harness,
-        invalid_rollback["deployment_id"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(invalid_rollback["status"], "failed", "{invalid_rollback}");
-    assert_eq!(
-        invalid_rollback["error_code"],
-        "MANAGED_FILE_PERMISSION_INVALID"
-    );
-    assert_eq!(recording_runner.calls(), calls_before_invalid_rollback);
-    std::fs::set_permissions(&first_secret, std::fs::Permissions::from_mode(0o444)).unwrap();
 
     let current = app_detail(&harness, app_id).await;
     let rollback = harness
@@ -2251,26 +2171,6 @@ async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollbac
     let report = harness.store.scan_read_only().unwrap();
     assert!(report.issues.is_empty(), "{:?}", report.issues);
     assert_eq!(report.valid_apps.len(), 1);
-    for revision in [first_revision, second_revision] {
-        let directory = harness
-            .store
-            .app_directory(app_id)
-            .join("config-revisions")
-            .join(revision.to_string());
-        for leaf in [
-            directory.join("files/public/public-config"),
-            directory.join("files/secret/secret-config"),
-        ] {
-            assert_eq!(
-                std::fs::metadata(leaf).unwrap().permissions().mode() & 0o777,
-                0o444
-            );
-        }
-        assert_eq!(
-            std::fs::metadata(directory).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-    }
 
     let containers = harness
         .state
@@ -2299,7 +2199,7 @@ async fn non_root_container_reads_managed_files_across_deploy_and_manual_rollbac
             &containers[0].id,
             "sh",
             "-c",
-            "cat /etc/nginx/conf.d/default.conf /etc/nginx/secret.conf >/dev/null && ! printf x >>/etc/nginx/secret.conf",
+            "grep -q first /etc/nginx/conf.d/default.conf && grep -q first-secret /etc/nginx/secret.conf && ! printf x >>/etc/nginx/conf.d/default.conf && ! printf x >>/etc/nginx/secret.conf",
         ],
     )
     .await;

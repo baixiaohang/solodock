@@ -549,9 +549,6 @@ async fn schedule_inner(
         Err(ScheduleError::ConfigInvalid) => {
             Err(ApiError::conflict("APP_CONFIG_INVALID", request_id))
         }
-        Err(ScheduleError::ManagedFilePermissionInvalid) => {
-            Err(ApiError::managed_file_permission(request_id))
-        }
         Err(ScheduleError::Idempotency(error)) => Err(ApiError::idempotency(error, request_id)),
         Err(ScheduleError::Internal) => Err(ApiError::internal(request_id)),
     }

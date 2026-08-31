@@ -38,7 +38,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 宿主上的 state root、应用目录、config revision 及 `files/{public,secret}` 目录保持 `0700 solodock:solodock`；只有实际 bind mount 的 `files/public/<logical-name>` 与 `files/secret/<logical-name>` direct leaf 是精确 `0444 solodock:solodock`。因此任意常见非 root 容器 UID/GID 可以读取显式挂入自己的文件，而普通宿主用户仍无法穿过私有 ancestor 枚举或读取 state tree。环境 secret、Registry/webhook credential、SQLite、release metadata 和其他控制面文件不使用该例外，继续保持私有文件权限。
 
-所有受管文件仍以 Compose `read_only: true` 挂载，容器不能写回宿主 inode。需要容器写入的持久内容必须使用 volume 或显式确认的 read-write bind，不能借受管文件绕过 secret、配额或不可变 release 语义。每次发布在私有 temp revision 内写完、显式设置最终 mode 并 fsync 后才原子可见；部署前 strict loader 会拒绝 mode、owner、类型或 symlink 漂移，并以 `MANAGED_FILE_PERMISSION_INVALID` 报告权限失败。
+所有受管文件仍以 Compose `read_only: true` 挂载，容器不能写回宿主 inode。需要容器写入的持久内容必须使用 volume 或显式确认的 read-write bind，不能借受管文件绕过 secret、配额或不可变 release 语义。每次发布在私有 temp revision 内写完、显式设置最终 mode 并 fsync 后才原子可见；部署前 strict loader 会拒绝 mode、owner、类型或 symlink 漂移，并沿用相应部署阶段的配置或 release 无效错误。
 
 ## Port、volume、bind 与 network
 
