@@ -1,0 +1,78 @@
+// @vitest-environment jsdom
+import { cleanup, render, screen } from '@testing-library/svelte'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+
+import AppShell from './AppShell.svelte'
+
+afterEach(cleanup)
+
+function stubViewport(mobile: boolean) {
+  const listeners = new Set<() => void>()
+  vi.stubGlobal('matchMedia', vi.fn(() => ({
+    matches: mobile,
+    media: '(max-width: 800px)',
+    onchange: null,
+    addEventListener: (_type: string, listener: () => void) => listeners.add(listener),
+    removeEventListener: (_type: string, listener: () => void) => listeners.delete(listener),
+    addListener: () => {},
+    removeListener: () => {},
+    dispatchEvent: () => true,
+  })))
+}
+
+afterEach(() => vi.unstubAllGlobals())
+
+describe('AppShell', () => {
+  it('提供两个主导航入口并按路由映射活动态', async () => {
+    stubViewport(false)
+    const rendered = render(AppShell, { route: '#/apps/123', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    const applications = screen.getByRole('link', { name: '应用' })
+    const credentials = screen.getByRole('link', { name: 'Registry 凭据' })
+
+    expect(applications.getAttribute('href')).toBe('#/')
+    expect(credentials.getAttribute('href')).toBe('#/credentials')
+    expect(applications.getAttribute('aria-current')).toBe('page')
+    expect(credentials.getAttribute('aria-current')).toBeNull()
+
+    await rendered.rerender({ route: '#/credentials', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    expect(applications.getAttribute('aria-current')).toBeNull()
+    expect(credentials.getAttribute('aria-current')).toBe('page')
+
+    await rendered.rerender({ route: '#/deployments/456', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    expect(applications.getAttribute('aria-current')).toBe('page')
+    expect(credentials.getAttribute('aria-current')).toBeNull()
+  })
+
+  it('可开关移动导航，并在点击路由或按 Escape 后关闭', async () => {
+    stubViewport(true)
+    const user = userEvent.setup()
+    render(AppShell, { route: '#/', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    const toggle = screen.getByRole('button', { name: '打开主导航' })
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(screen.queryByRole('link', { name: '应用' })).toBeNull()
+    await user.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    await user.click(screen.getByRole('link', { name: 'Registry 凭据' }))
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+
+    await user.click(toggle)
+    await user.keyboard('{Escape}')
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(toggle)
+    expect(screen.queryByRole('link', { name: '应用' })).toBeNull()
+  })
+
+  it('使用关闭按钮收起移动导航后把焦点归还菜单按钮', async () => {
+    stubViewport(true)
+    const user = userEvent.setup()
+    render(AppShell, { route: '#/', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    const toggle = screen.getByRole('button', { name: '打开主导航' })
+
+    await user.click(toggle)
+    await user.click(screen.getAllByRole('button', { name: '关闭主导航' })[0])
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(document.activeElement).toBe(toggle)
+  })
+})

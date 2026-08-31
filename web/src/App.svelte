@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { auth, loadSession, logout, revokeAll } from './lib/auth'
   import AuthView from './components/AuthView.svelte'
+  import AppShell from './components/AppShell.svelte'
   import Dashboard from './views/Dashboard.svelte'
   import AppDetail from './views/AppDetail.svelte'
   import NewApp from './views/NewApp.svelte'
@@ -30,24 +31,17 @@
 {:else if $auth.kind === 'setup' || $auth.kind === 'login'}
   <AuthView mode={$auth.kind} />
 {:else}
-  <header class="topbar">
-    <a class="brand" href="#/">SoloDock <span>观察台</span></a>
-    <nav aria-label="用户操作">
-      <a class="ghost button-link" href="#/credentials">Registry credentials</a>
-      <span class="user">admin</span>
-      <button class="ghost" onclick={() => void revokeAll()}>撤销全部会话</button>
-      <button class="ghost" onclick={() => void logout()}>退出</button>
-    </nav>
-  </header>
-  {#if credentials}
-    <Credentials />
-  {:else if deploymentId}
-    <DeploymentDetail {deploymentId} />
-  {:else if creating}
-    <NewApp />
-  {:else if appId}
-    <AppDetail {appId} />
-  {:else}
-    <Dashboard />
-  {/if}
+  <AppShell {route} onRevokeAll={revokeAll} onLogout={logout}>
+    {#if credentials}
+      <Credentials />
+    {:else if deploymentId}
+      <DeploymentDetail {deploymentId} />
+    {:else if creating}
+      <NewApp />
+    {:else if appId}
+      <AppDetail {appId} />
+    {:else}
+      <Dashboard />
+    {/if}
+  </AppShell>
 {/if}
