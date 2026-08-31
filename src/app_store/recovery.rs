@@ -15,7 +15,9 @@ use crate::{
     domain::{
         DesiredState, NetworkPlan, dto::DraftResponse, network_plan, validate_runnable_image,
     },
-    security::permissions::{PermissionError, check_private},
+    security::permissions::{
+        MANAGED_FILE_MODE, PermissionError, check_private, check_service_owned_file_mode,
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -142,6 +144,12 @@ enum ScanMode {
     ReadOnly,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManagedTreePolicy {
+    Strict,
+    DisposableAppTemp,
+}
+
 fn scan_with_mode(
     apps_directory: &Path,
     integrity_key: Option<&[u8]>,
@@ -164,7 +172,11 @@ fn scan_with_mode(
                 return Err(StoreError::SymlinkBoundary);
             }
             check_private(&entry.path(), true)?;
-            validate_managed_tree(&entry.path())?;
+            validate_managed_tree(
+                &entry.path(),
+                &entry.path(),
+                ManagedTreePolicy::DisposableAppTemp,
+            )?;
             if mode == ScanMode::StartupCleanup {
                 fs::remove_dir_all(entry.path())?;
                 super::sync_directory(apps_directory)?;
@@ -186,7 +198,11 @@ fn scan_with_mode(
             }
             if file_type.is_dir() {
                 check_private(&entry.path(), true)?;
-                validate_managed_tree(&entry.path())?;
+                validate_managed_tree(
+                    &entry.path(),
+                    &entry.path(),
+                    ManagedTreePolicy::DisposableAppTemp,
+                )?;
             } else if file_type.is_file() {
                 check_private(&entry.path(), false)?;
             } else {
@@ -231,7 +247,7 @@ fn scan_with_mode(
             continue;
         }
         check_private(&entry.path(), true)?;
-        if validate_managed_tree(&entry.path())? > 0 {
+        if validate_managed_tree(&entry.path(), &entry.path(), ManagedTreePolicy::Strict)? > 0 {
             report.issues.push(RecoveryIssue {
                 code: "TEMP_ARTIFACT_IGNORED",
                 app_id: Some(directory_id),
@@ -389,17 +405,21 @@ fn cleanup_revision_temps(app_directory: &Path) -> Result<(), StoreError> {
     super::sync_directory(&revisions)
 }
 
-fn validate_managed_tree(app_directory: &Path) -> Result<usize, StoreError> {
-    let mut pending = vec![app_directory.to_owned()];
+fn validate_managed_tree(
+    tree_root: &Path,
+    app_directory: &Path,
+    policy: ManagedTreePolicy,
+) -> Result<usize, StoreError> {
+    let mut pending = vec![tree_root.to_owned()];
     let mut temporary_artifacts = 0;
     while let Some(directory) = pending.pop() {
         for entry in fs::read_dir(&directory)? {
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
-            let is_release_link = directory == app_directory
+            let is_release_link = directory == tree_root
                 && matches!(entry.file_name().to_str(), Some("active" | "pending"));
-            let is_webhook_artifact = directory == app_directory
+            let is_webhook_artifact = directory == tree_root
                 && matches!(
                     entry.file_name().to_str(),
                     Some("webhook.toml" | "webhook-secret-revisions")
@@ -420,7 +440,26 @@ fn validate_managed_tree(app_directory: &Path) -> Result<usize, StoreError> {
                 check_private(&path, true)?;
                 pending.push(path);
             } else if file_type.is_file() {
-                check_private(&path, false)?;
+                match (
+                    policy,
+                    super::config_revision::managed_file_path_kind(app_directory, &path),
+                ) {
+                    (ManagedTreePolicy::DisposableAppTemp, Some(_)) => {
+                        check_allowed_managed_file_modes(
+                            &path,
+                            &[MANAGED_FILE_MODE, 0o400, 0o600],
+                        )?;
+                    }
+                    (
+                        ManagedTreePolicy::Strict,
+                        Some(super::config_revision::ManagedFilePathKind::Canonical),
+                    ) => check_allowed_managed_file_modes(&path, &[MANAGED_FILE_MODE])?,
+                    (
+                        ManagedTreePolicy::Strict,
+                        Some(super::config_revision::ManagedFilePathKind::Temporary),
+                    ) => check_allowed_managed_file_modes(&path, &[MANAGED_FILE_MODE, 0o600])?,
+                    (_, None) => check_private(&path, false)?,
+                }
             } else {
                 return Err(StoreError::SymlinkBoundary);
             }
@@ -430,6 +469,17 @@ fn validate_managed_tree(app_directory: &Path) -> Result<usize, StoreError> {
         }
     }
     Ok(temporary_artifacts)
+}
+
+fn check_allowed_managed_file_modes(path: &Path, allowed: &[u32]) -> Result<(), StoreError> {
+    if allowed
+        .iter()
+        .any(|mode| check_service_owned_file_mode(path, *mode).is_ok())
+    {
+        Ok(())
+    } else {
+        Err(StoreError::ManagedFilePermissionInvalid)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -739,7 +789,7 @@ fn collect_release_revisions(
                 return Err(StoreError::SymlinkBoundary);
             }
             check_private(&entry.path(), true)?;
-            validate_managed_tree(&entry.path())?;
+            validate_managed_tree(&entry.path(), app_directory, ManagedTreePolicy::Strict)?;
             if mode == ScanMode::StartupCleanup {
                 fs::remove_dir_all(entry.path())?;
             }
@@ -759,7 +809,7 @@ fn collect_release_revisions(
             return Ok(Err("RELEASE_DIRECTORY_ID_NON_CANONICAL"));
         }
         check_private(&entry.path(), true)?;
-        validate_managed_tree(&entry.path())?;
+        validate_managed_tree(&entry.path(), app_directory, ManagedTreePolicy::Strict)?;
         let link = ValidatedReleaseLink {
             release_id,
             release_directory: entry.path(),
@@ -925,7 +975,7 @@ fn cleanup_unreferenced_revisions(
         }
         if !referenced.contains(&revision) {
             check_private(&entry.path(), true)?;
-            validate_managed_tree(&entry.path())?;
+            validate_managed_tree(&entry.path(), app_directory, ManagedTreePolicy::Strict)?;
             fs::remove_dir_all(entry.path())?;
         }
     }
@@ -1085,6 +1135,164 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn managed_file_draft(key: &[u8], public_value: &str) -> crate::domain::NormalizedDraft {
+        crate::domain::normalize_draft(
+            crate::domain::DraftInput {
+                display_name: "Managed files".into(),
+                discovery_image_ref: "registry.example/app:stable".into(),
+                credential_ref: None,
+                auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
+                poll_interval_seconds: 300,
+                environment: crate::domain::EnvironmentInput::default(),
+                files: vec![
+                    crate::domain::ManagedFileInput {
+                        logical_name: "public".into(),
+                        target_path: "/app/public".into(),
+                        sensitive: false,
+                        readonly: true,
+                        content: crate::domain::ManagedFileContent::Public(
+                            crate::domain::PublicFileContent {
+                                content: public_value.into(),
+                            },
+                        ),
+                    },
+                    crate::domain::ManagedFileInput {
+                        logical_name: "secret".into(),
+                        target_path: "/app/secret".into(),
+                        sensitive: true,
+                        readonly: true,
+                        content: crate::domain::ManagedFileContent::Secret(
+                            crate::domain::SecretOperation::Replace {
+                                value: format!("secret-{public_value}"),
+                            },
+                        ),
+                    },
+                ],
+                ports: vec![],
+                volumes: vec![],
+                binds: vec![],
+                owned_default_network: true,
+                networks: vec![],
+                health: crate::domain::HealthPolicy::default(),
+            },
+            &crate::domain::ExistingSecrets::default(),
+            key,
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn startup_normalizes_all_canonical_managed_revisions_but_runtime_scan_never_mutates() {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let key = b"normalization-integrity-key".to_vec();
+        let store = crate::app_store::AppStore::initialize_managed(
+            root.path().join("apps"),
+            key.clone(),
+            vec![],
+        )
+        .unwrap();
+        let app_id = Uuid::new_v4();
+        let first_revision = Uuid::new_v4();
+        let first = managed_file_draft(&key, "first");
+        let now = OffsetDateTime::now_utc();
+        let metadata = store
+            .create_app(
+                app_id,
+                "managed",
+                first_revision,
+                Uuid::new_v4(),
+                &first,
+                now,
+            )
+            .unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let release_id = Uuid::new_v4();
+        store
+            .publish_v2_release(
+                &metadata,
+                release_id,
+                &crate::registry::ResolvedImage {
+                    source_image_ref: "registry.example/app:stable".into(),
+                    logical_registry: "registry.example".into(),
+                    repository: "app".into(),
+                    source_tag: "stable".into(),
+                    source_descriptor_digest: digest.clone(),
+                    index_digest: None,
+                    manifest_digest: digest.clone(),
+                    runnable_image_ref: format!("registry.example/app@{digest}"),
+                    platform: crate::registry::Platform::canonical("linux", "amd64", None).unwrap(),
+                    local_image_id: digest,
+                },
+                crate::app_store::releases::ReleaseTrigger::Manual,
+                None,
+            )
+            .unwrap();
+        crate::app_store::atomic::AtomicWriter::switch_release_link(
+            &store.app_directory(app_id),
+            "active",
+            release_id,
+        )
+        .unwrap();
+        let second_revision = Uuid::new_v4();
+        store
+            .update_draft(
+                app_id,
+                first_revision,
+                second_revision,
+                Uuid::new_v4(),
+                &managed_file_draft(&key, "second"),
+                now,
+            )
+            .unwrap();
+        let leaf = |revision: Uuid, kind: &str, name: &str| {
+            store
+                .app_directory(app_id)
+                .join("config-revisions")
+                .join(revision.to_string())
+                .join("files")
+                .join(kind)
+                .join(name)
+        };
+        let first_public = leaf(first_revision, "public", "public");
+        let first_secret = leaf(first_revision, "secret", "secret");
+        let second_public = leaf(second_revision, "public", "public");
+        fs::set_permissions(&first_public, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&first_secret, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::set_permissions(&second_public, fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(matches!(
+            store.scan_read_only(),
+            Err(StoreError::ManagedFilePermissionInvalid)
+        ));
+        assert_eq!(
+            fs::metadata(&first_public).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let report = store.scan().unwrap();
+        assert_eq!(report.valid_apps.len(), 1);
+        for path in [&first_public, &first_secret, &second_public] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                MANAGED_FILE_MODE
+            );
+        }
+        assert_eq!(store.scan().unwrap().valid_apps.len(), 1);
+
+        fs::set_permissions(&first_public, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.scan(),
+            Err(StoreError::ManagedFilePermissionInvalid)
+        ));
+        assert_eq!(
+            fs::metadata(first_public).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
 
     #[test]
     fn verified_m3_scan_rejects_tampered_active_compose() {
@@ -1317,9 +1525,39 @@ mod tests {
             .join(format!(".solodock-tmp-app-{}", Uuid::new_v4().simple()));
         fs::create_dir(&temporary).unwrap();
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700)).unwrap();
+        let revision = temporary
+            .join("config-revisions")
+            .join(Uuid::new_v4().to_string());
+        let public_directory = revision.join("files/public");
+        let secret_directory = revision.join("files/secret");
+        fs::create_dir_all(&public_directory).unwrap();
+        fs::create_dir(&secret_directory).unwrap();
+        for directory in [
+            temporary.join("config-revisions"),
+            revision.clone(),
+            revision.join("files"),
+            public_directory.clone(),
+            secret_directory.clone(),
+        ] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let public = public_directory.join("public");
+        let secret = secret_directory.join("secret");
+        fs::write(&public, "public").unwrap();
+        fs::write(&secret, "secret").unwrap();
+        fs::set_permissions(&public, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o400)).unwrap();
 
         let report = scan_read_only_with_options(root.path(), None, &[]).unwrap();
         assert!(temporary.exists());
+        assert_eq!(
+            fs::metadata(&public).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&secret).unwrap().permissions().mode() & 0o7777,
+            0o400
+        );
         assert!(
             report
                 .issues
