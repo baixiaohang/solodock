@@ -32,6 +32,10 @@ curl --fail http://127.0.0.1:8080/healthz
 
 任何引用 external network 的应用都必须先由管理员创建目标 Docker network。SoloDock 不改变该网络的 driver、IPAM、labels 或生命周期；升级、部署与删除也不会移除它。部署前若报告 `EXTERNAL_NETWORK_NOT_FOUND`、`NETWORK_ALIAS_CONFLICT` 或 `DOCKER_OBSERVATION_FAILED`，应在同一 Docker daemon 上用完整 container ID 检查成员和 `NetworkSettings.Networks.<name>.DNSNames`，解决冲突后重新预检；不要依赖短 ID、容器名或手工放宽 ownership。
 
+Owned network 的 host interface 固定为 UI 显示的 `sd-<slug>`。在 Ubuntu 24.04 且 UFW routed default deny 时，可按应用精确放行 HTTPS，例如 `sudo ufw route allow in on sd-example out on <uplink> proto tcp to any port 443`；先用 `ip link show sd-example` 与 `docker network inspect solodock-example-default` 核对身份。透明代理若不应接管受管容器流量，应在 redirect/tproxy 规则之前按输入接口排除，例如 nftables 规则 `iifname "sd-example" return`。SoloDock 不修改这些宿主规则；slug 不可变且 network 重建后 interface name 保持一致。
+
+`NETWORK_BRIDGE_IDENTITY_CONFLICT` 表示既有 owned network 的 driver 或 bridge option 与 canonical identity 不一致。SoloDock 不会删除或接管该 network；停止相关容器、核对 ownership 并由管理员处理冲突资源后，再重新部署。
+
 ## 自动部署与凭据
 
 自动部署必须由管理员显式确认启用。开关关闭只阻止未来 poll，不取消已经 durable claim 的部署。`config_pending_manual` 表示 digest 未变但 draft 配置变化，需使用 Deploy；`suppressed_failed_target` 表示该 target 已失败/回滚，先检查 health 和数据兼容，再由新 digest/config 或明确人工部署解除。轮换 Registry credential 会改变 generation 并重新进入带 jitter 的轮询。

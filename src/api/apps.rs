@@ -125,6 +125,7 @@ pub async fn detail(
     };
     Ok(Json(AppDetailResponse {
         observation: app,
+        resource_names: crate::domain::app_resource_names(&catalog.slug),
         draft: catalog.draft,
         draft_revision: catalog.draft_revision,
         draft_config_sha256: catalog.draft_config_sha256,
@@ -153,6 +154,7 @@ pub async fn detail(
 struct AppDetailResponse {
     #[serde(flatten)]
     observation: AppObservation,
+    resource_names: crate::domain::AppResourceNames,
     draft: Option<crate::domain::dto::DraftResponse>,
     draft_revision: Option<Uuid>,
     draft_config_sha256: Option<String>,

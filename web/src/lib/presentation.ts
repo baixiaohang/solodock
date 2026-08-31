@@ -8,6 +8,7 @@ const driftMessages: Record<string, string> = {
   IMAGE_REF_MISMATCH: '运行镜像与活动镜像不一致',
   NETWORK_ATTACHMENT_MISMATCH: '实际网络 attachment 与 immutable release 期望不一致',
   NETWORK_ALIAS_MISMATCH: '实际网络缺少期望 alias',
+  NETWORK_BRIDGE_IDENTITY_MISMATCH: 'Owned network 的 driver 或 host bridge identity 与期望不一致',
 }
 
 export function driftText(code: string): string {

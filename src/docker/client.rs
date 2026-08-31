@@ -19,9 +19,9 @@ use crate::registry::ManifestDescriptor;
 
 use super::{
     models::{
-        ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerReadApi,
-        DockerResource, DockerStream, HealthStatus, ImageRecord, LogChunk, LogRequest,
-        LogStreamKind, MountKind, MountProjection, NetworkMember, NetworkProjection,
+        ContainerRecord, ContainerStatus, DockerError, DockerErrorKind, DockerNetworkResource,
+        DockerReadApi, DockerResource, DockerStream, HealthStatus, ImageRecord, LogChunk,
+        LogRequest, LogStreamKind, MountKind, MountProjection, NetworkMember, NetworkProjection,
         NetworkSnapshot, PortProjection, ProbeSnapshot, ProbeStatus, RawDockerEvent, RawStats,
     },
     ownership::{MANAGED_LABEL, valid_container_id},
@@ -317,15 +317,20 @@ impl DockerReadApi for BollardReadClient {
         }
     }
 
-    async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
+    async fn inspect_network(
+        &self,
+        name: &str,
+    ) -> Result<Option<DockerNetworkResource>, DockerError> {
         let docker = self.client().await?;
         let result = tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_network(name, None))
             .await
             .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?;
         match result {
-            Ok(network) => Ok(Some(DockerResource {
+            Ok(network) => Ok(Some(DockerNetworkResource {
                 name: network.name.unwrap_or_default(),
                 labels: network.labels.unwrap_or_default(),
+                driver: network.driver,
+                options: network.options.unwrap_or_default(),
             })),
             Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(classify(&error, false)),

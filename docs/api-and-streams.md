@@ -38,9 +38,9 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
 
-Draft 输入包含默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`；旧 payload 缺字段仍解析为 owned default，旧 `owned_default` marker 只用于读取。Draft response 返回解析后的明确布尔值。Compose 预检返回 network mode、attachment 数量、external names/aliases 和 `EXTERNAL_NETWORK_UNMANAGED` warning。
+`POST /api/v1/apps` 的顶层 slug 是 1–12 字符的不可变创建身份；draft update/validate DTO 不含 slug，提交该未知字段会校验失败。Draft 输入包含默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`。Compose 预检除 network mode、attachment 与 warning 外，还返回 owned Docker network name 和 bridge name；external-only 时该 identity 为 `null`。
 
-应用详情把依据实际 release identity 选择的 immutable expected network plan 与 Docker actual network name/IP/effective DNS names 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`，Docker 自动附加的额外 DNS names 不算漂移。
+应用详情返回 slug 派生的 project/network/bridge 名称，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
 
 `GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
 

@@ -94,6 +94,7 @@ impl AppStore {
     pub fn create_app(
         &self,
         app_id: Uuid,
+        slug: &str,
         revision_id: Uuid,
         operation_id: Uuid,
         draft: &NormalizedDraft,
@@ -110,11 +111,10 @@ impl AppStore {
                 .create(temporary.join("releases"))?;
             config_revision::publish(&temporary, revision_id, draft)?;
             let metadata = AppMetadata {
-                schema_version: 1,
+                schema_version: 2,
                 id: app_id,
-                slug: draft.slug.clone(),
+                slug: slug.to_owned(),
                 display_name: draft.display_name.clone(),
-                project_name: AppMetadata::project_name(app_id),
                 discovery_image_ref: draft.discovery_image_ref.clone(),
                 credential_ref: draft.credential_ref,
                 draft_revision: revision_id,
@@ -172,7 +172,6 @@ impl AppStore {
             }
             Err(error) => return Err(error),
         }
-        metadata.slug = draft.slug.clone();
         metadata.display_name = draft.display_name.clone();
         metadata.discovery_image_ref = draft.discovery_image_ref.clone();
         metadata.credential_ref = draft.credential_ref;
@@ -371,7 +370,12 @@ fn read_metadata(directory: &Path) -> Result<AppMetadata, StoreError> {
             error.into()
         }
     })?;
-    toml::from_str(&contents).map_err(|_| StoreError::ContentInvalid)
+    let metadata: AppMetadata =
+        toml::from_str(&contents).map_err(|_| StoreError::ContentInvalid)?;
+    if metadata.schema_version != 2 {
+        return Err(StoreError::ContentInvalid);
+    }
+    Ok(metadata)
 }
 
 fn write_metadata(directory: &Path, metadata: &AppMetadata) -> Result<(), StoreError> {
@@ -403,11 +407,10 @@ mod tests {
         write_metadata(
             &app,
             &AppMetadata {
-                schema_version: 1,
+                schema_version: 2,
                 id: app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
-                project_name: AppMetadata::project_name(app_id),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
                 draft_revision: Uuid::new_v4(),
@@ -447,11 +450,10 @@ mod tests {
         write_metadata(
             &app,
             &AppMetadata {
-                schema_version: 1,
+                schema_version: 2,
                 id: app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
-                project_name: AppMetadata::project_name(app_id),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
                 draft_revision: Uuid::new_v4(),

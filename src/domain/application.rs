@@ -17,7 +17,6 @@ pub enum DesiredState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftInput {
-    pub slug: String,
     pub display_name: String,
     pub discovery_image_ref: String,
     #[serde(default)]
@@ -56,12 +55,12 @@ pub const fn default_poll_interval() -> u32 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AppMetadata {
     pub schema_version: u32,
     pub id: Uuid,
     pub slug: String,
     pub display_name: String,
-    pub project_name: String,
     pub discovery_image_ref: String,
     pub credential_ref: Option<Uuid>,
     pub draft_revision: Uuid,
@@ -77,7 +76,45 @@ pub struct AppMetadata {
 }
 
 impl AppMetadata {
-    pub fn project_name(id: Uuid) -> String {
-        format!("solodock-{}", id.simple())
+    pub fn resource_names(&self) -> AppResourceNames {
+        app_resource_names(&self.slug)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AppResourceNames {
+    pub project_name: String,
+    pub owned_default_network_name: String,
+    pub bridge_name: String,
+}
+
+pub fn app_resource_names(slug: &str) -> AppResourceNames {
+    AppResourceNames {
+        project_name: format!("solodock-{slug}"),
+        owned_default_network_name: format!("solodock-{slug}-default"),
+        bridge_name: format!("sd-{slug}"),
+    }
+}
+
+pub fn owned_volume_name(slug: &str, logical_name: &str) -> String {
+    format!("solodock-{slug}.{logical_name}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_names_share_the_immutable_slug_namespace() {
+        let names = app_resource_names("media-1");
+        assert_eq!(names.project_name, "solodock-media-1");
+        assert_eq!(names.owned_default_network_name, "solodock-media-1-default");
+        assert_eq!(names.bridge_name, "sd-media-1");
+        assert!(names.bridge_name.len() <= 15);
+        assert_eq!(
+            owned_volume_name("media-1", "data"),
+            "solodock-media-1.data"
+        );
+        assert_ne!(owned_volume_name("a-b", "c"), owned_volume_name("a", "b-c"));
     }
 }

@@ -4,7 +4,9 @@ SoloDock 只管理结构化的单 service 应用。管理员填写受支持字�
 
 ## 应用、draft 与 project
 
-应用拥有不可变 UUID 和由 UUID 派生的稳定 Compose project name。slug 和 display name 是经过校验的展示/业务字段，不能直接成为任意 CLI 参数。
+应用拥有不可变 UUID 与不可变 slug。UUID 是 API path、filesystem directory 和 ownership label 的权威身份；创建时输入的 slug 必须全局唯一，由 1–12 个小写 ASCII 字母、数字或连字符组成且首尾为字母或数字。slug 创建后不能更新，`display_name` 仍可修改。
+
+所有可读 Docker 名称只从 slug 派生：Compose project 为 `solodock-<slug>`，默认容器名通常为 `solodock-<slug>-app-1`，owned network 为 `solodock-<slug>-default`，owned volume 为 `solodock-<slug>.<logical-name>`，Linux bridge 为 `sd-<slug>`。不持久化 project name，也不允许用户设置 `container_name` 或任意 Docker resource name。`.` 不属于 slug 合法字符，因此它为 owned volume 的 slug 与 logical name 提供无歧义边界。
 
 `app.toml` 指向当前 draft config revision，并记录 desired state、Registry polling 配置和最后一次文件系统 mutation。每次编辑先完整发布新的 `config-revisions/<revision-id>/`，最后原子替换 metadata 作为 commit point。已经发布的 release 固定引用自己的 config revision，因此后续 draft 编辑不会改变 active 或 pending 容器挂载的内容。
 
@@ -61,7 +63,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ### Network
 
-新应用默认创建并挂载由 UUID 派生的 owned default network。配置也可同时加入最多 8 个显式存在的 external network，或关闭 owned default 后仅使用 external network；external-only 模式至少需要一个 attachment。旧 revision 中的 `owned_default` marker 只保留读取兼容，新配置由 `owned_default_network` 布尔值表达运行语义。
+新应用默认创建并挂载 slug 派生的 owned default network。其 Compose definition 固定使用 `bridge` driver，并设置 `com.docker.network.bridge.name=sd-<slug>`，因此 network 删除重建后 host interface identity 不变。配置也可同时加入最多 8 个显式存在的 external network，或关闭 owned default 后仅使用 external network；external-only 模式至少需要一个 attachment。External definition 不写 driver option。
 
 每个 external attachment 可为当前唯一 `app` service 配置最多 8 个稳定 alias。Alias 是小写 DNS label，在同一 attachment 内唯一；网络与 alias 都按 canonical 顺序进入 config SHA、release 完整性和 Compose。无 alias 的旧 release 继续使用 Compose networks 短语法，默认布尔值与空 alias 不参与旧 canonical serialization。
 
@@ -89,7 +91,7 @@ start、stop、restart 和 remove 只作用于通过 project/service/app/release
 1. preview 从 fresh filesystem、active/pending/draft config 和精确 Docker observation 生成 canonical facts；
 2. DELETE 提交 confirmation token、slug 和 disposition，并在 token consume 与 tombstone 前重算 facts hash。
 
-preview 合并 active、pending 与 draft 中的文件、volume、bind、network，并区分实际存在与仅配置。Network fact 带 owned/external kind、排序后的 aliases 和配置 scope；external-only revision 不虚构 owned default network。已配置或 degraded webhook 会保守提示其 write-only secret 随 app tombstone 永久删除。
+preview 合并 active、pending 与 draft 中的文件、volume、bind、network，并区分实际存在与仅配置。Network fact 带 owned/external kind、owned bridge name、排序后的 aliases 和配置 scope；external-only revision 不虚构 owned default network。已配置或 degraded webhook 会保守提示其 write-only secret 随 app tombstone 永久删除。
 
 默认 deletion 只 unregister。显式 remove 也只移除 token 绑定的精确 owned container；所有 volume、bind 内容和 network 继续保留。删除与 stream producer 之间使用可回滚 barrier，只有 filesystem tombstone commit 后才永久阻止该 app 的新流。
 
