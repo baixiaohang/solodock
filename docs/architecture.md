@@ -45,6 +45,8 @@ Browser
 
 任何SQLite投影都不能反向覆盖filesystem事实。SQLite丢失后可以从文件恢复app/release查询事实，但不能伪造管理员、session、audit或deployment历史；必须重新bootstrap。
 
+App header 只持久化 UUID 与不可变 slug，不持久化可派生 project name。domain naming helper 是 project、owned network、owned volume 和 bridge 名称的唯一来源；只持有 UUID 的异步路径必须重新读取已验证 metadata/catalog，不能猜测资源名。
+
 ## 持久化布局
 
 默认根目录如下；权限、HMAC和canonical entry由startup/recovery验证：
@@ -98,7 +100,7 @@ Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，�
 
 每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。统一的 canonical network plan 同时驱动 Compose、resource preflight、runtime drift、删除 facts 和 API projection；active/pending expectation 分别来自各自 immutable config revision，不能由 mutable draft 替代。
 
-Owned network 仅在对应 revision 启用时检查 exact ownership。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。Docker API 与 Compose CLI 之间没有跨调用锁，effect 后 observer 继续以 attachment/alias drift 暴露外部并发变化。
+Owned network 仅在对应 revision 启用时检查 exact name/ownership、`bridge` driver 和 `com.docker.network.bridge.name=sd-<slug>`；ownership 冲突与 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 都在 runner 前 fail closed。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。Docker API 与 Compose CLI 之间没有跨调用锁，effect 后 observer 继续以 attachment/alias/bridge drift 暴露外部并发变化。
 
 ## 发布与自动化
 

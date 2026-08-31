@@ -54,6 +54,8 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 ### Docker 与 Compose
 
 - project/service/schema/app/release/full ID ownership；
+- 1–12 字符不可变 slug，以及 project/container/network/volume/bridge 的统一可读命名；
+- owned network 的 bridge option、effect 前 identity conflict、observer expected/actual projection，以及删除重建后 `sd-<slug>` 稳定性；
 - unmanaged、stale、multiple、replacement collision在 runner前 fail closed；
 - canonical YAML、`.env` 隔离、固定 argv、禁 shell/exec/pull/build/down/volume removal；
 - owned-only、owned+external、external-only 的 canonical YAML，旧无 alias 短语法逐字节兼容，以及 typed alias 长语法；
@@ -61,6 +63,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
+- external-only 不生成、检查或展示 owned bridge identity。
 
 ### Registry 与 deployment
 

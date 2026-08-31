@@ -1,9 +1,7 @@
 use std::collections::HashSet;
 
+use super::{AppResourceNames, DomainError};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-use super::DomainError;
 
 pub const MAX_EXTERNAL_NETWORKS: usize = 8;
 pub const MAX_NETWORK_ALIASES: usize = 8;
@@ -58,12 +56,12 @@ pub struct NetworkPlan {
 }
 
 impl NetworkPlan {
-    pub fn expected_networks(&self, app_id: Uuid) -> Vec<ExpectedNetwork> {
+    pub fn expected_networks(&self, names: &AppResourceNames) -> Vec<ExpectedNetwork> {
         let mut expected =
             Vec::with_capacity(self.external.len() + usize::from(self.owned_default_network));
         if self.owned_default_network {
             expected.push(ExpectedNetwork {
-                name: format!("solodock-{}-default", app_id.simple()),
+                name: names.owned_default_network_name.clone(),
                 kind: ExpectedNetworkKind::OwnedDefault,
                 aliases: Vec::new(),
             });

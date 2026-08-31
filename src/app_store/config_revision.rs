@@ -77,7 +77,6 @@ impl LoadedRevision {
 
     pub fn input(
         &self,
-        slug: String,
         display_name: String,
         discovery_image_ref: String,
         credential_ref: Option<Uuid>,
@@ -85,7 +84,6 @@ impl LoadedRevision {
         poll_interval_seconds: u32,
     ) -> DraftInput {
         DraftInput {
-            slug,
             display_name,
             discovery_image_ref,
             credential_ref,
@@ -403,7 +401,6 @@ mod tests {
         let root = tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let input = DraftInput {
-            slug: "example".into(),
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -456,7 +453,6 @@ mod tests {
         let root = tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let input = DraftInput {
-            slug: "example".into(),
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,

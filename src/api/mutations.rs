@@ -37,7 +37,10 @@ use crate::{
         models::{ContainerRecord, ContainerStatus},
         ownership::validate_identity,
     },
-    domain::{DesiredState, DraftInput, ExistingSecrets, NormalizedDraft, normalize_draft},
+    domain::{
+        DesiredState, DraftInput, ExistingSecrets, NormalizedDraft, app_resource_names,
+        normalize_draft, validate_slug,
+    },
     error::{ApiError, RequestId},
     mutation::{
         AppMutationCoordinator, ClaimResult, EffectMarker, IdempotencyError, IdempotencyService,
@@ -97,6 +100,14 @@ pub struct UpdateDraftRequest {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct CreateAppRequest {
+    slug: String,
+    #[serde(flatten)]
+    draft: DraftInput,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ValidateRequest {
     #[serde(default)]
     draft: Option<DraftInput>,
@@ -107,10 +118,13 @@ pub async fn create(
     Extension(request_id): Extension<RequestId>,
     headers: HeaderMap,
     MutationAuthenticated(_): MutationAuthenticated,
-    payload: Result<Json<DraftInput>, JsonRejection>,
+    payload: Result<Json<CreateAppRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let services = services(&state, request_id)?;
     let Json(input) = payload.map_err(|error| json_error(error, request_id))?;
+    validate_slug(&input.slug).map_err(|error| ApiError::domain(error, request_id))?;
+    let slug = input.slug;
+    let input = input.draft;
     if input.auto_deploy_enabled && !input.auto_deploy_acknowledged {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -130,7 +144,7 @@ pub async fn create(
     let route = "/api/v1/apps";
     let raw_key =
         idempotency_key(&headers).map_err(|error| ApiError::idempotency(error, request_id))?;
-    let request_hmac = draft_fingerprint(services, route, &draft)?;
+    let request_hmac = draft_fingerprint(services, route, &slug, &draft)?;
     let claim = services
         .idempotency
         .claim(route, raw_key, &request_hmac, request_id.0)
@@ -180,7 +194,7 @@ pub async fn create(
         Ok(report) => report,
         Err(_) => return interrupt_internal(services, route, raw_key, request_id).await,
     };
-    if report.valid_apps.iter().any(|app| app.slug == draft.slug) {
+    if report.valid_apps.iter().any(|app| app.slug == slug) {
         return finish_error(
             services,
             route,
@@ -207,6 +221,7 @@ pub async fn create(
     };
     let metadata = match services.store.create_app(
         operation_id,
+        &slug,
         operation_id,
         operation_id,
         &draft,
@@ -352,7 +367,6 @@ pub async fn update_draft(
         };
         let draft = match normalize_draft(
             loaded.input(
-                current_metadata.slug.clone(),
                 current_metadata.display_name.clone(),
                 current_metadata.discovery_image_ref.clone(),
                 current_metadata.credential_ref,
@@ -432,25 +446,6 @@ pub async fn update_draft(
         }
     };
     validate_registry_credential(&state, &draft, request_id)?;
-    let report = match services.store.scan_read_only() {
-        Ok(report) => report,
-        Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
-    };
-    if report
-        .valid_apps
-        .iter()
-        .any(|other| other.app_id != app_id && other.slug == draft.slug)
-    {
-        return finish_error(
-            services,
-            &route,
-            raw_key,
-            "APP_SLUG_CONFLICT",
-            StatusCode::CONFLICT,
-            request_id,
-        )
-        .await;
-    }
     let metadata = match services.store.update_draft(
         app_id,
         payload.expected_revision,
@@ -596,6 +591,7 @@ pub async fn validate(
         let (runtime_yaml, plan) = generate(
             ComposeInput {
                 app_id,
+                slug: &app.slug,
                 release_id: operation_id,
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: &revision_directory,
@@ -694,9 +690,10 @@ fn idempotency_key(headers: &HeaderMap) -> Result<&str, IdempotencyError> {
 fn draft_fingerprint(
     services: &M3Services,
     route: &str,
+    slug: &str,
     draft: &NormalizedDraft,
 ) -> Result<Vec<u8>, ApiError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":draft.slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"auto_deploy_acknowledged":draft.auto_deploy_acknowledged,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
+    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"auto_deploy_acknowledged":draft.auto_deploy_acknowledged,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
     Ok(services.idempotency.fingerprint(&canonical))
 }
 fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> AppMutationDetail {
@@ -704,7 +701,7 @@ fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> App
         id: metadata.id,
         slug: metadata.slug.clone(),
         display_name: metadata.display_name.clone(),
-        project_name: metadata.project_name.clone(),
+        project_name: app_resource_names(&metadata.slug).project_name,
         config_revision: metadata.draft_revision,
         config_sha256: metadata.draft_config_sha256.clone(),
         desired_state: metadata.desired_state,
@@ -1918,6 +1915,7 @@ enum RetainedNetworkKind {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RetainedNetwork {
     name: String,
+    bridge_name: Option<String>,
     kind: RetainedNetworkKind,
     aliases: Vec<String>,
     configured_in: String,
@@ -2589,6 +2587,7 @@ fn verify_active_compose(
     let (canonical, _) = generate(
         ComposeInput {
             app_id: app.id,
+            slug: &app.slug,
             release_id,
             image_ref: image,
             revision_directory: &revision_directory,
@@ -2674,7 +2673,7 @@ async fn canonical_deletion_snapshot(
         .unwrap_or_default();
     let retained = retained_resources(
         state,
-        app_id,
+        &app.slug,
         active.as_ref().map(|loaded| &loaded.metadata),
         pending.as_ref().map(|loaded| &loaded.metadata),
         &draft.metadata,
@@ -2790,7 +2789,7 @@ fn managed_file_inventory(
 
 async fn retained_resources(
     state: &AppState,
-    app_id: Uuid,
+    slug: &str,
     active: Option<&crate::domain::ConfigMetadata>,
     pending: Option<&crate::domain::ConfigMetadata>,
     draft: &crate::domain::ConfigMetadata,
@@ -2798,7 +2797,7 @@ async fn retained_resources(
 ) -> Result<RetainedResources, &'static str> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        retained_resources_inner(state, app_id, active, pending, draft, containers),
+        retained_resources_inner(state, slug, active, pending, draft, containers),
     )
     .await
     .map_err(|_| "DOCKER_TIMEOUT")?
@@ -2806,7 +2805,7 @@ async fn retained_resources(
 
 async fn retained_resources_inner(
     state: &AppState,
-    app_id: Uuid,
+    slug: &str,
     active: Option<&crate::domain::ConfigMetadata>,
     pending: Option<&crate::domain::ConfigMetadata>,
     draft: &crate::domain::ConfigMetadata,
@@ -2827,7 +2826,7 @@ async fn retained_resources_inner(
         for volume in &metadata.volumes {
             let entry = match volume {
                 crate::domain::VolumeInput::Owned { logical_name, .. } => owned
-                    .entry(format!("solodock-{}-{logical_name}", app_id.simple()))
+                    .entry(crate::domain::owned_volume_name(slug, logical_name))
                     .or_default(),
                 crate::domain::VolumeInput::External { name, .. } => {
                     external.entry(name.clone()).or_default()
@@ -2840,9 +2839,10 @@ async fn retained_resources_inner(
             }
         }
         if metadata.owned_default_network {
+            let names = app_resource_names(slug);
             let default = networks
                 .entry((
-                    format!("solodock-{}-default", app_id.simple()),
+                    names.owned_default_network_name,
                     RetainedNetworkKind::OwnedDefault,
                     Vec::new(),
                 ))
@@ -2918,6 +2918,8 @@ async fn retained_resources_inner(
             .map_err(|error| error.public_code())?
             .is_some();
         retained_networks.push(RetainedNetwork {
+            bridge_name: (kind == RetainedNetworkKind::OwnedDefault)
+                .then(|| app_resource_names(slug).bridge_name),
             name,
             kind,
             aliases,
@@ -2963,7 +2965,6 @@ fn current_draft_input(
     loaded: &config_revision::LoadedRevision,
 ) -> DraftInput {
     loaded.input(
-        app.slug.clone(),
         app.display_name.clone(),
         app.discovery_image_ref.clone().unwrap_or_default(),
         app.draft.as_ref().and_then(|draft| draft.credential_ref),
@@ -3061,18 +3062,36 @@ async fn validate_resources_inner(
     check_alias_conflicts: bool,
     request_id: RequestId,
 ) -> Result<(), ApiError> {
-    let expected = crate::compose::generate::resource_labels(app_id);
+    let plan = crate::domain::network_plan(metadata.owned_default_network, &metadata.networks)
+        .map_err(|error| ApiError::domain(error, request_id))?;
+    let has_owned_volume = metadata
+        .volumes
+        .iter()
+        .any(|volume| matches!(volume, crate::domain::VolumeInput::Owned { .. }));
+    let owned_identity = if has_owned_volume || plan.owned_default_network {
+        let app = state
+            .observer
+            .catalog
+            .get(app_id)
+            .ok_or_else(|| ApiError::app_not_found(request_id))?;
+        let names = app_resource_names(&app.slug);
+        let labels = crate::compose::generate::resource_labels(app_id, &names.project_name);
+        Some((app.slug, names, labels))
+    } else {
+        None
+    };
     for volume in &metadata.volumes {
         match volume {
             crate::domain::VolumeInput::Owned { logical_name, .. } => {
-                let name = format!("solodock-{}-{logical_name}", app_id.simple());
+                let (slug, _, expected) = owned_identity.as_ref().expect("owned identity exists");
+                let name = crate::domain::owned_volume_name(slug, logical_name);
                 if let Some(resource) = state
                     .observer
                     .api
                     .inspect_volume(&name)
                     .await
                     .map_err(|error| ApiError::docker(request_id, error.public_code()))?
-                    && (resource.name != name || !has_exact_ownership(&resource.labels, &expected))
+                    && (resource.name != name || !has_exact_ownership(&resource.labels, expected))
                 {
                     return Err(ApiError::conflict("VOLUME_OWNERSHIP_CONFLICT", request_id));
                 }
@@ -3091,19 +3110,19 @@ async fn validate_resources_inner(
             }
         }
     }
-    let plan = crate::domain::network_plan(metadata.owned_default_network, &metadata.networks)
-        .map_err(|error| ApiError::domain(error, request_id))?;
     if plan.owned_default_network {
-        let owned_name = format!("solodock-{}-default", app_id.simple());
+        let (_, names, expected) = owned_identity.as_ref().expect("owned identity exists");
+        let owned_name = &names.owned_default_network_name;
         if let Some(resource) = state
             .observer
             .api
-            .inspect_network(&owned_name)
+            .inspect_network(owned_name)
             .await
             .map_err(|error| ApiError::docker(request_id, error.public_code()))?
-            && (resource.name != owned_name || !has_exact_ownership(&resource.labels, &expected))
+            && let Some(code) =
+                owned_network_identity_conflict(&resource, owned_name, &names.bridge_name, expected)
         {
-            return Err(ApiError::conflict("NETWORK_OWNERSHIP_CONFLICT", request_id));
+            return Err(ApiError::conflict(code, request_id));
         }
     }
     if allowed_replaceable_container_id
@@ -3149,6 +3168,27 @@ async fn validate_resources_inner(
     Ok(())
 }
 
+fn owned_network_identity_conflict(
+    resource: &crate::docker::models::DockerNetworkResource,
+    expected_name: &str,
+    expected_bridge_name: &str,
+    expected_labels: &std::collections::BTreeMap<String, String>,
+) -> Option<&'static str> {
+    if resource.name != expected_name || !has_exact_ownership(&resource.labels, expected_labels) {
+        return Some("NETWORK_OWNERSHIP_CONFLICT");
+    }
+    if resource.driver.as_deref() != Some("bridge")
+        || resource
+            .options
+            .get("com.docker.network.bridge.name")
+            .map(String::as_str)
+            != Some(expected_bridge_name)
+    {
+        return Some("NETWORK_BRIDGE_IDENTITY_CONFLICT");
+    }
+    None
+}
+
 fn has_exact_ownership(
     actual: &std::collections::HashMap<String, String>,
     expected: &std::collections::BTreeMap<String, String>,
@@ -3169,9 +3209,11 @@ mod tests {
         docker::{
             AppCatalog, DockerObserver,
             models::{
-                ContainerRecord, DockerError, DockerReadApi, DockerResource, DockerStream,
-                HealthStatus, LogChunk, LogRequest, ProbeSnapshot, RawDockerEvent, RawStats,
+                ContainerRecord, DockerError, DockerNetworkResource, DockerReadApi, DockerResource,
+                DockerStream, HealthStatus, LogChunk, LogRequest, ProbeSnapshot, RawDockerEvent,
+                RawStats,
             },
+            ownership::{APP_ID_LABEL, MANAGED_LABEL},
             probe::DockerSupervisor,
         },
     };
@@ -3230,6 +3272,72 @@ mod tests {
             &marker,
             Some(&replacement)
         ));
+    }
+
+    #[test]
+    fn owned_network_identity_rejects_ownership_driver_and_bridge_mismatches() {
+        let expected_labels = std::collections::BTreeMap::from([
+            (MANAGED_LABEL.into(), "true".into()),
+            (APP_ID_LABEL.into(), Uuid::nil().to_string()),
+        ]);
+        let valid = DockerNetworkResource {
+            name: "solodock-demo-default".into(),
+            labels: HashMap::from([
+                (MANAGED_LABEL.into(), "true".into()),
+                (APP_ID_LABEL.into(), Uuid::nil().to_string()),
+            ]),
+            driver: Some("bridge".into()),
+            options: HashMap::from([("com.docker.network.bridge.name".into(), "sd-demo".into())]),
+        };
+        assert_eq!(
+            owned_network_identity_conflict(
+                &valid,
+                "solodock-demo-default",
+                "sd-demo",
+                &expected_labels,
+            ),
+            None
+        );
+
+        let mut wrong_owner = valid.clone();
+        wrong_owner
+            .labels
+            .insert(APP_ID_LABEL.into(), Uuid::new_v4().to_string());
+        assert_eq!(
+            owned_network_identity_conflict(
+                &wrong_owner,
+                "solodock-demo-default",
+                "sd-demo",
+                &expected_labels,
+            ),
+            Some("NETWORK_OWNERSHIP_CONFLICT")
+        );
+
+        let mut wrong_driver = valid.clone();
+        wrong_driver.driver = Some("overlay".into());
+        assert_eq!(
+            owned_network_identity_conflict(
+                &wrong_driver,
+                "solodock-demo-default",
+                "sd-demo",
+                &expected_labels,
+            ),
+            Some("NETWORK_BRIDGE_IDENTITY_CONFLICT")
+        );
+
+        let mut wrong_bridge = valid;
+        wrong_bridge
+            .options
+            .insert("com.docker.network.bridge.name".into(), "br-random".into());
+        assert_eq!(
+            owned_network_identity_conflict(
+                &wrong_bridge,
+                "solodock-demo-default",
+                "sd-demo",
+                &expected_labels,
+            ),
+            Some("NETWORK_BRIDGE_IDENTITY_CONFLICT")
+        );
     }
 
     #[test]
@@ -3448,11 +3556,16 @@ mod tests {
                 labels: HashMap::new(),
             }))
         }
-        async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
+        async fn inspect_network(
+            &self,
+            name: &str,
+        ) -> Result<Option<DockerNetworkResource>, DockerError> {
             tokio::time::sleep(Duration::from_secs(1)).await;
-            Ok(Some(DockerResource {
+            Ok(Some(DockerNetworkResource {
                 name: name.into(),
                 labels: HashMap::new(),
+                driver: Some("bridge".into()),
+                options: HashMap::new(),
             }))
         }
     }
@@ -3490,7 +3603,10 @@ mod tests {
         async fn stats(&self, _: &str) -> Result<DockerStream<RawStats>, DockerError> {
             unreachable!()
         }
-        async fn inspect_network(&self, _: &str) -> Result<Option<DockerResource>, DockerError> {
+        async fn inspect_network(
+            &self,
+            _: &str,
+        ) -> Result<Option<DockerNetworkResource>, DockerError> {
             panic!("external-only preflight must not inspect the owned default network")
         }
         async fn inspect_network_snapshot(
@@ -3525,10 +3641,15 @@ mod tests {
         async fn stats(&self, _: &str) -> Result<DockerStream<RawStats>, DockerError> {
             unreachable!()
         }
-        async fn inspect_network(&self, name: &str) -> Result<Option<DockerResource>, DockerError> {
-            Ok(self.exists.then(|| DockerResource {
+        async fn inspect_network(
+            &self,
+            name: &str,
+        ) -> Result<Option<DockerNetworkResource>, DockerError> {
+            Ok(self.exists.then(|| DockerNetworkResource {
                 name: self.reported_name.clone().unwrap_or_else(|| name.into()),
                 labels: HashMap::new(),
+                driver: Some("bridge".into()),
+                options: HashMap::new(),
             }))
         }
         async fn inspect_network_snapshot(

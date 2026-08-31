@@ -864,7 +864,6 @@ mod tests {
     fn create_managed_app(app_store: &AppStore, key: &[u8], slug: &str) -> Uuid {
         let draft = normalize_draft(
             DraftInput {
-                slug: slug.into(),
                 display_name: slug.into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -889,6 +888,7 @@ mod tests {
         app_store
             .create_app(
                 app,
+                slug,
                 Uuid::new_v4(),
                 Uuid::new_v4(),
                 &draft,
@@ -911,11 +911,10 @@ mod tests {
         fs::create_dir(app.join("releases")).unwrap();
         fs::set_permissions(app.join("releases"), fs::Permissions::from_mode(0o700)).unwrap();
         let metadata = AppMetadata {
-            schema_version: 1,
+            schema_version: 2,
             id: app_id,
             slug: "example".into(),
             display_name: "Example".into(),
-            project_name: AppMetadata::project_name(app_id),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
             draft_revision: Uuid::new_v4(),

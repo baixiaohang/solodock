@@ -8,12 +8,13 @@ use crate::{
     docker::ownership::{APP_ID_LABEL, MANAGED_LABEL, RELEASE_ID_LABEL, SCHEMA_LABEL},
     domain::{
         ExternalNetworkAttachment, HealthPolicy, HttpClient, NetworkMode, NormalizedDraft,
-        PortProtocol, VolumeInput, network_plan,
+        PortProtocol, VolumeInput, app_resource_names, network_plan, owned_volume_name,
     },
 };
 
 pub struct ComposeInput<'a> {
     pub app_id: Uuid,
+    pub slug: &'a str,
     pub release_id: Uuid,
     pub image_ref: &'a str,
     pub revision_directory: &'a Path,
@@ -29,17 +30,24 @@ pub struct ComposePlan {
     pub mounts: usize,
     pub networks: usize,
     pub network_mode: NetworkMode,
+    pub owned_default_network: Option<OwnedDefaultNetworkIdentity>,
     pub external_networks: Vec<ExternalNetworkAttachment>,
     pub warnings: Vec<&'static str>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct OwnedDefaultNetworkIdentity {
+    pub docker_name: String,
+    pub bridge_name: String,
 }
 
 pub fn generate(
     input: ComposeInput<'_>,
     runnable: bool,
 ) -> Result<(String, ComposePlan), serde_yml::Error> {
-    let resource_prefix = format!("solodock-{}", input.app_id.simple());
+    let resource_names = app_resource_names(input.slug);
     let ownership = service_labels(input.app_id, input.release_id);
-    let resource_ownership = resource_labels(input.app_id);
+    let resource_ownership = resource_labels(input.app_id, &resource_names.project_name);
     let mut volumes = BTreeMap::new();
     let mut mounts = Vec::new();
     for (index, volume) in input.draft.volumes.iter().enumerate() {
@@ -49,7 +57,7 @@ pub fn generate(
                 logical_name,
                 target_path,
             } => {
-                let name = format!("{resource_prefix}-{logical_name}");
+                let name = owned_volume_name(input.slug, logical_name);
                 volumes.insert(
                     key.clone(),
                     VolumeDefinition {
@@ -118,7 +126,12 @@ pub fn generate(
             "default".into(),
             NetworkDefinition {
                 external: false,
-                name: format!("{resource_prefix}-default"),
+                driver: Some("bridge".into()),
+                driver_opts: BTreeMap::from([(
+                    "com.docker.network.bridge.name".into(),
+                    resource_names.bridge_name.clone(),
+                )]),
+                name: resource_names.owned_default_network_name.clone(),
                 labels: resource_ownership,
             },
         );
@@ -130,6 +143,8 @@ pub fn generate(
             key.clone(),
             NetworkDefinition {
                 external: true,
+                driver: None,
+                driver_opts: BTreeMap::new(),
                 name: literal(&network.name),
                 labels: BTreeMap::new(),
             },
@@ -241,6 +256,12 @@ pub fn generate(
             mounts: mount_count,
             networks: network_count,
             network_mode: network_plan.mode,
+            owned_default_network: network_plan.owned_default_network.then_some({
+                OwnedDefaultNetworkIdentity {
+                    docker_name: resource_names.owned_default_network_name,
+                    bridge_name: resource_names.bridge_name,
+                }
+            }),
             external_networks: network_plan.external,
             warnings,
         },
@@ -267,15 +288,12 @@ fn service_labels(app_id: Uuid, release_id: Uuid) -> BTreeMap<String, String> {
     ])
 }
 
-pub fn resource_labels(app_id: Uuid) -> BTreeMap<String, String> {
+pub fn resource_labels(app_id: Uuid, project_name: &str) -> BTreeMap<String, String> {
     BTreeMap::from([
         (MANAGED_LABEL.into(), "true".into()),
         (SCHEMA_LABEL.into(), "1".into()),
         (APP_ID_LABEL.into(), app_id.to_string()),
-        (
-            "com.solodock.project-name".into(),
-            crate::domain::AppMetadata::project_name(app_id),
-        ),
+        ("com.solodock.project-name".into(), project_name.to_owned()),
     ])
 }
 
@@ -343,7 +361,6 @@ mod tests {
     ) -> crate::domain::NormalizedDraft {
         crate::domain::normalize_draft(
             crate::domain::DraftInput {
-                slug: "example".into(),
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -370,7 +387,6 @@ mod tests {
     fn generated_yaml_is_single_service_and_never_contains_secret_material() {
         let draft = crate::domain::normalize_draft(
             crate::domain::DraftInput {
-                slug: "example".into(),
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:latest".into(),
                 credential_ref: None,
@@ -402,6 +418,7 @@ mod tests {
         let (yaml, plan) = generate(
             ComposeInput {
                 app_id: Uuid::nil(),
+                slug: "example",
                 release_id: Uuid::new_v4(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -423,7 +440,6 @@ mod tests {
     #[test]
     fn user_volume_names_cannot_collide_with_internal_resource_keys() {
         let input = crate::domain::DraftInput {
-            slug: "example".into(),
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -458,6 +474,7 @@ mod tests {
         let (yaml, _) = generate(
             ComposeInput {
                 app_id: Uuid::nil(),
+                slug: "example",
                 release_id: Uuid::new_v4(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -485,6 +502,7 @@ mod tests {
         );
         let input = ComposeInput {
             app_id,
+            slug: "example",
             release_id: Uuid::nil(),
             image_ref: &draft.discovery_image_ref,
             revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -494,6 +512,7 @@ mod tests {
         let (second, _) = generate(
             ComposeInput {
                 app_id,
+                slug: "example",
                 release_id: Uuid::nil(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -510,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_owned_external_without_aliases_keeps_exact_short_yaml() {
+    fn owned_and_external_networks_keep_driver_options_scoped_to_owned() {
         let draft = network_draft(
             true,
             vec![
@@ -524,6 +543,7 @@ mod tests {
         let (yaml, _) = generate(
             ComposeInput {
                 app_id: Uuid::nil(),
+                slug: "example",
                 release_id: Uuid::nil(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -532,9 +552,12 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(
-            yaml,
-            "services:\n  app:\n    image: registry.example/app:stable\n    labels:\n      com.solodock.app-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.managed: 'true'\n      com.solodock.release-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.schema-version: '1'\n    env_file:\n    - path: /var/lib/solodock/apps/revision/env/public.env\n      required: true\n    - path: /var/lib/solodock/apps/revision/secrets/runtime.env\n      required: true\n    volumes: []\n    ports: []\n    networks:\n    - default\n    - solodock-network-1\n    restart: unless-stopped\nvolumes: {}\nnetworks:\n  default:\n    name: solodock-00000000000000000000000000000000-default\n    labels:\n      com.solodock.app-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.managed: 'true'\n      com.solodock.project-name: solodock-00000000000000000000000000000000\n      com.solodock.schema-version: '1'\n  solodock-network-1:\n    external: true\n    name: shared\n"
-        );
+        assert!(yaml.contains("driver: bridge"));
+        assert!(yaml.contains("com.docker.network.bridge.name: sd-example"));
+        assert!(yaml.contains("name: solodock-example-default"));
+        let external = yaml.split("solodock-network-1:").nth(1).unwrap();
+        assert!(external.contains("external: true\n    name: shared"));
+        assert!(!external.contains("driver:"));
+        assert!(!yaml.contains("container_name"));
     }
 }

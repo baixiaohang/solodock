@@ -29,6 +29,7 @@
   let credentialRef = $state<string | null>(null)
   let matchingCredentials = $derived(credentialsForReference(credentials, image))
   let networkError = $derived(networkEditorError({ ownedDefaultNetwork, externalNetworks }))
+  let slugValid = $derived(/^[a-z0-9](?:[a-z0-9-]{0,10}[a-z0-9])?$/.test(slug))
   $effect(() => {
     if (credentialRef && credentials.length > 0 && !matchingCredentials.some((value) => value.id === credentialRef)) credentialRef = null
   })
@@ -45,15 +46,16 @@
     error = ''
     try {
       const draft: DraftInput = {
-        slug, display_name: displayName, discovery_image_ref: image,
+        display_name: displayName, discovery_image_ref: image,
         credential_ref: credentialRef, auto_deploy_enabled: autoDeploy, auto_deploy_acknowledged: autoDeploy, poll_interval_seconds: pollInterval,
         environment: environment(), files: JSON.parse(files), ports: JSON.parse(ports),
         volumes: JSON.parse(volumes), binds: JSON.parse(binds),
         ...networkDraft({ ownedDefaultNetwork, externalNetworks }),
         health: JSON.parse(health),
       }
-      retry = retryIdentity(retry, draft)
-      const result = await mutation<AppMutationResponse>('/api/v1/apps', draft, { idempotencyKey: retry.key })
+      const request = { slug, ...draft }
+      retry = retryIdentity(retry, request)
+      const result = await mutation<AppMutationResponse>('/api/v1/apps', request, { idempotencyKey: retry.key })
       secretEnv = ''
       retry = undefined
       window.location.hash = `/apps/${result.app.id}`
@@ -71,8 +73,9 @@
   <div class="page-heading"><div><p class="eyebrow">REGISTER</p><h1>注册应用</h1><p class="muted">这里只保存不可变 draft revision，不会拉取镜像或创建容器。</p></div></div>
   {#if error}<p class="notice danger">{error}</p>{/if}
   <form class="panel form-grid" onsubmit={handleSubmit}>
-    <label>Slug<input bind:value={slug} required pattern="[a-z0-9-]+" maxlength="63" /></label>
+    <label>Slug<input bind:value={slug} required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" maxlength="12" /><span class="muted">1–12 个小写字母、数字或连字符，创建后不可修改。</span></label>
     <label>显示名称<input bind:value={displayName} required maxlength="80" /></label>
+    {#if slugValid}<div class="wide notice"><strong>资源命名预览</strong><p>Compose project / container：<code>solodock-{slug}</code> / <code>solodock-{slug}-app-1</code></p>{#if ownedDefaultNetwork}<p>Owned network / host bridge：<code>solodock-{slug}-default</code> / <code>sd-{slug}</code></p>{/if}</div>{/if}
     <label class="wide">发现镜像（必须带 tag）<input bind:value={image} required placeholder="registry.example/app:stable" /></label>
     <label class="wide">Registry credential<select bind:value={credentialRef}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select><span class="muted">只显示与镜像 logical registry 精确匹配的 credential。</span></label>
     <label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={pollInterval} /></label>
@@ -87,6 +90,6 @@
     <NetworkEditor bind:ownedDefaultNetwork bind:externalNetworks />
     <label class="wide">健康策略 JSON<textarea bind:value={health} rows="4"></textarea></label>
     <div class="wide notice warning">所有 M3 配置都随首个 immutable draft revision 原子保存；secret 为 write-only，不会在响应中返回。读写 bind 必须显式确认不可随 release 回滚。</div>
-    <div class="wide actions"><button disabled={busy || !!networkError}>{busy ? '注册中…' : '注册应用'}</button><a class="ghost button-link" href="#/">取消</a></div>
+    <div class="wide actions"><button disabled={busy || !!networkError || !slugValid}>{busy ? '注册中…' : '注册应用'}</button><a class="ghost button-link" href="#/">取消</a></div>
   </form>
 </main>

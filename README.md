@@ -7,6 +7,8 @@ SoloDock 是面向个人 Docker 工作负载的轻量级单机容器部署控制
 
 SoloDock 提供聚焦的 Web 界面，用不可变镜像 digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时恢复旧 release。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
 
+创建应用时必须提供全局唯一、创建后不可修改的 1–12 字符 slug。SoloDock 用它统一派生 Compose project `solodock-<slug>`、默认容器名、owned network/volume 与稳定 host bridge `sd-<slug>`；UUID 仍是 API、目录和 ownership label 的安全身份。已有旧 schema 状态不做迁移，升级前应清空并重新登记应用。
+
 本仓库是私有项目，未授予公开使用、复制或分发许可。
 
 ## 环境要求

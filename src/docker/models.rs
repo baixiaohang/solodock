@@ -185,6 +185,14 @@ pub struct DockerResource {
 }
 
 #[derive(Clone, Debug)]
+pub struct DockerNetworkResource {
+    pub name: String,
+    pub labels: HashMap<String, String>,
+    pub driver: Option<String>,
+    pub options: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug)]
 pub struct NetworkMember {
     pub container_id: String,
     pub dns_names: Vec<String>,
@@ -387,7 +395,10 @@ pub trait DockerReadApi: Send + Sync {
     async fn inspect_volume(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
-    async fn inspect_network(&self, _name: &str) -> Result<Option<DockerResource>, DockerError> {
+    async fn inspect_network(
+        &self,
+        _name: &str,
+    ) -> Result<Option<DockerNetworkResource>, DockerError> {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
     async fn inspect_network_snapshot(

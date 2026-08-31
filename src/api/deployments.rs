@@ -680,11 +680,16 @@ async fn actual_fact(
     active: Option<Uuid>,
     request_id: RequestId,
 ) -> Result<Option<(Uuid, String)>, ApiError> {
-    let project = crate::domain::AppMetadata::project_name(app_id);
+    let mut app = state
+        .observer
+        .catalog
+        .get(app_id)
+        .ok_or_else(|| ApiError::app_not_found(request_id))?;
+    app.active_release_id = active;
     let candidates = state
         .observer
         .api()
-        .list_compose_app_containers(&project)
+        .list_compose_app_containers(&app.project_name)
         .await
         .map_err(|e| ApiError::docker(request_id, e.public_code()))?;
     if candidates.len() > 1 {
@@ -692,28 +697,6 @@ async fn actual_fact(
     }
     let Some(container) = candidates.into_iter().next() else {
         return Ok(None);
-    };
-    let app = crate::docker::AppCatalogEntry {
-        id: app_id,
-        slug: String::new(),
-        display_name: String::new(),
-        project_name: project,
-        active_release_id: active,
-        active_image_ref: None,
-        active_config_revision: None,
-        active_config_sha256: None,
-        active_network_plan: None,
-        pending_release_id: None,
-        pending_image_ref: None,
-        pending_config_revision: None,
-        pending_network_plan: None,
-        discovery_image_ref: None,
-        draft_revision: None,
-        draft_config_sha256: None,
-        desired_state: crate::domain::DesiredState::Stopped,
-        auto_deploy_enabled: false,
-        poll_interval_seconds: 300,
-        draft: None,
     };
     let identity = validate_syntactic_identity(&container.labels, &app)
         .ok_or_else(|| ApiError::conflict("APP_CONTAINER_INVALID", request_id))?;

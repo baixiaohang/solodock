@@ -49,7 +49,6 @@ pub struct ExistingSecrets {
 }
 
 pub struct NormalizedDraft {
-    pub slug: String,
     pub display_name: String,
     pub discovery_image_ref: String,
     pub credential_ref: Option<uuid::Uuid>,
@@ -87,7 +86,6 @@ pub fn normalize_draft(
     hmac_key: &[u8],
     allowed_bind_roots: &[PathBuf],
 ) -> Result<NormalizedDraft, DomainError> {
-    validate_slug(&input.slug)?;
     validate_display_name(&input.display_name)?;
     validate_discovery_image(&input.discovery_image_ref)?;
     if !(60..=86_400).contains(&input.poll_interval_seconds) {
@@ -166,7 +164,6 @@ pub fn normalize_draft(
     let digest = Sha256::digest(canonical);
     metadata.config_sha256 = hex(&digest);
     Ok(NormalizedDraft {
-        slug: input.slug,
         display_name: input.display_name.trim().to_owned(),
         discovery_image_ref: input.discovery_image_ref,
         credential_ref: input.credential_ref,
@@ -379,9 +376,9 @@ fn check_file_quota(value: &str, total: &mut usize) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn validate_slug(value: &str) -> Result<(), DomainError> {
+pub fn validate_slug(value: &str) -> Result<(), DomainError> {
     if value.is_empty()
-        || value.len() > 63
+        || value.len() > 12
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -910,7 +907,6 @@ mod tests {
 
     fn input() -> DraftInput {
         DraftInput {
-            slug: "example".into(),
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:latest".into(),
             credential_ref: None,
@@ -954,6 +950,16 @@ mod tests {
                 .unwrap(),
             DomainError::SecretOperationRequired
         );
+    }
+
+    #[test]
+    fn slug_is_short_ascii_and_stable_resource_safe() {
+        for valid in ["a", "app-1", "abcdefghijkl"] {
+            assert!(validate_slug(valid).is_ok(), "{valid}");
+        }
+        for invalid in ["", "-app", "app-", "App", "app_name", "abcdefghijklm"] {
+            assert_eq!(validate_slug(invalid), Err(DomainError::ConfigInvalid));
+        }
     }
 
     #[test]

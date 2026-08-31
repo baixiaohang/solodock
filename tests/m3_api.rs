@@ -19,12 +19,9 @@ use sha2::{Digest, Sha256};
 use solodock::{
     AppState,
     api::{deployments::M4Services, mutations::M3Services},
-    app_store::{AppStore, config_revision},
+    app_store::AppStore,
     auth::AuthService,
-    compose::{
-        ComposeAction, ComposeCapability, ComposeInput, ComposeOutput, ComposeRunner, RunContext,
-        generate,
-    },
+    compose::{ComposeAction, ComposeCapability, ComposeOutput, ComposeRunner, RunContext},
     db::Database,
     deploy::{
         DeploymentEngine, DeploymentLedger, DeploymentScheduler, FixedImagePuller, HealthVerifier,
@@ -153,7 +150,7 @@ impl DockerReadApi for MissingDocker {
     async fn inspect_network(
         &self,
         _name: &str,
-    ) -> Result<Option<solodock::docker::models::DockerResource>, DockerError> {
+    ) -> Result<Option<solodock::docker::models::DockerNetworkResource>, DockerError> {
         Ok(None)
     }
 }
@@ -200,7 +197,7 @@ impl DockerReadApi for ScriptedDocker {
     async fn inspect_network(
         &self,
         _name: &str,
-    ) -> Result<Option<solodock::docker::models::DockerResource>, DockerError> {
+    ) -> Result<Option<solodock::docker::models::DockerNetworkResource>, DockerError> {
         self.resource_inspect_gate().await;
         Ok(None)
     }
@@ -215,10 +212,7 @@ fn owned_container(id: char, app_id: Uuid, release_id: Uuid, managed: bool) -> C
             (SCHEMA_LABEL.into(), "1".into()),
             (APP_ID_LABEL.into(), app_id.to_string()),
             (RELEASE_ID_LABEL.into(), release_id.to_string()),
-            (
-                PROJECT_LABEL.into(),
-                format!("solodock-{}", app_id.simple()),
-            ),
+            (PROJECT_LABEL.into(), "solodock-example".into()),
             (SERVICE_LABEL.into(), "app".into()),
             (ONEOFF_LABEL.into(), "False".into()),
         ]),
@@ -477,54 +471,28 @@ impl Harness {
 
     fn publish_active(&self, app_id: Uuid, release_id: Uuid, image: &str) {
         let metadata = self.store.read_metadata(app_id).unwrap();
-        let loaded = config_revision::load_verified(
-            &self.store.app_directory(app_id),
-            metadata.draft_revision,
-            &self.idempotency.integrity_key(),
-        )
-        .unwrap();
-        let input = loaded.input(
-            metadata.slug.clone(),
-            metadata.display_name.clone(),
-            metadata.discovery_image_ref.clone(),
-            metadata.credential_ref,
-            metadata.auto_deploy_enabled,
-            metadata.poll_interval_seconds,
-        );
-        let normalized = solodock::domain::normalize_draft(
-            input,
-            &loaded.secrets,
-            &self.idempotency.integrity_key(),
-            &[],
-        )
-        .unwrap();
-        let revision_directory = self
-            .store
-            .app_directory(app_id)
-            .join("config-revisions")
-            .join(metadata.draft_revision.to_string());
-        let (yaml, _) = generate(
-            ComposeInput {
-                app_id,
+        let digest = image.split('@').nth(1).unwrap().to_owned();
+        self.store
+            .publish_v2_release(
+                &metadata,
                 release_id,
-                image_ref: image,
-                revision_directory: &revision_directory,
-                draft: &normalized,
-            },
-            true,
-        )
-        .unwrap();
-        let release = format!(
-            "schema_version=1\nid='{release_id}'\napp_id='{app_id}'\nrunnable_image_ref='{image}'\nconfig_revision='{}'\nconfig_sha256='{}'\ncreated_at='2026-08-29T00:00:00Z'\n",
-            metadata.draft_revision, metadata.draft_config_sha256
-        );
-        solodock::app_store::atomic::AtomicWriter::publish_release(
-            &self.store.app_directory(app_id).join("releases"),
-            release_id,
-            release.as_bytes(),
-            yaml.as_bytes(),
-        )
-        .unwrap();
+                &solodock::registry::ResolvedImage {
+                    source_image_ref: metadata.discovery_image_ref.clone(),
+                    logical_registry: "registry.example".into(),
+                    repository: "app".into(),
+                    source_tag: "stable".into(),
+                    source_descriptor_digest: digest.clone(),
+                    index_digest: None,
+                    manifest_digest: digest.clone(),
+                    runnable_image_ref: image.into(),
+                    platform: solodock::registry::Platform::canonical("linux", "amd64", None)
+                        .unwrap(),
+                    local_image_id: digest,
+                },
+                solodock::app_store::releases::ReleaseTrigger::Manual,
+                None,
+            )
+            .unwrap();
         solodock::app_store::atomic::AtomicWriter::switch_release_link(
             &self.store.app_directory(app_id),
             "active",
@@ -568,6 +536,18 @@ fn draft(secret: &str) -> Value {
     })
 }
 
+fn mutable_draft(secret: &str) -> Value {
+    let mut value = draft(secret);
+    value.as_object_mut().unwrap().remove("slug");
+    value
+}
+
+fn mutable(value: Value) -> Value {
+    let mut value = value;
+    value.as_object_mut().unwrap().remove("slug");
+    value
+}
+
 fn draft_with_owned_volume(secret: &str, logical_name: &str) -> Value {
     let mut value = draft(secret);
     value["volumes"] = json!([{
@@ -599,7 +579,7 @@ async fn body(response: axum::response::Response) -> (StatusCode, String) {
 async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
     let harness = Harness::new().await;
     let canary = "M3_SECRET_CANARY";
-    serde_json::from_value::<solodock::domain::DraftInput>(draft(canary)).unwrap();
+    serde_json::from_value::<solodock::domain::DraftInput>(mutable_draft(canary)).unwrap();
     let missing = harness.create(None, &draft(canary)).await;
     assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
     assert_eq!(missing.headers()[header::CACHE_CONTROL], "no-store");
@@ -634,6 +614,57 @@ async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
             .windows(canary.len())
             .any(|window| window == canary.as_bytes())
     );
+}
+
+#[tokio::test]
+async fn slug_is_short_unique_and_absent_from_mutable_draft() {
+    let harness = Harness::new().await;
+    let mut invalid = draft("secret");
+    invalid["slug"] = json!("abcdefghijklm");
+    assert_eq!(
+        harness
+            .create(Some("slug-too-long-0001"), &invalid)
+            .await
+            .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let (status, created) = body(
+        harness
+            .create(Some("slug-create-0001"), &draft("secret"))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id = created["app"]["id"].as_str().unwrap();
+    assert_eq!(
+        harness
+            .create(Some("slug-duplicate-0001"), &draft("secret"))
+            .await
+            .status(),
+        StatusCode::CONFLICT
+    );
+
+    let mut update = mutable_draft("secret");
+    update["slug"] = json!("renamed");
+    let response = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some("slug-update-0001"),
+            &json!({
+                "expected_revision": created["app"]["config_revision"],
+                "draft": update,
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let header = fs::read_to_string(harness.apps.join(app_id).join("app.toml")).unwrap();
+    assert!(header.contains("schema_version = 2"));
+    assert!(header.contains("slug = \"example\""));
+    assert!(!header.contains("project_name"));
 }
 
 #[tokio::test]
@@ -728,7 +759,7 @@ async fn interrupted_update_resumes_after_startup_only_old_revision_cleanup() {
     let created: Value = serde_json::from_str(&created).unwrap();
     let app_id = created["app"]["id"].as_str().unwrap();
     let old_revision = created["app"]["config_revision"].as_str().unwrap();
-    let mut updated = draft("new-secret");
+    let mut updated = mutable_draft("new-secret");
     updated["display_name"] = json!("Updated");
     let request = json!({"expected_revision":old_revision,"draft":updated});
     let route = format!("/api/v1/apps/{app_id}/draft");
@@ -901,7 +932,7 @@ async fn deletion_facts_ignore_stale_projection_union_active_and_draft_and_detec
     let route = format!("/api/v1/apps/{app_id}/draft");
     let update = json!({
         "expected_revision":active_revision,
-        "draft":draft_with_owned_volume("secret-b", "draft-data")
+        "draft":mutable(draft_with_owned_volume("secret-b", "draft-data"))
     });
     let (status, updated) = body(
         harness
@@ -933,19 +964,19 @@ async fn deletion_facts_ignore_stale_projection_union_active_and_draft_and_detec
     assert_eq!(preview["active_config_revision"], active_revision);
     let volumes = preview["retained"]["owned_volumes"].as_array().unwrap();
     assert!(volumes.iter().any(|item| {
-        item["name"].as_str().unwrap().ends_with("-active-data")
+        item["name"].as_str().unwrap().ends_with(".active-data")
             && item["configured_in"] == "active"
             && item["exists"] == false
     }));
     assert!(volumes.iter().any(|item| {
-        item["name"].as_str().unwrap().ends_with("-draft-data")
+        item["name"].as_str().unwrap().ends_with(".draft-data")
             && item["configured_in"] == "draft"
             && item["exists"] == false
     }));
 
     let changed = json!({
         "expected_revision":draft_revision,
-        "draft":draft_with_owned_volume("secret-c", "changed-data")
+        "draft":mutable(draft_with_owned_volume("secret-c", "changed-data"))
     });
     let (status, _) = body(
         harness
@@ -997,7 +1028,7 @@ async fn external_only_deletion_inventory_preserves_per_revision_alias_facts() {
     );
     let update = json!({
         "expected_revision":active_revision,
-        "draft":external_only_draft("secret-b", "database")
+        "draft":mutable(external_only_draft("secret-b", "database"))
     });
     let (status, updated) = body(
         harness
@@ -1700,7 +1731,7 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
     .await;
     let created: Value = serde_json::from_str(&created).unwrap();
     let app_id = created["app"]["id"].as_str().unwrap();
-    let mut candidate = draft("validate-secret");
+    let mut candidate = mutable_draft("validate-secret");
     candidate["files"] = json!([{
         "logical_name":"settings", "target_path":"/app/settings.toml",
         "sensitive":false, "readonly":true, "content":"mode='preview'"

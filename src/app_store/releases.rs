@@ -28,6 +28,7 @@ pub enum ReleaseTrigger {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseV2 {
     pub schema_version: u32,
+    pub compose_schema_version: u32,
     pub id: Uuid,
     pub app_id: Uuid,
     pub config_revision: Uuid,
@@ -69,7 +70,6 @@ impl AppStore {
             self.integrity_key()?,
         )?;
         let input = loaded.input(
-            app.slug.clone(),
             app.display_name.clone(),
             app.discovery_image_ref.clone(),
             app.credential_ref,
@@ -92,6 +92,7 @@ impl AppStore {
         let (compose, _) = generate(
             ComposeInput {
                 app_id: app.id,
+                slug: &app.slug,
                 release_id,
                 image_ref: &resolved.runnable_image_ref,
                 revision_directory: &revision_directory,
@@ -102,7 +103,8 @@ impl AppStore {
         .map_err(|_| StoreError::ContentInvalid)?;
         let compose_sha256 = format!("{:x}", Sha256::digest(compose.as_bytes()));
         let mut release = ReleaseV2 {
-            schema_version: 2,
+            schema_version: 3,
+            compose_schema_version: 2,
             id: release_id,
             app_id: app.id,
             config_revision: app.draft_revision,
@@ -149,7 +151,8 @@ impl AppStore {
         check_private_tree(&self.app_directory(app_id), &compose_path, false)?;
         let release: ReleaseV2 = toml::from_str(&fs::read_to_string(header_path)?)
             .map_err(|_| StoreError::ContentInvalid)?;
-        if release.schema_version != 2
+        if release.schema_version != 3
+            || release.compose_schema_version != 2
             || release.id != release_id
             || release.app_id != app_id
             || sign(&release, self.integrity_key()?) != release.integrity_hmac
@@ -171,7 +174,6 @@ impl AppStore {
             return Err(StoreError::ContentInvalid);
         }
         let input = loaded.input(
-            app.slug,
             app.display_name,
             release.source_image_ref.clone(),
             release.credential_ref,
@@ -192,6 +194,7 @@ impl AppStore {
         let (canonical, _) = generate(
             ComposeInput {
                 app_id,
+                slug: &app.slug,
                 release_id,
                 image_ref: &release.runnable_image_ref,
                 revision_directory: &revision_directory,
@@ -357,10 +360,11 @@ mod tests {
     };
 
     #[test]
-    fn serialized_v2_release_keeps_local_image_id_hmac_compatibility() {
+    fn serialized_current_release_round_trips_with_compose_schema_marker() {
         let manifest = format!("sha256:{}", "a".repeat(64));
         let mut release = ReleaseV2 {
-            schema_version: 2,
+            schema_version: 3,
+            compose_schema_version: 2,
             id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
             app_id: Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
             config_revision: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
@@ -386,12 +390,10 @@ mod tests {
         };
         let key = b"existing-v2-release-key";
         release.integrity_hmac = sign(&release, key);
-        assert_eq!(
-            release.integrity_hmac,
-            "ee4bd01647c57c37f9820e695f3bf6e3c5b383bd7e321269d66cb8ee46790402"
-        );
+        assert_eq!(release.integrity_hmac.len(), 64);
         let serialized = toml::to_string(&release).unwrap();
         assert!(serialized.contains("local_image_id = "));
+        assert!(serialized.contains("compose_schema_version = 2"));
 
         let parsed: ReleaseV2 = toml::from_str(&serialized).unwrap();
         assert_eq!(sign(&parsed, key), parsed.integrity_hmac);
@@ -409,7 +411,6 @@ mod tests {
         let store = AppStore::initialize_verified(root.path().join("apps"), key.clone()).unwrap();
         let draft = normalize_draft(
             DraftInput {
-                slug: "example".into(),
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -435,7 +436,14 @@ mod tests {
         let create_operation = Uuid::new_v4();
         let now = OffsetDateTime::now_utc();
         let metadata = store
-            .create_app(app_id, revision_id, create_operation, &draft, now)
+            .create_app(
+                app_id,
+                "example",
+                revision_id,
+                create_operation,
+                &draft,
+                now,
+            )
             .unwrap();
         let digest = format!("sha256:{}", "a".repeat(64));
         let release_id = Uuid::new_v4();

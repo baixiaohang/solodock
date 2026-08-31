@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    os::unix::fs::{PermissionsExt, symlink},
-    process::Command,
-};
+use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
 use solodock::{
     app_store::{AppStore, releases::ReleaseTrigger},
@@ -24,23 +20,71 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
     let apps = root.path().join("apps");
     fs::create_dir(&apps).unwrap();
     fs::set_permissions(&apps, fs::Permissions::from_mode(0o700)).unwrap();
+    let key = vec![9_u8; 32];
+    let store = AppStore::initialize_verified(apps, key.clone()).unwrap();
+    let draft = normalize_draft(
+        DraftInput {
+            display_name: "Example".into(),
+            discovery_image_ref: "registry.example/image:stable".into(),
+            credential_ref: None,
+            auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
+            poll_interval_seconds: 300,
+            environment: EnvironmentInput::default(),
+            files: vec![],
+            ports: vec![],
+            volumes: vec![],
+            binds: vec![],
+            owned_default_network: true,
+            networks: vec![],
+            health: HealthPolicy::default(),
+        },
+        &ExistingSecrets::default(),
+        &key,
+        &[],
+    )
+    .unwrap();
     let app_id = Uuid::new_v4();
+    let revision = Uuid::new_v4();
     let release_id = Uuid::new_v4();
-    let app = apps.join(app_id.to_string());
-    let release = app.join("releases").join(release_id.to_string());
-    fs::create_dir_all(&release).unwrap();
-    fs::write(app.join("app.toml"), format!("schema_version=1\nid='{app_id}'\nslug='example'\ndisplay_name='Example'\nproject_name='solodock-{}'\ncreated_at='2026-08-28T00:00:00Z'\nupdated_at='2026-08-28T00:00:00Z'\n", app_id.simple())).unwrap();
-    let digest = "b".repeat(64);
-    fs::write(release.join("release.toml"), format!("schema_version=1\nid='{release_id}'\napp_id='{app_id}'\nrunnable_image_ref='registry.example/image@sha256:{digest}'\ncreated_at='2026-08-28T00:00:00Z'\n")).unwrap();
-    symlink(format!("releases/{release_id}"), app.join("active")).unwrap();
-    for directory in [&app, &app.join("releases"), &release] {
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    for file in [app.join("app.toml"), release.join("release.toml")] {
-        fs::set_permissions(file, fs::Permissions::from_mode(0o600)).unwrap();
-    }
-
-    let report = AppStore::initialize(apps).unwrap().scan().unwrap();
+    let metadata = store
+        .create_app(
+            app_id,
+            "example",
+            revision,
+            Uuid::new_v4(),
+            &draft,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+    let digest = format!("sha256:{}", "b".repeat(64));
+    store
+        .publish_v2_release(
+            &metadata,
+            release_id,
+            &ResolvedImage {
+                source_image_ref: "registry.example/image:stable".into(),
+                logical_registry: "registry.example".into(),
+                repository: "image".into(),
+                source_tag: "stable".into(),
+                source_descriptor_digest: digest.clone(),
+                index_digest: None,
+                manifest_digest: digest.clone(),
+                runnable_image_ref: format!("registry.example/image@{digest}"),
+                platform: Platform::canonical("linux", "amd64", None).unwrap(),
+                local_image_id: digest.clone(),
+            },
+            ReleaseTrigger::Manual,
+            None,
+        )
+        .unwrap();
+    solodock::app_store::atomic::AtomicWriter::switch_release_link(
+        &store.app_directory(app_id),
+        "active",
+        release_id,
+    )
+    .unwrap();
+    let report = store.scan().unwrap();
     let database_path = root.path().join("state.sqlite3");
     let database = Database::open(&database_path).await.unwrap();
     database.refresh_app_index(&report).await.unwrap();
@@ -57,7 +101,7 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
     assert_eq!(indexed.0.as_deref(), Some(release_id.to_string().as_str()));
     assert_eq!(
         indexed.1.as_deref(),
-        Some(format!("registry.example/image@sha256:{digest}").as_str())
+        Some(format!("registry.example/image@{digest}").as_str())
     );
     assert_eq!(rebuilt.audit_count().await.unwrap(), 0);
     assert!(!rebuilt.has_admin().await.unwrap());
@@ -88,7 +132,6 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     let store = AppStore::initialize_managed(state.join("apps"), key.clone(), vec![]).unwrap();
     let draft = normalize_draft(
         DraftInput {
-            slug: "backup-fixture".into(),
             display_name: "Backup fixture".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -113,7 +156,7 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     let revision = Uuid::new_v4();
     let now = time::OffsetDateTime::now_utc();
     let metadata = store
-        .create_app(app_id, revision, Uuid::new_v4(), &draft, now)
+        .create_app(app_id, "backup", revision, Uuid::new_v4(), &draft, now)
         .unwrap();
     let resolved = |byte: char| {
         let digest = format!("sha256:{}", byte.to_string().repeat(64));

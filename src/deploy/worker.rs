@@ -301,7 +301,7 @@ impl DeploymentEngine {
             .compose
             .run(
                 ComposeAction::DeployCandidate,
-                self.context(record.app_id, candidate_id),
+                self.context(record.app_id, candidate_id)?,
             )
             .await;
         if let Err(error) = compose_result {
@@ -900,7 +900,7 @@ impl DeploymentEngine {
         expected_release: Option<Uuid>,
         expected_container_id: Option<&str>,
     ) -> Result<Option<ContainerRecord>, EngineError> {
-        let app = minimal_app(app_id, expected_release);
+        let app = minimal_app(&self.store, app_id, expected_release)?;
         let candidates = self
             .docker
             .list_compose_app_containers(&app.project_name)
@@ -982,7 +982,7 @@ impl DeploymentEngine {
         release: Uuid,
         old_id: Option<&str>,
     ) -> Result<ContainerRecord, EngineError> {
-        let app = minimal_app(app_id, Some(release));
+        let app = minimal_app(&self.store, app_id, Some(release))?;
         let candidates = self
             .docker
             .list_compose_app_containers(&app.project_name)
@@ -1008,7 +1008,7 @@ impl DeploymentEngine {
         record: &DeploymentRecord,
         candidate_id: Uuid,
     ) -> Result<FailedApplyObservation, EngineError> {
-        let app = minimal_app(record.app_id, Some(candidate_id));
+        let app = minimal_app(&self.store, record.app_id, Some(candidate_id))?;
         let candidates = self
             .docker
             .list_compose_app_containers(&app.project_name)
@@ -1030,7 +1030,11 @@ impl DeploymentEngine {
                 .as_deref()
                 .unwrap_or_default()
         {
-            let predecessor = minimal_app(record.app_id, record.expected_actual_release_id);
+            let predecessor = minimal_app(
+                &self.store,
+                record.app_id,
+                record.expected_actual_release_id,
+            )?;
             let identity = validate_syntactic_identity(&container.labels, &predecessor)
                 .ok_or(EngineError::Interrupted)?;
             if Some(identity.release_id) == record.expected_actual_release_id {
@@ -1123,7 +1127,7 @@ impl DeploymentEngine {
                 self.docker.as_ref(),
                 record,
                 candidate,
-                self.context(record.app_id, candidate),
+                self.context(record.app_id, candidate)?,
             )
             .await?;
             return Err(EngineError::Stable(code));
@@ -1201,7 +1205,7 @@ impl DeploymentEngine {
         self.compose
             .run(
                 ComposeAction::DeployCandidate,
-                self.context(record.app_id, old_id),
+                self.context(record.app_id, old_id)?,
             )
             .await
             .map_err(|error| match error {
@@ -1257,14 +1261,18 @@ impl DeploymentEngine {
         Ok(())
     }
 
-    fn context(&self, app_id: Uuid, release: Uuid) -> RunContext {
-        RunContext {
-            project_name: crate::domain::AppMetadata::project_name(app_id),
+    fn context(&self, app_id: Uuid, release: Uuid) -> Result<RunContext, EngineError> {
+        let metadata = self
+            .store
+            .read_metadata(app_id)
+            .map_err(|_| EngineError::Interrupted)?;
+        Ok(RunContext {
+            project_name: metadata.resource_names().project_name,
             project_directory: self.store.app_directory(app_id),
             compose_file: self.store.release_compose_path(app_id, release),
             timeout: Duration::from_secs(60),
             redaction_patterns: Vec::new(),
-        }
+        })
     }
 
     async fn validate_runtime_paths_fresh(
@@ -1336,12 +1344,13 @@ async fn remove_first_deploy_candidate(
     candidate: Uuid,
     context: RunContext,
 ) -> Result<(), EngineError> {
+    let project_name = context.project_name.clone();
     compose
         .run(ComposeAction::Remove, context)
         .await
         .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
     let remaining = docker
-        .list_compose_app_containers(&crate::domain::AppMetadata::project_name(record.app_id))
+        .list_compose_app_containers(&project_name)
         .await
         .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
     if !remaining.is_empty() {
@@ -1356,12 +1365,20 @@ async fn remove_first_deploy_candidate(
         .map_err(|_| EngineError::Interrupted)
 }
 
-fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
-    AppCatalogEntry {
+fn minimal_app(
+    store: &AppStore,
+    id: Uuid,
+    active: Option<Uuid>,
+) -> Result<AppCatalogEntry, EngineError> {
+    let metadata = store
+        .read_metadata(id)
+        .map_err(|_| EngineError::Interrupted)?;
+    let project_name = metadata.resource_names().project_name;
+    Ok(AppCatalogEntry {
         id,
-        slug: String::new(),
-        display_name: String::new(),
-        project_name: crate::domain::AppMetadata::project_name(id),
+        slug: metadata.slug,
+        display_name: metadata.display_name,
+        project_name,
         active_release_id: active,
         active_image_ref: None,
         active_config_revision: None,
@@ -1378,7 +1395,7 @@ fn minimal_app(id: Uuid, active: Option<Uuid>) -> AppCatalogEntry {
         auto_deploy_enabled: false,
         poll_interval_seconds: 300,
         draft: None,
-    }
+    })
 }
 fn resolved_from_release(value: &ReleaseV2) -> ResolvedImage {
     ResolvedImage {
@@ -1461,7 +1478,8 @@ mod tests {
     fn release() -> ReleaseV2 {
         let manifest = format!("sha256:{}", "a".repeat(64));
         ReleaseV2 {
-            schema_version: 2,
+            schema_version: 3,
+            compose_schema_version: 2,
             id: Uuid::new_v4(),
             app_id: Uuid::new_v4(),
             config_revision: Uuid::new_v4(),
@@ -1678,7 +1696,7 @@ mod tests {
             .await
             .unwrap();
         let context = RunContext {
-            project_name: crate::domain::AppMetadata::project_name(app_id),
+            project_name: crate::domain::app_resource_names("example").project_name,
             project_directory: app_directory,
             compose_file: store.release_compose_path(app_id, candidate),
             timeout: Duration::from_secs(60),

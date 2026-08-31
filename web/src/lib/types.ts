@@ -72,6 +72,7 @@ export interface ComposePlan {
   mounts: number
   networks: number
   network_mode: NetworkMode
+  owned_default_network: { docker_name: string; bridge_name: string } | null
   external_networks: ExternalNetworkAttachment[]
   warnings: string[]
 }
@@ -84,6 +85,8 @@ export interface AppObservation {
   actual_release_id: string | null
   actual: ContainerProjection | null
   expected_network_plan: NetworkPlan | null
+  expected_owned_default_network: { docker_name: string; bridge_name: string } | null
+  actual_owned_default_network: { docker_name: string; driver: string | null; bridge_name: string | null } | null
   drift_codes: string[]
 }
 
@@ -105,7 +108,6 @@ export interface HttpHealthcheck {
 }
 
 export interface DraftInput {
-  slug: string
   display_name: string
   discovery_image_ref: string
   credential_ref: string | null
@@ -160,7 +162,7 @@ export interface DeletionPreviewResponse {
     owned_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
     external_volumes: Array<{ name: string; configured_in: ConfiguredScope; exists: boolean }>
     binds: Array<{ source: string; readonly: boolean; configured_in: ConfiguredScope; exists: boolean }>
-    networks: Array<{ name: string; kind: 'owned_default' | 'external'; aliases: string[]; configured_in: ConfiguredScope; exists: boolean }>
+    networks: Array<{ name: string; bridge_name: string | null; kind: 'owned_default' | 'external'; aliases: string[]; configured_in: ConfiguredScope; exists: boolean }>
   }
   orphan_warning: boolean
   webhook_configured: boolean
@@ -199,6 +201,7 @@ export interface DraftResponse {
 }
 
 export interface AppDetailResponse extends AppObservation {
+  resource_names: { project_name: string; owned_default_network_name: string; bridge_name: string }
   draft: DraftResponse | null
   draft_revision: string | null
   draft_config_sha256: string | null

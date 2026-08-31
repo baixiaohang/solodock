@@ -185,7 +185,6 @@ struct MutationHarness {
     state: AppState,
     store: AppStore,
     catalog: AppCatalog,
-    idempotency: IdempotencyService,
     cookie: String,
     csrf: String,
 }
@@ -414,7 +413,6 @@ impl MutationHarness {
             state,
             store,
             catalog,
-            idempotency,
             cookie,
             csrf,
         }
@@ -477,62 +475,32 @@ impl MutationHarness {
             .store
             .read_metadata(app_id)
             .map_err(|error| format!("read app metadata: {error:?}"))?;
-        let loaded = solodock::app_store::config_revision::load_verified(
-            &self.store.app_directory(app_id),
-            metadata.draft_revision,
-            &self.idempotency.integrity_key(),
-        )
-        .map_err(|error| format!("load config revision: {error:?}"))?;
-        let allowed_bind_roots = &self
-            .state
-            .m3
-            .as_ref()
-            .ok_or_else(|| "M3 services missing".to_string())?
-            .allowed_bind_roots;
-        let draft = solodock::domain::normalize_draft(
-            loaded.input(
-                metadata.slug,
-                metadata.display_name,
-                metadata.discovery_image_ref,
-                metadata.credential_ref,
-                metadata.auto_deploy_enabled,
-                metadata.poll_interval_seconds,
-            ),
-            &loaded.secrets,
-            &self.idempotency.fingerprint(b"config"),
-            allowed_bind_roots,
-        )
-        .map_err(|error| format!("normalize active draft: {error:?}"))?;
-        let revision_directory = self
-            .store
-            .app_directory(app_id)
-            .join("config-revisions")
-            .join(metadata.draft_revision.to_string());
-        let (yaml, _) = solodock::compose::generate(
-            solodock::compose::ComposeInput {
-                app_id,
+        let digest = image
+            .split('@')
+            .nth(1)
+            .ok_or_else(|| format!("runnable image is not digest pinned: {image}"))?
+            .to_owned();
+        self.store
+            .publish_v2_release(
+                &metadata,
                 release_id,
-                image_ref: image,
-                revision_directory: &revision_directory,
-                draft: &draft,
-            },
-            true,
-        )
-        .map_err(|error| format!("generate active compose: {error:?}"))?;
-        let now = time::OffsetDateTime::now_utc()
-            .format(&time::format_description::well_known::Rfc3339)
-            .map_err(|error| format!("format active timestamp: {error:?}"))?;
-        let release = format!(
-            "schema_version = 1\nid = '{release_id}'\napp_id = '{app_id}'\nrunnable_image_ref = '{image}'\nconfig_revision = '{}'\nconfig_sha256 = '{}'\ncreated_at = '{now}'\n",
-            metadata.draft_revision, metadata.draft_config_sha256
-        );
-        solodock::app_store::atomic::AtomicWriter::publish_release(
-            &self.store.app_directory(app_id).join("releases"),
-            release_id,
-            release.as_bytes(),
-            yaml.as_bytes(),
-        )
-        .map_err(|error| format!("publish active release: {error:?}"))?;
+                &solodock::registry::ResolvedImage {
+                    source_image_ref: metadata.discovery_image_ref.clone(),
+                    logical_registry: "registry.example".into(),
+                    repository: "app".into(),
+                    source_tag: "stable".into(),
+                    source_descriptor_digest: digest.clone(),
+                    index_digest: None,
+                    manifest_digest: digest.clone(),
+                    runnable_image_ref: image.into(),
+                    platform: solodock::registry::Platform::canonical("linux", "amd64", None)
+                        .map_err(|error| format!("build canonical platform: {error:?}"))?,
+                    local_image_id: digest,
+                },
+                solodock::app_store::releases::ReleaseTrigger::Manual,
+                None,
+            )
+            .map_err(|error| format!("publish active release: {error:?}"))?;
         solodock::app_store::atomic::AtomicWriter::switch_release_link(
             &self.store.app_directory(app_id),
             "active",
@@ -601,12 +569,22 @@ async fn observes_owned_container_on_isolated_daemon() {
     let result: Result<Outcome, String> = async {
         let adapter = BollardReadClient::for_test_http(endpoint);
         let mut events = adapter.events().await.map_err(|error| error.to_string())?;
+        let expected_event_container_id = container_id.clone();
         let event_task = tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(10), events.next())
-                .await
-                .map_err(|_| "event timeout".to_string())?
-                .ok_or_else(|| "event stream ended".to_string())?
-                .map_err(|error| error.to_string())
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let event = events
+                        .next()
+                        .await
+                        .ok_or_else(|| "event stream ended".to_string())?
+                        .map_err(|error| error.to_string())?;
+                    if event.container_id == expected_event_container_id {
+                        return Ok::<_, String>(event);
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "event timeout".to_string())?
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         docker
@@ -965,8 +943,13 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
         network_id = Some(created_network.id);
 
         for alias in ["postgres", "sologrove"] {
+            let slug = match alias {
+                "postgres" => format!("pg{}", &run_token.simple().to_string()[..8]),
+                "sologrove" => format!("sg{}", &run_token.simple().to_string()[..8]),
+                _ => unreachable!(),
+            };
             let draft = json!({
-                "slug": format!("e2e-{alias}-{run_token}"),
+                "slug": slug,
                 "display_name": alias,
                 "discovery_image_ref": "nginx:1.27-alpine",
                 "credential_ref": null,
@@ -1015,7 +998,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
                 .state
                 .observer
                 .api()
-                .list_compose_app_containers(&format!("solodock-{}", app_id.simple()))
+                .list_compose_app_containers(&format!("solodock-{slug}"))
                 .await
                 .map_err(|error| format!("observe {alias} app: {error}"))?;
             if containers.len() != 1 {
@@ -1041,7 +1024,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
             if !effective.iter().any(|value| value == alias) {
                 return Err(format!("{alias} missing from effective DNS names"));
             }
-            let owned_name = format!("solodock-{}-default", app_id.simple());
+            let owned_name = format!("solodock-{slug}-default");
             if docker.inspect_network(&owned_name, None).await.is_ok() {
                 return Err(format!("external-only app created {owned_name}"));
             }
@@ -1137,7 +1120,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
         }
 
         let missing_draft = json!({
-            "slug": format!("e2e-missing-{run_token}"),
+            "slug": format!("miss{}", &run_token.simple().to_string()[..8]),
             "display_name": "missing network",
             "discovery_image_ref": "alpine:3.20",
             "credential_ref": null,
@@ -1319,8 +1302,8 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
     let release_id = Uuid::new_v4();
     let volume_name = format!("solodock-e2e-compose-volume-{run_token}");
     let network_name = format!("solodock-e2e-compose-network-{run_token}");
-    let owned_volume_name = format!("solodock-{}-owned", app_id.simple());
-    let owned_network_name = format!("solodock-{}-default", app_id.simple());
+    let owned_volume_name = "solodock-e2e.owned".to_string();
+    let owned_network_name = "solodock-e2e-default".to_string();
     let bind_root = format!("/tmp/solodock-e2e-bind-root-{run_token}");
     let bind_source = format!("{bind_root}/data");
     std::fs::create_dir_all(&bind_source).unwrap();
@@ -1409,7 +1392,6 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
     let compose_file = project.path().join("compose.yaml");
     let draft = solodock::domain::normalize_draft(
         solodock::domain::DraftInput {
-            slug: "e2e".into(),
             display_name: "E2E".into(),
             discovery_image_ref: "alpine:3.20".into(),
             credential_ref: None,
@@ -1458,6 +1440,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
     let (yaml, _) = solodock::compose::generate(
         solodock::compose::ComposeInput {
             app_id,
+            slug: "e2e",
             release_id,
             image_ref: &pinned,
             revision_directory: &revision_directory,
@@ -1477,7 +1460,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         endpoint.clone(),
     ));
     let context = || RunContext {
-        project_name: format!("solodock-{}", app_id.simple()),
+        project_name: "solodock-e2e".into(),
         project_directory: project.path().to_owned(),
         compose_file: compose_file.clone(),
         timeout: Duration::from_secs(60),
@@ -1505,7 +1488,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
                     .filters(&HashMap::from([(
                         "label".to_string(),
                         vec![
-                            format!("{PROJECT_LABEL}=solodock-{}", app_id.simple()),
+                            format!("{PROJECT_LABEL}=solodock-e2e"),
                             format!("{SERVICE_LABEL}=app"),
                         ],
                     )]))
@@ -1554,6 +1537,41 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         {
             return Err("owned network identity was not generated by SoloDock".into());
         }
+        if owned_network.driver.as_deref() != Some("bridge")
+            || owned_network
+                .options
+                .as_ref()
+                .and_then(|options| options.get("com.docker.network.bridge.name"))
+                .map(String::as_str)
+                != Some("sd-e2e")
+        {
+            return Err("owned network did not use the stable sd-e2e bridge".into());
+        }
+        docker
+            .remove_network(&owned_network_name)
+            .await
+            .map_err(|error| format!("remove owned network before recreation: {error}"))?;
+        runner
+            .run(ComposeAction::Recreate, context())
+            .await
+            .map_err(|error| format!("recreate after network deletion: {error}"))?;
+        let recreated_network = docker
+            .inspect_network(&owned_network_name, None)
+            .await
+            .map_err(|error| format!("inspect recreated owned network: {error}"))?;
+        if recreated_network
+            .options
+            .as_ref()
+            .and_then(|options| options.get("com.docker.network.bridge.name"))
+            .map(String::as_str)
+            != Some("sd-e2e")
+        {
+            return Err("recreated owned network changed its bridge identity".into());
+        }
+        runner
+            .run(ComposeAction::Remove, context())
+            .await
+            .map_err(|error| format!("remove recreated compose container: {error}"))?;
         let reader_name = format!("solodock-e2e-compose-reader-{run_token}");
         let reader = docker
             .create_container(
@@ -1807,7 +1825,7 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
             "POST",
             "/api/v1/apps",
             Some("e2e-unregister-create"),
-            Some(&create_body("e2e-unregister")),
+            Some(&create_body("unregister")),
         )
         .await;
     assert_eq!(create.status(), StatusCode::CREATED);
@@ -1835,7 +1853,7 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
         .state
         .observer
         .api()
-        .list_compose_app_containers(&format!("solodock-{}", app_id.simple()))
+        .list_compose_app_containers("solodock-unregister")
         .await
         .unwrap();
     assert_eq!(containers.len(), 1);
@@ -1856,7 +1874,7 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
             &format!("/api/v1/apps/{app_id}"),
             Some("e2e-unregister-delete"),
             Some(&json!({
-                "confirmation_token":preview["confirmation_token"], "slug":"e2e-unregister",
+                "confirmation_token":preview["confirmation_token"], "slug":"unregister",
                 "expected_revision":preview["expected_revision"], "remove_container":false
             })),
         )
@@ -1940,9 +1958,9 @@ async fn production_http_mutations_use_canonical_active_release_and_safe_deletio
             .await
             .is_ok()
     );
-    for id in [app_id, remove_app_id] {
-        let volume = format!("solodock-{}-owned", id.simple());
-        let network = format!("solodock-{}-default", id.simple());
+    for (id, slug) in [(app_id, "unregister"), (remove_app_id, "e2e-remove")] {
+        let volume = format!("solodock-{slug}.owned");
+        let network = format!("solodock-{slug}-default");
         let inspected = docker.inspect_volume(&volume).await.unwrap();
         assert_eq!(inspected.labels.get(APP_ID_LABEL), Some(&id.to_string()));
         docker
@@ -2263,7 +2281,7 @@ http {{
         "app publication must not drop registry credentials from the inventory"
     );
 
-    let project = format!("solodock-{}", app_id.simple());
+    let project = "solodock-m4-e2e".to_string();
     let collision_name = format!("solodock-m4-collision-{token}");
     let collision_id = docker_cli(
         &endpoint,
@@ -2341,7 +2359,7 @@ http {{
     assert_eq!(first["status"], "succeeded", "{first}");
     assert!(!first.to_string().contains(&registry_secret));
     let first_release = first["candidate_release_id"].as_str().unwrap().to_owned();
-    let owned_volume = format!("solodock-{}-owned", app_id.simple());
+    let owned_volume = "solodock-m4-e2e.owned".to_string();
     write_m4_volume_canaries(&docker, &owned_volume, &external_volume, token).await;
     assert!(
         first["source_image_ref"]
@@ -2638,7 +2656,7 @@ http {{
         .state
         .observer
         .api()
-        .list_compose_app_containers(&format!("solodock-{}", app_id.simple()))
+        .list_compose_app_containers("solodock-m4-e2e")
         .await
         .unwrap();
     assert_eq!(candidates.len(), 1);
@@ -2659,7 +2677,7 @@ http {{
         )
         .await
         .unwrap();
-    let owned_network = format!("solodock-{}-default", app_id.simple());
+    let owned_network = "solodock-m4-e2e-default".to_string();
     assert_eq!(
         docker
             .inspect_network(&owned_network, None)
@@ -2876,7 +2894,7 @@ async fn deterministic_pull_failure_publishes_cleared_pending() {
             "/api/v1/apps",
             Some("pull-failure-create-0001"),
             Some(&json!({
-                "slug":"pull-failure-projection",
+                "slug":"pull-fail",
                 "display_name":"Pull failure projection",
                 "discovery_image_ref":"alpine:3.20",
                 "credential_ref":null,
@@ -2914,7 +2932,7 @@ async fn deterministic_pull_failure_publishes_cleared_pending() {
     assert!(detail["active_release"].is_null(), "{detail}");
     assert!(detail["actual_release_id"].is_null(), "{detail}");
     assert_eq!(detail["deployment_status"], "DEPLOY_REQUIRED", "{detail}");
-    let project = format!("solodock-{}", app_id.simple());
+    let project = "solodock-pull-fail".to_string();
     assert!(
         harness
             .state
@@ -2977,7 +2995,7 @@ async fn containerd_postgres_deployment_identity_and_noop() {
                     "/api/v1/apps",
                     Some("containerd-postgres-create-0001"),
                     Some(&json!({
-                        "slug":"containerd-postgres",
+                        "slug":"ct-postgres",
                         "display_name":"Containerd PostgreSQL",
                         "discovery_image_ref":"postgres:16-alpine",
                         "credential_ref":null,
@@ -3061,7 +3079,7 @@ async fn containerd_postgres_deployment_identity_and_noop() {
 
     let shutdown_finished = shutdown_containerd_harness(&harness).await;
     if let Some(app_id) = cleanup_app_id {
-        cleanup_containerd_app(&docker, app_id, &["data"]).await;
+        cleanup_containerd_app(&docker, app_id, "ct-postgres", &["data"]).await;
     }
     assert!(
         shutdown_finished,
@@ -3115,7 +3133,7 @@ async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed
                     "/api/v1/apps",
                     Some("containerd-compensation-create-0001"),
                     Some(&json!({
-                        "slug":"containerd-compensation",
+                        "slug":"ct-comp",
                         "display_name":"Containerd compensation",
                         "discovery_image_ref":"alpine:3.20",
                         "credential_ref":null,
@@ -3147,7 +3165,7 @@ async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed
                 .await
                 .expect("candidate gate was not reached before its deadline");
 
-            let project = format!("solodock-{}", app_id.simple());
+            let project = "solodock-ct-comp".to_string();
             let original = harness
                 .state
                 .observer
@@ -3205,7 +3223,7 @@ async fn containerd_pre_marker_canonical_claim_mismatch_is_removed_before_failed
 
     let shutdown_finished = shutdown_containerd_harness(&harness).await;
     if let Some(app_id) = cleanup_app_id {
-        cleanup_containerd_app(&docker, app_id, &[]).await;
+        cleanup_containerd_app(&docker, app_id, "ct-comp", &[]).await;
     }
     assert!(
         shutdown_finished,
@@ -3260,7 +3278,7 @@ async fn containerd_post_marker_full_id_replacement_is_preserved() {
                     "/api/v1/apps",
                     Some("containerd-post-marker-create-0001"),
                     Some(&json!({
-                        "slug":"containerd-post-marker",
+                        "slug":"ct-marker",
                         "display_name":"Containerd post marker",
                         "discovery_image_ref":"alpine:3.20",
                         "credential_ref":null,
@@ -3291,7 +3309,7 @@ async fn containerd_post_marker_full_id_replacement_is_preserved() {
                 .await
                 .expect("candidate gate was not reached before its deadline");
 
-            let project = format!("solodock-{}", app_id.simple());
+            let project = "solodock-ct-marker".to_string();
             let original = harness
                 .state
                 .observer
@@ -3386,7 +3404,7 @@ async fn containerd_post_marker_full_id_replacement_is_preserved() {
 
     let shutdown_finished = shutdown_containerd_harness(&harness).await;
     if let Some(app_id) = cleanup_app_id {
-        cleanup_containerd_app(&docker, app_id, &[]).await;
+        cleanup_containerd_app(&docker, app_id, "ct-marker", &[]).await;
     }
     assert!(
         shutdown_finished,
@@ -3544,8 +3562,8 @@ async fn shutdown_containerd_harness(harness: &MutationHarness) -> bool {
     .is_ok()
 }
 
-async fn cleanup_containerd_app(docker: &Docker, app_id: Uuid, owned_volumes: &[&str]) {
-    let project = format!("solodock-{}", app_id.simple());
+async fn cleanup_containerd_app(docker: &Docker, app_id: Uuid, slug: &str, owned_volumes: &[&str]) {
+    let project = format!("solodock-{slug}");
     let filters = HashMap::from([(
         "label".to_string(),
         vec![
@@ -3585,7 +3603,7 @@ async fn cleanup_containerd_app(docker: &Docker, app_id: Uuid, owned_volumes: &[
     }
 
     for logical_name in owned_volumes {
-        let volume = format!("solodock-{}-{logical_name}", app_id.simple());
+        let volume = format!("solodock-{slug}.{logical_name}");
         match docker.inspect_volume(&volume).await {
             Ok(inspected) => {
                 assert_eq!(inspected.name, volume);
@@ -3621,9 +3639,12 @@ async fn update_draft(
     harness: &MutationHarness,
     app_id: Uuid,
     expected: &str,
-    draft: Value,
+    mut draft: Value,
     key: &str,
 ) {
+    if let Value::Object(fields) = &mut draft {
+        fields.remove("slug");
+    }
     let response = harness
         .request(
             "PUT",
