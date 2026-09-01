@@ -32,7 +32,6 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.sha }}
-          BASE_REF: ${{ github.ref_name }}
         run: |
           merged_pr=false
           validated_run_id=''
@@ -51,37 +50,24 @@ jobs:
             done <<<"$changed_paths"
           else
             run_docker_e2e=true
-            pulls=$(gh api "/repos/$REPOSITORY/commits/$COMMIT_SHA/pulls")
-            head_sha=$(jq -r --arg sha "$COMMIT_SHA" --arg base "$BASE_REF" '
-              [.[] | select(
-                .merged_at != null and
-                .merge_commit_sha == $sha and
-                .base.ref == $base
-              )] | first | .head.sha // empty
-            ' <<<"$pulls")
-            if [[ -n $head_sha ]]; then
-              current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
-              runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&head_sha=$head_sha&per_page=100")
-              while read -r run_id; do
-                [[ -n $run_id ]] || continue
-                artifacts=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts")
-                tree_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-validated-tree" and .expired == false)] | first | .id // empty' <<<"$artifacts")
-                package_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-embedded-package" and .expired == false)] | first | .id // empty' <<<"$artifacts")
-                [[ -n $tree_artifact_id && -n $package_artifact_id ]] || continue
-                gh api "/repos/$REPOSITORY/actions/artifacts/$tree_artifact_id/zip" >"$RUNNER_TEMP/validated-tree.zip"
-                validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
-                if [[ $validated_tree == "$current_tree" ]]; then
-                  merged_pr=true
-                  validated_run_id=$run_id
-                  run_docker_e2e=false
-                  break
-                fi
-              done < <(jq -r --arg head "$head_sha" '
-                .workflow_runs[] |
-                select(.head_sha == $head and .conclusion == "success") |
-                .id
-              ' <<<"$runs")
-            fi
+            current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
+            runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&per_page=20")
+            run_ids=$(jq -r '.workflow_runs[] | select(.conclusion == "success") | .id' <<<"$runs")
+            while read -r run_id; do
+              [[ -n $run_id ]] || continue
+              artifacts=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts")
+              tree_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-validated-tree" and .expired == false)] | first | .id // empty' <<<"$artifacts")
+              package_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-embedded-package" and .expired == false)] | first | .id // empty' <<<"$artifacts")
+              [[ -n $tree_artifact_id && -n $package_artifact_id ]] || continue
+              gh api "/repos/$REPOSITORY/actions/artifacts/$tree_artifact_id/zip" >"$RUNNER_TEMP/validated-tree.zip"
+              validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
+              if [[ $validated_tree == "$current_tree" ]]; then
+                merged_pr=true
+                validated_run_id=$run_id
+                run_docker_e2e=false
+                break
+              fi
+            done <<<"$run_ids"
           fi
 
           {
