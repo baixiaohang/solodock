@@ -8,67 +8,92 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  classify_push:
-    if: github.event_name == 'push'
+  classify:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
       pull-requests: read
     outputs:
-      merged_pr: ${{ steps.detect.outputs.merged_pr }}
+      merged_pr: ${{ steps.classify.outputs.merged_pr }}
+      validated_run_id: ${{ steps.classify.outputs.validated_run_id }}
+      run_docker_e2e: ${{ steps.classify.outputs.run_docker_e2e }}
     steps:
-      - name: Detect a merged pull request commit
-        id: detect
+      - name: Classify the change and reusable PR artifact
+        id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.sha }}
           BASE_REF: ${{ github.ref_name }}
         run: |
-          pulls=$(gh api "/repos/$REPOSITORY/commits/$COMMIT_SHA/pulls")
           merged_pr=false
-          head_sha=$(jq -r --arg sha "$COMMIT_SHA" --arg base "$BASE_REF" '
-            [.[] | select(
-              .merged_at != null and
-              .merge_commit_sha == $sha and
-              .base.ref == $base
-            )] | first | .head.sha // empty
-          ' <<<"$pulls")
-          if [[ -n $head_sha ]]; then
-            current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
-            runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&head_sha=$head_sha&per_page=100")
-            while read -r run_id; do
-              [[ -n $run_id ]] || continue
-              artifact_id=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts" --jq '
-                [.artifacts[] | select(
-                  .name == "solodock-validated-tree" and
-                  .expired == false
-                )] | first | .id // empty
-              ')
-              [[ -n $artifact_id ]] || continue
-              gh api "/repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" \
-                >"$RUNNER_TEMP/validated-tree.zip"
-              validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
-              if [[ $validated_tree == "$current_tree" ]]; then
-                merged_pr=true
-                break
-              fi
-            done < <(jq -r --arg head "$head_sha" '
-              .workflow_runs[] |
-              select(.head_sha == $head and .conclusion == "success") |
-              .id
-            ' <<<"$runs")
+          validated_run_id=''
+          run_docker_e2e=false
+
+          if [[ $EVENT_NAME == pull_request ]]; then
+            changed_paths=$(gh api --paginate "/repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+              --jq '.[] | .filename, (.previous_filename // empty)')
+            while read -r path; do
+              case "$path" in
+                .github/workflows/ci.yml|.github/workflows/extended-ci.yml|Cargo.toml|Cargo.lock|rust-toolchain.toml|migrations/*|scripts/measure-dind-daemon.sh|src/config.rs|src/lib.rs|src/main.rs|src/api/deployments.rs|src/api/mutations.rs|src/api/streams.rs|src/api/webhooks.rs|src/app_store/*|src/compose/*|src/db/*|src/deploy/*|src/docker/*|src/domain/*|src/mutation/*|src/registry/*|src/security/*|src/system/*|src/webhook/*|tests/docker_e2e.rs|tests/support/*)
+                  run_docker_e2e=true
+                  break
+                  ;;
+              esac
+            done <<<"$changed_paths"
+          else
+            run_docker_e2e=true
+            pulls=$(gh api "/repos/$REPOSITORY/commits/$COMMIT_SHA/pulls")
+            head_sha=$(jq -r --arg sha "$COMMIT_SHA" --arg base "$BASE_REF" '
+              [.[] | select(
+                .merged_at != null and
+                .merge_commit_sha == $sha and
+                .base.ref == $base
+              )] | first | .head.sha // empty
+            ' <<<"$pulls")
+            if [[ -n $head_sha ]]; then
+              current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
+              runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&head_sha=$head_sha&per_page=100")
+              while read -r run_id; do
+                [[ -n $run_id ]] || continue
+                artifacts=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts")
+                tree_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-validated-tree" and .expired == false)] | first | .id // empty' <<<"$artifacts")
+                package_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-embedded-package" and .expired == false)] | first | .id // empty' <<<"$artifacts")
+                [[ -n $tree_artifact_id && -n $package_artifact_id ]] || continue
+                gh api "/repos/$REPOSITORY/actions/artifacts/$tree_artifact_id/zip" >"$RUNNER_TEMP/validated-tree.zip"
+                validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
+                if [[ $validated_tree == "$current_tree" ]]; then
+                  merged_pr=true
+                  validated_run_id=$run_id
+                  run_docker_e2e=false
+                  break
+                fi
+              done < <(jq -r --arg head "$head_sha" '
+                .workflow_runs[] |
+                select(.head_sha == $head and .conclusion == "success") |
+                .id
+              ' <<<"$runs")
+            fi
           fi
-          echo "merged_pr=$merged_pr" >>"$GITHUB_OUTPUT"
+
+          {
+            echo "merged_pr=$merged_pr"
+            echo "validated_run_id=$validated_run_id"
+            echo "run_docker_e2e=$run_docker_e2e"
+          } >>"$GITHUB_OUTPUT"
 
   checks:
-    needs: classify_push
-    if: ${{ always() }}
+    needs: classify
+    if: needs.classify.outputs.merged_pr != 'true'
     runs-on: ubuntu-24.04
-    env:
-      RUN_QUALITY_CHECKS: ${{ github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,7 +101,8 @@ jobs:
           components: clippy,rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
-          cache-on-failure: ${{ needs.classify_push.outputs.merged_pr == 'true' }}
+          shared-key: checks
+          save-if: ${{ github.event_name == 'push' }}
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -85,24 +111,24 @@ jobs:
       - run: npm ci
         working-directory: web
       - run: npm run check
-        if: env.RUN_QUALITY_CHECKS == 'true'
         working-directory: web
       - run: npm run test
-        if: env.RUN_QUALITY_CHECKS == 'true'
         working-directory: web
       - run: npm run build
         working-directory: web
       - run: cargo fmt --check
-        if: env.RUN_QUALITY_CHECKS == 'true'
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-        if: env.RUN_QUALITY_CHECKS == 'true'
-      - run: cargo test --all-targets --all-features -- --test-threads=2
-        if: env.RUN_QUALITY_CHECKS == 'true'
+      - name: Lint all non-Docker targets
+        run: cargo clippy --features embed-ui --all-targets -- -D warnings
+      - name: Test all non-Docker targets
+        run: cargo test --features embed-ui --all-targets -- --test-threads=2
       - run: cargo build --release --locked --features embed-ui
       - run: chmod +x scripts/smoke-embedded-http.sh && scripts/smoke-embedded-http.sh target/release/solodock
       - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update packaging/smoke-test.sh && packaging/smoke-test.sh
       - run: chmod +x packaging/verify-unit.sh && packaging/verify-unit.sh
-      - name: Measure control-plane resource baseline
+      - name: Measure short control-plane resource smoke
+        env:
+          SOLODOCK_MEASURE_WARMUP_SECONDS: "1"
+          SOLODOCK_MEASURE_SAMPLE_SECONDS: "5"
         run: |
           chmod +x scripts/measure-resources.sh
           scripts/measure-resources.sh target/release/solodock "$RUNNER_TEMP/resource-report.json"
@@ -121,6 +147,7 @@ jobs:
           path: |
             ${{ runner.temp }}/solodock-package
             ${{ runner.temp }}/resource-report.json
+          retention-days: 30
       - name: Record validated source tree
         if: github.event_name == 'pull_request'
         run: git rev-parse 'HEAD^{tree}' >"$RUNNER_TEMP/validated-tree"
@@ -130,10 +157,33 @@ jobs:
           name: solodock-validated-tree
           path: ${{ runner.temp }}/validated-tree
           if-no-files-found: error
+          retention-days: 30
+
+  reuse-validated-package:
+    needs: classify
+    if: needs.classify.outputs.merged_pr == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: solodock-embedded-package
+          path: ${{ runner.temp }}/validated-package
+          repository: ${{ github.repository }}
+          run-id: ${{ needs.classify.outputs.validated_run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solodock-embedded-package
+          path: ${{ runner.temp }}/validated-package
+          if-no-files-found: error
+          retention-days: 30
 
   docker-e2e:
-    needs: classify_push
-    if: ${{ always() && (github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true') }}
+    needs: [classify, checks]
+    if: needs.classify.outputs.run_docker_e2e == 'true'
     runs-on: ubuntu-24.04
     services:
       docker:
@@ -154,10 +204,16 @@ jobs:
       DOCKER_HOST: tcp://127.0.0.1:2375
       SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
       SOLODOCK_E2E_SHARED_FIXTURE_ROOT: ${{ github.workspace }}/.solodock-e2e-fixtures
+      SOLODOCK_E2E_STREAM_HOLD_SECONDS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+          save-if: false
+      - name: Lint Docker E2E target
+        run: cargo clippy --features docker-e2e --test docker_e2e -- -D warnings
       - name: Assert Docker 27 classic image store
         run: |
           driver_status=$(docker info --format '{{json .DriverStatus}}')
@@ -169,13 +225,13 @@ jobs:
       - run: docker pull nginx:1.27-alpine
       - run: docker pull nginxinc/nginx-unprivileged:1.27-alpine
       - run: docker pull registry:2
-      - name: Run isolated Docker E2E with separate daemon sampling
+      - name: Run isolated Docker E2E with short resource smoke
         env:
           SOLODOCK_E2E_RESOURCE_REPORT: ${{ runner.temp }}/docker-e2e-resource-report.json
         run: |
           chmod +x scripts/measure-dind-daemon.sh
           scripts/measure-dind-daemon.sh '${{ job.services.docker.id }}' "$RUNNER_TEMP/docker-daemon-resource-report.json" -- \
-            cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2
+            cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2 --skip containerd_
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -184,10 +240,11 @@ jobs:
             ${{ runner.temp }}/docker-e2e-resource-report.json
             ${{ runner.temp }}/docker-daemon-resource-report.json
           if-no-files-found: error
+          retention-days: 14
 
   docker-containerd-e2e:
-    needs: classify_push
-    if: ${{ always() && (github.event_name == 'pull_request' || needs.classify_push.outputs.merged_pr != 'true') }}
+    needs: [classify, checks]
+    if: needs.classify.outputs.run_docker_e2e == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     services:
@@ -211,6 +268,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+          save-if: false
       - name: Assert Docker 29 containerd image store
         run: |
           driver_status=$(docker info --format '{{json .DriverStatus}}')
@@ -220,7 +280,7 @@ jobs:
           fi
       - run: docker pull postgres:16-alpine
       - run: docker pull alpine:3.20
-      - name: Run focused containerd identity deployment
+      - name: Run containerd identity and compensation suite
         run: >-
           cargo test --features docker-e2e --test docker_e2e
           containerd_ --

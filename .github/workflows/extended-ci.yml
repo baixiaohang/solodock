@@ -1,0 +1,140 @@
+name: Extended CI
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-ci
+  cancel-in-progress: false
+
+jobs:
+  control-plane-resources:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: cargo build --release --locked --features embed-ui
+      - name: Measure full control-plane resource baseline
+        run: |
+          chmod +x scripts/measure-resources.sh
+          scripts/measure-resources.sh target/release/solodock "$RUNNER_TEMP/resource-report.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: solodock-control-plane-resource-baseline
+          path: ${{ runner.temp }}/resource-report.json
+          if-no-files-found: error
+          retention-days: 30
+
+  docker-resources:
+    runs-on: ubuntu-24.04
+    services:
+      docker:
+        image: docker:27-dind
+        env:
+          DOCKER_TLS_CERTDIR: ""
+        ports:
+          - 2375:2375
+          - 5000:5000
+        options: >-
+          --privileged
+          --volume ${{ github.workspace }}:${{ github.workspace }}
+          --health-cmd "docker info"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_E2E_SHARED_FIXTURE_ROOT: ${{ github.workspace }}/.solodock-e2e-fixtures
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+          save-if: false
+      - name: Assert Docker 27 classic image store
+        run: |
+          driver_status=$(docker info --format '{{json .DriverStatus}}')
+          if [[ $driver_status == *io.containerd.snapshotter.v1* ]]; then
+            echo "expected classic image store, got: $driver_status" >&2
+            exit 1
+          fi
+      - run: docker pull alpine:3.20
+      - run: docker pull nginx:1.27-alpine
+      - run: docker pull registry:2
+      - name: Measure full Docker and stream resource baseline
+        env:
+          SOLODOCK_E2E_RESOURCE_REPORT: ${{ runner.temp }}/docker-e2e-resource-report.json
+        run: |
+          chmod +x scripts/measure-dind-daemon.sh
+          scripts/measure-dind-daemon.sh '${{ job.services.docker.id }}' "$RUNNER_TEMP/docker-daemon-resource-report.json" -- \
+            cargo test --features docker-e2e --test docker_e2e production_m5_polling_digest_deploy_auto_rollback_and_manual_rollback -- --ignored --nocapture --test-threads=1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: solodock-docker-resource-baseline
+          path: |
+            ${{ runner.temp }}/docker-e2e-resource-report.json
+            ${{ runner.temp }}/docker-daemon-resource-report.json
+          if-no-files-found: error
+          retention-days: 30
+
+  docker-containerd-full:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      docker:
+        image: docker:29.7.2-dind
+        env:
+          DOCKER_TLS_CERTDIR: ""
+        ports:
+          - 2375:2375
+        options: >-
+          --privileged
+          --health-cmd "docker info"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
+      SOLODOCK_EXPECT_CONTAINERD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: checks
+          save-if: false
+      - name: Assert Docker 29 containerd image store
+        run: |
+          driver_status=$(docker info --format '{{json .DriverStatus}}')
+          if [[ $driver_status != *io.containerd.snapshotter.v1* ]]; then
+            echo "expected io.containerd.snapshotter.v1, got: $driver_status" >&2
+            exit 1
+          fi
+      - run: docker pull postgres:16-alpine
+      - run: docker pull alpine:3.20
+      - name: Run full containerd identity and compensation suite
+        run: >-
+          cargo test --features docker-e2e --test docker_e2e
+          containerd_ --
+          --ignored --nocapture --test-threads=1

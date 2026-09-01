@@ -8,7 +8,7 @@
 
 Webhook ingress 固定为 1 KiB body、16 concurrent、bounded global/per-app rate buckets 和每应用一个 coalesced wake sequence；资源验收沿用 control-plane/DinD 上限，并覆盖 burst 后 replay rows、rate map 与 inflight permit 回落，不把通知数量转换为内存队列。
 
-每次正式验收需记录 kernel、CPU/memory cgroup limit、Rust/Node版本、commit、warm-up/采样窗口、binary size、RSS/CPU/FD/task、Docker daemon峰值以及是否 DinD。CI 产出三份机器可读报告：`resource-report.json` 使用 production embedded binary 完成 60 秒 warm-up 与 60 秒 idle CPU 采样；`docker-e2e-resource-report.json` 在完整 private Registry/DinD 自动部署、健康失败恢复、人工回滚与数据 canary 场景中，将 8 条 authenticated SSE（4 events、2 logs、2 stats）保持 60 秒，并在窗口末端记录 stream 增量、control-plane 峰值和 metadata 大小；`docker-daemon-resource-report.json` 从外层隔离 DinD 容器内按 process name 定位 `dockerd` 并持续读取其 `/proc/<pid>/status`，单独记录 daemon RSS 峰值。JSON 显式记录 `stream_hold_seconds` 与采样时点；本地定向调试可通过 `SOLODOCK_E2E_STREAM_HOLD_SECONDS=1..60` 缩短，但正式默认与 CI 不设置该变量，固定为 60 秒。它们仍是“本地/CI实测，不代表腾讯云实测”。不得设置可能在恢复阶段杀进程的 `MemoryMax`。
+每次正式验收需记录 kernel、CPU/memory cgroup limit、Rust/Node版本、commit、warm-up/采样窗口、binary size、RSS/CPU/FD/task、Docker daemon峰值以及是否 DinD。每周一及手动触发的 `Extended CI` 产出三份正式机器可读报告：`resource-report.json` 使用 production embedded binary 完成 60 秒 warm-up 与 60 秒 idle CPU 采样；`docker-e2e-resource-report.json` 在完整 private Registry/DinD 自动部署、健康失败恢复、人工回滚与数据 canary 场景中，将 8 条 authenticated SSE（4 events、2 logs、2 stats）保持 60 秒，并在窗口末端记录 stream 增量、control-plane 峰值和 metadata 大小；`docker-daemon-resource-report.json` 从外层隔离 DinD 容器内按 process name 定位 `dockerd` 并持续读取其 `/proc/<pid>/status`，单独记录 daemon RSS 峰值。JSON 显式记录 `stream_hold_seconds` 与采样时点；普通 PR/package artifact 使用 1 秒 warm-up、5 秒 idle sample 和 1 秒 SSE hold，只用于快速检查进程存活、宽 RSS ceiling 与 StreamGate 释放，不作为正式基线。它们仍是“本地/CI实测，不代表腾讯云实测”。不得设置可能在恢复阶段杀进程的 `MemoryMax`。
 
 ## 本地基线
 
