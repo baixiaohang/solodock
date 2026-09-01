@@ -20,9 +20,10 @@ installer 同时安装 `/usr/local/bin/solodock-update`。私有仓库需要先�
 
 ```bash
 gh auth login --hostname github.com
-sudo -v
 solodock-update
 ```
+
+updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交互终端提示一次。无 TTY 且未配置非交互 `sudo` 的调用会在修改服务前失败。
 
 updater 只选择目标分支最新一次成功的 `push` CI，下载 `solodock-embedded-package` 并校验包内 `SHA256SUMS`。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
 
