@@ -1,5 +1,7 @@
 #![cfg(feature = "docker-e2e")]
 
+mod support;
+
 use std::{
     collections::HashMap,
     os::unix::fs::PermissionsExt,
@@ -46,7 +48,6 @@ use solodock::{
     AppState,
     api::{deployments::M4Services, mutations::M3Services},
     app_store::AppStore,
-    auth::AuthService,
     compose::{
         ComposeAction, ComposeCapability, ComposeError, ComposeOutput, ComposeRunner,
         FixedComposeRunner, RunContext,
@@ -376,22 +377,14 @@ impl MutationHarness {
         let database = Database::open(&state_directory.join("state.sqlite3"))
             .await
             .unwrap();
-        let auth = AuthService::new(database.clone(), runtime_directory.join("bootstrap.token"));
-        assert!(auth.prepare_bootstrap().await.unwrap());
-        let token = std::fs::read_to_string(runtime_directory.join("bootstrap.token")).unwrap();
-        auth.bootstrap(token, "correct horse battery".into(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let login = auth
-            .login("admin", "correct horse battery".into(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let cookie = format!(
-            "__Host-solodock_session={}; __Host-solodock_csrf={}",
-            login.session_token.expose(),
-            login.csrf_token.expose()
-        );
-        let csrf = login.csrf_token.expose().to_owned();
+        let test_auth = support::seed_authenticated_session(
+            &database,
+            runtime_directory.join("bootstrap.token"),
+        )
+        .await;
+        let auth = test_auth.service;
+        let cookie = test_auth.cookie;
+        let csrf = test_auth.csrf;
         let idempotency =
             IdempotencyService::initialize(database.clone(), &state_directory).unwrap();
         let store = AppStore::initialize_managed(
