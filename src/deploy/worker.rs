@@ -297,14 +297,22 @@ impl DeploymentEngine {
             crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                 .map_err(|_| EngineError::Stable("BIND_CHANGED"))?;
         }
-        let compose_result = self
-            .compose
-            .run(
-                ComposeAction::DeployCandidate,
-                self.context(record.app_id, candidate_id)?,
-            )
-            .await;
-        if let Err(error) = compose_result {
+        let predecessor_context = record
+            .expected_actual_release_id
+            .map(|release| self.context(record.app_id, release))
+            .transpose()?;
+        let compose_result = deploy_candidate_after_predecessor(
+            self.compose.as_ref(),
+            predecessor_context,
+            self.context(record.app_id, candidate_id)?,
+        )
+        .await;
+        if matches!(compose_result, Err(SequencedComposeError::Stop)) {
+            self.restore_predecessor(&record, predecessor.as_ref())
+                .await?;
+            return Err(EngineError::Interrupted);
+        }
+        if let Err(SequencedComposeError::Apply(error)) = compose_result {
             if matches!(error, ComposeError::Cancelled) {
                 return Err(EngineError::Interrupted);
             }
@@ -335,10 +343,16 @@ impl DeploymentEngine {
                             | ComposeError::UnsafePath
                     ) =>
                 {
+                    self.restore_predecessor(&record, predecessor.as_ref())
+                        .await?;
                     self.cleanup_pending(record.app_id, candidate_id)?;
                     Err(EngineError::Stable(error.public_code()))
                 }
-                FailedApplyObservation::NoEffect => Err(EngineError::Interrupted),
+                FailedApplyObservation::NoEffect => {
+                    self.restore_predecessor(&record, predecessor.as_ref())
+                        .await?;
+                    Err(EngineError::Interrupted)
+                }
             };
         }
         self.test_candidate_boundary().await?;
@@ -1202,18 +1216,21 @@ impl DeploymentEngine {
             crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
                 .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
         }
-        self.compose
-            .run(
-                ComposeAction::DeployCandidate,
-                self.context(record.app_id, old_id)?,
-            )
-            .await
-            .map_err(|error| match error {
+        rollback_candidate_to_predecessor(
+            self.compose.as_ref(),
+            self.context(record.app_id, candidate)?,
+            self.context(record.app_id, old_id)?,
+        )
+        .await
+        .map_err(|error| match error {
+            SequencedComposeError::Stop => EngineError::NeedsAttention("ROLLBACK_FAILED"),
+            SequencedComposeError::Apply(
                 ComposeError::ValidationFailed
                 | ComposeError::OutputInvalid
-                | ComposeError::UnsafePath => EngineError::NeedsAttention("ROLLBACK_FAILED"),
-                _ => EngineError::Interrupted,
-            })?;
+                | ComposeError::UnsafePath,
+            ) => EngineError::NeedsAttention("ROLLBACK_FAILED"),
+            SequencedComposeError::Apply(_) => EngineError::Interrupted,
+        })?;
         let container = self
             .observe_owned_candidate(record.app_id, old_id, Some(&fresh_candidate.id))
             .await?;
@@ -1262,17 +1279,43 @@ impl DeploymentEngine {
     }
 
     fn context(&self, app_id: Uuid, release: Uuid) -> Result<RunContext, EngineError> {
-        let metadata = self
-            .store
-            .read_metadata(app_id)
-            .map_err(|_| EngineError::Interrupted)?;
-        Ok(RunContext {
-            project_name: metadata.resource_names().project_name,
-            project_directory: self.store.app_directory(app_id),
-            compose_file: self.store.release_compose_path(app_id, release),
-            timeout: Duration::from_secs(60),
-            redaction_patterns: Vec::new(),
-        })
+        release_run_context(&self.store, app_id, release)
+    }
+
+    async fn restore_predecessor(
+        &self,
+        record: &DeploymentRecord,
+        predecessor: Option<&ContainerRecord>,
+    ) -> Result<(), EngineError> {
+        let Some(predecessor) = predecessor else {
+            return Ok(());
+        };
+        if predecessor.status == ContainerStatus::Exited {
+            return Ok(());
+        }
+        let release_id = record
+            .expected_actual_release_id
+            .ok_or(EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        self.compose
+            .run(
+                ComposeAction::Start,
+                self.context(record.app_id, release_id)?,
+            )
+            .await
+            .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        let restored = self
+            .preflight(
+                record.app_id,
+                Some(release_id),
+                Some(predecessor.id.as_str()),
+            )
+            .await
+            .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?
+            .ok_or(EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        if restored.status != ContainerStatus::Running {
+            return Err(EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"));
+        }
+        Ok(())
     }
 
     async fn validate_runtime_paths_fresh(
@@ -1315,6 +1358,66 @@ impl DeploymentEngine {
     }
 }
 
+fn release_run_context(
+    store: &AppStore,
+    app_id: Uuid,
+    release: Uuid,
+) -> Result<RunContext, EngineError> {
+    let metadata = store
+        .read_metadata(app_id)
+        .map_err(|_| EngineError::Interrupted)?;
+    let stop_grace_period_seconds = store
+        .load_v2_release(app_id, release)
+        .map_err(|_| EngineError::Interrupted)?
+        .stop_grace_period_seconds;
+    Ok(RunContext {
+        project_name: metadata.resource_names().project_name,
+        project_directory: store.app_directory(app_id),
+        compose_file: store.release_compose_path(app_id, release),
+        timeout: Duration::from_secs(u64::from(stop_grace_period_seconds) + 60),
+        stop_grace_period_seconds,
+        redaction_patterns: Vec::new(),
+    })
+}
+
+#[derive(Debug)]
+enum SequencedComposeError {
+    Stop,
+    Apply(ComposeError),
+}
+
+async fn deploy_candidate_after_predecessor(
+    compose: &dyn ComposeRunner,
+    predecessor: Option<RunContext>,
+    candidate: RunContext,
+) -> Result<crate::compose::ComposeOutput, SequencedComposeError> {
+    if let Some(predecessor) = predecessor {
+        compose
+            .run(ComposeAction::Stop, predecessor)
+            .await
+            .map_err(|_| SequencedComposeError::Stop)?;
+    }
+    compose
+        .run(ComposeAction::DeployCandidate, candidate)
+        .await
+        .map_err(SequencedComposeError::Apply)
+}
+
+async fn rollback_candidate_to_predecessor(
+    compose: &dyn ComposeRunner,
+    candidate: RunContext,
+    predecessor: RunContext,
+) -> Result<crate::compose::ComposeOutput, SequencedComposeError> {
+    compose
+        .run(ComposeAction::Stop, candidate)
+        .await
+        .map_err(|_| SequencedComposeError::Stop)?;
+    compose
+        .run(ComposeAction::DeployCandidate, predecessor)
+        .await
+        .map_err(SequencedComposeError::Apply)
+}
+
 async fn record_terminal_error(ledger: &DeploymentLedger, deployment_id: Uuid, error: EngineError) {
     let (status, code) = match error {
         EngineError::Interrupted => (DeploymentStatus::Interrupted, "DEPLOYMENT_INTERRUPTED"),
@@ -1345,6 +1448,10 @@ async fn remove_first_deploy_candidate(
     context: RunContext,
 ) -> Result<(), EngineError> {
     let project_name = context.project_name.clone();
+    compose
+        .run(ComposeAction::Stop, context.clone())
+        .await
+        .map_err(|_| EngineError::NeedsAttention("CANDIDATE_CLEANUP_FAILED"))?;
     compose
         .run(ComposeAction::Remove, context)
         .await
@@ -1460,7 +1567,10 @@ mod tests {
     use std::{
         collections::HashMap,
         os::unix::fs::PermissionsExt,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use super::*;
@@ -1480,6 +1590,7 @@ mod tests {
         ReleaseV2 {
             schema_version: 3,
             compose_schema_version: 2,
+            stop_grace_period_seconds: 10,
             id: Uuid::new_v4(),
             app_id: Uuid::new_v4(),
             config_revision: Uuid::new_v4(),
@@ -1525,6 +1636,95 @@ mod tests {
         }
     }
 
+    fn context(stop_grace_period_seconds: u16) -> RunContext {
+        RunContext {
+            project_name: "solodock-example".into(),
+            project_directory: "/var/lib/solodock/apps/example".into(),
+            compose_file: format!("/var/lib/solodock/{stop_grace_period_seconds}.yaml").into(),
+            timeout: Duration::from_secs(u64::from(stop_grace_period_seconds) + 60),
+            stop_grace_period_seconds,
+            redaction_patterns: Vec::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCompose {
+        calls: Mutex<Vec<(ComposeAction, u16)>>,
+        fail_at: Mutex<Option<usize>>,
+    }
+
+    impl RecordingCompose {
+        fn failing_at(call: usize) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                fail_at: Mutex::new(Some(call)),
+            }
+        }
+
+        fn calls(&self) -> Vec<(ComposeAction, u16)> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ComposeRunner for RecordingCompose {
+        async fn run(
+            &self,
+            action: ComposeAction,
+            context: RunContext,
+        ) -> Result<ComposeOutput, ComposeError> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push((action, context.stop_grace_period_seconds));
+            let call = calls.len();
+            drop(calls);
+            if *self.fail_at.lock().unwrap() == Some(call) {
+                *self.fail_at.lock().unwrap() = None;
+                Err(ComposeError::UnknownEffect)
+            } else {
+                Ok(ComposeOutput {
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_stops_predecessor_with_its_grace_before_candidate_apply() {
+        let compose = RecordingCompose::default();
+        deploy_candidate_after_predecessor(&compose, Some(context(60)), context(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            compose.calls(),
+            vec![
+                (ComposeAction::Stop, 60),
+                (ComposeAction::DeployCandidate, 10),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_candidate_is_stopped_with_its_grace_before_predecessor_restore() {
+        let compose = RecordingCompose::failing_at(2);
+        assert!(matches!(
+            deploy_candidate_after_predecessor(&compose, Some(context(10)), context(60)).await,
+            Err(SequencedComposeError::Apply(ComposeError::UnknownEffect))
+        ));
+        rollback_candidate_to_predecessor(&compose, context(60), context(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            compose.calls(),
+            vec![
+                (ComposeAction::Stop, 10),
+                (ComposeAction::DeployCandidate, 60),
+                (ComposeAction::Stop, 60),
+                (ComposeAction::DeployCandidate, 10),
+            ]
+        );
+    }
+
     #[test]
     fn release_matcher_covers_noop_candidate_health_and_rollback_identity() {
         let release = release();
@@ -1555,9 +1755,114 @@ mod tests {
         assert!(!candidate_matches_release(&paused, &release));
     }
 
+    #[test]
+    fn run_context_uses_each_stopped_release_grace_period() {
+        let root = tempfile::tempdir().unwrap();
+        let apps = root.path().join("apps");
+        std::fs::create_dir(&apps).unwrap();
+        std::fs::set_permissions(&apps, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = vec![9; 32];
+        let store = AppStore::initialize_verified(apps, key.clone()).unwrap();
+        let app_id = Uuid::new_v4();
+        let first_revision = Uuid::new_v4();
+        let draft = |stop_grace_period_seconds| {
+            crate::domain::normalize_draft(
+                crate::domain::DraftInput {
+                    display_name: "Example".into(),
+                    discovery_image_ref: "registry.example/app:stable".into(),
+                    credential_ref: None,
+                    auto_deploy_enabled: false,
+                    auto_deploy_acknowledged: false,
+                    poll_interval_seconds: 300,
+                    stop_grace_period_seconds,
+                    environment: Default::default(),
+                    files: vec![],
+                    ports: vec![],
+                    volumes: vec![],
+                    binds: vec![],
+                    owned_default_network: true,
+                    networks: vec![],
+                    health: Default::default(),
+                },
+                &Default::default(),
+                &key,
+                &[],
+            )
+            .unwrap()
+        };
+        let mut metadata = store
+            .create_app(
+                app_id,
+                "example",
+                first_revision,
+                Uuid::new_v4(),
+                &draft(10),
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let resolved = crate::registry::ResolvedImage {
+            source_image_ref: "registry.example/app:stable".into(),
+            logical_registry: "registry.example".into(),
+            repository: "app".into(),
+            source_tag: "stable".into(),
+            source_descriptor_digest: digest.clone(),
+            index_digest: None,
+            manifest_digest: digest.clone(),
+            runnable_image_ref: format!("registry.example/app@{digest}"),
+            platform: crate::registry::Platform::canonical("linux", "amd64", None).unwrap(),
+            local_image_id: digest,
+        };
+        let predecessor = Uuid::new_v4();
+        store
+            .publish_v2_release(
+                &metadata,
+                predecessor,
+                &resolved,
+                ReleaseTrigger::Manual,
+                None,
+            )
+            .unwrap();
+        let candidate_revision = Uuid::new_v4();
+        metadata = store
+            .update_draft(
+                app_id,
+                first_revision,
+                candidate_revision,
+                Uuid::new_v4(),
+                &draft(60),
+                time::OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let candidate = Uuid::new_v4();
+        store
+            .publish_v2_release(
+                &metadata,
+                candidate,
+                &resolved,
+                ReleaseTrigger::Manual,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            release_run_context(&store, app_id, predecessor)
+                .unwrap()
+                .stop_grace_period_seconds,
+            10
+        );
+        assert_eq!(
+            release_run_context(&store, app_id, candidate)
+                .unwrap()
+                .stop_grace_period_seconds,
+            60
+        );
+    }
+
     struct CleanupCompose {
         fail_remove: bool,
         calls: AtomicUsize,
+        actions: Mutex<Vec<(ComposeAction, u16)>>,
     }
 
     #[async_trait::async_trait]
@@ -1567,9 +1872,12 @@ mod tests {
             action: ComposeAction,
             _context: RunContext,
         ) -> Result<ComposeOutput, ComposeError> {
-            assert_eq!(action, ComposeAction::Remove);
+            self.actions
+                .lock()
+                .unwrap()
+                .push((action, _context.stop_grace_period_seconds));
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.fail_remove {
+            if action == ComposeAction::Remove && self.fail_remove {
                 Err(ComposeError::UnknownEffect)
             } else {
                 Ok(ComposeOutput {
@@ -1700,6 +2008,7 @@ mod tests {
             project_directory: app_directory,
             compose_file: store.release_compose_path(app_id, candidate),
             timeout: Duration::from_secs(60),
+            stop_grace_period_seconds: 10,
             redaction_patterns: Vec::new(),
         };
         CleanupFixture {
@@ -1727,6 +2036,7 @@ mod tests {
         let compose = CleanupCompose {
             fail_remove,
             calls: AtomicUsize::new(0),
+            actions: Mutex::new(Vec::new()),
         };
         let docker = CleanupDocker {
             observation,
@@ -1772,7 +2082,7 @@ mod tests {
             Some(fixture.candidate),
             "{name}: cleanup failure must retain pending"
         );
-        assert_eq!(compose.calls.load(Ordering::SeqCst), 1, "{name}");
+        assert_eq!(compose.calls.load(Ordering::SeqCst), 2, "{name}");
         assert_eq!(
             docker.list_calls.load(Ordering::SeqCst),
             expected_list_calls,
@@ -1821,6 +2131,7 @@ mod tests {
         let compose = CleanupCompose {
             fail_remove: false,
             calls: AtomicUsize::new(0),
+            actions: Mutex::new(Vec::new()),
         };
         let docker = CleanupDocker {
             observation: CleanupObservation::Containers(Vec::new()),
@@ -1837,6 +2148,10 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(
+            *compose.actions.lock().unwrap(),
+            vec![(ComposeAction::Stop, 10), (ComposeAction::Remove, 10)]
+        );
         assert_eq!(
             fixture
                 .store

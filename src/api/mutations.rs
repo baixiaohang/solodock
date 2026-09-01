@@ -87,6 +87,7 @@ struct AppMutationDetail {
     config_revision: Uuid,
     config_sha256: String,
     desired_state: crate::domain::DesiredState,
+    stop_grace_period_seconds: u16,
     deployment_status: &'static str,
     warnings: Vec<&'static str>,
 }
@@ -365,19 +366,16 @@ pub async fn update_draft(
             Ok(loaded) => loaded,
             Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
         };
-        let draft = match normalize_draft(
-            loaded.input(
-                current_metadata.display_name.clone(),
-                current_metadata.discovery_image_ref.clone(),
-                current_metadata.credential_ref,
-                current_metadata.auto_deploy_enabled,
-                current_metadata.poll_interval_seconds,
-            ),
-            &loaded.secrets,
+        let draft = match loaded.normalize_verified(
+            current_metadata.display_name.clone(),
+            current_metadata.discovery_image_ref.clone(),
+            current_metadata.credential_ref,
+            current_metadata.auto_deploy_enabled,
+            current_metadata.poll_interval_seconds,
             &services.idempotency.fingerprint(b"config"),
             &services.allowed_bind_roots,
         ) {
-            Ok(draft) if draft.metadata == loaded.metadata => draft,
+            Ok(draft) => draft,
             _ => return interrupt_internal(services, &route, raw_key, request_id).await,
         };
         let projection_warning = refresh(&state, services).await;
@@ -596,6 +594,7 @@ pub async fn validate(
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: &revision_directory,
                 draft: &draft,
+                include_stop_grace_period: true,
             },
             false,
         )
@@ -626,6 +625,7 @@ pub async fn validate(
                 project_directory: temp.clone(),
                 compose_file: file,
                 timeout: compose_timeout,
+                stop_grace_period_seconds: draft.stop_grace_period_seconds,
                 redaction_patterns: draft.known_secrets(),
             },
         )
@@ -705,6 +705,7 @@ fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> App
         config_revision: metadata.draft_revision,
         config_sha256: metadata.draft_config_sha256.clone(),
         desired_state: metadata.desired_state,
+        stop_grace_period_seconds: draft.stop_grace_period_seconds,
         deployment_status: "DEPLOY_REQUIRED",
         warnings: if draft.binds.iter().any(|bind| !bind.readonly) || !draft.volumes.is_empty() {
             vec!["DATA_NOT_ROLLED_BACK"]
@@ -1331,7 +1332,6 @@ async fn lifecycle(
         ClaimResult::Resume(id) => (id, true),
         _ => unreachable!(),
     };
-    let operation_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let _app_guard = match services.coordinator.try_app(app_id) {
         Ok(guard) => guard,
         Err(_) => {
@@ -1390,6 +1390,8 @@ async fn lifecycle(
     }
     let active_release = verified.release_id;
     let active_metadata = verified.loaded.metadata.clone();
+    let operation_deadline = tokio::time::Instant::now()
+        + Duration::from_secs((u64::from(active_metadata.stop_grace_period_seconds) + 30).max(60));
     if let Err(code) = validate_runtime_paths(state, services, &active_metadata).await {
         return finish_error(
             services,
@@ -1672,6 +1674,10 @@ async fn lifecycle(
                     project_directory: services.store.app_directory(app_id),
                     compose_file: final_active.compose_file,
                     timeout: compose_timeout,
+                    stop_grace_period_seconds: final_active
+                        .loaded
+                        .metadata
+                        .stop_grace_period_seconds,
                     redaction_patterns: Vec::new(),
                 },
             )
@@ -2091,7 +2097,6 @@ pub async fn delete_app(
         ClaimResult::Resume(id) => (id, true),
         ClaimResult::Replay { .. } => unreachable!(),
     };
-    let operation_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let _catalog = services.coordinator.catalog_lock().await;
     let _guard = match services.coordinator.try_app(app_id) {
         Ok(guard) => guard,
@@ -2325,6 +2330,10 @@ pub async fn delete_app(
                 .await;
             }
         };
+        let operation_deadline = tokio::time::Instant::now()
+            + Duration::from_secs(
+                (u64::from(active.loaded.metadata.stop_grace_period_seconds) + 30).max(60),
+            );
         let _compose = match services.coordinator.try_compose() {
             Ok(guard) => guard,
             Err(_) => {
@@ -2435,20 +2444,27 @@ pub async fn delete_app(
                     .await;
                 }
             };
-        if let Err(error) = services
+        let remove_context = RunContext {
+            project_name: final_active.app.project_name,
+            project_directory: services.store.app_directory(app_id),
+            compose_file: final_active.compose_file,
+            timeout: compose_timeout,
+            stop_grace_period_seconds: final_active.loaded.metadata.stop_grace_period_seconds,
+            redaction_patterns: Vec::new(),
+        };
+        let stop_result = services
             .compose
-            .run(
-                ComposeAction::Remove,
-                RunContext {
-                    project_name: final_active.app.project_name,
-                    project_directory: services.store.app_directory(app_id),
-                    compose_file: final_active.compose_file,
-                    timeout: compose_timeout,
-                    redaction_patterns: Vec::new(),
-                },
-            )
-            .await
-        {
+            .run(ComposeAction::Stop, remove_context.clone())
+            .await;
+        let remove_result = if stop_result.is_ok() {
+            services
+                .compose
+                .run(ComposeAction::Remove, remove_context)
+                .await
+        } else {
+            stop_result
+        };
+        if let Err(error) = remove_result {
             let _ = error;
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
@@ -2569,16 +2585,21 @@ fn verify_active_compose(
     if app.active_config_sha256.as_deref() != Some(loaded.metadata.config_sha256.as_str()) {
         return Err(());
     }
-    let draft = normalize_draft(
-        current_draft_input(app, loaded),
-        &loaded.secrets,
-        &services.idempotency.fingerprint(b"config"),
-        &services.allowed_bind_roots,
-    )
-    .map_err(|_| ())?;
-    if draft.metadata != loaded.metadata {
-        return Err(());
-    }
+    let release = services
+        .store
+        .load_v2_release(app.id, release_id)
+        .map_err(|_| ())?;
+    let draft = loaded
+        .normalize_verified(
+            app.display_name.clone(),
+            release.source_image_ref.clone(),
+            release.credential_ref,
+            app.auto_deploy_enabled,
+            app.poll_interval_seconds,
+            &services.idempotency.fingerprint(b"config"),
+            &services.allowed_bind_roots,
+        )
+        .map_err(|_| ())?;
     let revision_directory = services
         .store
         .app_directory(app.id)
@@ -2592,6 +2613,7 @@ fn verify_active_compose(
             image_ref: image,
             revision_directory: &revision_directory,
             draft: &draft,
+            include_stop_grace_period: release.compose_schema_version >= 3,
         },
         true,
     )
@@ -3698,6 +3720,7 @@ mod tests {
     fn external_only_metadata() -> crate::domain::ConfigMetadata {
         crate::domain::ConfigMetadata {
             schema_version: 1,
+            stop_grace_period_seconds: 10,
             public_env_keys: vec![],
             secret_keys: vec![],
             secret_hmacs: Default::default(),
@@ -3874,6 +3897,7 @@ mod tests {
         );
         let metadata = crate::domain::ConfigMetadata {
             schema_version: 1,
+            stop_grace_period_seconds: 10,
             public_env_keys: vec![],
             secret_keys: vec![],
             secret_hmacs: Default::default(),

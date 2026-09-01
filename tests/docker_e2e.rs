@@ -1408,6 +1408,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
             environment: solodock::domain::EnvironmentInput::default(),
             files: vec![],
             ports: vec![],
@@ -1455,6 +1456,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
             image_ref: &pinned,
             revision_directory: &revision_directory,
             draft: &draft,
+            include_stop_grace_period: true,
         },
         true,
     )
@@ -1474,6 +1476,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         project_directory: project.path().to_owned(),
         compose_file: compose_file.clone(),
         timeout: Duration::from_secs(60),
+        stop_grace_period_seconds: 10,
         redaction_patterns: vec![],
     };
     let result: Result<(), String> = async {
@@ -1509,6 +1512,10 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         if target.len() != 1 {
             return Err("expected one exact compose-owned target".into());
         }
+        runner
+            .run(ComposeAction::Stop, context())
+            .await
+            .map_err(|error| error.to_string())?;
         runner
             .run(ComposeAction::Remove, context())
             .await
@@ -1578,6 +1585,10 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         {
             return Err("recreated owned network changed its bridge identity".into());
         }
+        runner
+            .run(ComposeAction::Stop, context())
+            .await
+            .map_err(|error| format!("stop recreated compose container: {error}"))?;
         runner
             .run(ComposeAction::Remove, context())
             .await

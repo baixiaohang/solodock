@@ -22,6 +22,8 @@ pub const MAX_FILE_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigMetadata {
     pub schema_version: u32,
+    #[serde(default = "default_stop_grace_period_seconds")]
+    pub stop_grace_period_seconds: u16,
     pub public_env_keys: Vec<String>,
     pub secret_keys: Vec<String>,
     pub secret_hmacs: BTreeMap<String, String>,
@@ -55,6 +57,7 @@ pub struct NormalizedDraft {
     pub auto_deploy_enabled: bool,
     pub auto_deploy_acknowledged: bool,
     pub poll_interval_seconds: u32,
+    pub stop_grace_period_seconds: u16,
     pub public_environment: Vec<PublicEnvInput>,
     pub secret_environment: SecretMap,
     pub files: Vec<ManagedFileMetadata>,
@@ -89,6 +92,9 @@ pub fn normalize_draft(
     validate_display_name(&input.display_name)?;
     validate_discovery_image(&input.discovery_image_ref)?;
     if !(60..=86_400).contains(&input.poll_interval_seconds) {
+        return Err(DomainError::ConfigInvalid);
+    }
+    if !(1..=super::MAX_STOP_GRACE_PERIOD_SECONDS).contains(&input.stop_grace_period_seconds) {
         return Err(DomainError::ConfigInvalid);
     }
 
@@ -145,7 +151,8 @@ pub fn normalize_draft(
         .map(|(key, value)| Ok((key.clone(), hmac_hex(hmac_key, value.expose().as_bytes())?)))
         .collect::<Result<_, DomainError>>()?;
     let mut metadata = ConfigMetadata {
-        schema_version: 1,
+        schema_version: 2,
+        stop_grace_period_seconds: input.stop_grace_period_seconds,
         public_env_keys,
         secret_keys,
         secret_hmacs,
@@ -170,6 +177,7 @@ pub fn normalize_draft(
         auto_deploy_enabled: input.auto_deploy_enabled,
         auto_deploy_acknowledged: input.auto_deploy_acknowledged,
         poll_interval_seconds: input.poll_interval_seconds,
+        stop_grace_period_seconds: input.stop_grace_period_seconds,
         public_environment,
         secret_environment,
         files,
@@ -765,6 +773,53 @@ fn canonical_non_secret(
     public_environment: &[PublicEnvInput],
     public_files: &BTreeMap<String, String>,
 ) -> Result<Vec<u8>, DomainError> {
+    if metadata.schema_version == 1 {
+        #[derive(Serialize)]
+        struct LegacyConfigMetadata<'a> {
+            schema_version: u32,
+            public_env_keys: &'a [String],
+            secret_keys: &'a [String],
+            secret_hmacs: &'a BTreeMap<String, String>,
+            files: &'a [ManagedFileMetadata],
+            public_file_sha256s: &'a BTreeMap<String, String>,
+            secret_file_hmacs: &'a BTreeMap<String, String>,
+            ports: &'a [PortInput],
+            volumes: &'a [VolumeInput],
+            binds: &'a [BindMountInput],
+            #[serde(skip_serializing_if = "is_true")]
+            owned_default_network: &'a bool,
+            networks: &'a [NetworkInput],
+            health: &'a HealthPolicy,
+            config_sha256: &'a str,
+        }
+        #[derive(Serialize)]
+        struct LegacyCanonical<'a> {
+            metadata: LegacyConfigMetadata<'a>,
+            public_environment: &'a [PublicEnvInput],
+            public_files: &'a BTreeMap<String, String>,
+        }
+        return serde_json::to_vec(&LegacyCanonical {
+            metadata: LegacyConfigMetadata {
+                schema_version: metadata.schema_version,
+                public_env_keys: &metadata.public_env_keys,
+                secret_keys: &metadata.secret_keys,
+                secret_hmacs: &metadata.secret_hmacs,
+                files: &metadata.files,
+                public_file_sha256s: &metadata.public_file_sha256s,
+                secret_file_hmacs: &metadata.secret_file_hmacs,
+                ports: &metadata.ports,
+                volumes: &metadata.volumes,
+                binds: &metadata.binds,
+                owned_default_network: &metadata.owned_default_network,
+                networks: &metadata.networks,
+                health: &metadata.health,
+                config_sha256: &metadata.config_sha256,
+            },
+            public_environment,
+            public_files,
+        })
+        .map_err(|_| DomainError::Internal);
+    }
     #[derive(Serialize)]
     struct Canonical<'a> {
         metadata: &'a ConfigMetadata,
@@ -777,6 +832,19 @@ fn canonical_non_secret(
         public_files,
     })
     .map_err(|_| DomainError::Internal)
+}
+
+#[cfg(test)]
+pub(crate) fn recompute_config_hash_for_test(
+    metadata: &ConfigMetadata,
+    public_environment: &[PublicEnvInput],
+    public_files: &BTreeMap<String, String>,
+) -> String {
+    let mut metadata = metadata.clone();
+    metadata.config_sha256.clear();
+    hex(&Sha256::digest(
+        canonical_non_secret(&metadata, public_environment, public_files).unwrap(),
+    ))
 }
 
 fn hmac_hex(key: &[u8], value: &[u8]) -> Result<String, DomainError> {
@@ -913,6 +981,7 @@ mod tests {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: default_stop_grace_period_seconds(),
             environment: EnvironmentInput::default(),
             files: Vec::new(),
             ports: Vec::new(),
@@ -931,6 +1000,25 @@ mod tests {
         let normalized =
             normalize_draft(input(), &ExistingSecrets::default(), b"key", &[]).unwrap();
         assert_eq!(normalized.metadata.config_sha256.len(), 64);
+        assert_eq!(normalized.stop_grace_period_seconds, 10);
+        for stop_grace_period_seconds in [0, 601] {
+            let mut invalid = input();
+            invalid.stop_grace_period_seconds = stop_grace_period_seconds;
+            assert!(matches!(
+                normalize_draft(invalid, &ExistingSecrets::default(), b"key", &[]),
+                Err(DomainError::ConfigInvalid)
+            ));
+        }
+        for stop_grace_period_seconds in [1, 600] {
+            let mut valid = input();
+            valid.stop_grace_period_seconds = stop_grace_period_seconds;
+            assert_eq!(
+                normalize_draft(valid, &ExistingSecrets::default(), b"key", &[])
+                    .unwrap()
+                    .stop_grace_period_seconds,
+                stop_grace_period_seconds
+            );
+        }
         let mut invalid = input();
         invalid.discovery_image_ref = "registry.example/app@sha256:deadbeef".into();
         assert_eq!(
@@ -1095,6 +1183,7 @@ mod tests {
             credential_ref: None,
             auto_deploy_enabled: false,
             poll_interval_seconds: normalized.poll_interval_seconds,
+            stop_grace_period_seconds: normalized.stop_grace_period_seconds,
             public_environment: normalized.public_environment,
             secret_keys: normalized.metadata.secret_keys,
             files: vec![crate::domain::dto::ManagedFileResponse {
@@ -1113,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_network_defaults_keep_canonical_config_bytes_and_hash() {
+    fn legacy_network_defaults_keep_existing_hash_while_new_revisions_record_stop_grace() {
         let legacy_external = r#"{"kind":"external","name":"shared"}"#;
         let parsed: NetworkInput = serde_json::from_str(legacy_external).unwrap();
         assert_eq!(serde_json::to_string(&parsed).unwrap(), legacy_external);
@@ -1127,12 +1216,10 @@ mod tests {
         let metadata_json = serde_json::to_string(&normalized.metadata).unwrap();
         assert!(!metadata_json.contains("owned_default_network"));
         assert!(!metadata_json.contains("aliases"));
+        assert!(metadata_json.contains("stop_grace_period_seconds"));
         let legacy_fixture = include_str!("../../tests/fixtures/legacy-config-v1.toml");
-        assert_eq!(
-            toml::to_string(&normalized.metadata).unwrap(),
-            legacy_fixture
-        );
         let loaded: ConfigMetadata = toml::from_str(legacy_fixture).unwrap();
+        assert_eq!(loaded.stop_grace_period_seconds, 10);
         assert!(loaded.owned_default_network);
         assert!(matches!(
             &loaded.networks[1],
@@ -1146,7 +1233,7 @@ mod tests {
             b"key",
         )
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             normalized.metadata.config_sha256,
             "739d53e83e08600fb6fa610333ffcd35e6e40e88ff97aa8bae406d43901d90c4"
         );

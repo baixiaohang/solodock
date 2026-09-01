@@ -10,6 +10,8 @@ SoloDock 只管理结构化的单 service 应用。管理员填写受支持字�
 
 `app.toml` 指向当前 draft config revision，并记录 desired state、Registry polling 配置和最后一次文件系统 mutation。每次编辑先完整发布新的 `config-revisions/<revision-id>/`，最后原子替换 metadata 作为 commit point。已经发布的 release 固定引用自己的 config revision，因此后续 draft 编辑不会改变 active 或 pending 容器挂载的内容。
 
+draft 还包含应用级 `stop_grace_period_seconds`，范围为 `1–600`，默认 `10`。发布时该值与 config revision 一起固定进 immutable release，并生成 Compose `services.app.stop_grace_period`。它表示 SIGTERM 后允许服务收尾的最长时间，而非固定等待；服务提前退出时 lifecycle 或部署立即继续。缺少该字段的旧 config revision 和 release 按 `10` 秒解释，并继续使用原 canonical hash/HMAC。
+
 ## 镜像与 credential
 
 draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry 发现；实际 release 和 Compose 使用：
@@ -22,10 +24,10 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ## 环境变量
 
-环境变量只有一份规范数据，UI 的表格和 dotenv 批量编辑是其不同投影。
+环境变量只有一份规范数据。注册页和配置页共用逐行编辑器，public 与 Secret 使用同一种行布局，不再分成两套输入区。
 
 - public 值可以读取和编辑；
-- secret 值只能以 `keep`、`replace`、`delete` 显式操作；
+- 已保存的 secret 只显示“已保存”占位且 value 保持空白；留空、输入新值和删除行分别投影为 `keep`、`replace`、`delete`；
 - API、UI、SQLite、release、Compose、audit、错误和 tracing 不回显 secret；
 - public/secret 分类转换必须显式删除旧分类并提交新分类；
 - 重复 key、非法名称、插值或命令替换语法会被拒绝。
@@ -86,7 +88,7 @@ volume、bind 和受管文件的容器 target path 必须互不冲突。preview 
 
 ## 生命周期与删除
 
-start、stop、restart 和 remove 只作用于通过 project/service/app/release/schema/full container ID 完整 ownership 校验的对象。unmanaged、stale、multiple 或 malformed candidate 一律 fail closed。
+start、stop、restart 和 remove 只作用于通过 project/service/app/release/schema/full container ID 完整 ownership 校验的对象。stop/restart 使用被操作 release 固定的停机宽限；remove 先以同一宽限显式 stop，再移除已停止容器。unmanaged、stale、multiple 或 malformed candidate 一律 fail closed。
 
 删除是两阶段协议：
 

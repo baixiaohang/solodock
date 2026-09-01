@@ -340,6 +340,9 @@ async fn docker_unavailable_keeps_catalog_and_health_available_but_rejects_strea
     );
     let health = json_body(harness.get("/api/v1/system/health", true).await).await;
     assert_eq!(health["status"], "degraded");
+    assert!(health["memory"]["total_bytes"].as_u64().unwrap() > 0);
+    assert!(health["memory"]["available_bytes"].as_u64().unwrap() > 0);
+    assert!(health["memory"]["used_percent"].as_f64().unwrap() >= 0.0);
     let logs = harness
         .get(&format!("/api/v1/apps/{}/logs", harness.app_id), true)
         .await;

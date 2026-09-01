@@ -38,6 +38,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 - bootstrap 至多一次、Origin/CSRF/session/revoke/heartbeat；
 - public/secret 分类和 `keep`/`replace`/`delete`；
+- 统一环境变量逐行编辑、Secret 掩码、分类转换、rename、重复/空 key，以及敏感输入成功后清空；
 - Registry/webhook secret write-only、zeroize、rotation/revoke/finalizer；
 - secret canary 不进入 API、SSE、audit、tracing、error、Compose、release、SQLite 或 argv；
 - degraded inventory保留旧 redactor，冷启动不完整 inventory fail closed。
@@ -64,6 +65,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
+- `/proc/meminfo` 正常、缺失、非法和 overflow，system health 五列状态条与 pull 门禁共用同一 parser；
 - 固定非 root image 同时读取 public/secret managed file，首次部署、第二 revision、manual rollback 和 strict recovery 成功，restart count 不增长且容器写入 readonly mount 失败；
 - external-only 不生成、检查或展示 owned bridge identity。
 
@@ -74,6 +76,9 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - classic image store 的 config ID 与 descriptor-absent 兼容路径；Docker 29.7.2 containerd image store 必须硬断言原始 `ImageInspect.Descriptor` digest 存在、platform 缺失且顶层 OS/architecture 完整，adapter 形成 effective observation 后首次部署和同 release no-op 均成功；descriptor 错误、冲突或补全后仍不完整继续 fail closed；
 - resolve→pull之间tag移动仍运行已解析digest；
 - candidate durable-before-effect；首次 post-effect observation 用唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim，并写入 exact `post_container_id`；
+- 停机宽限默认值、`1..=600` 边界、Compose `stop_grace_period`、stop/restart argv、stop-before-remove、predecessor/candidate 各自 release 值，以及缺字段旧 config/release 的 canonical hash/HMAC 兼容；
+- 全局时区默认 UTC、IANA allowlist、revision conflict、幂等 replay、Origin/CSRF/audit，以及 UTC、Asia/Shanghai 和 DST zone 的显示；API/SSE 原值与 expiry/cursor 保持 UTC；
+- deployment history 桌面一项一行、移动端不并排，并保留可访问的详情链接；
 - pre-marker canonical candidate claim 后的 semantic mismatch 进入确定性补偿；post-marker 不同 full ID 才是 replacement，必须保留 pending/替代容器且不能伪造 `failed`/`rolled_back`；
 - 首次部署的 remove 失败、remove 后 observation 失败或仍有 container 必须保留 pending 和原始 `candidate_failed` history，只能记录 `CANDIDATE_CLEANUP_FAILED`，不能写 `failed`；
 - health failure自动恢复、manual rollback和rollback failure；

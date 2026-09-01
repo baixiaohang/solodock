@@ -54,6 +54,7 @@ use uuid::Uuid;
 struct FakeCompose {
     validated_yaml: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     actions: Arc<std::sync::Mutex<Vec<ComposeAction>>>,
+    contexts: Arc<std::sync::Mutex<Vec<(ComposeAction, u16)>>>,
 }
 
 struct MissingDocker;
@@ -252,6 +253,10 @@ impl ComposeRunner for FakeCompose {
         context: RunContext,
     ) -> Result<ComposeOutput, solodock::compose::ComposeError> {
         self.actions.lock().unwrap().push(action);
+        self.contexts
+            .lock()
+            .unwrap()
+            .push((action, context.stop_grace_period_seconds));
         match action {
             ComposeAction::Version => Ok(ComposeOutput {
                 stdout: b"2.24.0\n".to_vec(),
@@ -288,6 +293,7 @@ struct Harness {
     state: AppState,
     validated_yaml: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     compose_actions: Arc<std::sync::Mutex<Vec<ComposeAction>>>,
+    compose_contexts: Arc<std::sync::Mutex<Vec<(ComposeAction, u16)>>>,
 }
 
 impl Harness {
@@ -331,6 +337,7 @@ impl Harness {
         let fake_compose = Arc::new(FakeCompose::default());
         let validated_yaml = fake_compose.validated_yaml.clone();
         let compose_actions = fake_compose.actions.clone();
+        let compose_contexts = fake_compose.contexts.clone();
         let compose: Arc<dyn ComposeRunner> = fake_compose;
         let capability = ComposeCapability::default();
         capability.probe(compose.as_ref()).await;
@@ -424,6 +431,7 @@ impl Harness {
             state,
             validated_yaml,
             compose_actions,
+            compose_contexts,
         }
     }
 
@@ -590,6 +598,7 @@ async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
     assert!(!first.contains(canary));
     let first_json: Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first_json["app"]["deployment_status"], "DEPLOY_REQUIRED");
+    assert_eq!(first_json["app"]["stop_grace_period_seconds"], 10);
     assert_eq!(first_json["idempotency_replayed"], false);
 
     let (status, replay) = body(harness.create(Some(key), &draft(canary)).await).await;
@@ -1227,6 +1236,67 @@ async fn remove_rechecks_all_candidates_after_effect_marker_before_compose() {
 }
 
 #[tokio::test]
+async fn remove_stops_with_the_active_release_grace_before_removing() {
+    let docker = Arc::new(ScriptedDocker::default());
+    let harness = Harness::new_with_docker(docker.clone()).await;
+    let mut input = draft("secret");
+    input["stop_grace_period_seconds"] = json!(60);
+    let (_, created) = body(harness.create(Some("m3-create-remove-grace"), &input).await).await;
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision = created["app"]["config_revision"].as_str().unwrap();
+    let release_id = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        release_id,
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+    let valid = owned_container('a', app_id, release_id, true);
+    docker.set(vec![vec![valid.clone()]]);
+    let (_, preview) = body(
+        harness
+            .mutate(
+                "POST",
+                &format!("/api/v1/apps/{app_id}/deletion-preview"),
+                None,
+                &json!({"remove_container":true}),
+            )
+            .await,
+    )
+    .await;
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+    docker.set(vec![
+        vec![valid.clone()],
+        vec![valid.clone()],
+        vec![valid],
+        Vec::new(),
+    ]);
+    harness.compose_contexts.lock().unwrap().clear();
+    let request = json!({
+        "confirmation_token":preview["confirmation_token"],
+        "slug":"example",
+        "expected_revision":revision,
+        "remove_container":true
+    });
+    let (status, response) = body(
+        harness
+            .mutate(
+                "DELETE",
+                &format!("/api/v1/apps/{app_id}"),
+                Some("m3-remove-with-grace"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        harness.compose_contexts.lock().unwrap().as_slice(),
+        [(ComposeAction::Stop, 60), (ComposeAction::Remove, 60)]
+    );
+}
+
+#[tokio::test]
 async fn failed_final_deletion_fact_recheck_unblocks_future_streams() {
     let docker = Arc::new(ScriptedDocker::default());
     let harness = Harness::new_with_docker(docker.clone()).await;
@@ -1800,6 +1870,7 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
     let created: Value = serde_json::from_str(&created).unwrap();
     let app_id = created["app"]["id"].as_str().unwrap();
     let mut candidate = mutable_draft("validate-secret");
+    candidate["stop_grace_period_seconds"] = json!(60);
     candidate["files"] = json!([{
         "logical_name":"settings", "target_path":"/app/settings.toml",
         "sensitive":false, "readonly":true, "content":"mode='preview'"
@@ -1817,6 +1888,9 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
     let response: Value = serde_json::from_str(&response).unwrap();
     let returned = response["compose_yaml"].as_str().unwrap().as_bytes();
     let captured = harness.validated_yaml.lock().unwrap().clone().unwrap();
+    let captured_text = String::from_utf8_lossy(&captured);
+    assert!(captured_text.contains("stop_grace_period:"));
+    assert!(captured_text.contains("60s"));
     assert_eq!(returned, captured);
     assert!(
         response["compose_yaml"]
@@ -2172,4 +2246,102 @@ async fn webhook_final_secret_check_serializes_with_rotate_revoke_and_delete() {
         StatusCode::UNAUTHORIZED
     );
     assert!(webhooks.poll_states.get(app_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
+    let harness = Harness::new().await;
+    let initial = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, initial) = body(initial).await;
+    assert_eq!(status, StatusCode::OK);
+    let initial: Value = serde_json::from_str(&initial).unwrap();
+    assert_eq!(initial["display_timezone"], "UTC");
+    assert_eq!(initial["supported_timezones"][0], "UTC");
+    let request = json!({
+        "expected_revision": initial["revision"],
+        "display_timezone": "Asia/Shanghai",
+    });
+
+    let missing_csrf = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("idempotency-key", "settings-missing-csrf")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    let updated = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-update-shanghai"),
+            &request,
+        )
+        .await;
+    let (status, updated) = body(updated).await;
+    assert_eq!(status, StatusCode::OK);
+    let updated: Value = serde_json::from_str(&updated).unwrap();
+    assert_eq!(updated["display_timezone"], "Asia/Shanghai");
+    assert_ne!(updated["revision"], initial["revision"]);
+    let replayed = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-update-shanghai"),
+            &request,
+        )
+        .await;
+    let (status, replayed) = body(replayed).await;
+    assert_eq!(status, StatusCode::OK);
+    let replayed: Value = serde_json::from_str(&replayed).unwrap();
+    assert_eq!(replayed["idempotency_replayed"], true);
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = '/api/v1/settings'")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(audit_count, 2);
+
+    let stale = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-stale-revision"),
+            &request,
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let invalid = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-invalid-timezone"),
+            &json!({
+                "expected_revision": updated["revision"],
+                "display_timezone": "Mars/Olympus",
+            }),
+        )
+        .await;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

@@ -870,6 +870,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: EnvironmentInput::default(),
                 files: vec![],
                 ports: vec![],

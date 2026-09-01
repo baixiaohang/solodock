@@ -386,16 +386,10 @@ fn check_disk_pressure(root: &Path, minimum: u128) -> Result<(), PullError> {
 }
 
 fn check_memory_pressure() -> Result<(), PullError> {
-    let memory = fs::read_to_string("/proc/meminfo").map_err(|_| PullError::MemoryPressure)?;
-    let available_kib = memory
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("MemAvailable:")
-                .and_then(|value| value.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-        })
+    let available_bytes = crate::system::memory::probe()
+        .available_bytes
         .ok_or(PullError::MemoryPressure)?;
-    if available_kib < 128 * 1024 {
+    if available_bytes < 128 * 1024 * 1024 {
         return Err(PullError::MemoryPressure);
     }
     Ok(())

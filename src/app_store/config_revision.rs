@@ -11,9 +11,11 @@ use uuid::Uuid;
 use super::{StoreError, atomic::rename_no_replace, sync_directory};
 use crate::{
     domain::{
-        ConfigMetadata, DraftInput, EnvironmentInput, ExistingSecrets, ManagedFileContent,
-        ManagedFileInput, NormalizedDraft, PublicEnvInput, SecretEnvInput, SecretOperation,
+        ConfigMetadata, DomainError, DraftInput, EnvironmentInput, ExistingSecrets,
+        ManagedFileContent, ManagedFileInput, NormalizedDraft, PublicEnvInput, SecretEnvInput,
+        SecretOperation,
         dto::{DraftResponse, ManagedFileResponse},
+        normalize_draft,
     },
     security::permissions::{
         LEGACY_MANAGED_FILE_MODES, MANAGED_FILE_MODE, check_private, check_private_tree,
@@ -37,6 +39,49 @@ pub struct LoadedRevision {
 }
 
 impl LoadedRevision {
+    #[allow(clippy::too_many_arguments)]
+    pub fn normalize_verified(
+        &self,
+        display_name: String,
+        discovery_image_ref: String,
+        credential_ref: Option<Uuid>,
+        auto_deploy_enabled: bool,
+        poll_interval_seconds: u32,
+        hmac_key: &[u8],
+        allowed_bind_roots: &[PathBuf],
+    ) -> Result<NormalizedDraft, DomainError> {
+        let mut normalized = normalize_draft(
+            self.input(
+                display_name,
+                discovery_image_ref,
+                credential_ref,
+                auto_deploy_enabled,
+                poll_interval_seconds,
+            ),
+            &self.secrets,
+            hmac_key,
+            allowed_bind_roots,
+        )?;
+        match self.metadata.schema_version {
+            1 => {
+                // Schema 1 predates stop_grace_period_seconds. Re-normalize all
+                // semantic fields with today's validators, but preserve the
+                // signed legacy metadata and hash for artifact verification.
+                let mut upgraded = self.metadata.clone();
+                upgraded.schema_version = normalized.metadata.schema_version;
+                upgraded.stop_grace_period_seconds = normalized.metadata.stop_grace_period_seconds;
+                upgraded.config_sha256 = normalized.metadata.config_sha256.clone();
+                if upgraded != normalized.metadata {
+                    return Err(DomainError::ConfigInvalid);
+                }
+                normalized.metadata = self.metadata.clone();
+            }
+            2 if normalized.metadata == self.metadata => {}
+            _ => return Err(DomainError::ConfigInvalid),
+        }
+        Ok(normalized)
+    }
+
     pub fn response(
         &self,
         discovery_image_ref: String,
@@ -49,6 +94,7 @@ impl LoadedRevision {
             credential_ref,
             auto_deploy_enabled,
             poll_interval_seconds,
+            stop_grace_period_seconds: self.metadata.stop_grace_period_seconds,
             public_environment: self.public_environment.clone(),
             secret_keys: self.metadata.secret_keys.clone(),
             files: self
@@ -99,6 +145,7 @@ impl LoadedRevision {
             auto_deploy_enabled,
             auto_deploy_acknowledged: false,
             poll_interval_seconds,
+            stop_grace_period_seconds: self.metadata.stop_grace_period_seconds,
             environment: EnvironmentInput {
                 public: self.public_environment.clone(),
                 secrets: self
@@ -231,10 +278,15 @@ pub fn load(app_directory: &Path, revision_id: Uuid) -> Result<LoadedRevision, S
             error.into()
         }
     })?;
-    let metadata: ConfigMetadata =
+    let mut metadata: ConfigMetadata =
         toml::from_str(&config).map_err(|_| StoreError::ContentInvalid)?;
-    if metadata.schema_version != 1 {
+    if !matches!(metadata.schema_version, 1 | 2) {
         return Err(StoreError::ContentInvalid);
+    }
+    if metadata.schema_version == 1 {
+        // The field was not part of schema 1's signed canonical form. Never
+        // accept an injected unsigned value as runtime control input.
+        metadata.stop_grace_period_seconds = crate::domain::default_stop_grace_period_seconds();
     }
     let public_environment = read_environment(
         app_directory,
@@ -524,6 +576,7 @@ mod tests {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
             environment: EnvironmentInput::default(),
             files: vec![
                 ManagedFileInput {
@@ -604,6 +657,7 @@ mod tests {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
             environment: EnvironmentInput {
                 public: vec![PublicEnvInput {
                     key: "MODE".into(),
@@ -656,6 +710,7 @@ mod tests {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
             environment: EnvironmentInput::default(),
             files: vec![],
             ports: vec![],

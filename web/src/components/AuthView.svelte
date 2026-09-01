@@ -12,6 +12,8 @@
   async function submit() {
     error = ''
     if (mode === 'setup' && password !== confirm) { error = '两次输入的密码不一致'; return }
+    const passwordError = validatePassword(password)
+    if (passwordError) { error = passwordError; return }
     busy = true
     try {
       if (mode === 'setup') await bootstrap(token, password)
@@ -20,6 +22,15 @@
     } catch (cause) {
       error = cause instanceof ApiError ? authMessage(cause.body.code) : '连接控制面失败，请稍后重试'
     } finally { busy = false }
+  }
+
+  function validatePassword(value: string): string {
+    const trimmed = value.trim()
+    const scalarCount = Array.from(trimmed).length
+    const byteCount = new TextEncoder().encode(trimmed).length
+    return scalarCount >= 14 && scalarCount <= 128 && byteCount <= 512
+      ? ''
+      : '密码需为 14–128 个 Unicode 字符（首尾空白不计）'
   }
 
   function authMessage(code: string): string {
@@ -40,9 +51,9 @@
       {#if mode === 'setup'}
         <label>Bootstrap token<input type="password" bind:value={token} required autocomplete="off" spellcheck="false" /></label>
       {/if}
-      <label>密码<input type="password" bind:value={password} required minlength="12" autocomplete={mode === 'login' ? 'current-password' : 'new-password'} /></label>
+      <label>密码（14–128 个字符）<input type="password" bind:value={password} required minlength="14" autocomplete={mode === 'login' ? 'current-password' : 'new-password'} /></label>
       {#if mode === 'setup'}
-        <label>确认密码<input type="password" bind:value={confirm} required minlength="12" autocomplete="new-password" /></label>
+        <label>确认密码<input type="password" bind:value={confirm} required minlength="14" autocomplete="new-password" /></label>
       {/if}
       {#if error}<p class="form-error" role="alert">{error}</p>{/if}
       <button class="primary" disabled={busy}>{busy ? '处理中…' : mode === 'setup' ? '完成初始化' : '登录'}</button>

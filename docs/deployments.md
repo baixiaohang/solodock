@@ -2,6 +2,8 @@
 
 SoloDock 的 manual deploy、poll auto-deploy 和 rollback 共用唯一的 `DeploymentScheduler` 与 deployment engine。外部 webhook 只生成 durable Registry recheck wake，不形成第二条 Registry、Docker 或 Compose mutation 路径。
 
+应用页只读取最近 20 条 deployment，每个 deployment 以一整行展示显示时区下的创建时间、status/phase、trigger、镜像或 digest 和错误码，并通过明确链接进入详情；移动端只允许单项内部换行，不会把两条历史并排。
+
 ## Registry credential
 
 Registry credential 以 filesystem-first 方式保存在 `registry-credentials/<credential-id>/`：metadata 与 immutable secret revision 分离并受完整性校验。API 只返回 registry、username 和 revision 等 metadata，不回显 token。
@@ -45,7 +47,7 @@ deployment ledger 的终态为：
 - daemon 实际 data-root、volume/network ownership 和 bind identity；
 - Compose project/service 下的全部 container candidate 与精确 predecessor。
 
-最后一个 Docker await 完成后直接调用固定 Compose action。unmanaged、stale、replacement、multiple candidate 或 resource drift 都不会进入 runner。
+最后一个 Docker await 完成后调用固定 Compose action。替换已有容器时，先使用 predecessor release 自己固定的停机宽限完成 stop，确认旧 writer 已退出后才启动 candidate；candidate 的新宽限只约束其后续关闭。若 candidate 尚未创建就失败，系统会先恢复已停止的 predecessor，再按确定性或不确定性结果收敛。unmanaged、stale、replacement、multiple candidate 或 resource drift 都不会进入 runner。
 
 Compose 后的首次 observation 是 ownership claim boundary：唯一非 predecessor full container ID 与全套 canonical project/service/app/schema/candidate-release labels 足以证明 owned candidate，并立即把 exact ID 作为 `post_container_id` 写入 ledger；configured digest reference、config/manifest image identity、可用的 manifest descriptor、platform、status 和 health 属于后续 release validity。首次 marker 前，即使 Docker daemon/root 主体复制全部 canonical labels 重建容器，当前信任模型仍会 claim 该唯一容器；这种具备 daemon 控制权的行为不在 threat model 内，系统不提供 Compose effect 因果 attestation。
 
@@ -57,7 +59,7 @@ candidate 达到 health policy 后才把 `active` 原子切向该 release，并�
 
 ## 失败恢复与回滚
 
-确定性 candidate identity/apply/health 失败且现场被证明属于该 candidate 时，系统进入同一补偿路径：有旧 active 时自动恢复并重新验证旧 release；没有旧 active 时精确执行 `rm --stop --force` 并复核 container 已不存在。rollback 重新执行旧 release 所需的 digest pull、resource/bind/data-root/candidate preflight、fixed Compose action、post-observation 和健康门禁，而不是直接信任历史 YAML 或旧 container。
+确定性 candidate identity/apply/health 失败且现场被证明属于该 candidate 时，系统进入同一补偿路径：有旧 active 时先用 candidate release 的宽限停止失败 candidate，再自动恢复并重新验证旧 release；没有旧 active 时先按 candidate 宽限显式 stop，再执行精确 `rm --force` 并复核 container 已不存在。rollback 重新执行旧 release 所需的 digest pull、resource/bind/data-root/candidate preflight、fixed Compose action、post-observation 和健康门禁，而不是直接信任历史 YAML 或旧 container。
 
 首次部署没有旧 active 时，失败清理只针对已经 claim 并写入 `post_container_id` 的 exact candidate；remove 结果和最终 absence 必须确认。任何 unknown effect、ownership collision，或 marker 后不同 full ID 的 replacement 都保留 pending/现场并标记 `interrupted` 或 `needs_attention`。
 

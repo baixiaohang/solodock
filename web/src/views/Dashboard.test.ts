@@ -29,6 +29,7 @@ const health = {
   status: 'ok',
   docker: { status: 'ready', error_code: null, server_version: '28.0', api_version: '1.48', os: 'linux', architecture: 'amd64', observed_at: '2026-01-01T00:00:00Z' },
   recovery: { status: 'ok', issue_count: 0, issues_by_code: {} },
+  memory: { total_bytes: 8589934592, available_bytes: 4294967296, used_percent: 50 },
   disk: { state: { status: 'normal', total_bytes: 4096, available_bytes: 2048, used_percent: 50 }, docker: null },
   streams: { active: 1, limit: 16 },
   projection: { status: 'ok' }, deployments: { active: 0, interrupted: 0, needs_attention: 0, limit: 1 },
@@ -68,6 +69,8 @@ describe('Dashboard', () => {
     expect(screen.getByText('running')).toBeTruthy()
     expect(screen.getByText('sha256:aaaaaaaaaaaa')).toBeTruthy()
     expect(screen.getByText('运行镜像与活动镜像不一致')).toBeTruthy()
+    expect(screen.getByText('主机内存可用')).toBeTruthy()
+    expect(screen.getByText('4.0 GiB')).toBeTruthy()
 
     await waitFor(() => expect(MockEventSource.instances).toHaveLength(1))
     MockEventSource.instances[0].emit('stats', { cpu_percent: 2.5, memory_usage_bytes: 1048576 })

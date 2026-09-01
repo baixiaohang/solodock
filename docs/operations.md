@@ -51,11 +51,17 @@ Owned network 的 host interface 固定为 UI 显示的 `sd-<slug>`。在 Ubuntu
 
 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 表示既有 owned network 的 driver 或 bridge option 与 canonical identity 不一致。SoloDock 不会删除或接管该 network；停止相关容器、核对 ownership 并由管理员处理冲突资源后，再重新部署。
 
+应用的停机宽限默认 `10` 秒，可在注册或配置页面设置为 `1–600` 秒。它是 SIGKILL 前的最大等待，服务提前退出不会空等。需要 flush 数据、drain 队列或最终同步的应用应按自身关闭契约显式放大；deploy/recreate 停止 predecessor、手动 stop/restart、显式 remove 和失败 rollback 都使用被停止 release 的值。
+
 ## 自动部署与凭据
 
 自动部署必须由管理员显式确认启用。开关关闭只阻止未来 poll，不取消已经 durable claim 的部署。`config_pending_manual` 表示 digest 未变但 draft 配置变化，需使用 Deploy；`suppressed_failed_target` 表示该 target 已失败/回滚，先检查 health 和数据兼容，再由新 digest/config 或明确人工部署解除。轮换 Registry credential 会改变 generation 并重新进入带 jitter 的轮询。
 
 磁盘告警时先扩容或清理 SoloDock 之外可确认的无用内容；不得删除 state 内 revision/ledger、Docker volume 或 bind source。`MemoryHigh=256M` 是 soft pressure，没有 `MemoryMax`。
+
+控制台 system health 的“主机内存可用”来自 Linux `/proc/meminfo` 的 `MemAvailable`，与应用容器自身的 memory usage 是两个不同事实。该解析器也被 image pull 前的 128 MiB 内存门禁复用；读取、字段或数值无效时返回 unknown 并使健康状态 degraded，不伪造为 0。
+
+全局显示时区在 Web“系统设置”中从后端 IANA tzdb 列表选择，保存在 SQLite singleton settings record，默认 `UTC`。修改使用 revision、幂等键、Origin、session 与 CSRF，保存后无需重启即可重绘所有 Web 时间。该设置不向受管容器注入 `TZ`，也不改变数据库、API、SSE、cursor、过期判断或下载日志中的 UTC 原值；浏览器不支持已保存 zone 时会明确告警并按 UTC fallback。
 
 ## 备份
 

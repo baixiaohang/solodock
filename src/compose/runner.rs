@@ -81,6 +81,7 @@ pub struct RunContext {
     pub project_directory: PathBuf,
     pub compose_file: PathBuf,
     pub timeout: Duration,
+    pub stop_grace_period_seconds: u16,
     pub redaction_patterns: Vec<Vec<u8>>,
 }
 
@@ -91,6 +92,7 @@ impl RunContext {
             project_directory: PathBuf::new(),
             compose_file: PathBuf::new(),
             timeout: Duration::from_secs(5),
+            stop_grace_period_seconds: crate::domain::default_stop_grace_period_seconds(),
             redaction_patterns: Vec::new(),
         }
     }
@@ -287,13 +289,20 @@ fn argv(action: ComposeAction, context: &RunContext) -> Vec<String> {
             ]
             .map(str::to_owned),
         ),
-        ComposeAction::Stop => result.extend(["stop", "--timeout", "30", "app"].map(str::to_owned)),
-        ComposeAction::Restart => {
-            result.extend(["restart", "--no-deps", "--timeout", "30", "app"].map(str::to_owned))
-        }
-        ComposeAction::Remove => {
-            result.extend(["rm", "--stop", "--force", "app"].map(str::to_owned))
-        }
+        ComposeAction::Stop => result.extend([
+            "stop".to_owned(),
+            "--timeout".to_owned(),
+            context.stop_grace_period_seconds.to_string(),
+            "app".to_owned(),
+        ]),
+        ComposeAction::Restart => result.extend([
+            "restart".to_owned(),
+            "--no-deps".to_owned(),
+            "--timeout".to_owned(),
+            context.stop_grace_period_seconds.to_string(),
+            "app".to_owned(),
+        ]),
+        ComposeAction::Remove => result.extend(["rm", "--force", "app"].map(str::to_owned)),
         ComposeAction::Version => unreachable!(),
     }
     result
@@ -328,6 +337,7 @@ mod tests {
             project_directory: "/state/app".into(),
             compose_file: "/state/app/releases/id/compose.yaml".into(),
             timeout: Duration::from_secs(60),
+            stop_grace_period_seconds: 60,
             redaction_patterns: Vec::new(),
         };
         for action in [
@@ -356,6 +366,21 @@ mod tests {
                     | "--remove-orphans"
             )));
         }
+        assert!(
+            argv(ComposeAction::Stop, &context)
+                .windows(2)
+                .any(|pair| pair == ["--timeout", "60"])
+        );
+        assert!(
+            argv(ComposeAction::Restart, &context)
+                .windows(2)
+                .any(|pair| pair == ["--timeout", "60"])
+        );
+        assert!(
+            !argv(ComposeAction::Remove, &context)
+                .iter()
+                .any(|arg| arg == "--stop")
+        );
     }
 
     #[test]
