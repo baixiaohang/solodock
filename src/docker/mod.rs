@@ -3,6 +3,7 @@ pub mod events;
 pub mod logs;
 pub mod models;
 pub mod ownership;
+pub mod platform_network;
 pub mod probe;
 pub mod stats;
 
@@ -30,6 +31,7 @@ pub struct AppCatalogEntry {
     pub id: Uuid,
     pub slug: String,
     pub display_name: String,
+    pub resource_name_schema_version: u32,
     #[serde(skip)]
     pub project_name: String,
     pub active_release_id: Option<Uuid>,
@@ -56,6 +58,7 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             id: value.app_id,
             slug: value.slug.clone(),
             display_name: value.display_name.clone(),
+            resource_name_schema_version: value.resource_name_schema_version,
             project_name: value.project_name.clone(),
             active_release_id: value.active_release_id,
             active_image_ref: value.active_image_ref.clone(),
@@ -74,6 +77,20 @@ impl From<&RecoveredApp> for AppCatalogEntry {
             poll_interval_seconds: value.poll_interval_seconds,
             draft: value.draft.clone(),
         }
+    }
+}
+
+impl AppCatalogEntry {
+    pub fn resource_identity(&self) -> crate::domain::AppResourceIdentity<'_> {
+        crate::domain::AppResourceIdentity {
+            app_id: self.id,
+            slug: &self.slug,
+            schema_version: self.resource_name_schema_version,
+        }
+    }
+
+    pub fn resource_names(&self) -> crate::domain::AppResourceNames {
+        self.resource_identity().resource_names()
     }
 }
 
@@ -146,6 +163,7 @@ pub enum DriftCode {
     NetworkAttachmentMismatch,
     NetworkAliasMismatch,
     NetworkBridgeIdentityMismatch,
+    PlatformNetworkIdentityMismatch,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -368,6 +386,45 @@ impl DockerObserver {
                 Ok(Some(_)) | Err(_) => snapshot.complete = false,
             }
         }
+
+        let platform_app_ids = snapshot
+            .apps
+            .iter()
+            .filter(|app| {
+                app.expected_network_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.service_discovery_enabled)
+            })
+            .map(|app| app.id)
+            .collect::<Vec<_>>();
+        if platform_app_ids.is_empty() {
+            return;
+        }
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.api
+                .inspect_network(crate::domain::PLATFORM_NETWORK_NAME),
+        )
+        .await;
+        match result {
+            Ok(Ok(Some(network)))
+                if crate::docker::platform_network::validate_existing(&network).is_ok() => {}
+            Ok(Ok(Some(_))) | Ok(Ok(None)) => {
+                for app_id in platform_app_ids {
+                    let Some(app) = snapshot.apps.iter_mut().find(|app| app.id == app_id) else {
+                        continue;
+                    };
+                    app.drift_codes
+                        .push(DriftCode::PlatformNetworkIdentityMismatch);
+                    snapshot.issues.push(issue(
+                        DriftCode::PlatformNetworkIdentityMismatch,
+                        Some(app_id),
+                        None,
+                    ));
+                }
+            }
+            Ok(Err(_)) | Err(_) => snapshot.complete = false,
+        }
     }
 
     pub async fn owned_container(
@@ -463,7 +520,7 @@ fn expected_owned_default_network(
 ) -> Option<crate::compose::OwnedDefaultNetworkIdentity> {
     let plan = plan?;
     plan.owned_default_network.then(|| {
-        let names = crate::domain::app_resource_names(&app.slug);
+        let names = app.resource_names();
         crate::compose::OwnedDefaultNetworkIdentity {
             docker_name: names.owned_default_network_name,
             bridge_name: names.bridge_name,
@@ -543,8 +600,8 @@ fn associate(
                 codes.push(DriftCode::ImageRefMismatch);
             }
             if let Some(plan) = &expected_network_plan {
-                let names = crate::domain::app_resource_names(&app.slug);
-                let expected = plan.expected_networks(&names);
+                let names = app.resource_names();
+                let expected = plan.expected_networks(&names, &app.slug);
                 let expected_names = expected
                     .iter()
                     .map(|network| network.name.as_str())
@@ -557,7 +614,7 @@ fn associate(
                 if expected_names != actual_names {
                     codes.push(DriftCode::NetworkAttachmentMismatch);
                 } else if expected.iter().any(|network| {
-                    network.kind == crate::domain::ExpectedNetworkKind::External
+                    network.kind != crate::domain::ExpectedNetworkKind::OwnedDefault
                         && network.aliases.iter().any(|alias| {
                             !container.networks.iter().any(|actual| {
                                 actual.name == network.name && actual.aliases.contains(alias)
@@ -641,6 +698,7 @@ mod tests {
         let release_id = Uuid::new_v4();
         let image = format!("example@sha256:{}", "a".repeat(64));
         let app = RecoveredApp {
+            resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
             app_id,
             slug: "example".into(),
             display_name: "Example".into(),
@@ -742,6 +800,7 @@ mod tests {
     ) -> AppCatalog {
         AppCatalog::from_recovery(&RecoveryReport {
             valid_apps: vec![RecoveredApp {
+                resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
                 app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
@@ -776,6 +835,7 @@ mod tests {
     ) -> AppCatalog {
         AppCatalog::from_recovery(&RecoveryReport {
             valid_apps: vec![RecoveredApp {
+                resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
                 app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
@@ -807,6 +867,7 @@ mod tests {
     fn network_drift_requires_exact_attachments_and_expected_alias_subset() {
         let (_, app_id, release_id, mut container) = fixture();
         let plan = crate::domain::network_plan(
+            false,
             false,
             &[crate::domain::NetworkInput::External {
                 name: "shared".into(),
@@ -920,15 +981,30 @@ mod tests {
             name: "solodock-example-default".into(),
             labels: HashMap::new(),
             driver: Some(driver.into()),
+            internal: false,
             options: HashMap::from([("com.docker.network.bridge.name".into(), bridge_name.into())]),
+        }
+    }
+
+    fn platform_network_resource() -> DockerNetworkResource {
+        DockerNetworkResource {
+            name: crate::domain::PLATFORM_NETWORK_NAME.into(),
+            labels: crate::docker::platform_network::expected_labels(),
+            driver: Some("bridge".into()),
+            internal: true,
+            options: HashMap::from([(
+                "com.docker.network.bridge.name".into(),
+                crate::domain::PLATFORM_BRIDGE_NAME.into(),
+            )]),
         }
     }
 
     #[tokio::test]
     async fn pending_only_network_identity_is_observed_without_a_container() {
         let app_id = Uuid::new_v4();
-        let plan = crate::domain::network_plan(true, &[crate::domain::NetworkInput::OwnedDefault])
-            .unwrap();
+        let plan =
+            crate::domain::network_plan(true, false, &[crate::domain::NetworkInput::OwnedDefault])
+                .unwrap();
         let catalog = catalog_with_pending_network_plan(app_id, Uuid::new_v4(), plan);
         let mut snapshot = associate(&catalog, vec![], ProbeStatus::Ready);
         assert!(snapshot.apps[0].expected_network_plan.is_some());
@@ -972,8 +1048,9 @@ mod tests {
     #[tokio::test]
     async fn network_observation_classifies_mismatch_error_timeout_and_external_only() {
         let app_id = Uuid::new_v4();
-        let owned = crate::domain::network_plan(true, &[crate::domain::NetworkInput::OwnedDefault])
-            .unwrap();
+        let owned =
+            crate::domain::network_plan(true, false, &[crate::domain::NetworkInput::OwnedDefault])
+                .unwrap();
         let catalog = catalog_with_pending_network_plan(app_id, Uuid::new_v4(), owned);
 
         for resource in [
@@ -1030,6 +1107,7 @@ mod tests {
 
         let external = crate::domain::network_plan(
             false,
+            false,
             &[crate::domain::NetworkInput::External {
                 name: "shared".into(),
                 aliases: vec![],
@@ -1051,6 +1129,55 @@ mod tests {
         assert!(snapshot.complete);
         assert_eq!(calls.load(Ordering::Acquire), 0);
         assert!(snapshot.apps[0].expected_owned_default_network.is_none());
+    }
+
+    #[tokio::test]
+    async fn platform_network_observation_is_separate_and_fail_closed_on_identity_drift() {
+        let app_id = Uuid::new_v4();
+        let plan = crate::domain::network_plan(false, true, &[]).unwrap();
+        let catalog = catalog_with_pending_network_plan(app_id, Uuid::new_v4(), plan);
+
+        let mut snapshot = associate(&catalog, vec![], ProbeStatus::Ready);
+        let observer = network_observer(
+            catalog.clone(),
+            Ok(Some(platform_network_resource())),
+            Duration::ZERO,
+            Arc::new(AtomicUsize::new(0)),
+        );
+        observer
+            .observe_owned_networks_with_timeout(&mut snapshot, Duration::from_millis(50))
+            .await;
+        assert!(snapshot.complete);
+        assert!(
+            !snapshot.apps[0]
+                .drift_codes
+                .contains(&DriftCode::PlatformNetworkIdentityMismatch)
+        );
+
+        for response in [
+            Ok(None),
+            Ok(Some(DockerNetworkResource {
+                internal: false,
+                ..platform_network_resource()
+            })),
+        ] {
+            let mut snapshot = associate(&catalog, vec![], ProbeStatus::Ready);
+            let observer = network_observer(
+                catalog.clone(),
+                response,
+                Duration::ZERO,
+                Arc::new(AtomicUsize::new(0)),
+            );
+            observer
+                .observe_owned_networks_with_timeout(&mut snapshot, Duration::from_millis(50))
+                .await;
+            assert!(snapshot.complete);
+            assert!(
+                snapshot.apps[0]
+                    .drift_codes
+                    .contains(&DriftCode::PlatformNetworkIdentityMismatch)
+            );
+        }
     }
 
     struct ObserverApi {
@@ -1121,8 +1248,9 @@ mod tests {
     #[tokio::test]
     async fn pending_only_network_plan_is_consistent_when_docker_or_listing_is_unavailable() {
         let app_id = Uuid::new_v4();
-        let plan = crate::domain::network_plan(true, &[crate::domain::NetworkInput::OwnedDefault])
-            .unwrap();
+        let plan =
+            crate::domain::network_plan(true, false, &[crate::domain::NetworkInput::OwnedDefault])
+                .unwrap();
         let catalog = catalog_with_pending_network_plan(app_id, Uuid::new_v4(), plan);
         let api = ObserverApi {
             containers: vec![],

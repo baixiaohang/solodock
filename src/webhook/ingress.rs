@@ -77,7 +77,8 @@ pub async fn receive(
             return unauthorized(request_id);
         }
     };
-    let known_app = state.observer.catalog.get(app_id).is_some();
+    let catalog_app = state.observer.catalog.get(app_id);
+    let known_app = catalog_app.is_some();
     if !webhooks.limiter.check(Some(app_id), known_app).await {
         drop(permit);
         return webhook_error(
@@ -85,6 +86,9 @@ pub async fn receive(
             "WEBHOOK_RATE_LIMITED",
             request_id,
         );
+    }
+    if catalog_app.is_some_and(|app| app.draft_revision.is_none()) {
+        return webhook_error(StatusCode::CONFLICT, "APP_UNCONFIGURED", request_id);
     }
     if one_header(&headers, header::CONTENT_TYPE.as_str()) != Ok("application/json") {
         return webhook_error(
@@ -146,6 +150,9 @@ pub async fn receive(
         Ok(value) => value,
         Err(_) => return unauthorized(request_id),
     };
+    if !metadata.is_configured() {
+        return webhook_error(StatusCode::CONFLICT, "APP_UNCONFIGURED", request_id);
+    }
     let generation = match poll_generation(&m3.store, &m4.credentials, &metadata) {
         Ok(value) => value,
         Err(_) => {

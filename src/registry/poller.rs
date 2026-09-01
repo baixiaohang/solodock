@@ -335,7 +335,10 @@ impl PollCoordinator {
                 )
                 .await;
         }
-        let image = match ImageReference::parse(&metadata.discovery_image_ref) {
+        let Some(discovery_image_ref) = metadata.discovery_image_ref.as_deref() else {
+            return Ok(());
+        };
+        let image = match ImageReference::parse(discovery_image_ref) {
             Ok(value) => value,
             Err(error) => {
                 return self
@@ -418,8 +421,9 @@ impl PollCoordinator {
                         && previous.last_manifest_digest.as_deref()
                             == Some(release.manifest_digest.as_str())
                     {
-                        let outcome = if release.config_revision == fresh.draft_revision
-                            && release.config_sha256 == fresh.draft_config_sha256
+                        let outcome = if Some(release.config_revision) == fresh.draft_revision
+                            && Some(release.config_sha256.as_str())
+                                == fresh.draft_config_sha256.as_deref()
                         {
                             PollOutcome::Unchanged
                         } else {
@@ -523,8 +527,8 @@ impl PollCoordinator {
                         )
                         .await;
                 }
-                let outcome = if release.config_revision == fresh.draft_revision
-                    && release.config_sha256 == fresh.draft_config_sha256
+                let outcome = if Some(release.config_revision) == fresh.draft_revision
+                    && Some(release.config_sha256.as_str()) == fresh.draft_config_sha256.as_deref()
                 {
                     PollOutcome::Unchanged
                 } else {
@@ -653,7 +657,7 @@ impl PollCoordinator {
             app_id: metadata.id,
             trigger: DeploymentTrigger::Poll,
             facts: ScheduleFacts {
-                draft_revision: fresh.draft_revision,
+                draft_revision: fresh.draft_revision.ok_or(())?,
                 active_release_id: active,
                 pending_release_id: pending,
                 actual_release_id: actual.as_ref().map(|value| value.0),
@@ -871,13 +875,17 @@ pub fn poll_generation(
     credentials: &CredentialStore,
     metadata: &crate::domain::AppMetadata,
 ) -> Result<String, StoreError> {
+    let discovery_image_ref = metadata
+        .discovery_image_ref
+        .as_deref()
+        .ok_or(StoreError::ContentInvalid)?;
     let credential = metadata
         .credential_ref
         .map(|id| credentials.load(id))
         .transpose()?;
     let canonical = serde_json::to_vec(&serde_json::json!({
         "app_id":metadata.id,"draft_revision":metadata.draft_revision,"draft_config_sha256":metadata.draft_config_sha256,
-        "source":ImageReference::parse(&metadata.discovery_image_ref).map_err(|_|StoreError::ContentInvalid)?.canonical_tagged_ref,
+        "source":ImageReference::parse(discovery_image_ref).map_err(|_|StoreError::ContentInvalid)?.canonical_tagged_ref,
         "credential":credential.as_ref().map(|value| (&value.metadata.id,&value.metadata.revision,&value.metadata.secret_revision)),
         "auto":metadata.auto_deploy_enabled,"interval":metadata.poll_interval_seconds,
     })).map_err(|_| StoreError::ContentInvalid)?;
@@ -938,7 +946,10 @@ fn target_key(metadata: &crate::domain::AppMetadata, resolved: &ResolvedImage) -
         format!(
             "{}:{}:{}:{}/{}/{}",
             metadata.id,
-            metadata.draft_config_sha256,
+            metadata
+                .draft_config_sha256
+                .as_deref()
+                .unwrap_or("unconfigured"),
             resolved.manifest_digest,
             resolved.platform.os,
             resolved.platform.architecture,

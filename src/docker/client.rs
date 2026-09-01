@@ -330,11 +330,33 @@ impl DockerReadApi for BollardReadClient {
                 name: network.name.unwrap_or_default(),
                 labels: network.labels.unwrap_or_default(),
                 driver: network.driver,
+                internal: network.internal.unwrap_or(false),
                 options: network.options.unwrap_or_default(),
             })),
             Err(error) if is_not_found(&error) => Ok(None),
             Err(error) => Err(classify(&error, false)),
         }
+    }
+
+    async fn create_platform_network(&self) -> Result<(), DockerError> {
+        use bollard::models::NetworkCreateRequest;
+        let docker = self.client().await?;
+        let request = NetworkCreateRequest {
+            name: crate::domain::PLATFORM_NETWORK_NAME.to_owned(),
+            driver: Some("bridge".to_owned()),
+            internal: Some(true),
+            labels: Some(crate::docker::platform_network::expected_labels()),
+            options: Some(HashMap::from([(
+                "com.docker.network.bridge.name".to_owned(),
+                crate::domain::PLATFORM_BRIDGE_NAME.to_owned(),
+            )])),
+            ..Default::default()
+        };
+        tokio::time::timeout(REQUEST_TIMEOUT, docker.create_network(request))
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
+            .map(|_| ())
+            .map_err(|error| classify(&error, false))
     }
 
     async fn inspect_network_snapshot(

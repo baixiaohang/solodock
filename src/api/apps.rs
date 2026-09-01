@@ -125,7 +125,7 @@ pub async fn detail(
     };
     Ok(Json(AppDetailResponse {
         observation: app,
-        resource_names: crate::domain::app_resource_names(&catalog.slug),
+        resource_names: catalog.resource_names(),
         draft: catalog.draft,
         draft_revision: catalog.draft_revision,
         draft_config_sha256: catalog.draft_config_sha256,
@@ -133,7 +133,9 @@ pub async fn detail(
         pending_release_id: catalog.pending_release_id,
         pending_image_ref: catalog.pending_image_ref,
         desired_state: catalog.desired_state,
-        deployment_status: if nonterminal {
+        deployment_status: if catalog.draft_revision.is_none() {
+            "UNCONFIGURED"
+        } else if nonterminal {
             "RUNNING"
         } else if catalog.pending_release_id.is_some() {
             "PENDING"
@@ -142,7 +144,11 @@ pub async fn detail(
         } else {
             "DEPLOY_REQUIRED"
         },
-        available_actions,
+        available_actions: if catalog.draft_revision.is_none() {
+            vec!["deletion_preview"]
+        } else {
+            available_actions
+        },
         compose_available: state.m3.as_ref().is_some_and(|m3| {
             m3.compose_capability.current() == crate::compose::ComposeStatus::Ready
         }),

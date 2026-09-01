@@ -11,12 +11,18 @@
   import { encodeWebhookSecret } from '../lib/webhookSecret'
   import { networkDraft, networkEditorError, networkEditorState } from '../lib/networks'
   import { formatTimestamp, timeSettings } from '../lib/time'
-  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, RegistryCredential, StatsSample, WebhookStatus } from '../lib/types'
+  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, RegistryCredential, SettingsResponse, StatsSample, WebhookStatus } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   import DeletionWebhookNotice from '../components/DeletionWebhookNotice.svelte'
   import NetworkEditor from '../components/NetworkEditor.svelte'
   import EnvironmentEditor from '../components/EnvironmentEditor.svelte'
+  import PortEditor from '../components/PortEditor.svelte'
+  import StorageEditor from '../components/StorageEditor.svelte'
+  import HealthLifecycleEditor from '../components/HealthLifecycleEditor.svelte'
+  import ManagedFileEditor from '../components/ManagedFileEditor.svelte'
+  import ImageSuggestions from '../components/ImageSuggestions.svelte'
   import { buildEnvironment, clearSensitiveEnvironmentValues, environmentRowsFromDraft, type EnvironmentRow } from '../lib/environmentRows'
+  import { buildManagedFiles, managedFileRowsFromDraft, type ManagedFileRow } from '../lib/managedFileRows'
   let { appId }: { appId: string } = $props()
   let app = $state<AppDetailResponse | null>(null)
   let stats = $state<StatsSample | null>(null)
@@ -39,14 +45,15 @@
   let editStopGrace = $state(10)
   let editAutoDeploy = $state(false)
   let editEnvironmentRows = $state<EnvironmentRow[]>([])
-  let editPublicFiles = $state('[]')
-  let editSecretFiles = $state('[]')
-  let editPorts = $state('[]')
-  let editVolumes = $state('[]')
-  let editBinds = $state('[]')
+  let editFileRows = $state<ManagedFileRow[]>([])
+  let editPorts = $state<DraftInput['ports']>([])
+  let editVolumes = $state<DraftInput['volumes']>([])
+  let editBinds = $state<DraftInput['binds']>([])
   let editOwnedDefaultNetwork = $state(true)
+  let editServiceDiscovery = $state(true)
   let editNetworks = $state<ExternalNetworkAttachment[]>([])
-  let editHealth = $state('{"policy":"running","stable_window_seconds":15}')
+  let editHealth = $state<DraftInput['health']>({ policy: 'running', stable_window_seconds: 15 })
+  let allowedBindRoots = $state<string[]>([])
   let credentials = $state<RegistryCredential[]>([])
   let editCredential = $state<string | null>(null)
   let deployments = $state<Deployment[]>([])
@@ -56,7 +63,7 @@
   let webhookSaved = $state(false)
   let webhookRetry = $state<RetryIdentity | undefined>()
   let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
-  let editNetworkError = $derived(networkEditorError({ ownedDefaultNetwork: editOwnedDefaultNetwork, externalNetworks: editNetworks }))
+  let editNetworkError = $derived(networkEditorError({ ownedDefaultNetwork: editOwnedDefaultNetwork, serviceDiscoveryEnabled: editServiceDiscovery, externalNetworks: editNetworks }))
   $effect(() => {
     if (editCredential && credentials.length > 0 && !matchingCredentials.some((value) => value.id === editCredential)) editCredential = null
   })
@@ -68,13 +75,14 @@
   })
 
   async function load() {
-    const [loadedApp, page, loadedCredentials, loadedWebhook] = await Promise.all([
+    const [loadedApp, page, loadedCredentials, loadedWebhook, loadedSettings] = await Promise.all([
       api<AppDetailResponse>(`/api/v1/apps/${appId}`),
       api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
       api<RegistryCredential[]>('/api/v1/registry-credentials'),
       api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`).catch(() => null),
+      api<SettingsResponse>('/api/v1/settings').catch(() => ({ revision: '', display_timezone: 'UTC', supported_timezones: ['UTC'], allowed_bind_roots: [], slug_max_length: 20, supported_mount_types: ['owned_volume', 'external_volume', 'bind'] })),
     ])
-    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook
+    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook; allowedBindRoots = loadedSettings.allowed_bind_roots
   }
 
   function prepareWebhookSecret() {
@@ -149,57 +157,40 @@
     return `${name} · ${scope} · ${exists ? '实际存在' : '仅配置'}`
   }
   function startEditing() {
-    if (!app?.draft || !app.draft_revision) return
-    editName = app.display_name; editImage = app.draft.discovery_image_ref
-    editPoll = app.draft.poll_interval_seconds
-    editStopGrace = app.draft.stop_grace_period_seconds
-    editAutoDeploy = app.draft.auto_deploy_enabled
-    editEnvironmentRows = environmentRowsFromDraft(app.draft)
-    editPublicFiles = pretty(app.draft.files.filter((file) => !file.sensitive).map((file) => ({ logical_name: file.logical_name, target_path: file.target_path, content: file.content ?? '' })))
-    editSecretFiles = '[]'
-    editPorts = pretty(app.draft.ports); editVolumes = pretty(app.draft.volumes)
-    editBinds = pretty(app.draft.binds)
-    const networkState = networkEditorState(app.draft.owned_default_network, app.draft.networks)
+    if (!app) return
+    editName = app.display_name; editImage = app.draft?.discovery_image_ref ?? ''
+    editPoll = app.draft?.poll_interval_seconds ?? 300
+    editStopGrace = app.draft?.stop_grace_period_seconds ?? 10
+    editAutoDeploy = app.draft?.auto_deploy_enabled ?? false
+    editEnvironmentRows = app.draft ? environmentRowsFromDraft(app.draft) : []
+    editFileRows = app.draft ? managedFileRowsFromDraft(app.draft) : []
+    editPorts = (app.draft?.ports ?? []).map((row) => ({ ...row })); editVolumes = (app.draft?.volumes ?? []).map((row) => ({ ...row }))
+    editBinds = (app.draft?.binds ?? []).map((row) => ({ ...row }))
+    const networkState = networkEditorState(app.draft?.owned_default_network ?? true, app.draft?.service_discovery_enabled ?? true, app.draft?.networks ?? [])
     editOwnedDefaultNetwork = networkState.ownedDefaultNetwork
+    editServiceDiscovery = app.draft?.service_discovery_enabled ?? true
     editNetworks = networkState.externalNetworks
-    editHealth = pretty(app.draft.health); editRetry = undefined; validation = null; editing = true
-    editCredential = app.draft.credential_ref
-  }
-  function jsonArray(value: string): Array<Record<string, unknown>> {
-    const parsed: unknown = JSON.parse(value); if (!Array.isArray(parsed)) throw new Error('array required')
-    return parsed as Array<Record<string, unknown>>
+    editHealth = JSON.parse(JSON.stringify(app.draft?.health ?? { policy: 'running', stable_window_seconds: 15 })); editRetry = undefined; validation = null; editing = true
+    editCredential = app.draft?.credential_ref ?? null
   }
   function buildDraft(): DraftInput {
-    if (!app?.draft) throw new Error('missing draft')
-    const publicFiles = jsonArray(editPublicFiles).map((file) => ({
-      logical_name: String(file.logical_name), target_path: String(file.target_path), sensitive: false as const,
-      readonly: true as const, content: String(file.content ?? ''),
-    }))
-    const changedSecretNames = new Set<string>()
-    const secretFiles = jsonArray(editSecretFiles).map((file) => {
-      const logical_name = String(file.logical_name); const operation = String(file.operation)
-      changedSecretNames.add(logical_name)
-      if (operation === 'delete') return { logical_name, target_path: String(file.target_path), sensitive: true as const, readonly: true as const, operation: 'delete' as const }
-      return { logical_name, target_path: String(file.target_path), sensitive: true as const, readonly: true as const, operation: 'replace' as const, value: String(file.value ?? '') }
-    })
-    const keptSecretFiles = app.draft.files.filter((file) => file.sensitive && !changedSecretNames.has(file.logical_name)).map((file) => ({
-      logical_name: file.logical_name, target_path: file.target_path, sensitive: true as const, readonly: true as const, operation: 'keep' as const,
-    }))
+    if (!app) throw new Error('missing app')
     return {
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
-      auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !app.draft.auto_deploy_enabled, poll_interval_seconds: editPoll,
+      auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !(app.draft?.auto_deploy_enabled ?? false), poll_interval_seconds: editPoll,
       stop_grace_period_seconds: editStopGrace,
       environment: buildEnvironment(editEnvironmentRows),
-      files: [...publicFiles, ...keptSecretFiles, ...secretFiles],
-      ports: jsonArray(editPorts) as unknown as DraftInput['ports'],
-      volumes: jsonArray(editVolumes) as unknown as DraftInput['volumes'],
-      binds: jsonArray(editBinds) as unknown as DraftInput['binds'],
-      ...networkDraft({ ownedDefaultNetwork: editOwnedDefaultNetwork, externalNetworks: editNetworks }),
-      health: JSON.parse(editHealth) as DraftInput['health'],
+      files: buildManagedFiles(editFileRows),
+      ports: editPorts,
+      volumes: editVolumes,
+      binds: editBinds,
+      ...networkDraft({ ownedDefaultNetwork: editOwnedDefaultNetwork, serviceDiscoveryEnabled: editServiceDiscovery, externalNetworks: editNetworks }),
+      service_discovery_enabled: editServiceDiscovery,
+      health: editHealth,
     }
   }
   async function deploy() {
-    if (!app?.draft_revision) return
+    if (!app) return
     const nonRollbackable = (app.draft?.volumes.length ?? 0) > 0 || (app.draft?.binds.length ?? 0) > 0
     if (nonRollbackable && !window.confirm('部署/回滚不会回退 named volume 或 bind 内容。继续？')) return
     actionBusy = true; error = ''
@@ -224,13 +215,13 @@
     catch { error = '配置预检失败，请检查资源、路径与 Compose 能力。' } finally { actionBusy = false }
   }
   async function saveDraft() {
-    if (!app?.draft_revision) return
+    if (!app) return
     actionBusy = true; error = ''
     try {
       const request = { expected_revision: app.draft_revision, draft: buildDraft() }
       editRetry = retryIdentity(editRetry, request)
       await mutation(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
-      clearSensitiveEnvironmentValues(editEnvironmentRows); editSecretFiles = '[]'; editRetry = undefined
+      clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = editFileRows.map((row) => ({ ...row, value: row.sensitive ? '' : row.value })); editRetry = undefined
     } catch { error = '保存失败；可修正后重试，同一请求会复用幂等键。' } finally { actionBusy = false }
     if (error) return
     try { await load(); startEditing() }
@@ -242,11 +233,10 @@
   <a class="back" href="#/">← 返回观察台</a>
   {#if error}<p class="notice danger">{error}</p>{/if}
   {#if app}
-    <div class="detail-heading"><div><p class="eyebrow">APPLICATION</p><h1>{app.display_name}</h1><code>{app.id}</code></div><span class:healthy={app.actual?.health === 'healthy'} class="state-pill large">{app.deployment_status === 'DEPLOY_REQUIRED' ? '等待首次部署' : `${app.actual?.status ?? 'unavailable'} · ${app.actual?.health ?? 'unknown'}`}</span></div>
+    <div class="detail-heading"><div><p class="eyebrow">APPLICATION</p><h1>{app.display_name}</h1><code>{app.id}</code></div><span class:healthy={app.actual?.health === 'healthy'} class="state-pill large">{app.deployment_status === 'UNCONFIGURED' ? '尚未配置' : app.deployment_status === 'DEPLOY_REQUIRED' ? '等待首次部署' : `${app.actual?.status ?? 'unavailable'} · ${app.actual?.health ?? 'unknown'}`}</span></div>
     <p class="notice"><strong>不可变 slug：</strong><code>{app.slug}</code> · <strong>Compose project：</strong><code>{app.resource_names.project_name}</code> · <strong>默认容器：</strong><code>{app.resource_names.project_name}-app-1</code></p>
     {#if app.expected_owned_default_network}<p class="notice"><strong>Owned network：</strong><code>{app.expected_owned_default_network.docker_name}</code> · <strong>Host bridge：</strong><code>{app.expected_owned_default_network.bridge_name}</code></p>{:else if !app.active_release && !app.pending_release_id && app.draft?.owned_default_network}<p class="notice"><strong>Draft owned network：</strong><code>{app.resource_names.owned_default_network_name}</code> · <strong>Host bridge：</strong><code>{app.resource_names.bridge_name}</code></p>{/if}
     <div class="actions"><button disabled={actionBusy || !app.available_actions.includes('deploy')} onclick={() => void deploy()}>部署 draft</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('start')} onclick={() => void lifecycle('start')}>启动</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('stop')} onclick={() => void lifecycle('stop')}>停止</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('restart')} onclick={() => void lifecycle('restart')}>重启</button><button class="danger danger-action" disabled={actionBusy} onclick={() => { deletionDialog = true; deletion = null; removeContainer = false }}>取消登记…</button></div>
-    {#if app.deployment_status === 'DEPLOY_REQUIRED'}<p class="notice warning">当前只有 draft config；点击“部署 draft”后才会把 tag 解析为本机平台 digest。</p>{:else if app.deployment_status === 'RUNNING'}<p class="notice warning">部署正在执行，期间只允许查看与安全删除预览。</p>{:else if app.deployment_status === 'PENDING'}<p class="notice warning">存在 pending release 或中断现场。请查看部署历史并基于当前 facts 明确重新收敛。</p>{/if}
     <div class="tabs"><button class:active={tab === 'overview'} onclick={() => { tab = 'overview' }}>概览</button><button class:active={tab === 'configuration'} onclick={() => { tab = 'configuration'; startEditing() }}>配置</button><button class:active={tab === 'deployments'} onclick={() => { tab = 'deployments' }}>部署历史</button><button class:active={tab === 'logs'} onclick={() => { tab = 'logs' }}>实时日志</button></div>
     {#if tab === 'logs'}
       <LogsPane {appId} />
@@ -269,25 +259,24 @@
     {:else if tab === 'configuration'}
       {#if editing}
         <form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
-          <header><h2>Draft 配置</h2><p class="muted">Revision <code>{app.draft_revision}</code> · 保存会原子创建新的不可变 revision。</p></header>
+          <header><h2>Draft 配置</h2><p class="muted">Revision <code>{app.draft_revision ?? '尚未创建'}</code> · 保存会原子创建新的不可变 revision。</p></header>
           <label>Slug（不可修改）<input value={app.slug} readonly /></label><label>显示名称<input bind:value={editName} required /></label>
           <label>发现镜像 tag<input bind:value={editImage} required /></label><label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={editPoll} /></label>
-          <label>停机宽限（秒）<input type="number" min="1" max="600" bind:value={editStopGrace} /><span class="muted">最大等待时间，服务提前退出时不会空等。</span></label>
           <label class="checkbox"><input type="checkbox" bind:checked={editAutoDeploy} /> 自动部署 tag 的新 digest</label>
           {#if editAutoDeploy}<p class="notice warning">启用后，新 digest 会自动替换容器并在健康失败时恢复旧 release；volume/bind 数据不会回滚。禁用不会取消已经 durable claim 的部署。</p>{/if}
           <label>Registry credential<select bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
+          <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} />
           <EnvironmentEditor bind:rows={editEnvironmentRows} />
-          <label>公开文件 JSON（logical_name、target_path、content）<textarea rows="6" bind:value={editPublicFiles}></textarea></label>
-          <label>Secret 文件操作 JSON（logical_name、target_path、operation=replace/delete、value）<textarea rows="5" bind:value={editSecretFiles} autocomplete="off"></textarea></label>
-          <label>端口 JSON<textarea rows="6" bind:value={editPorts}></textarea></label><label>Named volumes JSON<textarea rows="6" bind:value={editVolumes}></textarea></label>
-          <label>受限 bind JSON<textarea rows="6" bind:value={editBinds}></textarea></label>
-          <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:externalNetworks={editNetworks} />
-          <label>健康策略 JSON<textarea rows="5" bind:value={editHealth}></textarea></label>
+          <ManagedFileEditor bind:rows={editFileRows} />
+          <PortEditor bind:ports={editPorts} />
+          <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} />
+          <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:serviceDiscoveryEnabled={editServiceDiscovery} bind:externalNetworks={editNetworks} />
+          <HealthLifecycleEditor bind:health={editHealth} bind:stopGrace={editStopGrace} />
           <p class="notice warning">读写 bind 必须显式设置 acknowledge_non_rollbackable；SoloDock 永不修改或删除其源目录。敏感输入只保留在当前表单内，成功后立即清空。</p>
-          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError}>保存新 revision</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editSecretFiles = '[]'; tab = 'overview' }}>取消</button></div>
+          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError}>保存新 revision</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; tab = 'overview' }}>取消</button></div>
           {#if validation}<article class="notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · 停机宽限 {validation.plan.stop_grace_period_seconds} 秒 · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络 · {validation.plan.network_mode}</p>{#if validation.plan.owned_default_network}<p>Owned network：<code>{validation.plan.owned_default_network.docker_name}</code> · bridge：<code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{#if validation.plan.external_networks.length}<p>External network 不由 SoloDock 创建、修改或删除。</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
         </form>
-        {#if webhook}<article class="panel webhook-panel"><h2>Registry recheck webhook</h2><p><span class="tag">{webhook.degraded ? '配置损坏：请生成新 secret 修复' : webhook.configured ? '已配置' : '未配置'}</span> · {webhook.algorithm}</p><p><code>{webhook.public_origin}{webhook.public_path}</code></p><p class="muted">Webhook 只触发一次 durable Registry recheck；不会信任 payload 中的镜像信息，也不会绕过自动部署、退避、drift 或健康门禁。</p>{#if webhookSecret}<p class="notice warning">这是 secret 唯一一次显示机会，请保存到 CI secret store：<code>{webhookSecret}</code></p><label class="checkbox"><input type="checkbox" bind:checked={webhookSaved} /> 我已安全保存该 secret</label><div class="actions"><button disabled={actionBusy || !webhookSaved} onclick={() => void saveWebhook()}>{webhook.configured ? '确认轮换' : '确认配置'}</button><button class="ghost" onclick={() => { webhookSecret = ''; webhookSaved = false; webhookRetry = undefined }}>取消</button></div>{:else}<div class="actions"><button disabled={actionBusy} onclick={prepareWebhookSecret}>{webhook.configured ? '生成轮换 secret' : '生成 webhook secret'}</button>{#if webhook.configured}<button class="danger" disabled={actionBusy} onclick={() => void revokeWebhook()}>撤销 webhook</button>{/if}</div>{/if}</article>{/if}
+        {#if app.draft && webhook}<article class="panel webhook-panel"><h2>Registry recheck webhook</h2><p><span class="tag">{webhook.degraded ? '配置损坏：请生成新 secret 修复' : webhook.configured ? '已配置' : '未配置'}</span> · {webhook.algorithm}</p><p><code>{webhook.public_origin}{webhook.public_path}</code></p><p class="muted">Webhook 只触发一次 durable Registry recheck；不会信任 payload 中的镜像信息，也不会绕过自动部署、退避、drift 或健康门禁。</p>{#if webhookSecret}<p class="notice warning">这是 secret 唯一一次显示机会，请保存到 CI secret store：<code>{webhookSecret}</code></p><label class="checkbox"><input type="checkbox" bind:checked={webhookSaved} /> 我已安全保存该 secret</label><div class="actions"><button disabled={actionBusy || !webhookSaved} onclick={() => void saveWebhook()}>{webhook.configured ? '确认轮换' : '确认配置'}</button><button class="ghost" onclick={() => { webhookSecret = ''; webhookSaved = false; webhookRetry = undefined }}>取消</button></div>{:else}<div class="actions"><button disabled={actionBusy} onclick={prepareWebhookSecret}>{webhook.configured ? '生成轮换 secret' : '生成 webhook secret'}</button>{#if webhook.configured}<button class="danger" disabled={actionBusy} onclick={() => void revokeWebhook()}>撤销 webhook</button>{/if}</div>{/if}</article>{/if}
       {/if}
     {:else}
       {#if app.drift_codes.length}<div class="notice warning">{#each app.drift_codes as code}<span>{driftText(code)}</span>{/each}</div>{/if}

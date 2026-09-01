@@ -2,8 +2,10 @@ pub mod apps;
 pub mod assets;
 pub mod auth;
 pub mod deployments;
+pub mod image_inspection;
 pub mod middleware;
 pub mod mutations;
+pub mod presets;
 pub mod settings;
 pub mod streams;
 pub mod system;
@@ -134,6 +136,16 @@ pub fn router(state: AppState) -> Router {
     let settings = Router::new()
         .route("/api/v1/settings", get(settings::get).put(settings::update))
         .layer(DefaultBodyLimit::max(16 * 1024));
+    let presets = Router::new()
+        .route("/api/v1/app-presets", get(presets::list))
+        .route("/api/v1/apps/from-preset", post(presets::create))
+        .layer(DefaultBodyLimit::max(16 * 1024));
+    let image_inspection = Router::new()
+        .route(
+            "/api/v1/images/inspect-config",
+            post(image_inspection::inspect),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024));
     let public_webhook = Router::new()
         .route(
             "/hooks/v1/apps/{id}/registry",
@@ -163,6 +175,8 @@ pub fn router(state: AppState) -> Router {
         .merge(m4_mutations)
         .merge(webhook_admin)
         .merge(settings)
+        .merge(presets)
+        .merge(image_inspection)
         .merge(public_webhook)
         .fallback(assets::serve)
         .with_state(state.clone())

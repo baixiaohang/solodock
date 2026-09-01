@@ -19,6 +19,7 @@ describe('Settings', () => {
         revision: '00000000-0000-4000-8000-000000000001',
         display_timezone: 'UTC',
         supported_timezones: ['UTC', 'Asia/Shanghai', 'America/New_York'],
+        allowed_bind_roots: [],
       }), { status: 200 })
       expect(init.method).toBe('PUT')
       expect(JSON.parse(String(init.body)).display_timezone).toBe('Asia/Shanghai')
@@ -26,6 +27,7 @@ describe('Settings', () => {
         revision: '00000000-0000-4000-8000-000000000002',
         display_timezone: 'Asia/Shanghai',
         supported_timezones: ['UTC', 'Asia/Shanghai', 'America/New_York'],
+        allowed_bind_roots: [],
       }), { status: 200 })
     })
     vi.stubGlobal('fetch', fetch)
@@ -35,7 +37,7 @@ describe('Settings', () => {
     expect(screen.queryByRole('textbox')).toBeNull()
     const user = userEvent.setup()
     await user.selectOptions(select, 'Asia/Shanghai')
-    await user.click(screen.getByRole('button', { name: '保存全局时区' }))
+    await user.click(screen.getByRole('button', { name: '保存系统设置' }))
     expect(await screen.findByText('已生效')).toBeTruthy()
     expect(get(timeSettings).timezone).toBe('Asia/Shanghai')
   })
@@ -48,6 +50,7 @@ describe('Settings', () => {
         revision: '00000000-0000-4000-8000-000000000001',
         display_timezone: 'UTC',
         supported_timezones: ['UTC', 'Asia/Shanghai'],
+        allowed_bind_roots: [],
       }), { status: 200 })
       keys.push(new Headers(init.headers).get('Idempotency-Key') ?? '')
       putCount += 1
@@ -56,6 +59,7 @@ describe('Settings', () => {
         revision: '00000000-0000-4000-8000-000000000002',
         display_timezone: 'Asia/Shanghai',
         supported_timezones: ['UTC', 'Asia/Shanghai'],
+        allowed_bind_roots: [],
         idempotency_replayed: true,
       }), { status: 200 })
     })
@@ -65,9 +69,9 @@ describe('Settings', () => {
     render(Settings)
     const user = userEvent.setup()
     await user.selectOptions(await screen.findByLabelText('显示时区'), 'Asia/Shanghai')
-    await user.click(screen.getByRole('button', { name: '保存全局时区' }))
+    await user.click(screen.getByRole('button', { name: '保存系统设置' }))
     expect((await screen.findByRole('alert')).textContent).toContain('保存失败')
-    await user.click(screen.getByRole('button', { name: '保存全局时区' }))
+    await user.click(screen.getByRole('button', { name: '保存系统设置' }))
     expect(await screen.findByText('已生效')).toBeTruthy()
     expect(keys).toEqual([keys[0], keys[0]])
     expect(sequence).toBe(1)

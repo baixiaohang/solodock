@@ -35,6 +35,8 @@ pub struct ReleaseV2 {
     pub config_sha256: String,
     #[serde(default = "crate::domain::default_stop_grace_period_seconds")]
     pub stop_grace_period_seconds: u16,
+    #[serde(default)]
+    pub service_discovery_enabled: bool,
     pub source_image_ref: String,
     pub logical_registry: String,
     pub repository: String,
@@ -64,6 +66,9 @@ impl ReleaseV2 {
             // the TOML artifact explicitly.
             self.stop_grace_period_seconds = crate::domain::default_stop_grace_period_seconds();
         }
+        if matches!(self.schema_version, 3 | 4) {
+            self.service_discovery_enabled = false;
+        }
     }
 }
 
@@ -77,32 +82,38 @@ impl AppStore {
         source_release_id: Option<Uuid>,
     ) -> Result<ReleaseV2, StoreError> {
         let app_directory = self.app_directory(app.id);
-        let loaded = config_revision::load_verified(
-            &app_directory,
-            app.draft_revision,
-            self.integrity_key()?,
-        )?;
+        let draft_revision = app.draft_revision.ok_or(StoreError::ContentInvalid)?;
+        let draft_config_sha256 = app
+            .draft_config_sha256
+            .clone()
+            .ok_or(StoreError::ContentInvalid)?;
+        let discovery_image_ref = app
+            .discovery_image_ref
+            .clone()
+            .ok_or(StoreError::ContentInvalid)?;
+        let loaded =
+            config_revision::load_verified(&app_directory, draft_revision, self.integrity_key()?)?;
+        let allowed_bind_roots = self.allowed_bind_roots();
         let draft = loaded
             .normalize_verified(
                 app.display_name.clone(),
-                app.discovery_image_ref.clone(),
+                discovery_image_ref,
                 app.credential_ref,
                 app.auto_deploy_enabled,
                 app.poll_interval_seconds,
                 self.integrity_key()?,
-                self.allowed_bind_roots(),
+                &allowed_bind_roots,
             )
             .map_err(|_| StoreError::ContentInvalid)?;
-        if draft.metadata.config_sha256 != app.draft_config_sha256 {
+        if draft.metadata.config_sha256 != draft_config_sha256 {
             return Err(StoreError::ContentInvalid);
         }
         let revision_directory = app_directory
             .join("config-revisions")
-            .join(app.draft_revision.to_string());
+            .join(draft_revision.to_string());
         let (compose, _) = generate(
             ComposeInput {
-                app_id: app.id,
-                slug: &app.slug,
+                resource_identity: app.resource_identity(),
                 release_id,
                 image_ref: &resolved.runnable_image_ref,
                 revision_directory: &revision_directory,
@@ -114,13 +125,14 @@ impl AppStore {
         .map_err(|_| StoreError::ContentInvalid)?;
         let compose_sha256 = format!("{:x}", Sha256::digest(compose.as_bytes()));
         let mut release = ReleaseV2 {
-            schema_version: 4,
-            compose_schema_version: 3,
+            schema_version: 5,
+            compose_schema_version: 4,
             id: release_id,
             app_id: app.id,
-            config_revision: app.draft_revision,
-            config_sha256: app.draft_config_sha256.clone(),
+            config_revision: draft_revision,
+            config_sha256: draft_config_sha256,
             stop_grace_period_seconds: draft.stop_grace_period_seconds,
+            service_discovery_enabled: draft.service_discovery_enabled,
             source_image_ref: resolved.source_image_ref.clone(),
             logical_registry: resolved.logical_registry.clone(),
             repository: resolved.repository.clone(),
@@ -166,7 +178,7 @@ impl AppStore {
         release.apply_schema_defaults();
         if !matches!(
             (release.schema_version, release.compose_schema_version),
-            (3, 2) | (4, 3)
+            (3, 2) | (4, 3) | (5, 4)
         ) || release.id != release_id
             || release.app_id != app_id
             || sign(&release, self.integrity_key()?) != release.integrity_hmac
@@ -187,18 +199,22 @@ impl AppStore {
         if loaded.metadata.config_sha256 != release.config_sha256 {
             return Err(StoreError::ContentInvalid);
         }
+        let allowed_bind_roots = self.allowed_bind_roots();
         let draft = loaded
             .normalize_verified(
-                app.display_name,
+                app.display_name.clone(),
                 release.source_image_ref.clone(),
                 release.credential_ref,
                 app.auto_deploy_enabled,
                 app.poll_interval_seconds,
                 self.integrity_key()?,
-                self.allowed_bind_roots(),
+                &allowed_bind_roots,
             )
             .map_err(|_| StoreError::ContentInvalid)?;
         if release.stop_grace_period_seconds != loaded.metadata.stop_grace_period_seconds {
+            return Err(StoreError::ContentInvalid);
+        }
+        if release.service_discovery_enabled != loaded.metadata.service_discovery_enabled {
             return Err(StoreError::ContentInvalid);
         }
         let revision_directory = self
@@ -207,8 +223,7 @@ impl AppStore {
             .join(release.config_revision.to_string());
         let (canonical, _) = generate(
             ComposeInput {
-                app_id,
-                slug: &app.slug,
+                resource_identity: app.resource_identity(),
                 release_id,
                 image_ref: &release.runnable_image_ref,
                 revision_directory: &revision_directory,
@@ -355,7 +370,7 @@ impl ReleaseV2 {
 }
 
 pub(crate) fn sign(release: &ReleaseV2, key: &[u8]) -> String {
-    let encoded = if release.schema_version == 3 {
+    let encoded = if matches!(release.schema_version, 3 | 4) {
         #[derive(Serialize)]
         struct LegacyRelease<'a> {
             schema_version: u32,
@@ -364,6 +379,8 @@ pub(crate) fn sign(release: &ReleaseV2, key: &[u8]) -> String {
             app_id: Uuid,
             config_revision: Uuid,
             config_sha256: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stop_grace_period_seconds: Option<u16>,
             source_image_ref: &'a str,
             logical_registry: &'a str,
             repository: &'a str,
@@ -391,6 +408,8 @@ pub(crate) fn sign(release: &ReleaseV2, key: &[u8]) -> String {
             app_id: release.app_id,
             config_revision: release.config_revision,
             config_sha256: &release.config_sha256,
+            stop_grace_period_seconds: (release.schema_version == 4)
+                .then_some(release.stop_grace_period_seconds),
             source_image_ref: &release.source_image_ref,
             logical_registry: &release.logical_registry,
             repository: &release.repository,
@@ -443,6 +462,7 @@ mod tests {
             config_revision: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
             config_sha256: "0".repeat(64),
             stop_grace_period_seconds: 60,
+            service_discovery_enabled: false,
             source_image_ref: "registry.example/app:stable".into(),
             logical_registry: "registry.example".into(),
             repository: "app".into(),
@@ -489,6 +509,7 @@ mod tests {
             config_revision: Uuid::new_v4(),
             config_sha256: "0".repeat(64),
             stop_grace_period_seconds: 10,
+            service_discovery_enabled: false,
             source_image_ref: "registry.example/app:stable".into(),
             logical_registry: "registry.example".into(),
             repository: "app".into(),
@@ -552,6 +573,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: false,
                 networks: vec![],
                 health: HealthPolicy::default(),
             },
@@ -572,9 +594,8 @@ mod tests {
             .create_app(
                 app_id,
                 "legacy",
-                revision_id,
                 Uuid::new_v4(),
-                &draft,
+                Some((revision_id, &draft)),
                 OffsetDateTime::now_utc(),
             )
             .unwrap();
@@ -620,8 +641,7 @@ mod tests {
             .join(revision_id.to_string());
         let (legacy_compose, _) = generate(
             ComposeInput {
-                app_id,
-                slug: "legacy",
+                resource_identity: metadata.resource_identity(),
                 release_id: legacy_release_id,
                 image_ref: &resolved.runnable_image_ref,
                 revision_directory: &revision_directory,
@@ -709,7 +729,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             (current.schema_version, current.compose_schema_version),
-            (4, 3)
+            (5, 4)
         );
         let current_compose =
             fs::read_to_string(store.release_compose_path(app_id, current_release_id)).unwrap();
@@ -739,6 +759,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: HealthPolicy::default(),
             },
@@ -755,9 +776,8 @@ mod tests {
             .create_app(
                 app_id,
                 "example",
-                revision_id,
                 create_operation,
-                &draft,
+                Some((revision_id, &draft)),
                 now,
             )
             .unwrap();

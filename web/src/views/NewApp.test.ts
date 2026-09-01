@@ -1,33 +1,21 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen, waitFor } from '@testing-library/svelte'
+import { cleanup, render, screen } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-
 import NewApp from './NewApp.svelte'
 
-afterEach(() => {
-  cleanup()
-  vi.unstubAllGlobals()
-})
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
-describe('new app resource preview', () => {
-  it('hides owned network and bridge identity after switching to external-only', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('[]', { status: 200 })))
-    const user = userEvent.setup()
-    render(NewApp)
-
-    expect((screen.getByLabelText(/^停机宽限（秒）/) as HTMLInputElement).value).toBe('10')
-
-    await user.type(screen.getByLabelText(/^Slug/), 'demo')
-    expect(screen.getByText('solodock-demo-app-1')).toBeTruthy()
-    expect(screen.getByText('solodock-demo-default')).toBeTruthy()
-    expect(screen.getByText('sd-demo')).toBeTruthy()
-
-    await user.click(screen.getByLabelText('创建应用专属默认网络'))
-    await waitFor(() => {
-      expect(screen.queryByText('solodock-demo-default')).toBeNull()
-      expect(screen.queryByText('sd-demo')).toBeNull()
+describe('new app onboarding', () => {
+  it('creates an unconfigured service from only a 20-character-capable name', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (!init?.method) return new Response(JSON.stringify({ revision: 'r1', display_timezone: 'UTC', supported_timezones: ['UTC'], allowed_bind_roots: [], slug_max_length: 20, supported_mount_types: ['owned_volume', 'external_volume', 'bind'] }))
+      return new Response(JSON.stringify({ app: { id: '00000000-0000-4000-8000-000000000001', slug: JSON.parse(String(init.body)).slug, config_revision: null, stop_grace_period_seconds: null, deployment_status: 'UNCONFIGURED', warnings: [] }, idempotency_replayed: false }), { status: 201 })
     })
-    expect(screen.getByText('solodock-demo-app-1')).toBeTruthy()
+    vi.stubGlobal('fetch', fetch); vi.stubGlobal('crypto', { randomUUID: () => '00000000-0000-4000-8000-000000000002' })
+    render(NewApp); const input = screen.getByLabelText(/^服务名/) as HTMLInputElement
+    expect(input.maxLength).toBe(20); expect(screen.queryByText(/JSON/)).toBeNull(); expect(screen.getByText('PostgreSQL')).toBeTruthy()
+    const user = userEvent.setup(); await user.type(input, 'insight-agent'); await user.click(screen.getByRole('button', { name: '创建空白服务' }))
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
   })
 })

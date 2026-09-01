@@ -1,91 +1,22 @@
 <script lang="ts">
-  import { api, mutation } from '../lib/api'
   import { onMount } from 'svelte'
+  import { api, mutation } from '../lib/api'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
-  import { credentialsForReference } from '../lib/registryReference'
-  import { networkDraft, networkEditorError } from '../lib/networks'
-  import type { AppMutationResponse, DraftInput, ExternalNetworkAttachment, RegistryCredential } from '../lib/types'
-  import NetworkEditor from '../components/NetworkEditor.svelte'
-  import EnvironmentEditor from '../components/EnvironmentEditor.svelte'
-  import { buildEnvironment, clearSensitiveEnvironmentValues, type EnvironmentRow } from '../lib/environmentRows'
-
+  import type { AppMutationResponse, SettingsResponse } from '../lib/types'
   let slug = $state('')
-  let displayName = $state('')
-  let image = $state('')
-  let environmentRows = $state<EnvironmentRow[]>([])
-  let pollInterval = $state(300)
-  let stopGracePeriod = $state(10)
-  let autoDeploy = $state(false)
-  let files = $state('[]')
-  let ports = $state('[]')
-  let volumes = $state('[]')
-  let binds = $state('[]')
-  let ownedDefaultNetwork = $state(true)
-  let externalNetworks = $state<ExternalNetworkAttachment[]>([])
-  let health = $state('{"policy":"running","stable_window_seconds":15}')
   let busy = $state(false)
   let error = $state('')
   let retry = $state<RetryIdentity | undefined>()
-  let credentials = $state<RegistryCredential[]>([])
-  let credentialRef = $state<string | null>(null)
-  let matchingCredentials = $derived(credentialsForReference(credentials, image))
-  let networkError = $derived(networkEditorError({ ownedDefaultNetwork, externalNetworks }))
-  let slugValid = $derived(/^[a-z0-9](?:[a-z0-9-]{0,10}[a-z0-9])?$/.test(slug))
-  $effect(() => {
-    if (credentialRef && credentials.length > 0 && !matchingCredentials.some((value) => value.id === credentialRef)) credentialRef = null
-  })
-  onMount(() => { void api<RegistryCredential[]>('/api/v1/registry-credentials').then((value) => { credentials = value }) })
-
+  let slugMaxLength = $state(20)
+  let slugValid = $derived(new RegExp(`^[a-z0-9](?:[a-z0-9-]{0,${Math.max(0, slugMaxLength - 2)}}[a-z0-9])?$`).test(slug))
+  onMount(() => { void api<SettingsResponse>('/api/v1/settings').then((settings) => { slugMaxLength = settings.slug_max_length }).catch(() => undefined) })
   async function submit() {
-    busy = true
-    error = ''
-    try {
-      const draft: DraftInput = {
-        display_name: displayName, discovery_image_ref: image,
-        credential_ref: credentialRef, auto_deploy_enabled: autoDeploy, auto_deploy_acknowledged: autoDeploy, poll_interval_seconds: pollInterval,
-        stop_grace_period_seconds: stopGracePeriod,
-        environment: buildEnvironment(environmentRows), files: JSON.parse(files), ports: JSON.parse(ports),
-        volumes: JSON.parse(volumes), binds: JSON.parse(binds),
-        ...networkDraft({ ownedDefaultNetwork, externalNetworks }),
-        health: JSON.parse(health),
-      }
-      const request = { slug, ...draft }
-      retry = retryIdentity(retry, request)
-      const result = await mutation<AppMutationResponse>('/api/v1/apps', request, { idempotencyKey: retry.key })
-      clearSensitiveEnvironmentValues(environmentRows)
-      retry = undefined
-      window.location.hash = `/apps/${result.app.id}`
-    } catch { error = '配置无效或注册失败。请检查字段后重试。' } finally { busy = false }
-  }
-
-  function handleSubmit(event: SubmitEvent) {
-    event.preventDefault()
-    submit().catch(() => { error = '注册失败。' })
+    const request = { slug }; retry = retryIdentity(retry, request); busy = true; error = ''
+    try { const result = await mutation<AppMutationResponse>('/api/v1/apps', request, { idempotencyKey: retry.key }); retry = undefined; window.location.hash = `/apps/${result.app.id}` }
+    catch { error = '服务名无效、已存在，或创建结果不明确；重试会复用同一幂等键。' } finally { busy = false }
   }
 </script>
-
-<main class="page-shell narrow">
-  <a class="back" href="#/">← 返回应用控制台</a>
-  <div class="page-heading"><div><p class="eyebrow">REGISTER</p><h1>注册应用</h1><p class="muted">这里只保存不可变 draft revision，不会拉取镜像或创建容器。</p></div></div>
-  {#if error}<p class="notice danger">{error}</p>{/if}
-  <form class="panel form-grid" onsubmit={handleSubmit}>
-    <label>Slug<input bind:value={slug} required pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" maxlength="12" /><span class="muted">1–12 个小写字母、数字或连字符，创建后不可修改。</span></label>
-    <label>显示名称<input bind:value={displayName} required maxlength="80" /></label>
-    {#if slugValid}<div class="wide notice"><strong>资源命名预览</strong><p>Compose project / container：<code>solodock-{slug}</code> / <code>solodock-{slug}-app-1</code></p>{#if ownedDefaultNetwork}<p>Owned network / host bridge：<code>solodock-{slug}-default</code> / <code>sd-{slug}</code></p>{/if}</div>{/if}
-    <label class="wide">发现镜像（必须带 tag）<input bind:value={image} required placeholder="registry.example/app:stable" /></label>
-    <label class="wide">Registry credential<select bind:value={credentialRef}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select><span class="muted">只显示与镜像 logical registry 精确匹配的 credential。</span></label>
-    <label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={pollInterval} /></label>
-    <label>停机宽限（秒）<input type="number" min="1" max="600" bind:value={stopGracePeriod} /><span class="muted">强制结束前的最长等待；服务提前退出会立即继续。</span></label>
-    <label class="wide checkbox"><input type="checkbox" bind:checked={autoDeploy} /> 自动部署 Registry tag 的新 digest</label>
-    {#if autoDeploy}<div class="wide notice warning">新 digest 会自动替换容器，并在健康失败时恢复旧 release；volume 与 bind 中的数据不会随镜像回滚。</div>{/if}
-    <div class="wide"><EnvironmentEditor bind:rows={environmentRows} /></div>
-    <label class="wide">托管文件 JSON<textarea bind:value={files} rows="5"></textarea></label>
-    <label>端口 JSON<textarea bind:value={ports} rows="5"></textarea></label>
-    <label>Named volume JSON<textarea bind:value={volumes} rows="5"></textarea></label>
-    <label>受限 bind JSON<textarea bind:value={binds} rows="5"></textarea></label>
-    <NetworkEditor bind:ownedDefaultNetwork bind:externalNetworks />
-    <label class="wide">健康策略 JSON<textarea bind:value={health} rows="4"></textarea></label>
-    <div class="wide notice warning">所有 M3 配置都随首个 immutable draft revision 原子保存；secret 为 write-only，不会在响应中返回。读写 bind 必须显式确认不可随 release 回滚。</div>
-    <div class="wide actions"><button disabled={busy || !!networkError || !slugValid}>{busy ? '注册中…' : '注册应用'}</button><a class="ghost button-link" href="#/">取消</a></div>
-  </form>
-</main>
+<main class="page-shell narrow"><a class="back" href="#/">← 返回应用控制台</a><div class="page-heading"><div><p class="eyebrow">CREATE</p><h1>新建服务</h1><p class="muted">先登记服务名，创建后再按需配置和部署。</p></div></div>
+{#if error}<p class="notice danger">{error}</p>{/if}
+<form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void submit() }}><label>服务名<input bind:value={slug} required maxlength={slugMaxLength} pattern="[a-z0-9](?:[a-z0-9-]*[a-z0-9])?" placeholder="insight-agent" /><span class="muted">1–{slugMaxLength} 个小写字母、数字或连字符；创建后不可修改，同时作为内部 DNS 名称。</span></label><div class="actions"><button disabled={busy || !slugValid}>{busy ? '创建中…' : '创建空白服务'}</button></div></form>
+<section class="panel"><h2>快速部署</h2><p class="muted">受版本控制的内置预设会生成普通 draft，不会执行任意 Compose。</p><a class="button-link" href="#/apps/new/postgresql">PostgreSQL</a></section></main>

@@ -45,9 +45,9 @@ curl --fail http://127.0.0.1:8080/healthz
 
 认证后的 `/api/v1/system/health` 分开展示 Docker、恢复、projection、deployment、poll coordinator、磁盘与 credential 状态。`interrupted`、`needs_attention` 或 ownership collision 需要先按 deployment detail 与精确 `docker inspect` 处理，不能 prune、宽泛删除或猜测性重跑。
 
-任何引用 external network 的应用都必须先由管理员创建目标 Docker network。SoloDock 不改变该网络的 driver、IPAM、labels 或生命周期；升级、部署与删除也不会移除它。部署前若报告 `EXTERNAL_NETWORK_NOT_FOUND`、`NETWORK_ALIAS_CONFLICT` 或 `DOCKER_OBSERVATION_FAILED`，应在同一 Docker daemon 上用完整 container ID 检查成员和 `NetworkSettings.Networks.<name>.DNSNames`，解决冲突后重新预检；不要依赖短 ID、容器名或手工放宽 ownership。
+任何引用 external network 的应用都必须先由管理员创建目标 Docker network。SoloDock 不改变该网络的 driver、IPAM、labels 或生命周期；升级、部署与删除也不会移除它。新服务默认使用的 `solodock-services` 不是用户 external network：SoloDock 会在首次需要时创建 internal bridge，并严格校验 `sd-services` 与 platform labels；`PLATFORM_NETWORK_IDENTITY_CONFLICT` 时应先识别同名资源来源，不能让 SoloDock 接管或自动删除。应用可用 slug 和容器端口进行内部访问。
 
-Owned network 的 host interface 固定为 UI 显示的 `sd-<slug>`。在 Ubuntu 24.04 且 UFW routed default deny 时，可按应用精确放行 HTTPS，例如 `sudo ufw route allow in on sd-example out on <uplink> proto tcp to any port 443`；先用 `ip link show sd-example` 与 `docker network inspect solodock-example-default` 核对身份。透明代理若不应接管受管容器流量，应在 redirect/tproxy 规则之前按输入接口排除，例如 nftables 规则 `iifname "sd-example" return`。SoloDock 不修改这些宿主规则；slug 不可变且 network 重建后 interface name 保持一致。
+Owned network 的 host interface 以应用详情展示值为准：旧应用可能为 `sd-<slug>`，新应用为 UUID 派生 token。配置 UFW/nftables 前先用详情页、`ip link show` 与 `docker network inspect solodock-<slug>-default` 核对身份；不要自行按 slug 猜 bridge。平台内部网络使用 `sd-services` 且是 internal，不替代应用 owned network 的出网职责。
 
 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 表示既有 owned network 的 driver 或 bridge option 与 canonical identity 不一致。SoloDock 不会删除或接管该 network；停止相关容器、核对 ownership 并由管理员处理冲突资源后，再重新部署。
 
@@ -60,6 +60,10 @@ Owned network 的 host interface 固定为 UI 显示的 `sd-<slug>`。在 Ubuntu
 磁盘告警时先扩容或清理 SoloDock 之外可确认的无用内容；不得删除 state 内 revision/ledger、Docker volume 或 bind source。`MemoryHigh=256M` 是 soft pressure，没有 `MemoryMax`。
 
 控制台 system health 的“主机内存可用”来自 Linux `/proc/meminfo` 的 `MemAvailable`，与应用容器自身的 memory usage 是两个不同事实。该解析器也被 image pull 前的 128 MiB 内存门禁复用；读取、字段或数值无效时返回 unknown 并使健康状态 degraded，不伪造为 0。
+
+bind allow roots 在“系统设置 → 存储访问”维护。SoloDock 只验证既有绝对目录并授权应用引用，不提供目录浏览，不执行 `mkdir/chown/chmod/rm`。升级前 TOML 值只导入一次；之后应在 Web 修改。若删除被引用的 root 返回 `BIND_ROOT_IN_USE`，先从列出的 draft/active/pending 配置移除 bind 并完成安全迁移。
+
+PostgreSQL 快速部署默认使用 major 18 和 `/var/lib/postgresql` owned volume；选择 17 时目标为 `/var/lib/postgresql/data`。升级 major 不会自动改现有 volume target或迁移数据，必须按 PostgreSQL 官方流程单独备份、迁移和验收。数据库默认不发布宿主端口，其他新服务通过 `<postgres-slug>:5432` 访问。
 
 全局显示时区在 Web“系统设置”中从后端 IANA tzdb 列表选择，保存在 SQLite singleton settings record，默认 `UTC`。修改使用 revision、幂等键、Origin、session 与 CSRF，保存后无需重启即可重绘所有 Web 时间。该设置不向受管容器注入 `TZ`，也不改变数据库、API、SSE、cursor、过期判断或下载日志中的 UTC 原值；浏览器不支持已保存 zone 时会明确告警并按 UTC fallback。
 

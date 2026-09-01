@@ -152,6 +152,7 @@ impl Harness {
         let expected_image = format!("registry.example/app@sha256:{}", "a".repeat(64));
         let report = RecoveryReport {
             valid_apps: vec![RecoveredApp {
+                resource_name_schema_version: solodock::domain::RESOURCE_NAME_SCHEMA_LEGACY,
                 app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),

@@ -86,6 +86,7 @@ mod tests {
         let app_id = Uuid::new_v4();
         let release_id = Uuid::new_v4();
         let app = AppCatalogEntry {
+            resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
             id: app_id,
             slug: "example".into(),
             display_name: "Example".into(),

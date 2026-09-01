@@ -27,6 +27,7 @@ use solodock::{
     mutation::{AppMutationCoordinator, IdempotencyService},
     registry::{CredentialStore, PollCoordinator, PollStateStore, RegistryResolver},
     security::permissions::ensure_private_directory,
+    settings::SettingsStore,
     webhook::{WebhookRateLimiter, WebhookServices, WebhookStore},
 };
 use tokio::net::TcpListener;
@@ -46,7 +47,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         validate_restore(
             std::path::Path::new(&arguments[2]),
             std::path::Path::new(&arguments[3]),
-        )?;
+        )
+        .await?;
         return Ok(());
     }
     let config = Config::load()?;
@@ -56,12 +58,30 @@ async fn main() -> Result<(), Box<dyn Error>> {
     ensure_private_directory(&config.runtime_directory)?;
     solodock::compose::cleanup_temporary_directories(&config.runtime_directory)?;
     let database = Database::open(&config.database_path()).await?;
+    let docker_api = Arc::new(BollardReadClient::production());
+    let settings_store = SettingsStore::new(database.clone());
+    let settings = if settings_store.bind_roots_initialized().await? {
+        settings_store.load().await?
+    } else {
+        let docker_root = if config.allowed_bind_roots.is_empty() {
+            None
+        } else {
+            let probe = docker_api.probe().await?;
+            Some(
+                probe
+                    .docker_root_directory
+                    .ok_or("Docker data-root is unavailable during bind-root bootstrap")?,
+            )
+        };
+        let roots = config.validate_bootstrap_bind_roots(docker_root.as_deref())?;
+        settings_store.bootstrap_bind_roots(&roots).await?
+    };
     let idempotency = IdempotencyService::initialize(database.clone(), &config.state_directory)?;
     idempotency.interrupt_pending().await?;
     let app_store = AppStore::initialize_managed(
         config.apps_directory(),
         idempotency.integrity_key(),
-        config.allowed_bind_roots.clone(),
+        settings.allowed_bind_roots.clone(),
     )?;
     let webhook_store = WebhookStore::new(app_store.clone(), idempotency.integrity_key());
     idempotency
@@ -86,9 +106,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let catalog = AppCatalog::from_recovery(&recovery);
-    let docker_api = Arc::new(BollardReadClient::production());
     if let Ok(probe) = docker_api.probe().await {
-        config.validate_docker_root(probe.docker_root_directory.as_deref())?;
+        config.validate_docker_root_with_bind_roots(
+            probe.docker_root_directory.as_deref(),
+            &settings.allowed_bind_roots,
+        )?;
     }
     let shutdown = CancellationToken::new();
     let stream_tasks = TaskTracker::new();
@@ -149,7 +171,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let m3 = Arc::new(M3Services {
         store: app_store,
         database: database.clone(),
-        allowed_bind_roots: config.allowed_bind_roots.clone(),
+        allowed_bind_roots: settings.allowed_bind_roots.clone(),
         runtime_directory: config.runtime_directory.clone(),
         idempotency,
         coordinator,
@@ -298,7 +320,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn validate_restore(
+async fn validate_restore(
     state_directory: &std::path::Path,
     config_file: &std::path::Path,
 ) -> Result<(), Box<dyn Error>> {
@@ -315,16 +337,22 @@ fn validate_restore(
     let apps_directory = state_directory.join("apps");
     check_private_tree(state_directory, &apps_directory, true)?;
     solodock::app_store::config_revision::normalize_managed_file_permissions(&apps_directory)?;
-    let store = AppStore::initialize_managed(
-        apps_directory,
-        key.clone(),
-        config.allowed_bind_roots.clone(),
-    )?;
+    let database = Database::open(&state_directory.join("state.sqlite3")).await?;
+    let settings_store = SettingsStore::new(database.clone());
+    let settings = if settings_store.bind_roots_initialized().await? {
+        settings_store.load().await?
+    } else {
+        let roots = config.validate_bootstrap_bind_roots(None)?;
+        settings_store.bootstrap_bind_roots(&roots).await?
+    };
+    let store =
+        AppStore::initialize_managed(apps_directory, key.clone(), settings.allowed_bind_roots)?;
+    let allowed_bind_roots = store.allowed_bind_roots();
     let report = solodock::app_store::recovery::scan_read_only_relocated(
         store.apps_directory(),
         &config.apps_directory(),
         Some(store.integrity_key()?),
-        store.allowed_bind_roots(),
+        &allowed_bind_roots,
     )?;
     if !report.issues.is_empty() {
         return Err("restored application state is degraded".into());
@@ -344,6 +372,7 @@ fn validate_restore(
             let _credential = credentials.load(metadata.id)?;
         }
     }
+    database.close().await;
     Ok(())
 }
 

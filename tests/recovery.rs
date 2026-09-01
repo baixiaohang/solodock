@@ -4,7 +4,7 @@ use solodock::{
     app_store::{AppStore, releases::ReleaseTrigger},
     db::Database,
     domain::{
-        DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy,
+        BindMountInput, DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy,
         ManagedFileContent, ManagedFileInput, PublicFileContent, SecretOperation, normalize_draft,
     },
     registry::{Platform, ResolvedImage},
@@ -38,6 +38,7 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
             volumes: vec![],
             binds: vec![],
             owned_default_network: true,
+            service_discovery_enabled: false,
             networks: vec![],
             health: HealthPolicy::default(),
         },
@@ -53,9 +54,8 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
         .create_app(
             app_id,
             "example",
-            revision,
             Uuid::new_v4(),
-            &draft,
+            Some((revision, &draft)),
             time::OffsetDateTime::now_utc(),
         )
         .unwrap();
@@ -122,6 +122,9 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::set_permissions(directory, fs::Permissions::from_mode(0o700)).unwrap();
     }
     let key = vec![7_u8; 32];
+    let bind_root = package_root.join("srv");
+    let bind_source = bind_root.join("backup-data");
+    fs::create_dir_all(&bind_source).unwrap();
     let secrets = state.join("secrets");
     fs::create_dir(&secrets).unwrap();
     fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700)).unwrap();
@@ -131,7 +134,9 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    let store = AppStore::initialize_managed(state.join("apps"), key.clone(), vec![]).unwrap();
+    let store =
+        AppStore::initialize_managed(state.join("apps"), key.clone(), vec![bind_root.clone()])
+            .unwrap();
     let draft = normalize_draft(
         DraftInput {
             display_name: "Backup fixture".into(),
@@ -164,21 +169,33 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
             ],
             ports: vec![],
             volumes: vec![],
-            binds: vec![],
+            binds: vec![BindMountInput {
+                source: bind_source.display().to_string(),
+                target_path: "/app/backup-data".into(),
+                readonly: true,
+                acknowledge_non_rollbackable: false,
+            }],
             owned_default_network: true,
+            service_discovery_enabled: false,
             networks: vec![],
             health: HealthPolicy::default(),
         },
         &ExistingSecrets::default(),
         &key,
-        &[],
+        std::slice::from_ref(&bind_root),
     )
     .unwrap();
     let app_id = Uuid::new_v4();
     let revision = Uuid::new_v4();
     let now = time::OffsetDateTime::now_utc();
     let metadata = store
-        .create_app(app_id, "backup", revision, Uuid::new_v4(), &draft, now)
+        .create_app(
+            app_id,
+            "backup",
+            Uuid::new_v4(),
+            Some((revision, &draft)),
+            now,
+        )
         .unwrap();
     let resolved = |byte: char| {
         let digest = format!("sha256:{}", byte.to_string().repeat(64));
@@ -240,8 +257,9 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     fs::write(
         &config,
         format!(
-            "schema_version=1\nlisten_address='127.0.0.1:8080'\npublic_origin='https://solodock.example.invalid'\nwebhook_public_origin='https://hooks.example.invalid'\nstate_directory='{}'\nruntime_directory='/run/solodock'\nallowed_bind_roots=[]\n",
-            state.display()
+            "schema_version=1\nlisten_address='127.0.0.1:8080'\npublic_origin='https://solodock.example.invalid'\nwebhook_public_origin='https://hooks.example.invalid'\nstate_directory='{}'\nruntime_directory='/run/solodock'\nallowed_bind_roots=['{}']\n",
+            state.display(),
+            bind_root.display()
         ),
     )
     .unwrap();
@@ -302,9 +320,12 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::read_link(restored_app.join("pending")).unwrap(),
         std::path::PathBuf::from(format!("releases/{pending}"))
     );
-    let restored_store =
-        AppStore::initialize_managed(restored.join("var/lib/solodock/apps"), key.clone(), vec![])
-            .unwrap();
+    let restored_store = AppStore::initialize_managed(
+        restored.join("var/lib/solodock/apps"),
+        key.clone(),
+        vec![bind_root],
+    )
+    .unwrap();
     let restored_webhook = WebhookStore::new(restored_store, key);
     assert!(
         restored_webhook

@@ -7,21 +7,24 @@ use std::{
     fs,
     os::unix::fs::DirBuilderExt,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::domain::{AppMetadata, DesiredState, NormalizedDraft};
+use crate::domain::{
+    APP_METADATA_SCHEMA_VERSION, AppMetadata, DesiredState, NormalizedDraft,
+    RESOURCE_NAME_SCHEMA_CURRENT, RESOURCE_NAME_SCHEMA_LEGACY, validate_slug_for_resource_schema,
+};
 use crate::security::permissions::{PermissionError, check_private, ensure_private_directory};
 
 #[derive(Clone)]
 pub struct AppStore {
     apps_directory: PathBuf,
     integrity_key: Option<Arc<Vec<u8>>>,
-    allowed_bind_roots: Arc<Vec<PathBuf>>,
+    allowed_bind_roots: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 impl AppStore {
@@ -30,7 +33,7 @@ impl AppStore {
         Ok(Self {
             apps_directory,
             integrity_key: None,
-            allowed_bind_roots: Arc::default(),
+            allowed_bind_roots: Arc::new(RwLock::new(Vec::new())),
         })
     }
 
@@ -49,16 +52,17 @@ impl AppStore {
         allowed_bind_roots: Vec<PathBuf>,
     ) -> Result<Self, StoreError> {
         let mut store = Self::initialize_verified(apps_directory, integrity_key)?;
-        store.allowed_bind_roots = Arc::new(allowed_bind_roots);
+        store.allowed_bind_roots = Arc::new(RwLock::new(allowed_bind_roots));
         Ok(store)
     }
 
     pub fn scan(&self) -> Result<recovery::RecoveryReport, StoreError> {
         config_revision::normalize_managed_file_permissions(&self.apps_directory)?;
+        let allowed_bind_roots = self.allowed_bind_roots();
         recovery::scan_with_options(
             &self.apps_directory,
             self.integrity_key.as_deref().map(Vec::as_slice),
-            &self.allowed_bind_roots,
+            &allowed_bind_roots,
         )
     }
 
@@ -66,10 +70,11 @@ impl AppStore {
     /// startup-only cleanup. Runtime readers must never remove a writer's
     /// temporary or newly published-but-not-yet-referenced artifacts.
     pub fn scan_read_only(&self) -> Result<recovery::RecoveryReport, StoreError> {
+        let allowed_bind_roots = self.allowed_bind_roots();
         recovery::scan_read_only_with_options(
             &self.apps_directory,
             self.integrity_key.as_deref().map(Vec::as_slice),
-            &self.allowed_bind_roots,
+            &allowed_bind_roots,
         )
     }
 
@@ -84,8 +89,18 @@ impl AppStore {
             .ok_or(StoreError::ContentInvalid)
     }
 
-    pub fn allowed_bind_roots(&self) -> &[PathBuf] {
-        &self.allowed_bind_roots
+    pub fn allowed_bind_roots(&self) -> Vec<PathBuf> {
+        self.allowed_bind_roots
+            .read()
+            .expect("bind root lock poisoned")
+            .clone()
+    }
+
+    pub fn replace_allowed_bind_roots(&self, roots: Vec<PathBuf>) {
+        *self
+            .allowed_bind_roots
+            .write()
+            .expect("bind root lock poisoned") = roots;
     }
 
     pub fn app_directory(&self, app_id: Uuid) -> PathBuf {
@@ -96,9 +111,8 @@ impl AppStore {
         &self,
         app_id: Uuid,
         slug: &str,
-        revision_id: Uuid,
         operation_id: Uuid,
-        draft: &NormalizedDraft,
+        initial_draft: Option<(Uuid, &NormalizedDraft)>,
         now: OffsetDateTime,
     ) -> Result<AppMetadata, StoreError> {
         let temporary = self
@@ -110,19 +124,50 @@ impl AppStore {
             fs::DirBuilder::new()
                 .mode(0o700)
                 .create(temporary.join("releases"))?;
-            config_revision::publish(&temporary, revision_id, draft)?;
+            if let Some((revision_id, draft)) = initial_draft {
+                config_revision::publish(&temporary, revision_id, draft)?;
+            }
+            let (
+                display_name,
+                discovery_image_ref,
+                credential_ref,
+                draft_revision,
+                draft_hash,
+                auto_deploy_enabled,
+                poll_interval_seconds,
+            ) = match initial_draft {
+                Some((revision_id, draft)) => (
+                    draft.display_name.clone(),
+                    Some(draft.discovery_image_ref.clone()),
+                    draft.credential_ref,
+                    Some(revision_id),
+                    Some(draft.metadata.config_sha256.clone()),
+                    draft.auto_deploy_enabled,
+                    draft.poll_interval_seconds,
+                ),
+                None => (
+                    slug.to_owned(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    crate::domain::default_poll_interval(),
+                ),
+            };
             let metadata = AppMetadata {
-                schema_version: 2,
+                schema_version: APP_METADATA_SCHEMA_VERSION,
                 id: app_id,
                 slug: slug.to_owned(),
-                display_name: draft.display_name.clone(),
-                discovery_image_ref: draft.discovery_image_ref.clone(),
-                credential_ref: draft.credential_ref,
-                draft_revision: revision_id,
-                draft_config_sha256: draft.metadata.config_sha256.clone(),
+                display_name,
+                resource_name_schema_version: RESOURCE_NAME_SCHEMA_CURRENT,
+                discovery_image_ref,
+                credential_ref,
+                draft_revision,
+                draft_config_sha256: draft_hash,
                 desired_state: DesiredState::Stopped,
-                auto_deploy_enabled: draft.auto_deploy_enabled,
-                poll_interval_seconds: draft.poll_interval_seconds,
+                auto_deploy_enabled,
+                poll_interval_seconds,
                 last_operation_id: operation_id,
                 created_at: now,
                 updated_at: now,
@@ -145,7 +190,7 @@ impl AppStore {
     pub fn update_draft(
         &self,
         app_id: Uuid,
-        expected_revision: Uuid,
+        expected_revision: Option<Uuid>,
         revision_id: Uuid,
         operation_id: Uuid,
         draft: &NormalizedDraft,
@@ -174,11 +219,11 @@ impl AppStore {
             Err(error) => return Err(error),
         }
         metadata.display_name = draft.display_name.clone();
-        metadata.discovery_image_ref = draft.discovery_image_ref.clone();
+        metadata.discovery_image_ref = Some(draft.discovery_image_ref.clone());
         metadata.credential_ref = draft.credential_ref;
         metadata.auto_deploy_enabled = draft.auto_deploy_enabled;
-        metadata.draft_revision = revision_id;
-        metadata.draft_config_sha256 = draft.metadata.config_sha256.clone();
+        metadata.draft_revision = Some(revision_id);
+        metadata.draft_config_sha256 = Some(draft.metadata.config_sha256.clone());
         metadata.poll_interval_seconds = draft.poll_interval_seconds;
         metadata.last_operation_id = operation_id;
         metadata.updated_at = now;
@@ -375,10 +420,35 @@ fn read_metadata(directory: &Path) -> Result<AppMetadata, StoreError> {
     })?;
     let metadata: AppMetadata =
         toml::from_str(&contents).map_err(|_| StoreError::ContentInvalid)?;
-    if metadata.schema_version != 2 {
+    if !valid_metadata_identity_versions(
+        metadata.schema_version,
+        metadata.resource_name_schema_version,
+    ) || validate_slug_for_resource_schema(&metadata.slug, metadata.resource_name_schema_version)
+        .is_err()
+        || metadata.draft_revision.is_some() != metadata.draft_config_sha256.is_some()
+        || (metadata.draft_revision.is_none()
+            && (metadata.discovery_image_ref.is_some()
+                || metadata.credential_ref.is_some()
+                || metadata.desired_state != DesiredState::Stopped
+                || metadata.auto_deploy_enabled))
+    {
         return Err(StoreError::ContentInvalid);
     }
     Ok(metadata)
+}
+
+pub(crate) const fn valid_metadata_identity_versions(
+    metadata_schema_version: u32,
+    resource_name_schema_version: u32,
+) -> bool {
+    matches!(
+        (metadata_schema_version, resource_name_schema_version),
+        (2, RESOURCE_NAME_SCHEMA_LEGACY)
+            | (
+                APP_METADATA_SCHEMA_VERSION,
+                RESOURCE_NAME_SCHEMA_LEGACY | RESOURCE_NAME_SCHEMA_CURRENT
+            )
+    )
 }
 
 fn write_metadata(directory: &Path, metadata: &AppMetadata) -> Result<(), StoreError> {
@@ -398,6 +468,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_and_resource_identity_version_matrix_is_single_and_legacy_stable() {
+        for (metadata, naming, expected) in [
+            (2, RESOURCE_NAME_SCHEMA_LEGACY, true),
+            (2, RESOURCE_NAME_SCHEMA_CURRENT, false),
+            (
+                APP_METADATA_SCHEMA_VERSION,
+                RESOURCE_NAME_SCHEMA_LEGACY,
+                true,
+            ),
+            (
+                APP_METADATA_SCHEMA_VERSION,
+                RESOURCE_NAME_SCHEMA_CURRENT,
+                true,
+            ),
+            (1, RESOURCE_NAME_SCHEMA_LEGACY, false),
+            (APP_METADATA_SCHEMA_VERSION, 99, false),
+        ] {
+            assert_eq!(
+                valid_metadata_identity_versions(metadata, naming),
+                expected,
+                "metadata={metadata}, naming={naming}"
+            );
+        }
+        let app_id = Uuid::new_v4();
+        let identity = crate::domain::AppResourceIdentity {
+            app_id,
+            slug: "legacy",
+            schema_version: RESOURCE_NAME_SCHEMA_LEGACY,
+        };
+        assert_eq!(identity.resource_names().bridge_name, "sd-legacy");
+    }
+
+    #[test]
     fn tombstone_records_the_delete_operation_and_only_finalizes_that_entry() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -414,10 +517,11 @@ mod tests {
                 id: app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
-                discovery_image_ref: "registry.example/app:stable".into(),
+                resource_name_schema_version: RESOURCE_NAME_SCHEMA_LEGACY,
+                discovery_image_ref: Some("registry.example/app:stable".into()),
                 credential_ref: None,
-                draft_revision: Uuid::new_v4(),
-                draft_config_sha256: "hash".into(),
+                draft_revision: Some(Uuid::new_v4()),
+                draft_config_sha256: Some("hash".into()),
                 desired_state: DesiredState::Stopped,
                 auto_deploy_enabled: false,
                 poll_interval_seconds: 300,
@@ -457,10 +561,11 @@ mod tests {
                 id: app_id,
                 slug: "example".into(),
                 display_name: "Example".into(),
-                discovery_image_ref: "registry.example/app:stable".into(),
+                resource_name_schema_version: RESOURCE_NAME_SCHEMA_LEGACY,
+                discovery_image_ref: Some("registry.example/app:stable".into()),
                 credential_ref: None,
-                draft_revision: Uuid::new_v4(),
-                draft_config_sha256: "hash".into(),
+                draft_revision: Some(Uuid::new_v4()),
+                draft_config_sha256: Some("hash".into()),
                 desired_state: DesiredState::Stopped,
                 auto_deploy_enabled: false,
                 poll_interval_seconds: 300,

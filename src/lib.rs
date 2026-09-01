@@ -9,6 +9,7 @@ pub mod docker;
 pub mod domain;
 pub mod error;
 pub mod mutation;
+pub mod presets;
 pub mod registry;
 pub mod security;
 pub mod settings;

@@ -45,6 +45,8 @@ pub enum ScheduleResult {
 pub enum ScheduleError {
     #[error("application was not found")]
     AppNotFound,
+    #[error("application is not configured")]
+    Unconfigured,
     #[error("deployment is busy")]
     Busy,
     #[error("deployment facts changed")]
@@ -111,6 +113,7 @@ impl DeploymentScheduler {
             .store
             .read_metadata(command.app_id)
             .map_err(|_| ScheduleError::AppNotFound)?;
+        let draft_revision = metadata.draft_revision.ok_or(ScheduleError::Unconfigured)?;
         let active = m3
             .store
             .read_release_link(command.app_id, "active")
@@ -120,7 +123,7 @@ impl DeploymentScheduler {
             .read_release_link(command.app_id, "pending")
             .map_err(|_| ScheduleError::Internal)?;
         let actual = actual_fact(&state, command.app_id, active).await?;
-        if metadata.draft_revision != command.facts.draft_revision
+        if draft_revision != command.facts.draft_revision
             || active != command.facts.active_release_id
             || pending != command.facts.pending_release_id
             || actual.as_ref().map(|value| value.0) != command.facts.actual_release_id
@@ -148,7 +151,7 @@ impl DeploymentScheduler {
         }
         let draft = config_revision::load_verified(
             &m3.store.app_directory(command.app_id),
-            metadata.draft_revision,
+            draft_revision,
             m3.store
                 .integrity_key()
                 .map_err(|_| ScheduleError::Internal)?,
@@ -168,7 +171,7 @@ impl DeploymentScheduler {
                 command.request_id,
                 command.app_id,
                 command.trigger.as_str(),
-                metadata.draft_revision,
+                draft_revision,
                 active,
                 pending,
                 actual.as_ref().map(|value| value.0),
