@@ -25,7 +25,7 @@ solodock-update
 
 updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交互终端提示一次。无 TTY 且未配置非交互 `sudo` 的调用会在修改服务前失败。
 
-updater 只选择目标分支最新一次成功的 `push` CI，下载 `solodock-embedded-package` 并校验包内 `SHA256SUMS`。合并提交的 tree 与成功 PR 已验证 tree 完全一致时，`push` CI 会原样重新发布该 PR package；没有可复用 artifact、tree 不一致或直接 push 时才重新构建并完整验证。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
+updater 只选择目标分支最新一次成功的 `push` CI，下载 `solodock-embedded-package` 并校验包内 `SHA256SUMS`。当前 main Git tree 与近期成功 PR CI 的已验证 tree 完全一致，且同一次 run 的已验证 tree 与 package artifact 均未过期时，`push` CI 会原样重新发布该 package；没有匹配、artifact 缺失或过期时重新构建并完整验证，artifact 无法安全读取时分类直接失败。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
 
 这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数。
 
