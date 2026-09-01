@@ -15,6 +15,7 @@ pub struct SystemHealthResponse {
     status: &'static str,
     docker: crate::docker::models::ProbeSnapshot,
     recovery: RecoveryHealth,
+    memory: crate::system::memory::MemorySnapshot,
     disk: DiskHealth,
     streams: StreamHealth,
     projection: ProjectionHealth,
@@ -89,6 +90,7 @@ pub async fn health(
 ) -> impl IntoResponse {
     let docker = state.observer.supervisor.current().await;
     let state_disk = disk_probe(&state.state_directory);
+    let memory = crate::system::memory::probe();
     let docker_disk = docker
         .docker_root_directory
         .as_deref()
@@ -106,6 +108,7 @@ pub async fn health(
             DiskStatus::Warning | DiskStatus::Critical | DiskStatus::Unknown
         )
     });
+    let memory_degraded = memory.available_bytes.is_none();
     let projection_degraded = state.m3.as_ref().is_some_and(|services| {
         services
             .projection_degraded
@@ -145,6 +148,7 @@ pub async fn health(
         };
     let degraded = docker.status != ProbeStatus::Ready
         || recovery_degraded
+        || memory_degraded
         || disk_degraded
         || projection_degraded
         || deployment_interrupted > 0
@@ -173,6 +177,7 @@ pub async fn health(
             issue_count: issues.values().sum(),
             issues_by_code: issues,
         },
+        memory,
         disk: DiskHealth {
             state: state_disk,
             docker: docker_disk,

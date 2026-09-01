@@ -11,6 +11,7 @@ pub mod error;
 pub mod mutation;
 pub mod registry;
 pub mod security;
+pub mod settings;
 pub mod system;
 pub mod telemetry;
 pub mod webhook;

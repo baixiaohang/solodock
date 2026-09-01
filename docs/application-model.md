@@ -24,10 +24,10 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ## 环境变量
 
-环境变量只有一份规范数据，UI 的表格和 dotenv 批量编辑是其不同投影。
+环境变量只有一份规范数据。注册页和配置页共用逐行编辑器，public 与 Secret 使用同一种行布局，不再分成两套输入区。
 
 - public 值可以读取和编辑；
-- secret 值只能以 `keep`、`replace`、`delete` 显式操作；
+- 已保存的 secret 只显示“已保存”占位且 value 保持空白；留空、输入新值和删除行分别投影为 `keep`、`replace`、`delete`；
 - API、UI、SQLite、release、Compose、audit、错误和 tracing 不回显 secret；
 - public/secret 分类转换必须显式删除旧分类并提交新分类；
 - 重复 key、非法名称、插值或命令替换语法会被拒绝。

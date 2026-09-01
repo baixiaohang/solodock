@@ -24,20 +24,27 @@ function stubViewport(mobile: boolean) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('AppShell', () => {
-  it('提供两个主导航入口并按路由映射活动态', async () => {
+  it('提供三个主导航入口并按路由映射活动态', async () => {
     stubViewport(false)
     const rendered = render(AppShell, { route: '#/apps/123', onRevokeAll: vi.fn(), onLogout: vi.fn() })
     const applications = screen.getByRole('link', { name: '应用' })
     const credentials = screen.getByRole('link', { name: 'Registry 凭据' })
+    const settings = screen.getByRole('link', { name: '系统设置' })
 
     expect(applications.getAttribute('href')).toBe('#/')
     expect(credentials.getAttribute('href')).toBe('#/credentials')
+    expect(settings.getAttribute('href')).toBe('#/settings')
     expect(applications.getAttribute('aria-current')).toBe('page')
     expect(credentials.getAttribute('aria-current')).toBeNull()
+    expect(settings.getAttribute('aria-current')).toBeNull()
 
     await rendered.rerender({ route: '#/credentials', onRevokeAll: vi.fn(), onLogout: vi.fn() })
     expect(applications.getAttribute('aria-current')).toBeNull()
     expect(credentials.getAttribute('aria-current')).toBe('page')
+
+    await rendered.rerender({ route: '#/settings', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    expect(settings.getAttribute('aria-current')).toBe('page')
+    expect(credentials.getAttribute('aria-current')).toBeNull()
 
     await rendered.rerender({ route: '#/deployments/456', onRevokeAll: vi.fn(), onLogout: vi.fn() })
     expect(applications.getAttribute('aria-current')).toBe('page')

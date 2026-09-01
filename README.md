@@ -64,6 +64,8 @@ SQLite 保存管理员凭据、session、登录节流和真实审计历史；应
 
 SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，并通过唯一后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。每个应用可配置 `1–600` 秒的停机宽限，默认 `10` 秒；该值固定进 release，服务提前退出时部署立即继续。管理员可显式确认开启有界 Registry 轮询自动部署；busy 不排队，坏 target 会被抑制。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
 
+控制台状态条同时展示主机 `MemAvailable` 与状态盘可用空间。系统设置可从后端认可的 IANA 时区下拉列表中选择全局显示时区，默认 UTC，保存后立即刷新 Web 时间；SQLite、API、SSE、cursor 与下载日志始终保留 UTC。应用配置页使用单列直接编辑表单，public 与 write-only Secret 环境变量统一逐行管理；部署历史固定一项一行。
+
 Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
 
 可选的签名 Registry recheck webhook 使用独立 `webhook_public_origin`、每应用 write-only HMAC secret、5 分钟 timestamp window 和 durable nonce 防重放。Payload 不携带镜像事实；有效请求只产生 coalesced poll wake，并继续遵守原有自动部署、退避、抑制、drift 和健康门禁。协议与外部 WAF 边界见 [Webhook 运维说明](docs/webhooks.md)。

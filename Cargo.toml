@@ -15,6 +15,7 @@ base64 = "0.22"
 bollard = { version = "0.21", default-features = false, features = ["http", "pipe"] }
 bytes = "1"
 cookie = "0.18"
+chrono-tz = "0.10"
 futures-util = "0.3"
 getrandom = "0.3"
 hmac = "0.12"

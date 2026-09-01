@@ -2247,3 +2247,101 @@ async fn webhook_final_secret_check_serializes_with_rotate_revoke_and_delete() {
     );
     assert!(webhooks.poll_states.get(app_id).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
+    let harness = Harness::new().await;
+    let initial = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/settings")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, initial) = body(initial).await;
+    assert_eq!(status, StatusCode::OK);
+    let initial: Value = serde_json::from_str(&initial).unwrap();
+    assert_eq!(initial["display_timezone"], "UTC");
+    assert_eq!(initial["supported_timezones"][0], "UTC");
+    let request = json!({
+        "expected_revision": initial["revision"],
+        "display_timezone": "Asia/Shanghai",
+    });
+
+    let missing_csrf = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/settings")
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("idempotency-key", "settings-missing-csrf")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_csrf.status(), StatusCode::FORBIDDEN);
+
+    let updated = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-update-shanghai"),
+            &request,
+        )
+        .await;
+    let (status, updated) = body(updated).await;
+    assert_eq!(status, StatusCode::OK);
+    let updated: Value = serde_json::from_str(&updated).unwrap();
+    assert_eq!(updated["display_timezone"], "Asia/Shanghai");
+    assert_ne!(updated["revision"], initial["revision"]);
+    let replayed = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-update-shanghai"),
+            &request,
+        )
+        .await;
+    let (status, replayed) = body(replayed).await;
+    assert_eq!(status, StatusCode::OK);
+    let replayed: Value = serde_json::from_str(&replayed).unwrap();
+    assert_eq!(replayed["idempotency_replayed"], true);
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = '/api/v1/settings'")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(audit_count, 2);
+
+    let stale = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-stale-revision"),
+            &request,
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::CONFLICT);
+    let invalid = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-invalid-timezone"),
+            &json!({
+                "expected_revision": updated["revision"],
+                "display_timezone": "Mars/Olympus",
+            }),
+        )
+        .await;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}

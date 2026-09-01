@@ -4,6 +4,7 @@ pub mod auth;
 pub mod deployments;
 pub mod middleware;
 pub mod mutations;
+pub mod settings;
 pub mod streams;
 pub mod system;
 pub mod webhooks;
@@ -130,6 +131,9 @@ pub fn router(state: AppState) -> Router {
                 .delete(webhooks::revoke),
         )
         .layer(DefaultBodyLimit::max(16 * 1024));
+    let settings = Router::new()
+        .route("/api/v1/settings", get(settings::get).put(settings::update))
+        .layer(DefaultBodyLimit::max(16 * 1024));
     let public_webhook = Router::new()
         .route(
             "/hooks/v1/apps/{id}/registry",
@@ -158,6 +162,7 @@ pub fn router(state: AppState) -> Router {
         .merge(delete_mutations)
         .merge(m4_mutations)
         .merge(webhook_admin)
+        .merge(settings)
         .merge(public_webhook)
         .fallback(assets::serve)
         .with_state(state.clone())

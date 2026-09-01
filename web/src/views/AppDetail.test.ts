@@ -68,7 +68,10 @@ describe('app detail resource identity', () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input)
       if (url.endsWith('/deployments?limit=20')) {
-        return new Response(JSON.stringify({ items: [], next_cursor: null }), { status: 200 })
+        return new Response(JSON.stringify({ items: [
+          { id: '00000000-0000-4000-8000-000000000011', app_id: app.id, trigger: 'manual', status: 'succeeded', phase: 'terminal', source_image_ref: 'registry.example/app:stable', manifest_digest: null, candidate_release_id: null, error_code: null, created_at: '2026-01-01T00:00:00Z' },
+          { id: '00000000-0000-4000-8000-000000000012', app_id: app.id, trigger: 'poll', status: 'failed', phase: 'terminal', source_image_ref: 'registry.example/app:stable', manifest_digest: null, candidate_release_id: null, error_code: 'HEALTH_FAILED', created_at: '2026-01-02T00:00:00Z' },
+        ], next_cursor: null }), { status: 200 })
       }
       if (url.endsWith('/registry-credentials')) return new Response('[]', { status: 200 })
       if (url.endsWith('/webhook')) return new Response('{}', { status: 404 })
@@ -84,6 +87,11 @@ describe('app detail resource identity', () => {
     expect(screen.queryByText('sd-demo')).toBeNull()
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: '配置' }))
-    expect(await screen.findByText('10 秒')).toBeTruthy()
+    expect((await screen.findByLabelText(/^停机宽限（秒）/)) as HTMLInputElement).toHaveProperty('value', '10')
+    expect(screen.getByText('环境变量')).toBeTruthy()
+    expect(screen.queryByText('编辑完整配置…')).toBeNull()
+    await user.click(screen.getByRole('button', { name: '部署历史' }))
+    expect(document.querySelectorAll('.deployment-history article.deployment-row')).toHaveLength(2)
+    expect(screen.getAllByRole('link', { name: '查看详情' })).toHaveLength(2)
   })
 })

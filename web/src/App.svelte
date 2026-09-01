@@ -8,6 +8,7 @@
   import NewApp from './views/NewApp.svelte'
   import Credentials from './views/Credentials.svelte'
   import DeploymentDetail from './views/DeploymentDetail.svelte'
+  import Settings from './views/Settings.svelte'
 
   let route = window.location.hash
   const updateRoute = () => { route = window.location.hash }
@@ -21,6 +22,7 @@
   $: appId = route.match(/^#\/apps\/([0-9a-f-]+)$/)?.[1]
   $: creating = route === '#/apps/new'
   $: credentials = route === '#/credentials'
+  $: settings = route === '#/settings'
   $: deploymentId = route.match(/^#\/deployments\/([0-9a-f-]+)$/)?.[1]
 </script>
 
@@ -32,7 +34,9 @@
   <AuthView mode={$auth.kind} />
 {:else}
   <AppShell {route} onRevokeAll={revokeAll} onLogout={logout}>
-    {#if credentials}
+    {#if settings}
+      <Settings />
+    {:else if credentials}
       <Credentials />
     {:else if deploymentId}
       <DeploymentDetail {deploymentId} />

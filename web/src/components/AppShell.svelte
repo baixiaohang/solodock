@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import type { Snippet } from 'svelte'
+  import { loadTimeSettings, timeSettings } from '../lib/time'
 
   let {
     route,
@@ -19,8 +20,10 @@
   let menuButton = $state<HTMLButtonElement>()
   let applicationsActive = $derived(route === '' || route === '#/' || /^#\/(apps|deployments)(\/|$)/.test(route))
   let credentialsActive = $derived(route === '#/credentials')
+  let settingsActive = $derived(route === '#/settings')
 
   onMount(() => {
+    void loadTimeSettings().catch(() => {})
     const media = window.matchMedia('(max-width: 800px)')
     const updateMobile = () => {
       mobile = media.matches
@@ -88,12 +91,17 @@
           <span class="nav-icon" aria-hidden="true">⌾</span>
           Registry 凭据
         </a>
+        <a class:active={settingsActive} aria-current={settingsActive ? 'page' : undefined} href="#/settings" onclick={() => closeMenu()}>
+          <span class="nav-icon" aria-hidden="true">◷</span>
+          系统设置
+        </a>
       </nav>
     </aside>
     {#if menuOpen}
       <button class="drawer-backdrop" type="button" aria-label="关闭主导航" onclick={() => closeMenu(true)}></button>
     {/if}
     <div class="content-canvas">
+      {#if $timeSettings.warning}<p class="notice warning global-warning" role="alert">{$timeSettings.warning}</p>{/if}
       {#if children}{@render children()}{/if}
     </div>
   </div>

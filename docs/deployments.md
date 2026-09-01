@@ -2,6 +2,8 @@
 
 SoloDock 的 manual deploy、poll auto-deploy 和 rollback 共用唯一的 `DeploymentScheduler` 与 deployment engine。外部 webhook 只生成 durable Registry recheck wake，不形成第二条 Registry、Docker 或 Compose mutation 路径。
 
+应用页只读取最近 20 条 deployment，每个 deployment 以一整行展示显示时区下的创建时间、status/phase、trigger、镜像或 digest 和错误码，并通过明确链接进入详情；移动端只允许单项内部换行，不会把两条历史并排。
+
 ## Registry credential
 
 Registry credential 以 filesystem-first 方式保存在 `registry-credentials/<credential-id>/`：metadata 与 immutable secret revision 分离并受完整性校验。API 只返回 registry、username 和 revision 等 metadata，不回显 token。

@@ -9,6 +9,13 @@ export interface MeResponse {
   session: { created_at: string; expires_at: string }
 }
 
+export interface SettingsResponse {
+  revision: string
+  display_timezone: string
+  supported_timezones: string[]
+  idempotency_replayed?: boolean
+}
+
 export type DockerStatus = 'starting' | 'ready' | 'unavailable' | 'permission_denied' | 'incompatible'
 
 export interface DiskSnapshot {
@@ -30,6 +37,7 @@ export interface SystemHealth {
     observed_at: string
   }
   recovery: { status: 'ok' | 'degraded'; issue_count: number; issues_by_code: Record<string, number> }
+  memory: { total_bytes: number | null; available_bytes: number | null; used_percent: number | null }
   disk: { state: DiskSnapshot; docker: DiskSnapshot | null }
   streams: { active: number; limit: number }
   projection: { status: 'ok' | 'degraded' }

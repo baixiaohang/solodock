@@ -2,6 +2,7 @@
   import { onMount } from 'svelte'
   import { appendDeduplicatedLog, openSse } from '../lib/sse'
   import type { LogEvent } from '../lib/types'
+  import { formatTimestamp, timeSettings } from '../lib/time'
   let { appId }: { appId: string } = $props()
   let lines = $state<Array<LogEvent & { id: string }>>([])
   let status = $state('connecting')
@@ -36,7 +37,7 @@
   <header class="logs-toolbar"><span class={`connection ${status}`}>{status}</span><label><input type="checkbox" bind:checked={autoScroll} /> 自动滚动</label><button class="ghost" onclick={download}>下载当前窗口</button></header>
   <div class="log-viewport" role="log" aria-label="应用实时日志" bind:this={viewport} onscroll={(event) => { const target = event.currentTarget; if (target.scrollTop + target.clientHeight < target.scrollHeight - 30) autoScroll = false }}>
     {#each lines as line (line.id)}
-      <div class:stderr={line.stream === 'stderr'} class="log-line"><time>{line.timestamp}</time><span class="stream">{line.stream}</span><span>{line.message}</span></div>
+      <div class:stderr={line.stream === 'stderr'} class="log-line"><time datetime={line.timestamp}>{formatTimestamp(line.timestamp, $timeSettings.timezone)}</time><span class="stream">{line.stream}</span><span>{line.message}</span></div>
     {:else}<p class="log-empty">等待日志…</p>{/each}
   </div>
 </section>

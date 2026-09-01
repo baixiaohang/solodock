@@ -1513,6 +1513,10 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
             return Err("expected one exact compose-owned target".into());
         }
         runner
+            .run(ComposeAction::Stop, context())
+            .await
+            .map_err(|error| error.to_string())?;
+        runner
             .run(ComposeAction::Remove, context())
             .await
             .map_err(|error| error.to_string())?;
@@ -1581,6 +1585,10 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         {
             return Err("recreated owned network changed its bridge identity".into());
         }
+        runner
+            .run(ComposeAction::Stop, context())
+            .await
+            .map_err(|error| format!("stop recreated compose container: {error}"))?;
         runner
             .run(ComposeAction::Remove, context())
             .await

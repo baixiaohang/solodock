@@ -4,6 +4,7 @@
   import type { AppDetailResponse, Deployment } from '../lib/types'
   import { isTerminalDeployment } from '../lib/deploymentState'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { formatTimestamp, timeSettings } from '../lib/time'
   let { deploymentId }: { deploymentId: string } = $props()
   let deployment = $state<Deployment | null>(null)
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -42,7 +43,7 @@
     <article class="panel"><dl class="fact-list"><div><dt>触发</dt><dd>{deployment.trigger}</dd></div><div><dt>Source tag</dt><dd><code>{deployment.source_image_ref ?? '—'}</code></dd></div><div><dt>停机宽限</dt><dd>{deployment.candidate_stop_grace_period_seconds ?? '—'} 秒</dd></div><div><dt>Manifest</dt><dd><code>{deployment.manifest_digest ?? '—'}</code></dd></div><div><dt>Platform</dt><dd>{deployment.platform ?? '—'}</dd></div><div><dt>Error</dt><dd><code>{deployment.error_code ?? '—'}</code></dd></div></dl></article>
     {#if deployment.warnings?.length}<p class="notice warning">{deployment.warnings.join(' · ')}</p>{/if}
     <article class="panel"><h2>当前事实</h2><dl class="fact-list"><div><dt>Safe release</dt><dd><code>{deployment.safe_release_id ?? '—'}</code></dd></div><div><dt>Active</dt><dd><code>{deployment.current_active_release_id ?? '—'}</code></dd></div><div><dt>Pending</dt><dd><code>{deployment.current_pending_release_id ?? '—'}</code></dd></div><div><dt>Actual</dt><dd><code>{deployment.current_actual_release_id ?? '—'}</code></dd></div></dl></article>
-    <article class="panel"><h2>Timeline</h2><ol class="timeline">{#each deployment.transitions ?? [] as item}<li><code>{item.seq}</code><span>{item.phase} · {item.result} {item.code ?? ''}</span></li>{/each}</ol></article>
+    <article class="panel"><h2>Timeline</h2><ol class="timeline">{#each deployment.transitions ?? [] as item}<li><code>{item.seq}</code><span>{item.phase} · {item.result} {item.code ?? ''}<small><time datetime={item.created_at}>{formatTimestamp(item.created_at, $timeSettings.timezone)}</time></small></span></li>{/each}</ol></article>
     {#if deployment.available_actions.includes('rollback')}<button class="ghost" onclick={() => void rollback()}>以此 release 回滚…</button>{/if}
   {/if}
 </main>

@@ -33,6 +33,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 - Registry credential；
 - deployment schedule、history、detail 和 rollback；
 - per-app webhook status/configure/revoke；
+- 全局显示设置 `GET/PUT /api/v1/settings`；
 - system health 和 drift；
 - events、logs 和 stats SSE。
 
@@ -42,7 +43,9 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 应用详情返回 slug 派生的 project/network/bridge 名称，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
 
-`GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
+`GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、主机 `MemAvailable`、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
+
+`GET /api/v1/settings` 返回 revision、当前 `display_timezone` 与后端认可的 IANA timezone 列表；`PUT` 只接受列表中的值，并要求 `expected_revision`、`Idempotency-Key`、精确 Origin、session 与 CSRF。设置只影响 Web formatter，所有 API/SSE timestamp 继续返回 RFC3339 UTC。
 
 ## 两阶段删除
 

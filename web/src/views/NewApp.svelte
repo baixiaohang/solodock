@@ -1,18 +1,18 @@
 <script lang="ts">
   import { api, mutation } from '../lib/api'
   import { onMount } from 'svelte'
-  import { parseDotenv } from '../lib/dotenv'
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { credentialsForReference } from '../lib/registryReference'
   import { networkDraft, networkEditorError } from '../lib/networks'
   import type { AppMutationResponse, DraftInput, ExternalNetworkAttachment, RegistryCredential } from '../lib/types'
   import NetworkEditor from '../components/NetworkEditor.svelte'
+  import EnvironmentEditor from '../components/EnvironmentEditor.svelte'
+  import { buildEnvironment, clearSensitiveEnvironmentValues, type EnvironmentRow } from '../lib/environmentRows'
 
   let slug = $state('')
   let displayName = $state('')
   let image = $state('')
-  let publicEnv = $state('')
-  let secretEnv = $state('')
+  let environmentRows = $state<EnvironmentRow[]>([])
   let pollInterval = $state(300)
   let stopGracePeriod = $state(10)
   let autoDeploy = $state(false)
@@ -36,12 +36,6 @@
   })
   onMount(() => { void api<RegistryCredential[]>('/api/v1/registry-credentials').then((value) => { credentials = value }) })
 
-  function environment() {
-    const publicEntries = parseDotenv(publicEnv)
-    const secrets = parseDotenv(secretEnv).map(({ key, value }) => ({ key, operation: 'replace' as const, value }))
-    return { public: publicEntries, secrets }
-  }
-
   async function submit() {
     busy = true
     error = ''
@@ -50,7 +44,7 @@
         display_name: displayName, discovery_image_ref: image,
         credential_ref: credentialRef, auto_deploy_enabled: autoDeploy, auto_deploy_acknowledged: autoDeploy, poll_interval_seconds: pollInterval,
         stop_grace_period_seconds: stopGracePeriod,
-        environment: environment(), files: JSON.parse(files), ports: JSON.parse(ports),
+        environment: buildEnvironment(environmentRows), files: JSON.parse(files), ports: JSON.parse(ports),
         volumes: JSON.parse(volumes), binds: JSON.parse(binds),
         ...networkDraft({ ownedDefaultNetwork, externalNetworks }),
         health: JSON.parse(health),
@@ -58,7 +52,7 @@
       const request = { slug, ...draft }
       retry = retryIdentity(retry, request)
       const result = await mutation<AppMutationResponse>('/api/v1/apps', request, { idempotencyKey: retry.key })
-      secretEnv = ''
+      clearSensitiveEnvironmentValues(environmentRows)
       retry = undefined
       window.location.hash = `/apps/${result.app.id}`
     } catch { error = '配置无效或注册失败。请检查字段后重试。' } finally { busy = false }
@@ -84,8 +78,7 @@
     <label>停机宽限（秒）<input type="number" min="1" max="600" bind:value={stopGracePeriod} /><span class="muted">强制结束前的最长等待；服务提前退出会立即继续。</span></label>
     <label class="wide checkbox"><input type="checkbox" bind:checked={autoDeploy} /> 自动部署 Registry tag 的新 digest</label>
     {#if autoDeploy}<div class="wide notice warning">新 digest 会自动替换容器，并在健康失败时恢复旧 release；volume 与 bind 中的数据不会随镜像回滚。</div>{/if}
-    <label class="wide">公开环境变量<textarea bind:value={publicEnv} rows="5" placeholder="KEY=value&#10;OTHER=value"></textarea><span class="muted">有限 dotenv 语法；重复 key 会被拒绝。</span></label>
-    <label class="wide">Secret 环境变量（可多项，KEY=value）<textarea bind:value={secretEnv} rows="5" autocomplete="new-password"></textarea><span class="muted">write-only；成功后立即清空。</span></label>
+    <div class="wide"><EnvironmentEditor bind:rows={environmentRows} /></div>
     <label class="wide">托管文件 JSON<textarea bind:value={files} rows="5"></textarea></label>
     <label>端口 JSON<textarea bind:value={ports} rows="5"></textarea></label>
     <label>Named volume JSON<textarea bind:value={volumes} rows="5"></textarea></label>
