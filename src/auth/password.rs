@@ -113,22 +113,4 @@ mod tests {
         assert!(PasswordService::validate("1234567890123").is_err());
         assert!(PasswordService::validate(&"界".repeat(129)).is_err());
     }
-
-    #[tokio::test]
-    async fn hashes_and_verifies_password() {
-        let service = PasswordService::default();
-        let hash = service.hash("correct horse battery".into()).await.unwrap();
-        assert!(
-            service
-                .verify("correct horse battery".into(), hash.clone())
-                .await
-                .unwrap()
-        );
-        assert!(
-            !service
-                .verify("wrong horse battery".into(), hash)
-                .await
-                .unwrap()
-        );
-    }
 }

@@ -459,6 +459,10 @@ mod tests {
         },
     };
 
+    use argon2::{
+        Algorithm, Argon2, Params, Version,
+        password_hash::{PasswordHasher, SaltString},
+    };
     use tempfile::tempdir;
     use tokio::sync::Barrier;
 
@@ -491,6 +495,20 @@ mod tests {
                 self.0.fetch_add(1, Ordering::SeqCst)
             )))
         }
+    }
+
+    fn fast_test_password_hash(password: &str) -> String {
+        Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(8, 1, 1, None).unwrap(),
+        )
+        .hash_password(
+            password.as_bytes(),
+            &SaltString::encode_b64(b"solodock-auth-test").unwrap(),
+        )
+        .unwrap()
+        .to_string()
     }
 
     #[tokio::test]
@@ -603,14 +621,14 @@ mod tests {
             clock,
             Arc::new(TestTokens(AtomicUsize::new(0))),
         );
-        auth.prepare_bootstrap().await.unwrap();
-        auth.bootstrap(
-            "test-token-0".into(),
-            "correct horse battery".into(),
-            Uuid::new_v4(),
-        )
-        .await
-        .unwrap();
+        let now = format_time(auth.clock.now()).unwrap();
+        sqlx::query("INSERT INTO admin_credentials (singleton_id, username, password_hash, created_at, updated_at) VALUES (1, 'admin', ?, ?, ?)")
+            .bind(fast_test_password_hash("correct horse battery"))
+            .bind(&now)
+            .bind(&now)
+            .execute(database.pool())
+            .await
+            .unwrap();
 
         let barrier = Arc::new(Barrier::new(7));
         let mut attempts = Vec::new();

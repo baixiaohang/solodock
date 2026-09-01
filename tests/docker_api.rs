@@ -1,3 +1,5 @@
+mod support;
+
 use std::{
     collections::HashMap,
     fs,
@@ -139,18 +141,11 @@ impl Harness {
         let database = Database::open(&root.path().join("state.sqlite3"))
             .await
             .unwrap();
-        let bootstrap_path = root.path().join("bootstrap.token");
-        let auth = AuthService::new(database, bootstrap_path.clone());
-        auth.prepare_bootstrap().await.unwrap();
-        let token = fs::read_to_string(&bootstrap_path).unwrap();
-        auth.bootstrap(token, "correct horse battery".into(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let login = auth
-            .login("admin", "correct horse battery".into(), Uuid::new_v4())
-            .await
-            .unwrap();
-        let cookie = format!("__Host-solodock_session={}", login.session_token.expose());
+        let test_auth =
+            support::seed_authenticated_session(&database, root.path().join("bootstrap.token"))
+                .await;
+        let auth = test_auth.service;
+        let cookie = test_auth.cookie;
 
         let app_id = Uuid::new_v4();
         let release_id = Uuid::new_v4();

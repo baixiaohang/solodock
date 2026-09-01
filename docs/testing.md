@@ -13,11 +13,15 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 测试数量会随实现演进，文档只固定场景和护栏，不把某次运行的计数作为长期契约。
 
+非认证 integration/API 与 Docker E2E fixture 直接写入格式有效、期限受控的测试管理员与 session，不重复执行生产参数 Argon2。认证 API 仍完整覆盖 bootstrap、密码 hash/verify、login、cookie、CSRF、logout、revoke 和 audit；AuthService 的生产参数 bootstrap/login 单元路径也保留。测试 session helper 不进入 production binary，且保留 bootstrap/login 两条 fixture audit，使业务用例的审计计数语义不变。
+
+普通 PR 先运行前后端静态检查、非 Docker Rust tests、release/package smoke；只有 Docker、Compose、deployment、Registry、受管存储或相关 workflow 路径变化时才继续运行 DinD。Docker job 依赖普通 checks 成功，避免已失败提交继续消耗 DinD runner。PR 上 classic suite 使用 1 秒 SSE hold 验证连接与 permit 释放；相关 PR 的 Docker 29 job 继续运行 descriptor deployment/no-op 与两个 compensation 场景。完整资源窗口由每周一及手动触发的 `Extended CI` 运行，后者也周期性复验三个 `containerd_` 场景。
+
 ## Docker 隔离
 
 Docker/Compose E2E 必须使用隔离 daemon 或显式 test-only endpoint。生产代码固定 `/var/run/docker.sock`；仅 `docker-e2e` feature 可把 runner连接到测试 daemon。
 
-CI 同时运行 Docker 27 classic image store 的完整 DinD 回归和固定 Docker 29.7.2 的 focused containerd job。两个 job 都有 backend 硬断言：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter，不能把两个 job 静默跑成同一存储模式。classic DinD job 把 workspace 下的专用 fixture root 以同一绝对路径挂入 daemon service；managed-file bind source 必须位于该 root，不能依赖 daemon 看不到的 runner 临时路径，也不能挂载生产 Docker socket。三个 `containerd_` 场景均受场景总 deadline、deployment/gate deadline 和 shutdown deadline 约束；成功、失败、panic 或超时后都按 exact app/project/full ID 和 ownership label 清理本场景 container、network 与已声明 volume，job 级 timeout 只作最后保险。
+相关 PR 同时运行 Docker 27 classic image store 的完整 DinD 回归和固定 Docker 29.7.2 的三个 `containerd_` 场景，覆盖 descriptor deployment/no-op、pre-marker 错误 claim 清理与 post-marker replacement 现场保留；`Extended CI` 周期性复验同一 Docker 29 套件。两个 daemon 模式都有 backend 硬断言：classic job 拒绝 `io.containerd.snapshotter.v1`，containerd job 必须观察到该 snapshotter，不能把两个 job 静默跑成同一存储模式。classic DinD job 把 workspace 下的专用 fixture root 以同一绝对路径挂入 daemon service；managed-file bind source 必须位于该 root，不能依赖 daemon 看不到的 runner 临时路径，也不能挂载生产 Docker socket。三个 `containerd_` 场景均受场景总 deadline、deployment/gate deadline 和 shutdown deadline 约束；成功、失败、panic 或超时后都按 exact app/project/full ID 和 ownership label 清理本场景 container、network 与已声明 volume，job 级 timeout 只作最后保险。
 
 每次运行生成唯一 project/run token，并记录所有 container、volume、network 和临时 bind source 的精确 ID。cleanup 前重新 inspect full ID、label 与 run token，finally 只删除本次创建的对象。
 
@@ -97,7 +101,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 ## 资源验收
 
-正式资源场景记录 commit、kernel、cgroup、工具链、warm-up/sample窗口、binary size、RSS/CPU/FD/task、control-plane峰值、dockerd峰值和metadata大小。8条 authenticated SSE 在正式默认与CI中保持60秒并于窗口末端采样，drop后StreamGate permit必须归零。
+正式资源场景记录 commit、kernel、cgroup、工具链、warm-up/sample窗口、binary size、RSS/CPU/FD/task、control-plane峰值、dockerd峰值和metadata大小。8条 authenticated SSE 在 `Extended CI` 正式窗口中保持60秒并于窗口末端采样，drop后StreamGate permit必须归零；普通 PR 仅保留短窗口回归 smoke。
 
 目标、报告格式和当前基线见 [资源预算](resource-budget.md)。这些结果是本地/CI回归基线，不冒充真实生产主机测量。
 
