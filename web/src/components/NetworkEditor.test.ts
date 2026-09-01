@@ -8,13 +8,13 @@ afterEach(cleanup)
 
 describe('NetworkEditor', () => {
   it('默认启用 owned default，并即时阻止空的 external-only 配置', async () => {
-    render(NetworkEditor, { ownedDefaultNetwork: true, externalNetworks: [] })
+    render(NetworkEditor, { ownedDefaultNetwork: true, serviceDiscoveryEnabled: false, externalNetworks: [] })
     const checkbox = screen.getByLabelText('创建应用专属默认网络') as HTMLInputElement
     expect(checkbox.checked).toBe(true)
     expect(screen.queryByRole('alert')).toBeNull()
 
     await fireEvent.click(checkbox)
-    expect(screen.getByRole('alert').textContent).toContain('至少需要一个 external network')
+    expect(screen.getByRole('alert').textContent).toContain('至少需要应用专属网络')
     await fireEvent.click(screen.getByRole('button', { name: '添加 external network' }))
     expect(screen.queryByRole('alert')).toBeNull()
   })
@@ -30,16 +30,27 @@ describe('NetworkEditor', () => {
     await fireEvent.click(screen.getAllByRole('button', { name: '删除 alias' })[0])
     expect(screen.queryByDisplayValue('postgres')).toBeNull()
   })
+
+  it('允许只使用平台内部服务发现网络', () => {
+    render(NetworkEditor, {
+      ownedDefaultNetwork: false,
+      serviceDiscoveryEnabled: true,
+      externalNetworks: [],
+    })
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
 })
 
 describe('network form projection', () => {
   it('过滤 legacy marker 并回显 alias，再生成仅含 external 的新 payload', () => {
-    const state = networkEditorState(true, [
+    const state = networkEditorState(true, true, [
       { kind: 'owned_default' },
       { kind: 'external', name: 'shared', aliases: ['postgres'] },
     ])
     expect(state).toEqual({
       ownedDefaultNetwork: true,
+      serviceDiscoveryEnabled: true,
       externalNetworks: [{ name: 'shared', aliases: ['postgres'] }],
     })
     expect(networkDraft(state)).toEqual({

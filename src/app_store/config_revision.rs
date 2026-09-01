@@ -63,20 +63,21 @@ impl LoadedRevision {
             allowed_bind_roots,
         )?;
         match self.metadata.schema_version {
-            1 => {
-                // Schema 1 predates stop_grace_period_seconds. Re-normalize all
-                // semantic fields with today's validators, but preserve the
-                // signed legacy metadata and hash for artifact verification.
+            1 | 2 => {
+                // Legacy schemas predate some current controls. Re-normalize
+                // all semantic fields, then preserve the signed legacy
+                // metadata and hash for artifact verification.
                 let mut upgraded = self.metadata.clone();
                 upgraded.schema_version = normalized.metadata.schema_version;
                 upgraded.stop_grace_period_seconds = normalized.metadata.stop_grace_period_seconds;
+                upgraded.service_discovery_enabled = normalized.metadata.service_discovery_enabled;
                 upgraded.config_sha256 = normalized.metadata.config_sha256.clone();
                 if upgraded != normalized.metadata {
                     return Err(DomainError::ConfigInvalid);
                 }
                 normalized.metadata = self.metadata.clone();
             }
-            2 if normalized.metadata == self.metadata => {}
+            3 if normalized.metadata == self.metadata => {}
             _ => return Err(DomainError::ConfigInvalid),
         }
         Ok(normalized)
@@ -115,6 +116,7 @@ impl LoadedRevision {
             volumes: self.metadata.volumes.clone(),
             binds: self.metadata.binds.clone(),
             owned_default_network: self.metadata.owned_default_network,
+            service_discovery_enabled: self.metadata.service_discovery_enabled,
             networks: self.metadata.networks.clone(),
             health: self.metadata.health.clone(),
         }
@@ -184,6 +186,7 @@ impl LoadedRevision {
             volumes: self.metadata.volumes.clone(),
             binds: self.metadata.binds.clone(),
             owned_default_network: self.metadata.owned_default_network,
+            service_discovery_enabled: self.metadata.service_discovery_enabled,
             networks: self.metadata.networks.clone(),
             health: self.metadata.health.clone(),
         }
@@ -280,13 +283,17 @@ pub fn load(app_directory: &Path, revision_id: Uuid) -> Result<LoadedRevision, S
     })?;
     let mut metadata: ConfigMetadata =
         toml::from_str(&config).map_err(|_| StoreError::ContentInvalid)?;
-    if !matches!(metadata.schema_version, 1 | 2) {
+    if !matches!(metadata.schema_version, 1..=3) {
         return Err(StoreError::ContentInvalid);
     }
     if metadata.schema_version == 1 {
         // The field was not part of schema 1's signed canonical form. Never
         // accept an injected unsigned value as runtime control input.
         metadata.stop_grace_period_seconds = crate::domain::default_stop_grace_period_seconds();
+    }
+    if matches!(metadata.schema_version, 1 | 2) {
+        // The field was outside both legacy schemas' signed canonical form.
+        metadata.service_discovery_enabled = false;
     }
     let public_environment = read_environment(
         app_directory,
@@ -602,6 +609,7 @@ mod tests {
             volumes: vec![],
             binds: vec![],
             owned_default_network: true,
+            service_discovery_enabled: true,
             networks: vec![],
             health: crate::domain::HealthPolicy::default(),
         };
@@ -675,6 +683,7 @@ mod tests {
             volumes: Vec::new(),
             binds: Vec::new(),
             owned_default_network: true,
+            service_discovery_enabled: true,
             networks: Vec::new(),
             health: crate::domain::HealthPolicy::default(),
         };
@@ -717,6 +726,7 @@ mod tests {
             volumes: vec![],
             binds: vec![],
             owned_default_network: true,
+            service_discovery_enabled: true,
             networks: vec![],
             health: crate::domain::HealthPolicy::default(),
         };

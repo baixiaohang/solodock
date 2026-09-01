@@ -24,6 +24,10 @@ pub enum NetworkMode {
     OwnedOnly,
     OwnedAndExternal,
     ExternalOnly,
+    OwnedAndPlatform,
+    OwnedPlatformAndExternal,
+    PlatformAndExternal,
+    PlatformOnly,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -45,25 +49,41 @@ pub struct ExpectedNetwork {
 #[serde(rename_all = "snake_case")]
 pub enum ExpectedNetworkKind {
     OwnedDefault,
+    Platform,
     External,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct NetworkPlan {
     pub owned_default_network: bool,
+    pub service_discovery_enabled: bool,
     pub mode: NetworkMode,
     pub external: Vec<ExternalNetworkAttachment>,
 }
 
 impl NetworkPlan {
-    pub fn expected_networks(&self, names: &AppResourceNames) -> Vec<ExpectedNetwork> {
-        let mut expected =
-            Vec::with_capacity(self.external.len() + usize::from(self.owned_default_network));
+    pub fn expected_networks(
+        &self,
+        names: &AppResourceNames,
+        service_alias: &str,
+    ) -> Vec<ExpectedNetwork> {
+        let mut expected = Vec::with_capacity(
+            self.external.len()
+                + usize::from(self.owned_default_network)
+                + usize::from(self.service_discovery_enabled),
+        );
         if self.owned_default_network {
             expected.push(ExpectedNetwork {
                 name: names.owned_default_network_name.clone(),
                 kind: ExpectedNetworkKind::OwnedDefault,
                 aliases: Vec::new(),
+            });
+        }
+        if self.service_discovery_enabled {
+            expected.push(ExpectedNetwork {
+                name: PLATFORM_NETWORK_NAME.to_owned(),
+                kind: ExpectedNetworkKind::Platform,
+                aliases: vec![service_alias.to_owned()],
             });
         }
         expected.extend(self.external.iter().map(|attachment| ExpectedNetwork {
@@ -78,10 +98,17 @@ impl NetworkPlan {
 
 pub fn normalize_networks(
     owned_default_network: bool,
+    service_discovery_enabled: bool,
     networks: &mut [NetworkInput],
 ) -> Result<NetworkPlan, DomainError> {
     for network in networks.iter_mut() {
-        if let NetworkInput::External { aliases, .. } = network {
+        if let NetworkInput::External { name, aliases } = network {
+            // Current revisions reserve the platform-owned service network.
+            // The lower-level reader intentionally remains permissive so an
+            // already signed legacy artifact can still be verified.
+            if name == PLATFORM_NETWORK_NAME {
+                return Err(DomainError::ConfigInvalid);
+            }
             let mut seen = HashSet::new();
             for alias in aliases.iter() {
                 validate_alias(alias)?;
@@ -96,11 +123,12 @@ pub fn normalize_networks(
         }
     }
     networks.sort_by(|left, right| network_sort_key(left).cmp(&network_sort_key(right)));
-    network_plan(owned_default_network, networks)
+    network_plan(owned_default_network, service_discovery_enabled, networks)
 }
 
 pub fn network_plan(
     owned_default_network: bool,
+    service_discovery_enabled: bool,
     networks: &[NetworkInput],
 ) -> Result<NetworkPlan, DomainError> {
     let mut names = HashSet::new();
@@ -139,22 +167,34 @@ pub fn network_plan(
     if owned_markers > 1 || (!owned_default_network && owned_markers != 0) {
         return Err(DomainError::ConfigInvalid);
     }
-    if !owned_default_network && external.is_empty() {
+    if !owned_default_network && !service_discovery_enabled && external.is_empty() {
         return Err(DomainError::ConfigInvalid);
     }
     external.sort_by(|left, right| left.name.cmp(&right.name));
-    let mode = match (owned_default_network, external.is_empty()) {
-        (true, true) => NetworkMode::OwnedOnly,
-        (true, false) => NetworkMode::OwnedAndExternal,
-        (false, false) => NetworkMode::ExternalOnly,
-        (false, true) => return Err(DomainError::ConfigInvalid),
+    let mode = match (
+        owned_default_network,
+        service_discovery_enabled,
+        external.is_empty(),
+    ) {
+        (true, false, true) => NetworkMode::OwnedOnly,
+        (true, false, false) => NetworkMode::OwnedAndExternal,
+        (false, false, false) => NetworkMode::ExternalOnly,
+        (true, true, true) => NetworkMode::OwnedAndPlatform,
+        (true, true, false) => NetworkMode::OwnedPlatformAndExternal,
+        (false, true, false) => NetworkMode::PlatformAndExternal,
+        (false, true, true) => NetworkMode::PlatformOnly,
+        (false, false, true) => return Err(DomainError::ConfigInvalid),
     };
     Ok(NetworkPlan {
         owned_default_network,
+        service_discovery_enabled,
         mode,
         external,
     })
 }
+
+pub const PLATFORM_NETWORK_NAME: &str = "solodock-services";
+pub const PLATFORM_BRIDGE_NAME: &str = "sd-services";
 
 fn network_sort_key(value: &NetworkInput) -> (u8, &str) {
     match value {
@@ -208,7 +248,7 @@ mod tests {
                 aliases: vec![],
             },
         ];
-        let plan = normalize_networks(true, &mut networks).unwrap();
+        let plan = normalize_networks(true, false, &mut networks).unwrap();
         assert_eq!(plan.mode, NetworkMode::OwnedAndExternal);
         assert_eq!(plan.external[0].name, "alpha");
         assert_eq!(plan.external[0].source_index, 1);
@@ -219,7 +259,7 @@ mod tests {
     #[test]
     fn rejects_invalid_external_only_and_aliases() {
         assert_eq!(
-            normalize_networks(false, &mut []).unwrap_err(),
+            normalize_networks(false, false, &mut []).unwrap_err(),
             DomainError::ConfigInvalid
         );
         for alias in ["UPPER", "-bad", "bad-", "bad.name", ""] {
@@ -228,9 +268,33 @@ mod tests {
                 aliases: vec![alias.into()],
             }];
             assert_eq!(
-                normalize_networks(false, &mut networks).unwrap_err(),
+                normalize_networks(false, false, &mut networks).unwrap_err(),
                 DomainError::ConfigInvalid
             );
         }
+    }
+
+    #[test]
+    fn current_writes_reserve_the_platform_network_name_but_legacy_plans_remain_readable() {
+        for service_discovery_enabled in [false, true] {
+            let mut networks = vec![NetworkInput::External {
+                name: PLATFORM_NETWORK_NAME.into(),
+                aliases: vec!["legacy-alias".into()],
+            }];
+            assert_eq!(
+                normalize_networks(true, service_discovery_enabled, &mut networks).unwrap_err(),
+                DomainError::ConfigInvalid
+            );
+        }
+        let legacy = network_plan(
+            true,
+            false,
+            &[NetworkInput::External {
+                name: PLATFORM_NETWORK_NAME.into(),
+                aliases: vec!["legacy-alias".into()],
+            }],
+        )
+        .unwrap();
+        assert_eq!(legacy.external[0].name, PLATFORM_NETWORK_NAME);
     }
 }

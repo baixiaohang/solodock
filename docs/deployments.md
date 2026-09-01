@@ -4,6 +4,8 @@ SoloDock 的 manual deploy、poll auto-deploy 和 rollback 共用唯一的 `Depl
 
 应用页只读取最近 20 条 deployment，每个 deployment 以一整行展示显示时区下的创建时间、status/phase、trigger、镜像或 digest 和错误码，并通过明确链接进入详情；移动端只允许单项内部换行，不会把两条历史并排。
 
+`UNCONFIGURED` 应用没有 draft revision，不能进入 scheduler、poller、webhook 或 lifecycle Docker effect。第一次保存完整 draft 后才具备 deploy 条件。PostgreSQL 快速部署的“创建 configured app”和“调度 deployment”是两个独立幂等阶段；第二阶段失败会保留应用与 revision，并在详情页提供继续部署，不删除数据资源或伪造整体回滚。
+
 ## Registry credential
 
 Registry credential 以 filesystem-first 方式保存在 `registry-credentials/<credential-id>/`：metadata 与 immutable secret revision 分离并受完整性校验。API 只返回 registry、username 和 revision 等 metadata，不回显 token。
@@ -45,6 +47,7 @@ deployment ledger 的终态为：
 - current app metadata、active/pending link 和 immutable release；
 - HMAC、config revision、digest image 和 canonical Compose；
 - daemon 实际 data-root、volume/network ownership 和 bind identity；
+- service discovery 启用时，平台网络的 exact internal/bridge/label identity；
 - Compose project/service 下的全部 container candidate 与精确 predecessor。
 
 最后一个 Docker await 完成后调用固定 Compose action。替换已有容器时，先使用 predecessor release 自己固定的停机宽限完成 stop，确认旧 writer 已退出后才启动 candidate；candidate 的新宽限只约束其后续关闭。若 candidate 尚未创建就失败，系统会先恢复已停止的 predecessor，再按确定性或不确定性结果收敛。unmanaged、stale、replacement、multiple candidate 或 resource drift 都不会进入 runner。

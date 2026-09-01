@@ -19,6 +19,7 @@ pub struct DraftResponse {
     pub volumes: Vec<VolumeInput>,
     pub binds: Vec<super::BindMountInput>,
     pub owned_default_network: bool,
+    pub service_discovery_enabled: bool,
     pub networks: Vec<NetworkInput>,
     pub health: HealthPolicy,
 }

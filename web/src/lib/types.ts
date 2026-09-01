@@ -13,6 +13,9 @@ export interface SettingsResponse {
   revision: string
   display_timezone: string
   supported_timezones: string[]
+  allowed_bind_roots: string[]
+  slug_max_length: number
+  supported_mount_types: Array<'owned_volume' | 'external_volume' | 'bind'>
   idempotency_replayed?: boolean
 }
 
@@ -65,10 +68,11 @@ export interface ContainerProjection {
   networks: Array<{ name: string; container_ip: string | null; aliases: string[] }>
 }
 
-export type NetworkMode = 'owned_only' | 'owned_and_external' | 'external_only'
+export type NetworkMode = 'owned_only' | 'owned_and_external' | 'external_only' | 'owned_and_platform' | 'owned_platform_and_external' | 'platform_and_external' | 'platform_only'
 export interface ExternalNetworkAttachment { name: string; aliases: string[] }
 export interface NetworkPlan {
   owned_default_network: boolean
+  service_discovery_enabled: boolean
   mode: NetworkMode
   external: ExternalNetworkAttachment[]
 }
@@ -147,6 +151,7 @@ export interface DraftInput {
   >
   binds: Array<{ source: string; target_path: string; readonly: boolean; acknowledge_non_rollbackable: boolean }>
   owned_default_network: boolean
+  service_discovery_enabled: boolean
   networks: Array<{ kind: 'owned_default' } | { kind: 'external'; name: string; aliases?: string[] }>
   health:
     | { policy: 'running'; stable_window_seconds: number }
@@ -207,6 +212,7 @@ export interface DraftResponse {
   volumes: DraftInput['volumes']
   binds: DraftInput['binds']
   owned_default_network: boolean
+  service_discovery_enabled: boolean
   networks: DraftInput['networks']
   health: DraftInput['health']
 }
@@ -220,7 +226,7 @@ export interface AppDetailResponse extends AppObservation {
   pending_release_id: string | null
   pending_image_ref: string | null
   desired_state: 'running' | 'stopped'
-  deployment_status: 'ACTIVE' | 'PENDING' | 'RUNNING' | 'DEPLOY_REQUIRED'
+  deployment_status: 'ACTIVE' | 'PENDING' | 'RUNNING' | 'DEPLOY_REQUIRED' | 'UNCONFIGURED'
   available_actions: Array<'start' | 'stop' | 'restart' | 'deploy' | 'deletion_preview'>
   compose_available: boolean
   polling: PollState | null
@@ -246,10 +252,13 @@ export interface PollState {
 }
 
 export interface AppMutationResponse {
-  app: { id: string; slug: string; display_name: string; config_revision: string; stop_grace_period_seconds: number; deployment_status: string; warnings: string[] }
+  app: { id: string; slug: string; display_name: string; config_revision: string | null; stop_grace_period_seconds: number | null; deployment_status: string; warnings: string[] }
   idempotency_replayed: boolean
   projection_warning?: string
 }
+
+export interface ImageConfigSuggestion { resolved_digest: string; exposed_ports: Array<{ container_port: number; protocol: 'tcp' | 'udp' }>; volume_targets: string[]; has_healthcheck: boolean; user: string | null; stop_signal: string | null; warnings: string[] }
+export interface AppPresetDescriptor { id: string; schema_version: number; display_name: string; description: string; default_major: string; supported_majors: string[]; default_username: string; default_database: string; password_generated_by_client: boolean }
 
 export interface AppListItem {
   id: string

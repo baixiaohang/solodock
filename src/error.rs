@@ -227,6 +227,27 @@ impl ApiError {
         )
     }
 
+    pub fn registry(code: &'static str, request_id: RequestId) -> Self {
+        let status = match code {
+            "REGISTRY_CREDENTIAL_REQUIRED"
+            | "REGISTRY_CREDENTIAL_INVALID"
+            | "REGISTRY_FORBIDDEN"
+            | "REGISTRY_CREDENTIAL_MISMATCH" => StatusCode::UNPROCESSABLE_ENTITY,
+            "REGISTRY_TAG_NOT_FOUND" => StatusCode::NOT_FOUND,
+            "REGISTRY_RATE_LIMITED"
+            | "REGISTRY_UNAVAILABLE"
+            | "REGISTRY_TIMEOUT"
+            | "REGISTRY_TLS_ERROR" => StatusCode::SERVICE_UNAVAILABLE,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        Self::new(
+            status,
+            code,
+            "The image registry request failed",
+            request_id,
+        )
+    }
+
     pub fn internal(request_id: RequestId) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

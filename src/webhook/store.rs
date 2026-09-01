@@ -146,6 +146,9 @@ impl WebhookStore {
     }
 
     pub fn load_current(&self, app_id: Uuid) -> Result<LoadedWebhook, StoreError> {
+        if !self.apps.read_metadata(app_id)?.is_configured() {
+            return Err(StoreError::ContentInvalid);
+        }
         let metadata = self.load_metadata(app_id)?;
         if !metadata.enabled {
             return Err(StoreError::ContentInvalid);
@@ -162,7 +165,9 @@ impl WebhookStore {
         operation_id: Uuid,
         secret: &SecretValue,
     ) -> Result<WebhookMetadata, StoreError> {
-        self.apps.read_metadata(app_id)?;
+        if !self.apps.read_metadata(app_id)?.is_configured() {
+            return Err(StoreError::ContentInvalid);
+        }
         let decoded_secret = decode_secret(secret).map_err(|_| StoreError::ContentInvalid)?;
         let existing = match self.load_metadata(app_id) {
             Ok(value) => Some(value),
@@ -275,6 +280,9 @@ impl WebhookStore {
         expected: Uuid,
         operation_id: Uuid,
     ) -> Result<WebhookMetadata, StoreError> {
+        if !self.apps.read_metadata(app_id)?.is_configured() {
+            return Err(StoreError::ContentInvalid);
+        }
         let mut metadata = self.load_metadata(app_id)?;
         if metadata.last_operation_id == operation_id {
             self.repair_durability(app_id, metadata.secret_revision)?;
@@ -877,6 +885,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: HealthPolicy::default(),
             },
@@ -891,8 +900,7 @@ mod tests {
                 app,
                 slug,
                 Uuid::new_v4(),
-                Uuid::new_v4(),
-                &draft,
+                Some((Uuid::new_v4(), &draft)),
                 OffsetDateTime::now_utc(),
             )
             .unwrap();
@@ -916,10 +924,11 @@ mod tests {
             id: app_id,
             slug: "example".into(),
             display_name: "Example".into(),
-            discovery_image_ref: "registry.example/app:stable".into(),
+            resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
+            discovery_image_ref: Some("registry.example/app:stable".into()),
             credential_ref: None,
-            draft_revision: Uuid::new_v4(),
-            draft_config_sha256: "hash".into(),
+            draft_revision: Some(Uuid::new_v4()),
+            draft_config_sha256: Some("hash".into()),
             desired_state: DesiredState::Stopped,
             auto_deploy_enabled: true,
             poll_interval_seconds: 300,
@@ -970,6 +979,47 @@ mod tests {
             .unwrap();
         assert!(!revoked.enabled);
         assert!(store.load_current(app).is_err());
+    }
+
+    #[test]
+    fn unconfigured_app_cannot_create_or_load_webhook_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let apps = root.path().join("apps");
+        let app_store = AppStore::initialize_verified(apps, vec![7; 32]).unwrap();
+        let app_id = Uuid::new_v4();
+        app_store
+            .create_app(
+                app_id,
+                "empty",
+                Uuid::new_v4(),
+                None,
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let store = WebhookStore::new(app_store.clone(), vec![7; 32]);
+        let secret = SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into());
+
+        assert!(matches!(
+            store.configure(app_id, None, Uuid::new_v4(), &secret),
+            Err(StoreError::ContentInvalid)
+        ));
+        assert!(matches!(
+            store.load_current(app_id),
+            Err(StoreError::ContentInvalid)
+        ));
+        assert!(
+            !app_store
+                .app_directory(app_id)
+                .join("webhook.toml")
+                .exists()
+        );
+        assert!(
+            !app_store
+                .app_directory(app_id)
+                .join("webhook-secret-revisions")
+                .exists()
+        );
     }
 
     #[test]

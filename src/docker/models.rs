@@ -189,6 +189,7 @@ pub struct DockerNetworkResource {
     pub name: String,
     pub labels: HashMap<String, String>,
     pub driver: Option<String>,
+    pub internal: bool,
     pub options: HashMap<String, String>,
 }
 
@@ -399,6 +400,9 @@ pub trait DockerReadApi: Send + Sync {
         &self,
         _name: &str,
     ) -> Result<Option<DockerNetworkResource>, DockerError> {
+        Err(DockerError::new(DockerErrorKind::Unavailable))
+    }
+    async fn create_platform_network(&self) -> Result<(), DockerError> {
         Err(DockerError::new(DockerErrorKind::Unavailable))
     }
     async fn inspect_network_snapshot(

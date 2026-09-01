@@ -6,7 +6,7 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 - 单元测试：domain validation、reference/parser、HMAC、redactor、state machine、clock/backoff、path 和 filesystem helper；
 - integration/API：临时目录中的 SQLite、filesystem-first publication、认证、幂等、删除、recovery 与 typed response；
-- frontend：dotenv、write-only retry identity、deployment/poll state、credential、结构化 network editor 和 destructive preview组件；
+- frontend：dotenv、write-only retry identity、deployment/poll state、credential、逐行 port/storage/health/managed-file editor、结构化 network editor、preset 两阶段恢复和 destructive preview组件；
 - embedded/package smoke：production asset、真实 HTTP bootstrap/login/API、installer upgrade、systemd、backup/restore；
 - Registry + Docker E2E：独立 private Bearer Registry 和 Docker-in-Docker daemon，穿过 production HTTP、poll/webhook、scheduler、pull、Compose、health、rollback 和 cleanup 边界；
 - resource harness：production embedded binary、60 秒 idle sample、60 秒 authenticated SSE 和独立 dockerd采样。
@@ -56,14 +56,19 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 ### Docker 与 Compose
 
 - project/service/schema/app/release/full ID ownership；
-- 1–12 字符不可变 slug，以及 project/container/network/volume/bridge 的统一可读命名；
-- owned network 的 bridge option、effect 前 identity conflict、observer expected/actual projection，以及删除重建后 `sd-<slug>` 稳定性；
+- 新应用 1–20 字符不可变 slug、旧应用 12 字符边界，以及版本化 project/container/network/volume/bridge identity；
+- owned network 的版本化 bridge option、effect 前 identity conflict、observer expected/actual projection，以及删除重建后 identity 稳定性；
+- `UNCONFIGURED` create/replay、首次 nullable revision、deploy/start/poll/webhook fail closed 且不创建 Docker 资源；
+- 平台 internal network inspect-or-create、同名漂移拒绝、旧 release 不自动加入、两个应用以 slug 跨服务连接；
+- PostgreSQL 18/17 major-specific volume target、Secret 不回显、创建/部署双幂等与部分失败恢复；
+- OCI config blob 大小/media type/digest、allowlist 投影和 Env/labels/command 不回显；
 - unmanaged、stale、multiple、replacement collision在 runner前 fail closed；
 - canonical YAML、`.env` 隔离、固定 argv、禁 shell/exec/pull/build/down/volume removal；
 - owned-only、owned+external、external-only 的 canonical YAML，旧无 alias 短语法逐字节兼容，以及 typed alias 长语法；
 - external network 缺失、无关成员 alias 冲突、精确 predecessor full ID 放行、不完整成员 observation fail closed；
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation；
+- SQLite bind roots 一次 bootstrap、revision 更新、引用保护与扫描失败关闭；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
 - `/proc/meminfo` 正常、缺失、非法和 overflow，system health 五列状态条与 pull 门禁共用同一 parser；
 - 固定非 root image 同时读取 public/secret managed file，首次部署、第二 revision、manual rollback 和 strict recovery 成功，restart count 不增长且容器写入 readonly mount 失败；
@@ -86,6 +91,8 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - timeout/shutdown/unknown effect保持interrupted并由fresh exact facts收敛；
 - poll no-op、busy coalescing、backoff、ETag generation隔离和failed-target suppression；
 - production coordinator heap/dispatch、durable webhook wake、cancel和TaskTracker join。
+
+完整 DinD 验收还应快速部署 PostgreSQL，用第二个新应用通过 `<slug>:5432` 写入 canary，Recreate 后再次读取；不得为了测试暴露 PostgreSQL host port。Insight Agent 的三个既有宿主目录、UID/GID、deploy key 与旧 systemd 单 writer 切换仍属于生产维护窗口人工验收，不进入 CI fixture。
 
 ### 删除
 

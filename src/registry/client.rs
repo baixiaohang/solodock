@@ -15,6 +15,7 @@ use super::{
 use crate::security::secret::SecretValue;
 
 const MANIFEST_LIMIT: usize = 8 * 1024 * 1024;
+const CONFIG_LIMIT: usize = 2 * 1024 * 1024;
 const TOKEN_LIMIT: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -96,6 +97,23 @@ pub struct RegistryResolver {
     allow_http_loopback: bool,
 }
 
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ExposedPort {
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, PartialEq, Eq)]
+pub struct ImageConfigSuggestion {
+    pub resolved_digest: String,
+    pub exposed_ports: Vec<ExposedPort>,
+    pub volume_targets: Vec<String>,
+    pub has_healthcheck: bool,
+    pub user: Option<String>,
+    pub stop_signal: Option<String>,
+    pub warnings: Vec<String>,
+}
+
 impl RegistryResolver {
     pub fn production() -> Result<Self, RegistryError> {
         let client = Client::builder()
@@ -133,6 +151,24 @@ impl RegistryResolver {
             PollResolve::Modified { image, .. } => Ok(*image),
             PollResolve::NotModified => Err(RegistryError::Protocol),
         }
+    }
+
+    pub async fn inspect_config(
+        &self,
+        image: &ImageReference,
+        platform: &Platform,
+        credential: Option<(&str, &SecretValue)>,
+    ) -> Result<ImageConfigSuggestion, RegistryError> {
+        let resolved = self.resolve(image, platform, credential).await?;
+        let response = self
+            .fetch_blob_authenticated(image, &resolved.local_image_id, credential)
+            .await?;
+        classify_status(response.status(), credential.is_some())?;
+        let body = read_limited(response, CONFIG_LIMIT).await?;
+        if digest(&body) != resolved.local_image_id {
+            return Err(RegistryError::DigestMismatch);
+        }
+        parse_image_config(&body, resolved.manifest_digest)
     }
 
     pub async fn resolve_poll(
@@ -365,6 +401,142 @@ impl RegistryResolver {
         }
         request.send().await.map_err(classify_transport)
     }
+
+    async fn fetch_blob_authenticated(
+        &self,
+        image: &ImageReference,
+        digest: &str,
+        credential: Option<(&str, &SecretValue)>,
+    ) -> Result<Response, RegistryError> {
+        let first = self.fetch_blob(image, digest, None).await?;
+        if first.status() != StatusCode::UNAUTHORIZED {
+            return Ok(first);
+        }
+        let challenge = first
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .ok_or(RegistryError::CredentialRequired)?;
+        let challenge = parse_bearer(challenge, self.allow_http_loopback)?;
+        let mut url = challenge.realm;
+        {
+            let mut pairs = url.query_pairs_mut();
+            if let Some(service) = challenge.service {
+                pairs.append_pair("service", &service);
+            }
+            pairs.append_pair("scope", &format!("repository:{}:pull", image.repository));
+        }
+        let mut request = self.client.get(url);
+        if let Some((username, secret)) = credential {
+            request = request.basic_auth(username, Some(secret.expose()));
+        }
+        let token_response = request.send().await.map_err(classify_transport)?;
+        classify_status(token_response.status(), credential.is_some())?;
+        let token_body = Zeroizing::new(read_limited(token_response, TOKEN_LIMIT).await?);
+        #[derive(Deserialize)]
+        struct Token {
+            token: Option<SecretValue>,
+            access_token: Option<SecretValue>,
+        }
+        let token: Token =
+            serde_json::from_slice(&token_body).map_err(|_| RegistryError::Protocol)?;
+        let token = token
+            .token
+            .or(token.access_token)
+            .filter(|value| !value.expose().is_empty() && value.expose().len() <= 16 * 1024)
+            .ok_or(RegistryError::CredentialInvalid)?;
+        self.fetch_blob(image, digest, Some(token.expose())).await
+    }
+
+    async fn fetch_blob(
+        &self,
+        image: &ImageReference,
+        digest: &str,
+        bearer: Option<&str>,
+    ) -> Result<Response, RegistryError> {
+        let scheme = if self.allow_http_loopback
+            && (image.transport_registry.starts_with("127.0.0.1:")
+                || image.transport_registry.starts_with("localhost:"))
+        {
+            "http"
+        } else {
+            "https"
+        };
+        let url = format!(
+            "{scheme}://{}/v2/{}/blobs/{digest}",
+            image.transport_registry, image.repository
+        );
+        let mut request = self.client.get(url);
+        if let Some(token) = bearer {
+            request = request.bearer_auth(token);
+        }
+        request.send().await.map_err(classify_transport)
+    }
+}
+
+fn parse_image_config(
+    body: &[u8],
+    resolved_digest: String,
+) -> Result<ImageConfigSuggestion, RegistryError> {
+    #[derive(Deserialize)]
+    struct Root {
+        #[serde(default)]
+        config: Config,
+    }
+    #[derive(Default, Deserialize)]
+    #[serde(rename_all = "PascalCase")]
+    struct Config {
+        #[serde(default)]
+        exposed_ports: std::collections::BTreeMap<String, serde_json::Value>,
+        #[serde(default)]
+        volumes: std::collections::BTreeMap<String, serde_json::Value>,
+        healthcheck: Option<serde_json::Value>,
+        user: Option<String>,
+        stop_signal: Option<String>,
+    }
+    let root: Root = serde_json::from_slice(body).map_err(|_| RegistryError::Protocol)?;
+    let mut exposed_ports = root
+        .config
+        .exposed_ports
+        .keys()
+        .map(|value| {
+            let (port, protocol) = value.split_once('/').ok_or(RegistryError::Protocol)?;
+            let container_port = port.parse::<u16>().map_err(|_| RegistryError::Protocol)?;
+            if container_port == 0 || !matches!(protocol, "tcp" | "udp") {
+                return Err(RegistryError::Protocol);
+            }
+            Ok(ExposedPort {
+                container_port,
+                protocol: protocol.to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>, RegistryError>>()?;
+    exposed_ports.sort_by_key(|value| (value.container_port, value.protocol.clone()));
+    if exposed_ports.len() > 64 || root.config.volumes.len() > 64 {
+        return Err(RegistryError::Protocol);
+    }
+    let mut volume_targets = root.config.volumes.into_keys().collect::<Vec<_>>();
+    if volume_targets
+        .iter()
+        .any(|target| !target.starts_with('/') || target.len() > 4096)
+    {
+        return Err(RegistryError::Protocol);
+    }
+    volume_targets.sort();
+    Ok(ImageConfigSuggestion {
+        resolved_digest,
+        exposed_ports,
+        volume_targets,
+        has_healthcheck: root.config.healthcheck.is_some(),
+        user: root
+            .config
+            .user
+            .filter(|value| !value.is_empty() && value.len() <= 256),
+        stop_signal: root
+            .config
+            .stop_signal
+            .filter(|value| !value.is_empty() && value.len() <= 64),
+        warnings: Vec::new(),
+    })
 }
 
 fn safe_etag(value: &header::HeaderValue) -> Option<String> {
@@ -602,6 +774,34 @@ mod tests {
         assert!(safe_etag(&header::HeaderValue::from_static("")).is_none());
         let oversized = header::HeaderValue::from_str(&format!("\"{}\"", "a".repeat(255))).unwrap();
         assert!(safe_etag(&oversized).is_none());
+    }
+
+    #[test]
+    fn image_config_projection_is_allowlisted_and_canonical() {
+        let body = serde_json::json!({
+            "config": {
+                "ExposedPorts": {"3000/tcp": {}, "5353/udp": {}},
+                "Volumes": {"/var/lib/data": {}, "/cache": {}},
+                "Healthcheck": {"Test": ["CMD", "curl", "http://localhost/healthz"]},
+                "User": "10001:10001",
+                "StopSignal": "SIGTERM",
+                "Env": ["SECRET_CANARY=must-not-project"],
+                "Labels": {"secret": "must-not-project"},
+                "Entrypoint": ["/bin/private"]
+            }
+        });
+        let suggestion = parse_image_config(
+            serde_json::to_vec(&body).unwrap().as_slice(),
+            format!("sha256:{}", "a".repeat(64)),
+        )
+        .unwrap();
+        assert_eq!(suggestion.exposed_ports.len(), 2);
+        assert_eq!(suggestion.volume_targets, vec!["/cache", "/var/lib/data"]);
+        assert!(suggestion.has_healthcheck);
+        let serialized = serde_json::to_string(&suggestion).unwrap();
+        assert!(!serialized.contains("SECRET_CANARY"));
+        assert!(!serialized.contains("must-not-project"));
+        assert!(!serialized.contains("/bin/private"));
     }
 
     #[tokio::test]

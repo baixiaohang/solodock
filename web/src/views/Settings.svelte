@@ -7,6 +7,7 @@
 
   let settings = $state<SettingsResponse | null>(null)
   let selected = $state('UTC')
+  let bindRoots = $state<string[]>([])
   let busy = $state(false)
   let error = $state('')
   let saved = $state(false)
@@ -19,6 +20,7 @@
     try {
       settings = await loadTimeSettings()
       selected = settings.display_timezone
+      bindRoots = [...(settings.allowed_bind_roots ?? [])]
       retry = undefined
     } catch {
       error = '无法加载全局设置。'
@@ -31,6 +33,7 @@
     const request = {
       expected_revision: settings.revision,
       display_timezone: selected,
+      allowed_bind_roots: bindRoots.filter(Boolean),
     }
     retry = retryIdentity(retry, request)
     try {
@@ -38,6 +41,7 @@
       retry = undefined
       applyTimeSettings(settings)
       selected = settings.display_timezone
+      bindRoots = [...(settings.allowed_bind_roots ?? [])]
       saved = true
     } catch {
       error = '保存失败；设置可能已被其他页面修改，请刷新后重试。'
@@ -64,7 +68,8 @@
         {/each}
       </select>
       <p class="muted">选项来自后端内置的 IANA tzdb，不能提交任意字符串。保存后所有已打开页面立即按新时区重绘。</p>
-      <div class="actions"><button disabled={busy || selected === settings.display_timezone}>{busy ? '保存中…' : '保存全局时区'}</button>{#if saved}<span class="success-text" role="status">已生效</span>{/if}</div>
+      <fieldset class="row-editor"><legend>存储访问</legend><p class="muted">每行一个已存在的安全宿主目录。SoloDock 只把它作为 bind allowlist，不会浏览、创建、改权限或删除目录。</p>{#each bindRoots as root, index}<div class="editor-row"><label>允许根目录<input bind:value={bindRoots[index]} placeholder="/home/ubuntu" required /></label><button type="button" class="ghost" onclick={() => { bindRoots = bindRoots.filter((_, current) => current !== index) }}>删除</button></div>{/each}<button type="button" class="ghost" onclick={() => { bindRoots = [...bindRoots, ''] }}>添加根目录</button></fieldset>
+      <div class="actions"><button disabled={busy}>{busy ? '保存中…' : '保存系统设置'}</button>{#if saved}<span class="success-text" role="status">已生效</span>{/if}</div>
     </form>
   {/if}
 </main>

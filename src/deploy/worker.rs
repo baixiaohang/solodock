@@ -149,7 +149,7 @@ impl DeploymentEngine {
             .store
             .read_metadata(record.app_id)
             .map_err(|_| EngineError::Stable("APP_NOT_FOUND"))?;
-        if metadata.draft_revision != record.requested_revision {
+        if metadata.draft_revision != Some(record.requested_revision) {
             return Err(EngineError::Stable("DEPLOYMENT_FACTS_CHANGED"));
         }
         let active = self
@@ -294,8 +294,27 @@ impl DeploymentEngine {
         .await
         .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         for identity in &binds {
-            crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
+            crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
                 .map_err(|_| EngineError::Stable("BIND_CHANGED"))?;
+        }
+        if loaded.metadata.service_discovery_enabled {
+            let app = state
+                .observer
+                .catalog
+                .get(record.app_id)
+                .ok_or(EngineError::NeedsAttention("APP_NOT_FOUND"))?;
+            let allowed = final_predecessor
+                .as_ref()
+                .map(|container| container.id.as_str())
+                .into_iter()
+                .collect::<Vec<_>>();
+            crate::docker::platform_network::ensure_for_app(
+                self.docker.as_ref(),
+                &app.slug,
+                &allowed,
+            )
+            .await
+            .map_err(|error| EngineError::Stable(error.public_code()))?;
         }
         let predecessor_context = record
             .expected_actual_release_id
@@ -506,8 +525,13 @@ impl DeploymentEngine {
         metadata: &crate::domain::AppMetadata,
         active: Option<Uuid>,
     ) -> Result<(ResolvedImage, Uuid, ReleaseV2), EngineError> {
-        let image = ImageReference::parse(&metadata.discovery_image_ref)
-            .map_err(|error| EngineError::Stable(error.public_code()))?;
+        let image = ImageReference::parse(
+            metadata
+                .discovery_image_ref
+                .as_deref()
+                .ok_or(EngineError::Stable("APP_UNCONFIGURED"))?,
+        )
+        .map_err(|error| EngineError::Stable(error.public_code()))?;
         let probe = self
             .docker
             .probe()
@@ -538,8 +562,8 @@ impl DeploymentEngine {
         if let Some(active_id) = active
             && let Ok(old) = self.store.load_v2_release(record.app_id, active_id)
             && old.manifest_digest == resolved.manifest_digest
-            && old.config_revision == metadata.draft_revision
-            && old.config_sha256 == metadata.draft_config_sha256
+            && Some(old.config_revision) == metadata.draft_revision
+            && Some(old.config_sha256.as_str()) == metadata.draft_config_sha256.as_deref()
             && record.expected_pending_release_id.is_none()
             && self
                 .no_op_runtime_converged(record, active_id, &old)
@@ -674,7 +698,7 @@ impl DeploymentEngine {
             .scheduled_source_image_ref
             .as_deref()
             .ok_or(EngineError::Stable("POLL_TARGET_INVALID"))?;
-        if source != metadata.discovery_image_ref {
+        if Some(source) != metadata.discovery_image_ref.as_deref() {
             return Err(EngineError::Stable("DEPLOYMENT_FACTS_CHANGED"));
         }
         let image = ImageReference::parse(source)
@@ -723,8 +747,8 @@ impl DeploymentEngine {
             && let Ok(old) = self.store.load_v2_release(record.app_id, active_id)
             && old.manifest_digest == resolved.manifest_digest
         {
-            if old.config_revision != metadata.draft_revision
-                || old.config_sha256 != metadata.draft_config_sha256
+            if Some(old.config_revision) != metadata.draft_revision
+                || Some(old.config_sha256.as_str()) != metadata.draft_config_sha256.as_deref()
             {
                 return Err(EngineError::Stable("CONFIG_PENDING_MANUAL"));
             }
@@ -1131,7 +1155,7 @@ impl DeploymentEngine {
                 return Err(EngineError::Interrupted);
             }
             for identity in &binds {
-                crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
+                crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
                     .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
             }
             remove_first_deploy_candidate(
@@ -1213,8 +1237,22 @@ impl DeploymentEngine {
         .await
         .map_err(|error| EngineError::NeedsAttention(error.code_and_status().0))?;
         for identity in &binds {
-            crate::domain::revalidate_bind_identity(identity, &m3.allowed_bind_roots)
+            crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
                 .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
+        }
+        if loaded.metadata.service_discovery_enabled {
+            let app = state
+                .observer
+                .catalog
+                .get(record.app_id)
+                .ok_or(EngineError::NeedsAttention("APP_NOT_FOUND"))?;
+            crate::docker::platform_network::ensure_for_app(
+                self.docker.as_ref(),
+                &app.slug,
+                &[fresh_candidate.id.as_str()],
+            )
+            .await
+            .map_err(|error| EngineError::NeedsAttention(error.public_code()))?;
         }
         rollback_candidate_to_predecessor(
             self.compose.as_ref(),
@@ -1485,6 +1523,7 @@ fn minimal_app(
         id,
         slug: metadata.slug,
         display_name: metadata.display_name,
+        resource_name_schema_version: metadata.resource_name_schema_version,
         project_name,
         active_release_id: active,
         active_image_ref: None,
@@ -1591,6 +1630,7 @@ mod tests {
             schema_version: 3,
             compose_schema_version: 2,
             stop_grace_period_seconds: 10,
+            service_discovery_enabled: false,
             id: Uuid::new_v4(),
             app_id: Uuid::new_v4(),
             config_revision: Uuid::new_v4(),
@@ -1781,6 +1821,7 @@ mod tests {
                     volumes: vec![],
                     binds: vec![],
                     owned_default_network: true,
+                    service_discovery_enabled: true,
                     networks: vec![],
                     health: Default::default(),
                 },
@@ -1794,9 +1835,8 @@ mod tests {
             .create_app(
                 app_id,
                 "example",
-                first_revision,
                 Uuid::new_v4(),
-                &draft(10),
+                Some((first_revision, &draft(10))),
                 time::OffsetDateTime::now_utc(),
             )
             .unwrap();
@@ -1827,7 +1867,7 @@ mod tests {
         metadata = store
             .update_draft(
                 app_id,
-                first_revision,
+                Some(first_revision),
                 candidate_revision,
                 Uuid::new_v4(),
                 &draft(60),
@@ -2004,7 +2044,13 @@ mod tests {
             .await
             .unwrap();
         let context = RunContext {
-            project_name: crate::domain::app_resource_names("example").project_name,
+            project_name: crate::domain::AppResourceIdentity {
+                app_id,
+                slug: "example",
+                schema_version: crate::domain::RESOURCE_NAME_SCHEMA_CURRENT,
+            }
+            .resource_names()
+            .project_name,
             project_directory: app_directory,
             compose_file: store.release_compose_path(app_id, candidate),
             timeout: Duration::from_secs(60),

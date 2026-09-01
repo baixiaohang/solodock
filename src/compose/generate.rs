@@ -7,14 +7,13 @@ use super::model::*;
 use crate::{
     docker::ownership::{APP_ID_LABEL, MANAGED_LABEL, RELEASE_ID_LABEL, SCHEMA_LABEL},
     domain::{
-        ExternalNetworkAttachment, HealthPolicy, HttpClient, NetworkMode, NormalizedDraft,
-        PortProtocol, VolumeInput, app_resource_names, network_plan, owned_volume_name,
+        AppResourceIdentity, ExternalNetworkAttachment, HealthPolicy, HttpClient, NetworkMode,
+        NormalizedDraft, PLATFORM_NETWORK_NAME, PortProtocol, VolumeInput, network_plan,
     },
 };
 
 pub struct ComposeInput<'a> {
-    pub app_id: Uuid,
-    pub slug: &'a str,
+    pub resource_identity: AppResourceIdentity<'a>,
     pub release_id: Uuid,
     pub image_ref: &'a str,
     pub revision_directory: &'a Path,
@@ -47,9 +46,10 @@ pub fn generate(
     input: ComposeInput<'_>,
     runnable: bool,
 ) -> Result<(String, ComposePlan), serde_yml::Error> {
-    let resource_names = app_resource_names(input.slug);
-    let ownership = service_labels(input.app_id, input.release_id);
-    let resource_ownership = resource_labels(input.app_id, &resource_names.project_name);
+    let resource_names = input.resource_identity.resource_names();
+    let ownership = service_labels(input.resource_identity.app_id, input.release_id);
+    let resource_ownership =
+        resource_labels(input.resource_identity.app_id, &resource_names.project_name);
     let mut volumes = BTreeMap::new();
     let mut mounts = Vec::new();
     for (index, volume) in input.draft.volumes.iter().enumerate() {
@@ -59,7 +59,7 @@ pub fn generate(
                 logical_name,
                 target_path,
             } => {
-                let name = owned_volume_name(input.slug, logical_name);
+                let name = input.resource_identity.owned_volume_name(logical_name);
                 volumes.insert(
                     key.clone(),
                     VolumeDefinition {
@@ -119,8 +119,12 @@ pub fn generate(
     }
     mounts.sort_by(|left, right| left.target.cmp(&right.target));
 
-    let network_plan = network_plan(input.draft.owned_default_network, &input.draft.networks)
-        .expect("normalized drafts always contain a valid network plan");
+    let network_plan = network_plan(
+        input.draft.owned_default_network,
+        input.draft.service_discovery_enabled,
+        &input.draft.networks,
+    )
+    .expect("normalized drafts always contain a valid network plan");
     let mut networks = BTreeMap::new();
     let mut service_network_keys = Vec::new();
     if network_plan.owned_default_network {
@@ -138,6 +142,19 @@ pub fn generate(
             },
         );
         service_network_keys.push("default".to_owned());
+    }
+    if network_plan.service_discovery_enabled {
+        networks.insert(
+            "solodock-services".into(),
+            NetworkDefinition {
+                external: true,
+                driver: None,
+                driver_opts: BTreeMap::new(),
+                name: PLATFORM_NETWORK_NAME.into(),
+                labels: BTreeMap::new(),
+            },
+        );
+        service_network_keys.push("solodock-services".to_owned());
     }
     for network in &network_plan.external {
         let key = format!("solodock-network-{}", network.source_index);
@@ -157,12 +174,21 @@ pub fn generate(
         .external
         .iter()
         .all(|network| network.aliases.is_empty())
+        && !network_plan.service_discovery_enabled
     {
         ServiceNetworks::Short(service_network_keys)
     } else {
         let mut attachments = BTreeMap::new();
         if network_plan.owned_default_network {
             attachments.insert("default".into(), ServiceNetworkAttachment::default());
+        }
+        if network_plan.service_discovery_enabled {
+            attachments.insert(
+                "solodock-services".into(),
+                ServiceNetworkAttachment {
+                    aliases: vec![input.resource_identity.slug.to_owned()],
+                },
+            );
         }
         for network in &network_plan.external {
             attachments.insert(
@@ -361,6 +387,14 @@ fn health(policy: &HealthPolicy) -> (String, Option<Healthcheck>) {
 mod tests {
     use super::*;
 
+    fn identity(app_id: Uuid, slug: &str) -> crate::domain::AppResourceIdentity<'_> {
+        crate::domain::AppResourceIdentity {
+            app_id,
+            slug,
+            schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
+        }
+    }
+
     fn network_draft(
         owned_default_network: bool,
         networks: Vec<crate::domain::NetworkInput>,
@@ -380,6 +414,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network,
+                service_discovery_enabled: false,
                 networks,
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -415,6 +450,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -425,8 +461,7 @@ mod tests {
         .unwrap();
         let (yaml, plan) = generate(
             ComposeInput {
-                app_id: Uuid::nil(),
-                slug: "example",
+                resource_identity: identity(Uuid::nil(), "example"),
                 release_id: Uuid::new_v4(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -474,6 +509,7 @@ mod tests {
             ],
             binds: vec![],
             owned_default_network: true,
+            service_discovery_enabled: true,
             networks: vec![],
             health: crate::domain::HealthPolicy::default(),
         };
@@ -486,8 +522,7 @@ mod tests {
         .unwrap();
         let (yaml, _) = generate(
             ComposeInput {
-                app_id: Uuid::nil(),
-                slug: "example",
+                resource_identity: identity(Uuid::nil(), "example"),
                 release_id: Uuid::new_v4(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -515,8 +550,7 @@ mod tests {
             }],
         );
         let input = ComposeInput {
-            app_id,
-            slug: "example",
+            resource_identity: identity(app_id, "example"),
             release_id: Uuid::nil(),
             image_ref: &draft.discovery_image_ref,
             revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -526,8 +560,7 @@ mod tests {
         let (first, plan) = generate(input, true).unwrap();
         let (second, _) = generate(
             ComposeInput {
-                app_id,
-                slug: "example",
+                resource_identity: identity(app_id, "example"),
                 release_id: Uuid::nil(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
@@ -558,8 +591,7 @@ mod tests {
         );
         let (yaml, _) = generate(
             ComposeInput {
-                app_id: Uuid::nil(),
-                slug: "example",
+                resource_identity: identity(Uuid::nil(), "example"),
                 release_id: Uuid::nil(),
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),

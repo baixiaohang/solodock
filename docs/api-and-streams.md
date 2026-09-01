@@ -30,6 +30,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 接口按稳定资源分组：
 
 - app catalog、detail、draft、validate、lifecycle 和 deletion；
+- 内置 app preset 与只读 OCI image config 建议；
 - Registry credential；
 - deployment schedule、history、detail 和 rollback；
 - per-app webhook status/configure/revoke；
@@ -39,13 +40,17 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
 
-`POST /api/v1/apps` 的顶层 slug 是 1–12 字符的不可变创建身份；draft update/validate DTO 不含 slug，提交该未知字段会校验失败。Draft 输入包含 `1..=600` 的 `stop_grace_period_seconds`（缺失默认 `10`）、默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`。Compose 预检返回最终停机宽限、network mode、attachment、warning、owned Docker network name 和 bridge name；external-only 时该 identity 为 `null`。应用详情与 mutation 响应展示 draft 生效值，deployment detail 展示 candidate release 固定值。
+`POST /api/v1/apps` 只接受 1–20 字符的不可变 `slug` 并返回 `UNCONFIGURED` 应用。首次 draft mutation 接受 `expected_revision: null`，以后必须提交精确 UUID；两种路径共享 revision/idempotency guard。Draft 输入包含 `1..=600` 的 `stop_grace_period_seconds`（缺失默认 `10`）、新 revision 默认启用的 `owned_default_network`/`service_discovery_enabled` 和结构化 external attachment。Compose 预检返回最终停机宽限、network mode、attachment、platform DNS alias、warning 与版本化资源 identity。
+
+`GET /api/v1/app-presets` 只返回版本化公开 descriptor；`POST /api/v1/apps/from-preset` 以 write-only 变量生成正常 revision。PostgreSQL v1 支持 major 18/17，分别挂载 `/var/lib/postgresql` 与 `/var/lib/postgresql/data`，不使用 `latest`，且 response 不回显密码。Web 随后以独立稳定幂等键调用现有 deployment mutation；创建成功而部署失败时保留可恢复应用。
+
+`POST /api/v1/images/inspect-config` 复用 Registry credential 与 manifest resolver，验证 config blob digest/大小/media type，只投影 exposed ports、volume targets、healthcheck presence、user 和 stop signal。它不返回 image Env、labels、entrypoint/command，不写 revision；用户明确采用建议后仍走正常 draft mutation。
 
 应用详情返回 slug 派生的 project/network/bridge 名称，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
 
 `GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、主机 `MemAvailable`、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
 
-`GET /api/v1/settings` 返回 revision、当前 `display_timezone` 与后端认可的 IANA timezone 列表；`PUT` 只接受列表中的值，并要求 `expected_revision`、`Idempotency-Key`、精确 Origin、session 与 CSRF。设置只影响 Web formatter，所有 API/SSE timestamp 继续返回 RFC3339 UTC。
+`GET /api/v1/settings` 返回 revision、显示时区、IANA 列表、动态 `allowed_bind_roots`、`slug_max_length` 和支持的 mount 类型。`PUT` 原子更新时区与 bind roots；被 revision 引用的 root 不得删除，扫描或 artifact 读取失败时 fail closed。设置 mutation要求 `expected_revision`、`Idempotency-Key`、精确 Origin、session 与 CSRF。显示设置只影响 Web formatter，所有 API/SSE timestamp 继续返回 RFC3339 UTC。
 
 ## 两阶段删除
 

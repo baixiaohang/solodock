@@ -38,6 +38,8 @@ pub struct ConfigMetadata {
         skip_serializing_if = "is_true"
     )]
     pub owned_default_network: bool,
+    #[serde(default)]
+    pub service_discovery_enabled: bool,
     pub networks: Vec<NetworkInput>,
     pub health: HealthPolicy,
     pub config_sha256: String,
@@ -67,6 +69,7 @@ pub struct NormalizedDraft {
     pub volumes: Vec<VolumeInput>,
     pub binds: Vec<BindMountInput>,
     pub owned_default_network: bool,
+    pub service_discovery_enabled: bool,
     pub networks: Vec<NetworkInput>,
     pub health: HealthPolicy,
     pub metadata: ConfigMetadata,
@@ -124,7 +127,11 @@ pub fn normalize_draft(
     validate_binds(&binds, allowed_bind_roots)?;
     binds.sort_by(|left, right| left.target_path.cmp(&right.target_path));
     let mut networks = input.networks;
-    normalize_networks(input.owned_default_network, &mut networks)?;
+    normalize_networks(
+        input.owned_default_network,
+        input.service_discovery_enabled,
+        &mut networks,
+    )?;
     validate_health(&input.health)?;
     validate_mount_target_conflicts(&files, &volumes, &binds)?;
 
@@ -151,7 +158,7 @@ pub fn normalize_draft(
         .map(|(key, value)| Ok((key.clone(), hmac_hex(hmac_key, value.expose().as_bytes())?)))
         .collect::<Result<_, DomainError>>()?;
     let mut metadata = ConfigMetadata {
-        schema_version: 2,
+        schema_version: 3,
         stop_grace_period_seconds: input.stop_grace_period_seconds,
         public_env_keys,
         secret_keys,
@@ -163,6 +170,7 @@ pub fn normalize_draft(
         volumes: volumes.clone(),
         binds: binds.clone(),
         owned_default_network: input.owned_default_network,
+        service_discovery_enabled: input.service_discovery_enabled,
         networks: networks.clone(),
         health: input.health.clone(),
         config_sha256: String::new(),
@@ -187,6 +195,7 @@ pub fn normalize_draft(
         volumes,
         binds,
         owned_default_network: input.owned_default_network,
+        service_discovery_enabled: input.service_discovery_enabled,
         networks,
         health: input.health,
         metadata,
@@ -385,8 +394,20 @@ fn check_file_quota(value: &str, total: &mut usize) -> Result<(), DomainError> {
 }
 
 pub fn validate_slug(value: &str) -> Result<(), DomainError> {
+    validate_slug_for_resource_schema(value, RESOURCE_NAME_SCHEMA_CURRENT)
+}
+
+pub fn validate_slug_for_resource_schema(
+    value: &str,
+    resource_name_schema_version: u32,
+) -> Result<(), DomainError> {
+    let max = match resource_name_schema_version {
+        RESOURCE_NAME_SCHEMA_LEGACY => 12,
+        RESOURCE_NAME_SCHEMA_CURRENT => 20,
+        _ => return Err(DomainError::ConfigInvalid),
+    };
     if value.is_empty()
-        || value.len() > 12
+        || value.len() > max
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -820,6 +841,55 @@ fn canonical_non_secret(
         })
         .map_err(|_| DomainError::Internal);
     }
+    if metadata.schema_version == 2 {
+        #[derive(Serialize)]
+        struct Schema2Metadata<'a> {
+            schema_version: u32,
+            stop_grace_period_seconds: u16,
+            public_env_keys: &'a [String],
+            secret_keys: &'a [String],
+            secret_hmacs: &'a BTreeMap<String, String>,
+            files: &'a [ManagedFileMetadata],
+            public_file_sha256s: &'a BTreeMap<String, String>,
+            secret_file_hmacs: &'a BTreeMap<String, String>,
+            ports: &'a [PortInput],
+            volumes: &'a [VolumeInput],
+            binds: &'a [BindMountInput],
+            #[serde(skip_serializing_if = "is_true")]
+            owned_default_network: &'a bool,
+            networks: &'a [NetworkInput],
+            health: &'a HealthPolicy,
+            config_sha256: &'a str,
+        }
+        #[derive(Serialize)]
+        struct Schema2Canonical<'a> {
+            metadata: Schema2Metadata<'a>,
+            public_environment: &'a [PublicEnvInput],
+            public_files: &'a BTreeMap<String, String>,
+        }
+        return serde_json::to_vec(&Schema2Canonical {
+            metadata: Schema2Metadata {
+                schema_version: metadata.schema_version,
+                stop_grace_period_seconds: metadata.stop_grace_period_seconds,
+                public_env_keys: &metadata.public_env_keys,
+                secret_keys: &metadata.secret_keys,
+                secret_hmacs: &metadata.secret_hmacs,
+                files: &metadata.files,
+                public_file_sha256s: &metadata.public_file_sha256s,
+                secret_file_hmacs: &metadata.secret_file_hmacs,
+                ports: &metadata.ports,
+                volumes: &metadata.volumes,
+                binds: &metadata.binds,
+                owned_default_network: &metadata.owned_default_network,
+                networks: &metadata.networks,
+                health: &metadata.health,
+                config_sha256: &metadata.config_sha256,
+            },
+            public_environment,
+            public_files,
+        })
+        .map_err(|_| DomainError::Internal);
+    }
     #[derive(Serialize)]
     struct Canonical<'a> {
         metadata: &'a ConfigMetadata,
@@ -988,6 +1058,7 @@ mod tests {
             volumes: Vec::new(),
             binds: Vec::new(),
             owned_default_network: true,
+            service_discovery_enabled: true,
             networks: vec![NetworkInput::OwnedDefault],
             health: HealthPolicy::Running {
                 stable_window_seconds: 15,
@@ -1042,10 +1113,17 @@ mod tests {
 
     #[test]
     fn slug_is_short_ascii_and_stable_resource_safe() {
-        for valid in ["a", "app-1", "abcdefghijkl"] {
+        for valid in ["a", "app-1", "abcdefghijkl", "abcdefghijklmnopqrst"] {
             assert!(validate_slug(valid).is_ok(), "{valid}");
         }
-        for invalid in ["", "-app", "app-", "App", "app_name", "abcdefghijklm"] {
+        for invalid in [
+            "",
+            "-app",
+            "app-",
+            "App",
+            "app_name",
+            "abcdefghijklmnopqrstu",
+        ] {
             assert_eq!(validate_slug(invalid), Err(DomainError::ConfigInvalid));
         }
     }
@@ -1194,6 +1272,7 @@ mod tests {
             volumes: normalized.volumes,
             binds: normalized.binds,
             owned_default_network: normalized.owned_default_network,
+            service_discovery_enabled: normalized.service_discovery_enabled,
             networks: normalized.networks,
             health: normalized.health,
         })

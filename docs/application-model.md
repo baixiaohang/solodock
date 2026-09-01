@@ -4,9 +4,11 @@ SoloDock 只管理结构化的单 service 应用。管理员填写受支持字�
 
 ## 应用、draft 与 project
 
-应用拥有不可变 UUID 与不可变 slug。UUID 是 API path、filesystem directory 和 ownership label 的权威身份；创建时输入的 slug 必须全局唯一，由 1–12 个小写 ASCII 字母、数字或连字符组成且首尾为字母或数字。slug 创建后不能更新，`display_name` 仍可修改。
+应用拥有不可变 UUID 与不可变 slug。UUID 是 API path、filesystem directory 和 ownership label 的权威身份；新应用的 slug 必须全局唯一，由 1–20 个小写 ASCII 字母、数字或连字符组成且首尾为字母或数字。slug 创建后不能更新，`display_name` 仍可修改。
 
-所有可读 Docker 名称只从 slug 派生：Compose project 为 `solodock-<slug>`，默认容器名通常为 `solodock-<slug>-app-1`，owned network 为 `solodock-<slug>-default`，owned volume 为 `solodock-<slug>.<logical-name>`，Linux bridge 为 `sd-<slug>`。不持久化 project name，也不允许用户设置 `container_name` 或任意 Docker resource name。`.` 不属于 slug 合法字符，因此它为 owned volume 的 slug 与 logical name 提供无歧义边界。
+资源命名只有一个版本化 helper。Compose project 为 `solodock-<slug>`，默认容器名通常为 `solodock-<slug>-app-1`，owned network 为 `solodock-<slug>-default`，owned volume 为 `solodock-<slug>.<logical-name>`。旧 naming v1 应用继续使用 `sd-<slug>` bridge；新 naming v2 应用使用 UUID 派生的 `sd-<12-char-token>`，从而允许 20 字符 slug 且不改变历史 UFW/nftables identity。不允许用户设置 `container_name` 或任意 Docker resource name。
+
+空白创建只写 app metadata，不伪造空 config revision，也不创建 Docker 资源。此时详情状态为 `UNCONFIGURED`，draft/image/credential/active/pending 均为空且 desired state 为 stopped。第一次保存配置与普通更新复用同一 revision mutation，只有当前没有 draft 时才接受 `expected_revision = null`；deploy/start/poll/webhook 对未配置应用确定性返回 `APP_UNCONFIGURED`。
 
 `app.toml` 指向当前 draft config revision，并记录 desired state、Registry polling 配置和最后一次文件系统 mutation。每次编辑先完整发布新的 `config-revisions/<revision-id>/`，最后原子替换 metadata 作为 commit point。已经发布的 release 固定引用自己的 config revision，因此后续 draft 编辑不会改变 active 或 pending 容器挂载的内容。
 
@@ -56,7 +58,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ### Bind mount
 
-`allowed_bind_roots` 默认空，即默认禁用 bind。启用后：
+允许 bind 的根目录由 SQLite 全局设置维护，默认空，即默认禁用 bind。升级时 TOML `allowed_bind_roots` 只做一次 bootstrap import；此后 UI/SQLite 是唯一事实源。删除仍被 draft、active 或 pending revision 引用的 root 会返回冲突。启用后：
 
 - root 必须是既有、绝对、无 symlink 的私有安全路径；
 - source 必须是 root 的严格子目录，不能直接挂载整个 root；
@@ -67,7 +69,9 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ### Network
 
-新应用默认创建并挂载 slug 派生的 owned default network。其 Compose definition 固定使用 `bridge` driver，并设置 `com.docker.network.bridge.name=sd-<slug>`，因此 network 删除重建后 host interface identity 不变。配置也可同时加入最多 8 个显式存在的 external network，或关闭 owned default 后仅使用 external network；external-only 模式至少需要一个 attachment。External definition 不写 driver option。
+新应用默认同时挂载应用 owned default network 和平台内部服务发现网络。owned network 的 bridge identity 由应用 naming schema 决定；平台网络固定为 internal `solodock-services`、host bridge `sd-services`，并带精确 platform ownership labels。首次需要时由唯一 manager inspect-or-create；同名资源的 driver、internal、bridge 或 labels 不匹配时 fail closed，绝不接管。应用在平台网络上的 DNS alias 为 slug，因此可通过 `<slug>:<container-port>` 互通。平台网络不随单个应用删除。
+
+config schema 1/2 与 release schema 3/4 的 `service_discovery_enabled` 有效值固定为 `false`，即使向旧签名域注入该字段也不能扩大网络权限。旧应用只有显式保存新 revision/release 后才加入。配置还可加入最多 8 个显式存在的 external network，或按高级设置关闭 owned/platform network；若三类网络均关闭则拒绝配置。
 
 每个 external attachment 可为当前唯一 `app` service 配置最多 8 个稳定 alias。Alias 是小写 DNS label，在同一 attachment 内唯一；网络与 alias 都按 canonical 顺序进入 config SHA、release 完整性和 Compose。无 alias 的旧 release 继续使用 Compose networks 短语法，默认布尔值与空 alias 不参与旧 canonical serialization。
 

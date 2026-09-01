@@ -65,19 +65,38 @@ impl Config {
     }
 
     pub fn validate_docker_root(&self, docker_root: Option<&str>) -> Result<(), ConfigError> {
+        self.validate_docker_root_with_bind_roots(docker_root, &self.allowed_bind_roots)
+    }
+
+    pub fn validate_docker_root_with_bind_roots(
+        &self,
+        docker_root: Option<&str>,
+        allowed_bind_roots: &[PathBuf],
+    ) -> Result<(), ConfigError> {
         let Some(root) = docker_root else {
             return Ok(());
         };
         let root = Path::new(root);
         if !root.is_absolute()
-            || self
-                .allowed_bind_roots
+            || allowed_bind_roots
                 .iter()
                 .any(|allowed| paths_overlap(allowed, root))
         {
             return Err(ConfigError::BindRootSensitive);
         }
         Ok(())
+    }
+
+    pub fn validate_bootstrap_bind_roots(
+        &self,
+        docker_root: Option<&str>,
+    ) -> Result<Vec<PathBuf>, ConfigError> {
+        validate_bind_roots(
+            &self.allowed_bind_roots,
+            &self.state_directory,
+            &self.runtime_directory,
+            docker_root,
+        )
     }
 }
 
@@ -108,11 +127,11 @@ impl TryFrom<ConfigFile> for Config {
         validate_managed_path("runtime_directory", &raw.runtime_directory)?;
         let mut allowed_bind_roots = Vec::with_capacity(raw.allowed_bind_roots.len());
         for root in &raw.allowed_bind_roots {
-            allowed_bind_roots.push(validate_bind_root(
-                root,
-                &raw.state_directory,
-                &raw.runtime_directory,
-            )?);
+            // Deprecated TOML roots are bootstrap candidates. Filesystem and
+            // Docker data-root checks run only after SQLite proves it has not
+            // already imported them.
+            validate_managed_path("allowed_bind_roots", root)?;
+            allowed_bind_roots.push(root.clone());
         }
         allowed_bind_roots.sort();
         allowed_bind_roots.dedup();
@@ -127,7 +146,28 @@ impl TryFrom<ConfigFile> for Config {
     }
 }
 
-fn validate_bind_root(
+pub(crate) fn validate_bind_roots(
+    roots: &[PathBuf],
+    state_directory: &Path,
+    runtime_directory: &Path,
+    docker_root: Option<&str>,
+) -> Result<Vec<PathBuf>, ConfigError> {
+    let mut validated = roots
+        .iter()
+        .map(|root| validate_bind_root(root, state_directory, runtime_directory))
+        .collect::<Result<Vec<_>, _>>()?;
+    validated.sort();
+    validated.dedup();
+    if let Some(root) = docker_root {
+        let root = Path::new(root);
+        if !root.is_absolute() || validated.iter().any(|allowed| paths_overlap(allowed, root)) {
+            return Err(ConfigError::BindRootSensitive);
+        }
+    }
+    Ok(validated)
+}
+
+pub(crate) fn validate_bind_root(
     root: &Path,
     state_directory: &Path,
     runtime_directory: &Path,
@@ -443,8 +483,9 @@ mod tests {
         for root in ["/etc/ssh", "/var/lib/docker/volumes/example"] {
             let mut value = raw();
             value.allowed_bind_roots = vec![root.into()];
+            let config = Config::try_from(value).unwrap();
             assert!(matches!(
-                Config::try_from(value),
+                config.validate_bootstrap_bind_roots(None),
                 Err(ConfigError::BindRootSensitive)
             ));
         }
@@ -458,9 +499,27 @@ mod tests {
         value.state_directory = state;
         value.runtime_directory = runtime;
         value.allowed_bind_roots = vec![temporary.path().to_owned()];
+        let config = Config::try_from(value).unwrap();
         assert!(matches!(
-            Config::try_from(value),
+            config.validate_bootstrap_bind_roots(None),
             Err(ConfigError::BindRootSensitive)
+        ));
+    }
+
+    #[test]
+    fn deprecated_bind_roots_are_parsed_without_touching_stale_host_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let stale = temporary.path().join("removed-after-sqlite-import");
+        let mut value = raw();
+        value.state_directory = temporary.path().join("state");
+        value.runtime_directory = temporary.path().join("runtime");
+        value.allowed_bind_roots = vec![stale.clone()];
+
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(config.allowed_bind_roots, [stale]);
+        assert!(matches!(
+            config.validate_bootstrap_bind_roots(None),
+            Err(ConfigError::BindRoot { .. })
         ));
     }
 }

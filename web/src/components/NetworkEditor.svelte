@@ -4,13 +4,15 @@
 
   let {
     ownedDefaultNetwork = $bindable(true),
+    serviceDiscoveryEnabled = $bindable(true),
     externalNetworks = $bindable<ExternalNetworkAttachment[]>([]),
   }: {
     ownedDefaultNetwork: boolean
+    serviceDiscoveryEnabled?: boolean
     externalNetworks: ExternalNetworkAttachment[]
   } = $props()
 
-  let error = $derived(networkEditorError({ ownedDefaultNetwork, externalNetworks }))
+  let error = $derived(networkEditorError({ ownedDefaultNetwork, serviceDiscoveryEnabled, externalNetworks }))
 
   function addNetwork() {
     externalNetworks = [...externalNetworks, { name: '', aliases: [] }]
@@ -51,6 +53,8 @@
     <input aria-label="创建应用专属默认网络" type="checkbox" bind:checked={ownedDefaultNetwork} />
     创建应用专属默认网络
   </label>
+  <label class="checkbox"><input aria-label="启用平台内部服务发现" type="checkbox" bind:checked={serviceDiscoveryEnabled} /> 启用平台内部服务发现</label>
+  <p class="muted">启用后可通过服务 slug 和容器端口互通；所有启用服务属于同一内部信任域，当前没有服务级网络 ACL。</p>
   <p class="muted">External network 必须预先存在；SoloDock 不会创建、修改或删除它。</p>
   {#each externalNetworks as network, networkIndex}
     <section class="network-attachment">

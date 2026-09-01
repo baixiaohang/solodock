@@ -41,11 +41,12 @@ Browser
 | container实际状态、full ID、image和resource存在性 | Docker daemon |
 | tag当前指向 | Registry；调度后以release manifest digest为准 |
 | 管理员、session、audit、幂等、deployment执行和poll/replay状态 | SQLite |
+| 全局显示时区与 bind allow roots | SQLite global settings |
 | catalog/redactor/查询索引 | 从上述事实派生的可重建投影 |
 
 任何SQLite投影都不能反向覆盖filesystem事实。SQLite丢失后可以从文件恢复app/release查询事实，但不能伪造管理员、session、audit或deployment历史；必须重新bootstrap。
 
-App header 只持久化 UUID 与不可变 slug，不持久化可派生 project name。domain naming helper 是 project、owned network、owned volume 和 bridge 名称的唯一来源；只持有 UUID 的异步路径必须重新读取已验证 metadata/catalog，不能猜测资源名。
+App header 持久化 UUID、不可变 slug 与 `resource_name_schema_version`，不持久化可派生 project name。domain naming helper 是 project、owned network、owned volume 和 bridge 名称的唯一来源；旧 schema 保留 slug bridge，新 schema 使用 UUID token bridge。只持有 UUID 的异步路径必须重新读取已验证 metadata/catalog，不能猜测资源名。
 
 ## 持久化布局
 
@@ -98,9 +99,11 @@ filesystem commit之后才发布内存catalog/redactor和SQLite投影。投影�
 
 Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，禁用隐式 `.env`，不使用shell。它只能生成version/validate/start/recreate/deploy-candidate/stop/restart/remove的封闭argv；不存在build、pull、exec、down、volume remove或用户参数透传。
 
-每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。统一的 canonical network plan 同时驱动 Compose、resource preflight、runtime drift、删除 facts 和 API projection；active/pending expectation 分别来自各自 immutable config revision，不能由 mutable draft 替代。
+每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。统一的 canonical network plan 同时驱动 Compose、resource preflight、runtime drift、删除 facts 和 API projection；active/pending expectation 分别来自各自 immutable config revision，不能由 mutable draft 替代。未配置应用没有 revision/release，所有 Docker effect 都在资源创建前以 `APP_UNCONFIGURED` 结束。
 
-Owned network 仅在对应 revision 启用时检查 exact name/ownership、`bridge` driver 和 `com.docker.network.bridge.name=sd-<slug>`；ownership 冲突与 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 都在 runner 前 fail closed。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。Docker API 与 Compose CLI 之间没有跨调用锁，effect 后 observer 继续以 attachment/alias/bridge drift 暴露外部并发变化。
+Owned network 仅在对应 revision 启用时检查版本化 exact name/ownership、`bridge` driver 和 bridge option；ownership 冲突与 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 都在 runner 前 fail closed。平台内部网络由全局 manager 在首次 deployment effect 前创建或校验，固定 internal/bridge/labels，既不伪装为 external network，也不由应用 deletion 删除。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。
+
+内置 preset 只负责把少量输入渲染成普通 `DraftInput`，不生成 Compose、不直接操作 Docker。OCI metadata inspection 同样是无副作用 reader，复用 Registry auth/redirect/timeout/digest 校验并只返回 UI 消费的 allowlist。两者最终都回到唯一 config revision、release resolver 与 deployment engine。
 
 ## 发布与自动化
 

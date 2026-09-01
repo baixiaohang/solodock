@@ -6,6 +6,7 @@
   import Dashboard from './views/Dashboard.svelte'
   import AppDetail from './views/AppDetail.svelte'
   import NewApp from './views/NewApp.svelte'
+  import PresetNewApp from './views/PresetNewApp.svelte'
   import Credentials from './views/Credentials.svelte'
   import DeploymentDetail from './views/DeploymentDetail.svelte'
   import Settings from './views/Settings.svelte'
@@ -21,6 +22,7 @@
 
   $: appId = route.match(/^#\/apps\/([0-9a-f-]+)$/)?.[1]
   $: creating = route === '#/apps/new'
+  $: creatingPostgresql = route === '#/apps/new/postgresql'
   $: credentials = route === '#/credentials'
   $: settings = route === '#/settings'
   $: deploymentId = route.match(/^#\/deployments\/([0-9a-f-]+)$/)?.[1]
@@ -40,6 +42,8 @@
       <Credentials />
     {:else if deploymentId}
       <DeploymentDetail {deploymentId} />
+    {:else if creatingPostgresql}
+      <PresetNewApp />
     {:else if creating}
       <NewApp />
     {:else if appId}

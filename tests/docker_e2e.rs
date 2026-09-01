@@ -60,6 +60,7 @@ use solodock::{
         AppCatalog, DockerObserver,
         events::DockerEventHub,
         logs::{EmptySecretProvider, SecretRedactor},
+        platform_network,
         probe::DockerSupervisor,
         stats::StatsHub,
     },
@@ -76,6 +77,96 @@ use uuid::Uuid;
 const CONTAINERD_SCENARIO_TIMEOUT: Duration = Duration::from_secs(240);
 const CONTAINERD_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTAINERD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[tokio::test]
+#[ignore = "requires a dedicated Docker-in-Docker daemon"]
+async fn platform_service_network_resolves_cross_app_aliases() {
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let api = BollardReadClient::for_test_http(endpoint);
+    platform_network::ensure(&api).await.unwrap();
+
+    let token = Uuid::new_v4();
+    let labels = HashMap::from([("com.solodock.test-run".into(), token.to_string())]);
+    let attach = |alias: &str| NetworkingConfig {
+        endpoints_config: Some(HashMap::from([(
+            solodock::domain::PLATFORM_NETWORK_NAME.to_owned(),
+            EndpointSettings {
+                aliases: Some(vec![alias.to_owned()]),
+                ..Default::default()
+            },
+        )])),
+    };
+    let server = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-service-server-{token}"))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("nginx:1.27-alpine".into()),
+                labels: Some(labels.clone()),
+                networking_config: Some(attach("backend")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let client = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-service-client-{token}"))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "for attempt in 1 2 3 4 5; do wget -qO- http://backend/ >/dev/null && exit 0; sleep 1; done; exit 1".into(),
+                ]),
+                labels: Some(labels),
+                networking_config: Some(attach("consumer")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+
+    docker.start_container(&server, None).await.unwrap();
+    docker.start_container(&client, None).await.unwrap();
+    let outcome = docker
+        .wait_container(
+            &client,
+            Some(
+                WaitContainerOptionsBuilder::default()
+                    .condition("not-running")
+                    .build(),
+            ),
+        )
+        .next()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status_code, 0);
+
+    remove_test_container(&docker, &client, token).await;
+    remove_test_container(&docker, &server, token).await;
+    let retained = api
+        .inspect_network(solodock::domain::PLATFORM_NETWORK_NAME)
+        .await
+        .unwrap()
+        .unwrap();
+    platform_network::validate_existing(&retained).unwrap();
+}
 
 struct Outcome {
     listed: bool,
@@ -435,6 +526,69 @@ impl MutationHarness {
         key: Option<&str>,
         body: Option<&Value>,
     ) -> axum::response::Response {
+        if method == "POST"
+            && uri == "/api/v1/apps"
+            && body.is_some_and(|value| value.get("display_name").is_some())
+        {
+            let input = body.unwrap();
+            let create_body = json!({"slug": input["slug"]});
+            let created = self
+                .request_raw(
+                    method,
+                    uri,
+                    key.map(|value| format!("create-{value}")),
+                    Some(&create_body),
+                )
+                .await;
+            let status = created.status();
+            let created = Self::try_json(created).await.unwrap();
+            if status != StatusCode::CREATED {
+                return axum::response::Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(created.to_string()))
+                    .unwrap();
+            }
+            let app_id = created["app"]["id"].as_str().unwrap();
+            let mut draft = input.clone();
+            draft.as_object_mut().unwrap().remove("slug");
+            draft
+                .as_object_mut()
+                .unwrap()
+                .entry("service_discovery_enabled")
+                .or_insert(Value::Bool(false));
+            let update_body = json!({"expected_revision":null,"draft":draft});
+            let updated = self
+                .request_raw(
+                    "PUT",
+                    &format!("/api/v1/apps/{app_id}/draft"),
+                    key.map(str::to_owned),
+                    Some(&update_body),
+                )
+                .await;
+            let status = updated.status();
+            let updated = Self::try_json(updated).await.unwrap();
+            return axum::response::Response::builder()
+                .status(if status == StatusCode::OK {
+                    StatusCode::CREATED
+                } else {
+                    status
+                })
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(updated.to_string()))
+                .unwrap();
+        }
+        self.request_raw(method, uri, key.map(str::to_owned), body)
+            .await
+    }
+
+    async fn request_raw(
+        &self,
+        method: &str,
+        uri: &str,
+        key: Option<String>,
+        body: Option<&Value>,
+    ) -> axum::response::Response {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
@@ -495,7 +649,10 @@ impl MutationHarness {
                 &metadata,
                 release_id,
                 &solodock::registry::ResolvedImage {
-                    source_image_ref: metadata.discovery_image_ref.clone(),
+                    source_image_ref: metadata
+                        .discovery_image_ref
+                        .clone()
+                        .expect("configured app"),
                     logical_registry: "registry.example".into(),
                     repository: "app".into(),
                     source_tag: "stable".into(),
@@ -1429,6 +1586,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
                 acknowledge_non_rollbackable: false,
             }],
             owned_default_network: true,
+            service_discovery_enabled: false,
             networks: vec![
                 solodock::domain::NetworkInput::OwnedDefault,
                 solodock::domain::NetworkInput::External {
@@ -1450,8 +1608,11 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         .join(release_id.to_string());
     let (yaml, _) = solodock::compose::generate(
         solodock::compose::ComposeInput {
-            app_id,
-            slug: "e2e",
+            resource_identity: solodock::domain::AppResourceIdentity {
+                app_id,
+                slug: "e2e",
+                schema_version: solodock::domain::RESOURCE_NAME_SCHEMA_LEGACY,
+            },
             release_id,
             image_ref: &pinned,
             revision_directory: &revision_directory,

@@ -7,7 +7,7 @@ SoloDock 是面向个人 Docker 工作负载的轻量级单机容器部署控制
 
 SoloDock 提供聚焦的 Web 界面，用不可变镜像 digest 部署预构建容器镜像、检查应用健康状态，并在新版本失败时恢复旧 release。它不构建源码、不管理域名或 TLS、不提供反向代理，也不编排多台主机。
 
-创建应用时必须提供全局唯一、创建后不可修改的 1–12 字符 slug。SoloDock 用它统一派生 Compose project `solodock-<slug>`、默认容器名、owned network/volume 与稳定 host bridge `sd-<slug>`；UUID 仍是 API、目录和 ownership label 的安全身份。已有旧 schema 状态不做迁移，升级前应清空并重新登记应用。
+新建空白服务只需填写全局唯一、创建后不可修改的 1–20 字符服务名；服务会以 `UNCONFIGURED` 状态登记，随后再在详情页逐行配置镜像、端口、存储、健康检查和受管文件。SoloDock 仍以 UUID 作为 API、目录和 ownership label 的安全身份，并通过版本化 naming helper 派生 Docker 资源。旧应用保留原 `sd-<slug>` bridge，新应用使用 UUID 派生的稳定短 bridge，升级不会重命名已有资源。
 
 本仓库是私有项目，未授予公开使用、复制或分发许可。
 
@@ -66,6 +66,8 @@ SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为�
 
 控制台状态条同时展示主机 `MemAvailable` 与状态盘可用空间。系统设置可从后端认可的 IANA 时区下拉列表中选择全局显示时区，默认 UTC，保存后立即刷新 Web 时间；SQLite、API、SSE、cursor 与下载日志始终保留 UTC。应用配置页使用单列直接编辑表单，public 与 write-only Secret 环境变量统一逐行管理；部署历史固定一项一行。
 
+新服务默认加入 SoloDock 管理的内部服务发现网络，服务间可使用 `<slug>:<container-port>` 互通且无需发布数据库宿主端口；旧 release 不会因升级被自动加入。内置“快速部署 → PostgreSQL”会生成普通 immutable draft，默认使用 `postgres:18`、owned data volume、自动生成的 write-only 密码和内部网络，然后通过正常 deployment 状态机部署；它不引入任意 Compose 或远程模板执行。
+
 Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
 
 可选的签名 Registry recheck webhook 使用独立 `webhook_public_origin`、每应用 write-only HMAC secret、5 分钟 timestamp window 和 durable nonce 防重放。Payload 不携带镜像事实；有效请求只产生 coalesced poll wake，并继续遵守原有自动部署、退避、抑制、drift 和健康门禁。协议与外部 WAF 边界见 [Webhook 运维说明](docs/webhooks.md)。
@@ -76,11 +78,13 @@ Deploy/rollback 均返回 `202 Accepted` 和 deployment ID。可在应用页查�
 
 显式挂入容器的 public/secret managed file leaf 固定为 `0444 solodock:solodock`，支持镜像内任意常见非 root UID/GID 读取；宿主 state、应用与 revision ancestor 仍为 `0700`，Compose mount 继续 `read_only: true`。启动会在 listen 前把 canonical legacy `0400/0600` leaf 收敛到 `0444`，运行期权限漂移则由 strict loader 在 Compose effect 前 fail closed。
 
-`allowed_bind_roots` 默认是空列表，即禁用 host bind mount。授权根必须是既有、无 symlink 的安全绝对目录；应用只能使用其严格子目录，并且授权根不得与 Docker daemon 报告的实际 data-root 重叠。SoloDock 不创建、改权限、写入、备份或删除 bind source。每次 Compose mutation 都从 filesystem active release 重建并校验 canonical artifact，同时枚举 project/service 的全部候选并对 unmanaged、stale 或 invalid collision fail closed。unregister 默认不移除容器；即使显式移除精确 owned container，也保留 owned/external volume、bind 内容和 network。删除预览同样从 filesystem 生成，稳定合并 active pinned config 与当前 draft 的资源，并标明资源实际存在或仅配置；DELETE 在消费 token 和提交 tombstone 前都重算完整 facts hash。
+host bind 默认禁用。管理员在“系统设置 → 存储访问”逐行维护允许根目录；授权根必须是既有、无 symlink 的安全绝对目录，应用只能使用其严格子目录，并且授权根不得与 Docker daemon 报告的实际 data-root 重叠。正在被 draft/active/pending revision 引用的 root 不能删除。SoloDock 不浏览、创建、改权限、写入、备份或删除 bind source。每次 Compose mutation 都从 filesystem active release 重建并校验 canonical artifact，同时枚举 project/service 的全部候选并对 unmanaged、stale 或 invalid collision fail closed。unregister 默认不移除容器；即使显式移除精确 owned container，也保留 owned/external volume、bind 内容和 network。删除预览同样从 filesystem 生成，稳定合并 active pinned config 与当前 draft 的资源，并标明资源实际存在或仅配置；DELETE 在消费 token 和提交 tombstone 前都重算完整 facts hash。
 
 ```toml
 allowed_bind_roots = ["/srv/solodock-data"]
 ```
+
+上面的 TOML 字段只用于升级后的首次 SQLite bootstrap import；导入后以 Web/SQLite 全局设置为唯一事实源，后续重启不会重新合并 TOML。
 
 运行后端验证：
 

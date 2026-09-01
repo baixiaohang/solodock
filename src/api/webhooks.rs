@@ -56,8 +56,12 @@ pub async fn status(
     _authenticated: Authenticated,
 ) -> Result<Json<WebhookResponse>, ApiError> {
     let services = services(&state, request_id)?;
-    if state.observer.catalog.get(app_id).is_none() {
-        return Err(ApiError::app_not_found(request_id));
+    match state.observer.catalog.get(app_id) {
+        None => return Err(ApiError::app_not_found(request_id)),
+        Some(app) if app.draft_revision.is_none() => {
+            return Err(ApiError::conflict("APP_UNCONFIGURED", request_id));
+        }
+        Some(_) => {}
     }
     let status = services.store.status(app_id).map_err(|_| {
         ApiError::new(
@@ -112,6 +116,32 @@ pub async fn configure(
         _ => unreachable!(),
     };
     let _catalog = m3.coordinator.catalog_lock().await;
+    match m3.store.read_metadata(app_id) {
+        Ok(app) if app.is_configured() => {}
+        Ok(_) => {
+            return finish_error(
+                &state,
+                &route,
+                key,
+                "APP_UNCONFIGURED",
+                StatusCode::CONFLICT,
+                request_id,
+            )
+            .await;
+        }
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return finish_error(
+                &state,
+                &route,
+                key,
+                "APP_NOT_FOUND",
+                StatusCode::NOT_FOUND,
+                request_id,
+            )
+            .await;
+        }
+        Err(_) => return interrupt(&state, &route, key, request_id).await,
+    }
     // Publish the new secret pattern under the same mutex used by complete
     // inventory replacement. A reconciler that collected the old inventory
     // can therefore never overwrite this first fail-closed publication after
@@ -196,6 +226,32 @@ pub async fn revoke(
         _ => unreachable!(),
     };
     let _catalog = m3.coordinator.catalog_lock().await;
+    match m3.store.read_metadata(app_id) {
+        Ok(app) if app.is_configured() => {}
+        Ok(_) => {
+            return finish_error(
+                &state,
+                &route,
+                key,
+                "APP_UNCONFIGURED",
+                StatusCode::CONFLICT,
+                request_id,
+            )
+            .await;
+        }
+        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            return finish_error(
+                &state,
+                &route,
+                key,
+                "APP_NOT_FOUND",
+                StatusCode::NOT_FOUND,
+                request_id,
+            )
+            .await;
+        }
+        Err(_) => return interrupt(&state, &route, key, request_id).await,
+    }
     let metadata =
         match services
             .store

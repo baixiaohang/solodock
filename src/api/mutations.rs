@@ -38,8 +38,7 @@ use crate::{
         ownership::validate_identity,
     },
     domain::{
-        DesiredState, DraftInput, ExistingSecrets, NormalizedDraft, app_resource_names,
-        normalize_draft, validate_slug,
+        DesiredState, DraftInput, ExistingSecrets, NormalizedDraft, normalize_draft, validate_slug,
     },
     error::{ApiError, RequestId},
     mutation::{
@@ -51,6 +50,8 @@ use crate::{
 pub struct M3Services {
     pub store: AppStore,
     pub database: Database,
+    /// Startup snapshot retained for compatibility with test/service builders.
+    /// Runtime validation reads the current SQLite-backed snapshot from `store`.
     pub allowed_bind_roots: Vec<PathBuf>,
     pub runtime_directory: PathBuf,
     pub idempotency: IdempotencyService,
@@ -71,23 +72,23 @@ impl Drop for ExactTempDirectory {
 }
 
 #[derive(Serialize)]
-struct MutationResponse {
-    app: AppMutationDetail,
-    idempotency_replayed: bool,
+pub(crate) struct MutationResponse {
+    pub(crate) app: AppMutationDetail,
+    pub(crate) idempotency_replayed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    projection_warning: Option<&'static str>,
+    pub(crate) projection_warning: Option<&'static str>,
 }
 
 #[derive(Serialize)]
-struct AppMutationDetail {
+pub(crate) struct AppMutationDetail {
     id: Uuid,
     slug: String,
     display_name: String,
     project_name: String,
-    config_revision: Uuid,
-    config_sha256: String,
+    config_revision: Option<Uuid>,
+    config_sha256: Option<String>,
     desired_state: crate::domain::DesiredState,
-    stop_grace_period_seconds: u16,
+    stop_grace_period_seconds: Option<u16>,
     deployment_status: &'static str,
     warnings: Vec<&'static str>,
 }
@@ -95,7 +96,7 @@ struct AppMutationDetail {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateDraftRequest {
-    expected_revision: Uuid,
+    expected_revision: Option<Uuid>,
     draft: DraftInput,
 }
 
@@ -103,8 +104,6 @@ pub struct UpdateDraftRequest {
 #[serde(deny_unknown_fields)]
 pub struct CreateAppRequest {
     slug: String,
-    #[serde(flatten)]
-    draft: DraftInput,
 }
 
 #[derive(Deserialize)]
@@ -125,27 +124,17 @@ pub async fn create(
     let Json(input) = payload.map_err(|error| json_error(error, request_id))?;
     validate_slug(&input.slug).map_err(|error| ApiError::domain(error, request_id))?;
     let slug = input.slug;
-    let input = input.draft;
-    if input.auto_deploy_enabled && !input.auto_deploy_acknowledged {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "AUTO_DEPLOY_ACK_REQUIRED",
-            "Automatic deployment requires explicit acknowledgement",
-            request_id,
-        ));
-    }
-    let draft = normalize_draft(
-        input,
-        &ExistingSecrets::default(),
-        &services.idempotency.fingerprint(b"config"),
-        &services.allowed_bind_roots,
-    )
-    .map_err(|error| ApiError::domain(error, request_id))?;
-    validate_registry_credential(&state, &draft, request_id)?;
     let route = "/api/v1/apps";
     let raw_key =
         idempotency_key(&headers).map_err(|error| ApiError::idempotency(error, request_id))?;
-    let request_hmac = draft_fingerprint(services, route, &slug, &draft)?;
+    let request_hmac = services.idempotency.fingerprint(
+        &serde_json::to_vec(&serde_json::json!({
+            "actor": "admin",
+            "route": route,
+            "slug": slug,
+        }))
+        .map_err(|_| ApiError::internal(request_id))?,
+    );
     let claim = services
         .idempotency
         .claim(route, raw_key, &request_hmac, request_id.0)
@@ -160,24 +149,13 @@ pub async fn create(
         ClaimResult::Replay { .. } => unreachable!(),
     };
     let _catalog = services.coordinator.catalog_lock().await;
-    if validate_registry_credential(&state, &draft, request_id).is_err() {
-        return finish_error(
-            services,
-            route,
-            raw_key,
-            "REGISTRY_CREDENTIAL_INVALID",
-            StatusCode::UNPROCESSABLE_ENTITY,
-            request_id,
-        )
-        .await;
-    }
     if let Ok(existing) = services.store.read_metadata(operation_id)
         && existing.last_operation_id == operation_id
-        && existing.draft_revision == operation_id
+        && existing.draft_revision.is_none()
     {
         let projection_warning = refresh(&state, services).await;
         let response = MutationResponse {
-            app: detail(&existing, &draft),
+            app: detail(&existing, None),
             idempotency_replayed: false,
             projection_warning,
         };
@@ -224,8 +202,7 @@ pub async fn create(
         operation_id,
         &slug,
         operation_id,
-        operation_id,
-        &draft,
+        None,
         OffsetDateTime::now_utc(),
     ) {
         Ok(metadata) => metadata,
@@ -252,7 +229,7 @@ pub async fn create(
         Err(_) => match services.store.read_metadata(operation_id) {
             Ok(existing)
                 if existing.last_operation_id == operation_id
-                    && existing.draft_revision == operation_id =>
+                    && existing.draft_revision.is_none() =>
             {
                 if services.store.repair_app_durability(operation_id).is_err() {
                     return interrupt_internal(services, route, raw_key, request_id).await;
@@ -264,7 +241,7 @@ pub async fn create(
     };
     let projection_warning = refresh(&state, services).await;
     let response = MutationResponse {
-        app: detail(&metadata, &draft),
+        app: detail(&metadata, None),
         idempotency_replayed: false,
         projection_warning,
     };
@@ -360,7 +337,7 @@ pub async fn update_draft(
         .await;
     }
     if current_metadata.last_operation_id == operation_id
-        && current_metadata.draft_revision == operation_id
+        && current_metadata.draft_revision == Some(operation_id)
     {
         let loaded = match load_config(services, app_id, operation_id) {
             Ok(loaded) => loaded,
@@ -368,19 +345,22 @@ pub async fn update_draft(
         };
         let draft = match loaded.normalize_verified(
             current_metadata.display_name.clone(),
-            current_metadata.discovery_image_ref.clone(),
+            current_metadata
+                .discovery_image_ref
+                .clone()
+                .ok_or_else(|| ApiError::conflict("APP_UNCONFIGURED", request_id))?,
             current_metadata.credential_ref,
             current_metadata.auto_deploy_enabled,
             current_metadata.poll_interval_seconds,
             &services.idempotency.fingerprint(b"config"),
-            &services.allowed_bind_roots,
+            &services.store.allowed_bind_roots(),
         ) {
             Ok(draft) => draft,
             _ => return interrupt_internal(services, &route, raw_key, request_id).await,
         };
         let projection_warning = refresh(&state, services).await;
         let response = MutationResponse {
-            app: detail(&current_metadata, &draft),
+            app: detail(&current_metadata, Some(&draft)),
             idempotency_replayed: false,
             projection_warning,
         };
@@ -420,15 +400,18 @@ pub async fn update_draft(
         )
         .await;
     }
-    let loaded = match load_config(services, app_id, payload.expected_revision) {
-        Ok(loaded) => loaded,
-        Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
+    let existing = match payload.expected_revision {
+        Some(revision) => match load_config(services, app_id, revision) {
+            Ok(loaded) => loaded.secrets,
+            Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
+        },
+        None => ExistingSecrets::default(),
     };
     let draft = match normalize_draft(
         payload.draft,
-        &loaded.secrets,
+        &existing,
         &services.idempotency.fingerprint(b"config"),
-        &services.allowed_bind_roots,
+        &services.store.allowed_bind_roots(),
     ) {
         Ok(draft) => draft,
         Err(error) => {
@@ -487,7 +470,7 @@ pub async fn update_draft(
         Err(_) => match services.store.read_metadata(app_id) {
             Ok(existing)
                 if existing.last_operation_id == operation_id
-                    && existing.draft_revision == operation_id =>
+                    && existing.draft_revision == Some(operation_id) =>
             {
                 if services.store.repair_app_durability(app_id).is_err() {
                     return interrupt_internal(services, &route, raw_key, request_id).await;
@@ -499,7 +482,7 @@ pub async fn update_draft(
     };
     let projection_warning = refresh(&state, services).await;
     let response = MutationResponse {
-        app: detail(&metadata, &draft),
+        app: detail(&metadata, Some(&draft)),
         idempotency_replayed: false,
         projection_warning,
     };
@@ -537,22 +520,29 @@ pub async fn validate(
         .catalog
         .get(app_id)
         .ok_or_else(|| ApiError::app_not_found(request_id))?;
-    let revision = app
-        .draft_revision
-        .ok_or_else(|| ApiError::conflict("APP_DEPLOY_REQUIRED", request_id))?;
-    let loaded =
-        load_config(services, app_id, revision).map_err(|_| ApiError::internal(request_id))?;
     let Json(payload) = payload.map_err(|error| json_error(error, request_id))?;
-    let input = payload
-        .draft
-        .unwrap_or_else(|| current_draft_input(&app, &loaded));
+    let loaded = app
+        .draft_revision
+        .map(|revision| load_config(services, app_id, revision))
+        .transpose()
+        .map_err(|_| ApiError::internal(request_id))?;
+    let input = match (payload.draft, loaded.as_ref()) {
+        (Some(input), _) => input,
+        (None, Some(loaded)) => current_draft_input(&app, loaded),
+        (None, None) => return Err(ApiError::conflict("APP_UNCONFIGURED", request_id)),
+    };
+    let empty_secrets = ExistingSecrets::default();
     let draft = normalize_draft(
         input,
-        &loaded.secrets,
+        loaded
+            .as_ref()
+            .map(|loaded| &loaded.secrets)
+            .unwrap_or(&empty_secrets),
         &services.idempotency.fingerprint(b"config"),
-        &services.allowed_bind_roots,
+        &services.store.allowed_bind_roots(),
     )
     .map_err(|error| ApiError::domain(error, request_id))?;
+    validate_registry_credential(&state, &draft, request_id)?;
     let bind_identities = validate_runtime_paths(&state, services, &draft.metadata)
         .await
         .map_err(|code| ApiError::conflict(code, request_id))?;
@@ -570,7 +560,7 @@ pub async fn validate(
     )
     .await?;
     for identity in &bind_identities {
-        crate::domain::revalidate_bind_identity(identity, &services.allowed_bind_roots)
+        crate::domain::revalidate_bind_identity(identity, &services.store.allowed_bind_roots())
             .map_err(|error| ApiError::domain(error, request_id))?;
     }
     let operation_id = Uuid::new_v4();
@@ -588,8 +578,7 @@ pub async fn validate(
         let revision_directory = temp.join("config-revisions").join(operation_id.to_string());
         let (runtime_yaml, plan) = generate(
             ComposeInput {
-                app_id,
-                slug: &app.slug,
+                resource_identity: app.resource_identity(),
                 release_id: operation_id,
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: &revision_directory,
@@ -610,7 +599,7 @@ pub async fn validate(
     // Draft secrets are scoped to this validation only. They must not enter
     // the active/draft global provider until a filesystem revision commits.
     for identity in &bind_identities {
-        crate::domain::revalidate_bind_identity(identity, &services.allowed_bind_roots)
+        crate::domain::revalidate_bind_identity(identity, &services.store.allowed_bind_roots())
             .map_err(|error| ApiError::domain(error, request_id))?;
     }
     let compose_timeout = operation_deadline
@@ -642,7 +631,7 @@ pub async fn validate(
         .into_response())
 }
 
-fn services(state: &AppState, request_id: RequestId) -> Result<&M3Services, ApiError> {
+pub(crate) fn services(state: &AppState, request_id: RequestId) -> Result<&M3Services, ApiError> {
     state
         .m3
         .as_deref()
@@ -680,34 +669,34 @@ fn validate_registry_credential(
     }
     Ok(())
 }
-fn idempotency_key(headers: &HeaderMap) -> Result<&str, IdempotencyError> {
+pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<&str, IdempotencyError> {
     headers
         .get("idempotency-key")
         .ok_or(IdempotencyError::KeyRequired)?
         .to_str()
         .map_err(|_| IdempotencyError::KeyInvalid)
 }
-fn draft_fingerprint(
-    services: &M3Services,
-    route: &str,
-    slug: &str,
-    draft: &NormalizedDraft,
-) -> Result<Vec<u8>, ApiError> {
-    let canonical = serde_json::to_vec(&serde_json::json!({"actor":"admin","route":route,"slug":slug,"display_name":draft.display_name,"image":draft.discovery_image_ref,"credential_ref":draft.credential_ref,"auto_deploy_enabled":draft.auto_deploy_enabled,"auto_deploy_acknowledged":draft.auto_deploy_acknowledged,"poll":draft.poll_interval_seconds,"config":draft.metadata})).map_err(|_| ApiError::internal(RequestId(Uuid::nil())))?;
-    Ok(services.idempotency.fingerprint(&canonical))
-}
-fn detail(metadata: &crate::domain::AppMetadata, draft: &NormalizedDraft) -> AppMutationDetail {
+pub(crate) fn detail(
+    metadata: &crate::domain::AppMetadata,
+    draft: Option<&NormalizedDraft>,
+) -> AppMutationDetail {
     AppMutationDetail {
         id: metadata.id,
         slug: metadata.slug.clone(),
         display_name: metadata.display_name.clone(),
-        project_name: app_resource_names(&metadata.slug).project_name,
+        project_name: metadata.resource_names().project_name,
         config_revision: metadata.draft_revision,
         config_sha256: metadata.draft_config_sha256.clone(),
         desired_state: metadata.desired_state,
-        stop_grace_period_seconds: draft.stop_grace_period_seconds,
-        deployment_status: "DEPLOY_REQUIRED",
-        warnings: if draft.binds.iter().any(|bind| !bind.readonly) || !draft.volumes.is_empty() {
+        stop_grace_period_seconds: draft.map(|value| value.stop_grace_period_seconds),
+        deployment_status: if draft.is_some() {
+            "DEPLOY_REQUIRED"
+        } else {
+            "UNCONFIGURED"
+        },
+        warnings: if draft.is_some_and(|draft| {
+            draft.binds.iter().any(|bind| !bind.readonly) || !draft.volumes.is_empty()
+        }) {
             vec!["DATA_NOT_ROLLED_BACK"]
         } else {
             vec![]
@@ -962,7 +951,7 @@ fn replay(status: u16, body: String) -> Result<Response, ApiError> {
     Ok(response)
 }
 
-fn replay_recorded(status: u16, body: String) -> Result<Response, ApiError> {
+pub(crate) fn replay_recorded(status: u16, body: String) -> Result<Response, ApiError> {
     let body = match serde_json::from_str::<serde_json::Value>(&body) {
         Ok(mut value) => {
             if let Some(object) = value.as_object_mut() {
@@ -974,7 +963,7 @@ fn replay_recorded(status: u16, body: String) -> Result<Response, ApiError> {
     };
     replay(status, body)
 }
-async fn finish_json<T: Serialize>(
+pub(crate) async fn finish_json<T: Serialize>(
     services: &M3Services,
     route: &str,
     key: &str,
@@ -1142,6 +1131,9 @@ fn load_verified_active(
         .find(|candidate| candidate.app_id == app_id)
         .ok_or("APP_NOT_FOUND")?;
     let app = AppCatalogEntry::from(recovered);
+    if app.draft_revision.is_none() {
+        return Err("APP_UNCONFIGURED");
+    }
     let release_id = app.active_release_id.ok_or("APP_DEPLOY_REQUIRED")?;
     let revision = app
         .active_config_revision
@@ -1151,7 +1143,7 @@ fn load_verified_active(
     verify_active_compose(services, &app, release_id, &loaded)
         .map_err(|_| "ACTIVE_COMPOSE_INVALID")?;
     let bind_identities =
-        crate::domain::validate_binds(&loaded.metadata.binds, &services.allowed_bind_roots)
+        crate::domain::validate_binds(&loaded.metadata.binds, &services.store.allowed_bind_roots())
             .map_err(|_| "BIND_INVALID")?;
     let compose_file = services
         .store
@@ -1182,6 +1174,9 @@ fn load_verified_pending(
         .find(|candidate| candidate.app_id == app_id)
         .ok_or("APP_NOT_FOUND")?;
     let app = AppCatalogEntry::from(recovered);
+    if app.draft_revision.is_none() {
+        return Err("APP_UNCONFIGURED");
+    }
     if app.active_release_id.is_some() {
         return load_verified_active(services, app_id);
     }
@@ -1196,7 +1191,7 @@ fn load_verified_pending(
     let loaded = load_config(services, app_id, release.config_revision)
         .map_err(|_| "PENDING_RELEASE_CONFIG_UNKNOWN")?;
     let bind_identities =
-        crate::domain::validate_binds(&loaded.metadata.binds, &services.allowed_bind_roots)
+        crate::domain::validate_binds(&loaded.metadata.binds, &services.store.allowed_bind_roots())
             .map_err(|_| "BIND_INVALID")?;
     Ok(VerifiedActive {
         app,
@@ -1284,11 +1279,11 @@ pub(crate) fn validate_runtime_paths_for_docker_root(
     metadata: &crate::domain::ConfigMetadata,
     docker_root: Option<&str>,
 ) -> Result<Vec<crate::domain::BindIdentity>, &'static str> {
-    let identities = crate::domain::validate_binds(&metadata.binds, &services.allowed_bind_roots)
+    let allowed_bind_roots = services.store.allowed_bind_roots();
+    let identities = crate::domain::validate_binds(&metadata.binds, &allowed_bind_roots)
         .map_err(|_| "BIND_INVALID")?;
     if let Some(root) = docker_root.map(PathBuf::from)
-        && (services
-            .allowed_bind_roots
+        && (allowed_bind_roots
             .iter()
             .any(|allowed| paths_overlap(allowed, &root))
             || identities
@@ -1573,6 +1568,30 @@ async fn lifecycle(
             let (code, status) = error.code_and_status();
             return finish_error(services, &route, raw_key, code, status, request_id).await;
         }
+        if !matches!(action, LifecycleAction::Stop) && active_metadata.service_discovery_enabled {
+            let docker = state.observer.api();
+            let allowed = expected_container_id
+                .as_deref()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Err(error) = crate::docker::platform_network::ensure_for_app(
+                docker.as_ref(),
+                &app.slug,
+                &allowed,
+            )
+            .await
+            {
+                return finish_error(
+                    services,
+                    &route,
+                    raw_key,
+                    error.public_code(),
+                    StatusCode::CONFLICT,
+                    request_id,
+                )
+                .await;
+            }
+        }
         let identity_still_matches = match mutation_container_policy(state, &app, allow_pending)
             .await
         {
@@ -1644,8 +1663,11 @@ async fn lifecycle(
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
         for identity in &final_active.bind_identities {
-            if crate::domain::revalidate_bind_identity(identity, &services.allowed_bind_roots)
-                .is_err()
+            if crate::domain::revalidate_bind_identity(
+                identity,
+                &services.store.allowed_bind_roots(),
+            )
+            .is_err()
             {
                 return interrupt_internal(services, &route, raw_key, request_id).await;
             }
@@ -1842,7 +1864,7 @@ fn mutation_status(code: &str) -> StatusCode {
     }
 }
 
-async fn finish_error(
+pub(crate) async fn finish_error(
     services: &M3Services,
     route: &str,
     key: &str,
@@ -1866,7 +1888,7 @@ async fn finish_error(
     replay(status.as_u16(), body)
 }
 
-async fn interrupt_internal(
+pub(crate) async fn interrupt_internal(
     services: &M3Services,
     route: &str,
     key: &str,
@@ -1915,6 +1937,7 @@ struct RetainedResources {
 #[serde(rename_all = "snake_case")]
 enum RetainedNetworkKind {
     OwnedDefault,
+    Platform,
     External,
 }
 
@@ -1953,7 +1976,7 @@ struct RetainedManagedFile {
 struct DeletionFacts {
     app_id: Uuid,
     slug: String,
-    expected_revision: Uuid,
+    expected_revision: Option<Uuid>,
     project_name: String,
     active_release_id: Option<Uuid>,
     active_config_revision: Option<Uuid>,
@@ -2010,7 +2033,13 @@ pub async fn deletion_preview(
         .bind(&authenticated.session.id)
         .bind(app_id.to_string())
         .bind(&snapshot.facts.slug)
-        .bind(snapshot.facts.expected_revision.to_string())
+        .bind(
+            snapshot
+                .facts
+                .expected_revision
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unconfigured".to_owned()),
+        )
         .bind(preview_hash)
         .bind(&facts_json)
         .bind(payload.remove_container)
@@ -2036,7 +2065,7 @@ pub async fn deletion_preview(
 pub struct DeleteRequest {
     confirmation_token: SecretValue,
     slug: String,
-    expected_revision: Uuid,
+    expected_revision: Option<Uuid>,
     #[serde(default)]
     remove_container: bool,
 }
@@ -2149,7 +2178,11 @@ pub async fn delete_app(
     let consumed_at: Option<String> = row.get(8);
     if preview_session != authenticated.session.id
         || preview_slug != payload.slug
-        || preview_revision != payload.expected_revision.to_string()
+        || preview_revision
+            != payload
+                .expected_revision
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unconfigured".to_owned())
         || preview_remove != payload.remove_container
         || preview_facts.app_id != app_id
         || preview_facts.slug != preview_slug
@@ -2415,8 +2448,11 @@ pub async fn delete_app(
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
         for identity in &final_active.bind_identities {
-            if crate::domain::revalidate_bind_identity(identity, &services.allowed_bind_roots)
-                .is_err()
+            if crate::domain::revalidate_bind_identity(
+                identity,
+                &services.store.allowed_bind_roots(),
+            )
+            .is_err()
             {
                 return finish_error(
                     services,
@@ -2597,7 +2633,7 @@ fn verify_active_compose(
             app.auto_deploy_enabled,
             app.poll_interval_seconds,
             &services.idempotency.fingerprint(b"config"),
-            &services.allowed_bind_roots,
+            &services.store.allowed_bind_roots(),
         )
         .map_err(|_| ())?;
     let revision_directory = services
@@ -2607,8 +2643,7 @@ fn verify_active_compose(
         .join(revision.to_string());
     let (canonical, _) = generate(
         ComposeInput {
-            app_id: app.id,
-            slug: &app.slug,
+            resource_identity: app.resource_identity(),
             release_id,
             image_ref: image,
             revision_directory: &revision_directory,
@@ -2654,10 +2689,15 @@ async fn canonical_deletion_snapshot(
         .find(|candidate| candidate.app_id == app_id)
         .ok_or("APP_NOT_FOUND")?;
     let app = AppCatalogEntry::from(recovered);
-    let draft_revision = app.draft_revision.ok_or("APP_DEPLOY_REQUIRED")?;
-    let draft =
-        load_config(services, app_id, draft_revision).map_err(|_| "CONFIG_REVISION_INVALID")?;
-    validate_runtime_paths(state, services, &draft.metadata).await?;
+    let draft = match app.draft_revision {
+        Some(revision) => {
+            let loaded =
+                load_config(services, app_id, revision).map_err(|_| "CONFIG_REVISION_INVALID")?;
+            validate_runtime_paths(state, services, &loaded.metadata).await?;
+            Some(loaded)
+        }
+        None => None,
+    };
 
     let active = match (app.active_release_id, app.active_config_revision) {
         (Some(release_id), Some(revision)) => {
@@ -2695,10 +2735,10 @@ async fn canonical_deletion_snapshot(
         .unwrap_or_default();
     let retained = retained_resources(
         state,
-        &app.slug,
+        app.resource_identity(),
         active.as_ref().map(|loaded| &loaded.metadata),
         pending.as_ref().map(|loaded| &loaded.metadata),
-        &draft.metadata,
+        draft.as_ref().map(|loaded| &loaded.metadata),
         if remove_container {
             &[]
         } else {
@@ -2709,13 +2749,13 @@ async fn canonical_deletion_snapshot(
     let managed_files = managed_file_inventory(
         active.as_ref().map(|loaded| &loaded.metadata),
         pending.as_ref().map(|loaded| &loaded.metadata),
-        &draft.metadata,
+        draft.as_ref().map(|loaded| &loaded.metadata),
     );
     Ok(DeletionSnapshot {
         facts: DeletionFacts {
             app_id,
             slug: app.slug.clone(),
-            expected_revision: draft_revision,
+            expected_revision: app.draft_revision,
             project_name: app.project_name.clone(),
             active_release_id: app.active_release_id,
             active_config_revision: app.active_config_revision,
@@ -2782,7 +2822,7 @@ fn configured_scope(active: bool, pending: bool, draft: bool) -> String {
 fn managed_file_inventory(
     active: Option<&crate::domain::ConfigMetadata>,
     pending: Option<&crate::domain::ConfigMetadata>,
-    draft: &crate::domain::ConfigMetadata,
+    draft: Option<&crate::domain::ConfigMetadata>,
 ) -> Vec<RetainedManagedFile> {
     let mut files: BTreeMap<String, (bool, bool, bool)> = BTreeMap::new();
     if let Some(active) = active {
@@ -2795,8 +2835,10 @@ fn managed_file_inventory(
             files.entry(file.logical_name.clone()).or_default().1 = true;
         }
     }
-    for file in &draft.files {
-        files.entry(file.logical_name.clone()).or_default().2 = true;
+    if let Some(draft) = draft {
+        for file in &draft.files {
+            files.entry(file.logical_name.clone()).or_default().2 = true;
+        }
     }
     files
         .into_iter()
@@ -2811,15 +2853,15 @@ fn managed_file_inventory(
 
 async fn retained_resources(
     state: &AppState,
-    slug: &str,
+    identity: crate::domain::AppResourceIdentity<'_>,
     active: Option<&crate::domain::ConfigMetadata>,
     pending: Option<&crate::domain::ConfigMetadata>,
-    draft: &crate::domain::ConfigMetadata,
+    draft: Option<&crate::domain::ConfigMetadata>,
     containers: &[String],
 ) -> Result<RetainedResources, &'static str> {
     tokio::time::timeout(
         Duration::from_secs(5),
-        retained_resources_inner(state, slug, active, pending, draft, containers),
+        retained_resources_inner(state, identity, active, pending, draft, containers),
     )
     .await
     .map_err(|_| "DOCKER_TIMEOUT")?
@@ -2827,10 +2869,10 @@ async fn retained_resources(
 
 async fn retained_resources_inner(
     state: &AppState,
-    slug: &str,
+    identity: crate::domain::AppResourceIdentity<'_>,
     active: Option<&crate::domain::ConfigMetadata>,
     pending: Option<&crate::domain::ConfigMetadata>,
-    draft: &crate::domain::ConfigMetadata,
+    draft: Option<&crate::domain::ConfigMetadata>,
     containers: &[String],
 ) -> Result<RetainedResources, &'static str> {
     type ScopePresence = (bool, bool, bool);
@@ -2843,12 +2885,12 @@ async fn retained_resources_inner(
         .into_iter()
         .map(|metadata| (metadata, 0_u8))
         .chain(pending.into_iter().map(|metadata| (metadata, 1_u8)))
-        .chain(std::iter::once((draft, 2_u8)))
+        .chain(draft.into_iter().map(|metadata| (metadata, 2_u8)))
     {
         for volume in &metadata.volumes {
             let entry = match volume {
                 crate::domain::VolumeInput::Owned { logical_name, .. } => owned
-                    .entry(crate::domain::owned_volume_name(slug, logical_name))
+                    .entry(identity.owned_volume_name(logical_name))
                     .or_default(),
                 crate::domain::VolumeInput::External { name, .. } => {
                     external.entry(name.clone()).or_default()
@@ -2861,7 +2903,7 @@ async fn retained_resources_inner(
             }
         }
         if metadata.owned_default_network {
-            let names = app_resource_names(slug);
+            let names = identity.resource_names();
             let default = networks
                 .entry((
                     names.owned_default_network_name,
@@ -2873,6 +2915,20 @@ async fn retained_resources_inner(
                 0 => default.0 = true,
                 1 => default.1 = true,
                 _ => default.2 = true,
+            }
+        }
+        if metadata.service_discovery_enabled {
+            let platform = networks
+                .entry((
+                    crate::domain::PLATFORM_NETWORK_NAME.to_owned(),
+                    RetainedNetworkKind::Platform,
+                    vec![identity.slug.to_owned()],
+                ))
+                .or_default();
+            match is_active {
+                0 => platform.0 = true,
+                1 => platform.1 = true,
+                _ => platform.2 = true,
             }
         }
         for network in &metadata.networks {
@@ -2941,7 +2997,7 @@ async fn retained_resources_inner(
             .is_some();
         retained_networks.push(RetainedNetwork {
             bridge_name: (kind == RetainedNetworkKind::OwnedDefault)
-                .then(|| app_resource_names(slug).bridge_name),
+                .then(|| identity.resource_names().bridge_name),
             name,
             kind,
             aliases,
@@ -3084,8 +3140,12 @@ async fn validate_resources_inner(
     check_alias_conflicts: bool,
     request_id: RequestId,
 ) -> Result<(), ApiError> {
-    let plan = crate::domain::network_plan(metadata.owned_default_network, &metadata.networks)
-        .map_err(|error| ApiError::domain(error, request_id))?;
+    let plan = crate::domain::network_plan(
+        metadata.owned_default_network,
+        metadata.service_discovery_enabled,
+        &metadata.networks,
+    )
+    .map_err(|error| ApiError::domain(error, request_id))?;
     let has_owned_volume = metadata
         .volumes
         .iter()
@@ -3096,17 +3156,29 @@ async fn validate_resources_inner(
             .catalog
             .get(app_id)
             .ok_or_else(|| ApiError::app_not_found(request_id))?;
-        let names = app_resource_names(&app.slug);
+        let names = app.resource_names();
         let labels = crate::compose::generate::resource_labels(app_id, &names.project_name);
-        Some((app.slug, names, labels))
+        Some((
+            app.id,
+            app.slug.clone(),
+            app.resource_name_schema_version,
+            names,
+            labels,
+        ))
     } else {
         None
     };
     for volume in &metadata.volumes {
         match volume {
             crate::domain::VolumeInput::Owned { logical_name, .. } => {
-                let (slug, _, expected) = owned_identity.as_ref().expect("owned identity exists");
-                let name = crate::domain::owned_volume_name(slug, logical_name);
+                let (app_id, slug, schema_version, _, expected) =
+                    owned_identity.as_ref().expect("owned identity exists");
+                let identity = crate::domain::AppResourceIdentity {
+                    app_id: *app_id,
+                    slug,
+                    schema_version: *schema_version,
+                };
+                let name = identity.owned_volume_name(logical_name);
                 if let Some(resource) = state
                     .observer
                     .api
@@ -3133,7 +3205,7 @@ async fn validate_resources_inner(
         }
     }
     if plan.owned_default_network {
-        let (_, names, expected) = owned_identity.as_ref().expect("owned identity exists");
+        let (_, _, _, names, expected) = owned_identity.as_ref().expect("owned identity exists");
         let owned_name = &names.owned_default_network_name;
         if let Some(resource) = state
             .observer
@@ -3145,6 +3217,29 @@ async fn validate_resources_inner(
                 owned_network_identity_conflict(&resource, owned_name, &names.bridge_name, expected)
         {
             return Err(ApiError::conflict(code, request_id));
+        }
+    }
+    if plan.service_discovery_enabled {
+        let app = state
+            .observer
+            .catalog
+            .get(app_id)
+            .ok_or_else(|| ApiError::app_not_found(request_id))?;
+        if check_alias_conflicts {
+            let allowed = allowed_replaceable_container_id
+                .into_iter()
+                .collect::<Vec<_>>();
+            crate::docker::platform_network::validate_for_app_if_present(
+                state.observer.api.as_ref(),
+                &app.slug,
+                &allowed,
+            )
+            .await
+            .map_err(|error| ApiError::conflict(error.public_code(), request_id))?;
+        } else {
+            crate::docker::platform_network::validate_if_present(state.observer.api.as_ref())
+                .await
+                .map_err(|error| ApiError::conflict(error.public_code(), request_id))?;
         }
     }
     if allowed_replaceable_container_id
@@ -3309,6 +3404,7 @@ mod tests {
                 (APP_ID_LABEL.into(), Uuid::nil().to_string()),
             ]),
             driver: Some("bridge".into()),
+            internal: false,
             options: HashMap::from([("com.docker.network.bridge.name".into(), "sd-demo".into())]),
         };
         assert_eq!(
@@ -3487,6 +3583,7 @@ mod tests {
             id: app_id,
             slug: "example".into(),
             display_name: "Example".into(),
+            resource_name_schema_version: crate::domain::RESOURCE_NAME_SCHEMA_LEGACY,
             project_name: format!("solodock-{}", app_id.simple()),
             active_release_id: Some(release_id),
             active_image_ref: Some(format!("example@sha256:{}", "a".repeat(64))),
@@ -3587,6 +3684,7 @@ mod tests {
                 name: name.into(),
                 labels: HashMap::new(),
                 driver: Some("bridge".into()),
+                internal: false,
                 options: HashMap::new(),
             }))
         }
@@ -3671,6 +3769,7 @@ mod tests {
                 name: self.reported_name.clone().unwrap_or_else(|| name.into()),
                 labels: HashMap::new(),
                 driver: Some("bridge".into()),
+                internal: false,
                 options: HashMap::new(),
             }))
         }
@@ -3731,6 +3830,7 @@ mod tests {
             volumes: vec![],
             binds: vec![],
             owned_default_network: false,
+            service_discovery_enabled: false,
             networks: vec![crate::domain::NetworkInput::External {
                 name: "shared".into(),
                 aliases: vec!["postgres".into()],
@@ -3913,6 +4013,7 @@ mod tests {
                 .collect(),
             binds: vec![],
             owned_default_network: true,
+            service_discovery_enabled: false,
             networks: (0..8)
                 .map(|index| crate::domain::NetworkInput::External {
                     name: format!("network-{index}"),

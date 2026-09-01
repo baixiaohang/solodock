@@ -445,7 +445,9 @@ pub async fn rollback(
         .read_metadata(source.app_id)
         .map_err(|_| ApiError::app_not_found(request_id))?;
     let request = ScheduleRequest {
-        expected_draft_revision: metadata.draft_revision,
+        expected_draft_revision: metadata
+            .draft_revision
+            .ok_or_else(|| ApiError::conflict("APP_UNCONFIGURED", request_id))?,
         expected_active_release_id: value.expected_active_release_id,
         expected_pending_release_id: value.expected_pending_release_id,
         expected_actual_release_id: value.expected_actual_release_id,
@@ -532,6 +534,7 @@ async fn schedule_inner(
                 .into_response())
         }
         Err(ScheduleError::AppNotFound) => Err(ApiError::app_not_found(request_id)),
+        Err(ScheduleError::Unconfigured) => Err(ApiError::conflict("APP_UNCONFIGURED", request_id)),
         Err(ScheduleError::Busy) => Err(ApiError::conflict("DEPLOYMENT_BUSY", request_id)),
         Err(ScheduleError::FactsChanged) => {
             Err(ApiError::conflict("DEPLOYMENT_FACTS_CHANGED", request_id))

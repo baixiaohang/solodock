@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from '@testing-library/svelte'
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -16,6 +16,41 @@ afterEach(() => {
 })
 
 describe('app detail resource identity', () => {
+  it('creates the first draft from an unconfigured service with a null revision', async () => {
+    const app = {
+      id: '00000000-0000-4000-8000-000000000021', slug: 'insight-agent', display_name: 'insight-agent',
+      resource_names: { project_name: 'solodock-insight-agent', owned_default_network_name: 'solodock-insight-agent-default', bridge_name: 'sd-0123456789ab' },
+      active_release: null, actual_release_id: null, actual: null, expected_network_plan: null,
+      expected_owned_default_network: null, actual_owned_default_network: null, drift_codes: [], draft: null,
+      draft_revision: null, draft_config_sha256: null, active_config_revision: null, pending_release_id: null,
+      pending_image_ref: null, desired_state: 'stopped', deployment_status: 'UNCONFIGURED',
+      available_actions: ['deletion_preview'], compose_available: true, polling: null,
+    }
+    let saved: Record<string, unknown> | undefined
+    vi.stubGlobal('EventSource', MockEventSource)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/deployments?limit=20')) return new Response(JSON.stringify({ items: [], next_cursor: null }), { status: 200 })
+      if (url.endsWith('/registry-credentials')) return new Response('[]', { status: 200 })
+      if (url.endsWith('/webhook')) return new Response('{}', { status: 404 })
+      if (url.endsWith(`/apps/${app.id}/draft`) && init?.method === 'PUT') {
+        saved = JSON.parse(String(init.body)) as Record<string, unknown>
+        return new Response('{}', { status: 200 })
+      }
+      if (url.endsWith(`/apps/${app.id}`)) return new Response(JSON.stringify(app), { status: 200 })
+      throw new Error(`unexpected request: ${url}`)
+    }))
+
+    render(AppDetail, { appId: app.id })
+    expect(await screen.findByText('尚未配置')).toBeTruthy()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: '配置' }))
+    await user.type(screen.getByLabelText('发现镜像 tag'), 'ghcr.io/example/insight-agent:stable')
+    await user.click(screen.getByRole('button', { name: '保存新 revision' }))
+    await waitFor(() => expect(saved).toBeDefined())
+    expect(saved?.expected_revision).toBeNull()
+  })
+
   it('does not display an owned network or bridge for an external-only app', async () => {
     const app = {
       id: '00000000-0000-4000-8000-000000000001',

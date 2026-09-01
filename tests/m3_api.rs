@@ -59,6 +59,10 @@ struct FakeCompose {
 
 struct MissingDocker;
 
+struct SettingsDocker {
+    docker_root_directory: Option<String>,
+}
+
 #[derive(Default)]
 struct ScriptedDocker {
     candidates: std::sync::Mutex<VecDeque<Vec<ContainerRecord>>>,
@@ -153,6 +157,36 @@ impl DockerReadApi for MissingDocker {
         _name: &str,
     ) -> Result<Option<solodock::docker::models::DockerNetworkResource>, DockerError> {
         Ok(None)
+    }
+}
+
+#[async_trait]
+impl DockerReadApi for SettingsDocker {
+    async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+        let mut probe = ready_probe();
+        probe.docker_root_directory = self.docker_root_directory.clone();
+        Ok(probe)
+    }
+    async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+        Ok(Vec::new())
+    }
+    async fn inspect_container(&self, _id: &str) -> Result<ContainerRecord, DockerError> {
+        Err(DockerError::new(
+            solodock::docker::models::DockerErrorKind::ContainerChanged,
+        ))
+    }
+    async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
+    }
+    async fn logs(
+        &self,
+        _id: &str,
+        _request: LogRequest,
+    ) -> Result<DockerStream<LogChunk>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
+    }
+    async fn stats(&self, _id: &str) -> Result<DockerStream<RawStats>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
     }
 }
 
@@ -435,7 +469,8 @@ impl Harness {
         }
     }
 
-    async fn create(&self, key: Option<&str>, body: &Value) -> axum::response::Response {
+    async fn create(&self, key: Option<&str>, input: &Value) -> axum::response::Response {
+        let slug = input.get("slug").cloned().unwrap_or(Value::Null);
         let mut request = Request::builder()
             .method("POST")
             .uri("/api/v1/apps")
@@ -444,12 +479,48 @@ impl Harness {
             .header("x-csrf-token", &self.csrf)
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(key) = key {
-            request = request.header("idempotency-key", key);
+            request = request.header("idempotency-key", format!("create-{key}"));
         }
-        self.app
+        let created = self
+            .app
             .clone()
-            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .oneshot(
+                request
+                    .body(Body::from(json!({"slug": slug}).to_string()))
+                    .unwrap(),
+            )
             .await
+            .unwrap();
+        let Some(key) = key else { return created };
+        let (status, response) = body(created).await;
+        if status != StatusCode::CREATED {
+            return axum::response::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::from(response))
+                .unwrap();
+        }
+        let created: Value = serde_json::from_str(&response).unwrap();
+        let app_id = created["app"]["id"].as_str().unwrap();
+        let updated = self
+            .mutate(
+                "PUT",
+                &format!("/api/v1/apps/{app_id}/draft"),
+                Some(key),
+                &json!({"expected_revision": null, "draft": mutable(input.clone())}),
+            )
+            .await;
+        let (status, response) = body(updated).await;
+        axum::response::Response::builder()
+            .status(if status == StatusCode::OK {
+                StatusCode::CREATED
+            } else {
+                status
+            })
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(response))
             .unwrap()
     }
 
@@ -485,7 +556,10 @@ impl Harness {
                 &metadata,
                 release_id,
                 &solodock::registry::ResolvedImage {
-                    source_image_ref: metadata.discovery_image_ref.clone(),
+                    source_image_ref: metadata
+                        .discovery_image_ref
+                        .clone()
+                        .expect("configured app"),
                     logical_registry: "registry.example".into(),
                     repository: "app".into(),
                     source_tag: "stable".into(),
@@ -540,6 +614,7 @@ fn draft(secret: &str) -> Value {
             "secrets": [{"key":"TOKEN","operation":"replace","value":secret}]
         },
         "files": [], "ports": [], "volumes": [], "binds": [], "networks": [],
+        "service_discovery_enabled": false,
         "health": {"policy":"running","stable_window_seconds":15}
     })
 }
@@ -607,7 +682,7 @@ async fn create_requires_idempotency_and_replays_without_secret_disclosure() {
     assert_eq!(replay_json["app"]["id"], first_json["app"]["id"]);
     assert_eq!(replay_json["idempotency_replayed"], true);
     assert!(!replay.contains(canary));
-    assert_eq!(harness.database.audit_count().await.unwrap(), 4); // bootstrap, login, attempt, success
+    assert_eq!(harness.database.audit_count().await.unwrap(), 6); // bootstrap, login, create/update attempt and success
 
     let database_bytes = fs::read(harness._root.path().join("state/state.sqlite3")).unwrap();
     assert!(
@@ -664,7 +739,7 @@ async fn deployment_preflight_reports_managed_file_permission_drift_before_compo
         .store
         .app_directory(app_id)
         .join("config-revisions")
-        .join(revision.to_string())
+        .join(revision.expect("configured app").to_string())
         .join("files/secret/secret-config");
     fs::set_permissions(&drifted, fs::Permissions::from_mode(0o600)).unwrap();
     harness.compose_actions.lock().unwrap().clear();
@@ -697,7 +772,7 @@ async fn deployment_preflight_reports_managed_file_permission_drift_before_compo
 async fn slug_is_short_unique_and_absent_from_mutable_draft() {
     let harness = Harness::new().await;
     let mut invalid = draft("secret");
-    invalid["slug"] = json!("abcdefghijklm");
+    invalid["slug"] = json!("abcdefghijklmnopqrstu");
     assert_eq!(
         harness
             .create(Some("slug-too-long-0001"), &invalid)
@@ -739,7 +814,7 @@ async fn slug_is_short_unique_and_absent_from_mutable_draft() {
     assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 
     let header = fs::read_to_string(harness.apps.join(app_id).join("app.toml")).unwrap();
-    assert!(header.contains("schema_version = 2"));
+    assert!(header.contains("schema_version = 3"));
     assert!(header.contains("slug = \"example\""));
     assert!(!header.contains("project_name"));
 }
@@ -757,6 +832,7 @@ async fn create_requires_auto_deploy_ack_and_persists_enabled_state() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
 
+    enabled["slug"] = json!("auto-enabled");
     enabled["auto_deploy_acknowledged"] = json!(true);
     let key = "m5-auto-create-with-ack";
     let (status, created) = body(harness.create(Some(key), &enabled).await).await;
@@ -802,16 +878,28 @@ async fn same_idempotency_key_with_different_secret_is_rejected() {
 async fn interrupted_create_reconciles_the_filesystem_commit_without_a_second_app() {
     let harness = Harness::new().await;
     let key = "m3-create-interrupted-0001";
-    let request = draft("reconcile-secret");
-    let (status, first) = body(harness.create(Some(key), &request).await).await;
+    let request = json!({"slug":"unconfigured-resume"});
+    let (status, first) = body(
+        harness
+            .mutate("POST", "/api/v1/apps", Some(key), &request)
+            .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     let first: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(first["app"]["deployment_status"], "UNCONFIGURED");
+    assert!(first["app"]["config_revision"].is_null());
     sqlx::query("UPDATE idempotency_records SET status='interrupted',response_status=NULL,response_body=NULL WHERE route='/api/v1/apps'")
         .execute(harness.database.pool())
         .await
         .unwrap();
 
-    let (status, resumed) = body(harness.create(Some(key), &request).await).await;
+    let (status, resumed) = body(
+        harness
+            .mutate("POST", "/api/v1/apps", Some(key), &request)
+            .await,
+    )
+    .await;
     assert_eq!(status, StatusCode::CREATED);
     let resumed: Value = serde_json::from_str(&resumed).unwrap();
     assert_eq!(resumed["app"]["id"], first["app"]["id"]);
@@ -822,6 +910,240 @@ async fn interrupted_create_reconciles_the_filesystem_commit_without_a_second_ap
             .count(),
         1
     );
+}
+
+#[tokio::test]
+async fn unconfigured_app_first_revision_is_nullable_and_docker_actions_fail_closed() {
+    let harness = Harness::new().await;
+    let request = json!({"slug":"insight-agent"});
+    let (status, created) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps",
+                Some("unconfigured-create"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    assert_eq!(created["app"]["deployment_status"], "UNCONFIGURED");
+    assert!(created["app"]["config_revision"].is_null());
+    let app_id = created["app"]["id"].as_str().unwrap();
+    let app_uuid: Uuid = app_id.parse().unwrap();
+    harness.compose_actions.lock().unwrap().clear();
+
+    let webhook_status = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/apps/{app_id}/webhook"))
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, webhook_status) = body(webhook_status).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{webhook_status}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&webhook_status).unwrap()["code"],
+        "APP_UNCONFIGURED"
+    );
+    let secret = URL_SAFE_NO_PAD.encode([5_u8; 32]);
+    let webhook_configure = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/webhook"),
+            Some("unconfigured-webhook"),
+            &json!({"expected_metadata_revision":null,"secret":secret}),
+        )
+        .await;
+    let (status, webhook_configure) = body(webhook_configure).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{webhook_configure}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&webhook_configure).unwrap()["code"],
+        "APP_UNCONFIGURED"
+    );
+    let ingress = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/hooks/v1/apps/{app_id}/registry"))
+                .header(header::HOST, "hooks.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, ingress) = body(ingress).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{ingress}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&ingress).unwrap()["code"],
+        "APP_UNCONFIGURED"
+    );
+    let app_path = harness.apps.join(app_id);
+    assert!(!app_path.join("webhook.toml").exists());
+    assert!(!app_path.join("webhook-secret-revisions").exists());
+    assert!(
+        harness
+            .state
+            .webhooks
+            .as_ref()
+            .unwrap()
+            .poll_states
+            .get(app_uuid)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let start = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/apps/{app_id}/actions/start"))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("x-csrf-token", &harness.csrf)
+                .header("idempotency-key", "unconfigured-start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, start) = body(start).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{start}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&start).unwrap()["code"],
+        "APP_UNCONFIGURED"
+    );
+    assert!(harness.compose_actions.lock().unwrap().is_empty());
+
+    let validate = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/validate"),
+            None,
+            &json!({"draft":mutable_draft("first-secret")}),
+        )
+        .await;
+    let (status, validate) = body(validate).await;
+    assert_eq!(status, StatusCode::OK, "{validate}");
+    assert_eq!(
+        harness.compose_actions.lock().unwrap().as_slice(),
+        &[ComposeAction::Validate]
+    );
+    harness.compose_actions.lock().unwrap().clear();
+
+    let first = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some("unconfigured-first-revision"),
+            &json!({"expected_revision":null,"draft":mutable_draft("first-secret")}),
+        )
+        .await;
+    let (status, first) = body(first).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first: Value = serde_json::from_str(&first).unwrap();
+    assert!(first["app"]["config_revision"].is_string());
+
+    let stale_null = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some("unconfigured-stale-null"),
+            &json!({"expected_revision":null,"draft":mutable_draft("other-secret")}),
+        )
+        .await;
+    assert_eq!(stale_null.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn postgresql_preset_is_versioned_idempotent_and_never_echoes_password() {
+    let harness = Harness::new().await;
+    let descriptors = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/app-presets")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, descriptors) = body(descriptors).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&descriptors).unwrap()[0]["id"],
+        "postgresql"
+    );
+
+    let password = "POSTGRES_PRESET_SECRET_CANARY";
+    let request = json!({
+        "slug":"postgres",
+        "preset_id":"postgresql",
+        "preset_schema_version":1,
+        "variables":{"major":"18","username":"postgres","database":"postgres","password":password,"initdb_args":""}
+    });
+    let (status, created) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps/from-preset",
+                Some("postgresql-preset-create"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert!(!created.contains(password));
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let loaded = solodock::app_store::config_revision::load_verified(
+        &harness.store.app_directory(app_id),
+        revision,
+        harness.store.integrity_key().unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        &loaded.metadata.volumes[0],
+        solodock::domain::VolumeInput::Owned { target_path, .. } if target_path == "/var/lib/postgresql"
+    ));
+    assert!(loaded.metadata.service_discovery_enabled);
+    assert!(loaded.metadata.ports.is_empty());
+
+    let (status, replay) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps/from-preset",
+                Some("postgresql-preset-create"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let replay: Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(replay["app"]["id"], created["app"]["id"]);
+    assert_eq!(replay["idempotency_replayed"], true);
 }
 
 #[tokio::test]
@@ -2271,6 +2593,7 @@ async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
     let request = json!({
         "expected_revision": initial["revision"],
         "display_timezone": "Asia/Shanghai",
+        "allowed_bind_roots": [],
     });
 
     let missing_csrf = harness
@@ -2340,8 +2663,125 @@ async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
             &json!({
                 "expected_revision": updated["revision"],
                 "display_timezone": "Mars/Olympus",
+                "allowed_bind_roots": [],
             }),
         )
         .await;
     assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn settings_replay_precedes_mutable_bind_root_validation() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let bind_path = bind_root.path().to_path_buf();
+    let harness = Harness::new_with_docker(Arc::new(SettingsDocker {
+        docker_root_directory: Some("/var/lib/docker".into()),
+    }))
+    .await;
+    let initial = solodock::settings::SettingsStore::new(harness.database.clone())
+        .load()
+        .await
+        .unwrap();
+    let request = json!({
+        "expected_revision": initial.revision,
+        "display_timezone": "UTC",
+        "allowed_bind_roots": [bind_path],
+    });
+    let first = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-bind-replay"),
+            &request,
+        )
+        .await;
+    assert_eq!(first.status(), StatusCode::OK);
+    fs::remove_dir_all(&bind_path).unwrap();
+
+    let replay = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-bind-replay"),
+            &request,
+        )
+        .await;
+    let (status, replay) = body(replay).await;
+    assert_eq!(status, StatusCode::OK);
+    let replay: Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(replay["idempotency_replayed"], true);
+    assert_eq!(replay["allowed_bind_roots"], json!([bind_path]));
+}
+
+#[tokio::test]
+async fn settings_reject_bind_roots_overlapping_the_live_docker_data_root() {
+    let external = tempfile::tempdir().unwrap();
+    let docker_root = external.path().join("docker-data");
+    fs::create_dir(&docker_root).unwrap();
+    let harness = Harness::new_with_docker(Arc::new(SettingsDocker {
+        docker_root_directory: Some(docker_root.display().to_string()),
+    }))
+    .await;
+    let initial = solodock::settings::SettingsStore::new(harness.database.clone())
+        .load()
+        .await
+        .unwrap();
+    let rejected = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-docker-root-overlap"),
+            &json!({
+                "expected_revision": initial.revision,
+                "display_timezone": "UTC",
+                "allowed_bind_roots": [external.path()],
+            }),
+        )
+        .await;
+    let (status, rejected) = body(rejected).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        serde_json::from_str::<Value>(&rejected).unwrap()["code"],
+        "BIND_ROOT_INVALID"
+    );
+    assert!(
+        solodock::settings::SettingsStore::new(harness.database.clone())
+            .load()
+            .await
+            .unwrap()
+            .allowed_bind_roots
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn settings_fail_closed_when_docker_root_cannot_be_observed() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let harness =
+        Harness::new_with_docker(Arc::new(solodock::docker::models::UnavailableDocker)).await;
+    let initial = solodock::settings::SettingsStore::new(harness.database.clone())
+        .load()
+        .await
+        .unwrap();
+    let rejected = harness
+        .mutate(
+            "PUT",
+            "/api/v1/settings",
+            Some("settings-docker-unavailable"),
+            &json!({
+                "expected_revision": initial.revision,
+                "display_timezone": "UTC",
+                "allowed_bind_roots": [bind_root.path()],
+            }),
+        )
+        .await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        solodock::settings::SettingsStore::new(harness.database.clone())
+            .load()
+            .await
+            .unwrap()
+            .allowed_bind_roots
+            .is_empty()
+    );
 }

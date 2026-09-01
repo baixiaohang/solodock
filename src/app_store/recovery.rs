@@ -25,6 +25,7 @@ pub struct RecoveredApp {
     pub app_id: Uuid,
     pub slug: String,
     pub display_name: String,
+    pub resource_name_schema_version: u32,
     pub project_name: String,
     pub active_release_id: Option<Uuid>,
     pub active_image_ref: Option<String>,
@@ -505,7 +506,7 @@ fn scan_app(
         Ok(schema) => schema,
         Err(_) => return Ok(Err("APP_HEADER_INVALID")),
     };
-    if schema.schema_version != 2 {
+    if !matches!(schema.schema_version, 2 | 3) {
         return Ok(Err("APP_SCHEMA_UNSUPPORTED"));
     }
     let header: AppHeader = match toml::from_str(&contents) {
@@ -515,44 +516,72 @@ fn scan_app(
     if header.id != directory_id {
         return Ok(Err("APP_ID_MISMATCH"));
     }
-    if crate::domain::validate_slug(&header.slug).is_err()
+    if !super::valid_metadata_identity_versions(
+        schema.schema_version,
+        header.resource_name_schema_version,
+    ) || crate::domain::validate_slug_for_resource_schema(
+        &header.slug,
+        header.resource_name_schema_version,
+    )
+    .is_err()
         || header.display_name.trim().is_empty()
         || !(60..=86_400).contains(&header.poll_interval_seconds)
         || header.created_at > header.updated_at
     {
         return Ok(Err("APP_HEADER_INVALID"));
     }
-    let draft = match load_revision(path, header.draft_revision, integrity_key) {
-        Ok(loaded) if loaded.metadata.config_sha256 == header.draft_config_sha256 => {
-            if let Some(key) = integrity_key {
-                match loaded.normalize_verified(
-                    header.display_name.clone(),
-                    header.discovery_image_ref.clone(),
-                    header.credential_ref,
-                    header.auto_deploy_enabled,
-                    header.poll_interval_seconds,
-                    key,
-                    allowed_bind_roots,
-                ) {
-                    Ok(_) => {}
-                    _ => return Ok(Err("CONFIG_REVISION_INVALID")),
+    if header.draft_revision.is_none() != header.draft_config_sha256.is_none()
+        || (header.draft_revision.is_none()
+            && (header.discovery_image_ref.is_some()
+                || header.credential_ref.is_some()
+                || header.desired_state != DesiredState::Stopped
+                || header.auto_deploy_enabled
+                || active.is_some()
+                || pending.is_some()))
+    {
+        return Ok(Err("APP_HEADER_INVALID"));
+    }
+    let draft = match (
+        header.draft_revision,
+        header.draft_config_sha256.as_deref(),
+        header.discovery_image_ref.as_deref(),
+    ) {
+        (None, None, None) => None,
+        (Some(revision), Some(expected_hash), Some(image_ref)) => {
+            match load_revision(path, revision, integrity_key) {
+                Ok(loaded) if loaded.metadata.config_sha256 == expected_hash => {
+                    if let Some(key) = integrity_key {
+                        match loaded.normalize_verified(
+                            header.display_name.clone(),
+                            image_ref.to_owned(),
+                            header.credential_ref,
+                            header.auto_deploy_enabled,
+                            header.poll_interval_seconds,
+                            key,
+                            allowed_bind_roots,
+                        ) {
+                            Ok(_) => {}
+                            _ => return Ok(Err("CONFIG_REVISION_INVALID")),
+                        }
+                    }
+                    Some(loaded.response(
+                        image_ref.to_owned(),
+                        header.credential_ref,
+                        header.auto_deploy_enabled,
+                        header.poll_interval_seconds,
+                    ))
                 }
+                Ok(_) | Err(StoreError::ContentInvalid) => {
+                    return Ok(Err("CONFIG_REVISION_INVALID"));
+                }
+                Err(StoreError::Permission(error)) => return Err(StoreError::Permission(error)),
+                Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Err("CONFIG_REVISION_MISSING"));
+                }
+                Err(error) => return Err(error),
             }
-            Some(loaded.response(
-                header.discovery_image_ref.clone(),
-                header.credential_ref,
-                header.auto_deploy_enabled,
-                header.poll_interval_seconds,
-            ))
         }
-        Ok(_) | Err(StoreError::ContentInvalid) => {
-            return Ok(Err("CONFIG_REVISION_INVALID"));
-        }
-        Err(StoreError::Permission(error)) => return Err(StoreError::Permission(error)),
-        Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Err("CONFIG_REVISION_MISSING"));
-        }
-        Err(error) => return Err(error),
+        _ => return Ok(Err("APP_HEADER_INVALID")),
     };
     let releases = path.join("releases");
     match fs::symlink_metadata(&releases) {
@@ -647,6 +676,7 @@ fn scan_app(
         let loaded = load_revision(path, revision, integrity_key)?;
         network_plan(
             loaded.metadata.owned_default_network,
+            loaded.metadata.service_discovery_enabled,
             &loaded.metadata.networks,
         )
         .map(Some)
@@ -677,15 +707,18 @@ fn scan_app(
         }
     }
     let mut referenced: HashSet<Uuid> = release_revisions.keys().copied().collect();
-    referenced.insert(header.draft_revision);
+    if let Some(revision) = header.draft_revision {
+        referenced.insert(revision);
+    }
     if mode == ScanMode::StartupCleanup {
         cleanup_unreferenced_revisions(path, &referenced)?;
     }
     Ok(Ok(RecoveredApp {
         app_id: header.id,
-        project_name: crate::domain::app_resource_names(&header.slug).project_name,
+        project_name: header.resource_names().project_name,
         slug: header.slug,
         display_name: header.display_name,
+        resource_name_schema_version: header.resource_name_schema_version,
         active_release_id,
         active_image_ref,
         active_config_revision,
@@ -695,9 +728,9 @@ fn scan_app(
         pending_image_ref,
         pending_config_revision,
         pending_network_plan,
-        discovery_image_ref: Some(header.discovery_image_ref),
-        draft_revision: Some(header.draft_revision),
-        draft_config_sha256: Some(header.draft_config_sha256),
+        discovery_image_ref: header.discovery_image_ref,
+        draft_revision: header.draft_revision,
+        draft_config_sha256: header.draft_config_sha256,
         desired_state: header.desired_state,
         auto_deploy_enabled: header.auto_deploy_enabled,
         poll_interval_seconds: header.poll_interval_seconds,
@@ -738,7 +771,9 @@ fn validate_active_compose(
     };
     let draft = match loaded.normalize_verified(
         app.display_name.clone(),
-        app.discovery_image_ref.clone(),
+        app.discovery_image_ref
+            .clone()
+            .ok_or(StoreError::ContentInvalid)?,
         app.credential_ref,
         app.auto_deploy_enabled,
         app.poll_interval_seconds,
@@ -753,8 +788,7 @@ fn validate_active_compose(
         .join(revision_id.to_string());
     let (expected, _) = generate(
         ComposeInput {
-            app_id: app.id,
-            slug: &app.slug,
+            resource_identity: app.resource_identity(),
             release_id,
             image_ref,
             revision_directory: &revision_directory,
@@ -825,7 +859,7 @@ fn collect_release_revisions(
             Ok(release) => release,
             Err(code) => return Ok(Err(code)),
         };
-        if !matches!(release.schema_version, 3 | 4) {
+        if !matches!(release.schema_version, 3..=5) {
             return Ok(Err("RELEASE_SCHEMA_UNSUPPORTED"));
         }
         match validate_v2_release(
@@ -880,7 +914,7 @@ fn validate_v2_release(
     release.apply_schema_defaults();
     if !matches!(
         (release.schema_version, release.compose_schema_version),
-        (3, 2) | (4, 3)
+        (3, 2) | (4, 3) | (5, 4)
     ) || release.app_id != app_id
         || release.id != release_id
         || super::releases::sign(&release, key) != release.integrity_hmac
@@ -902,9 +936,9 @@ fn validate_v2_release(
         Ok(value) => value,
         Err(code) => return Ok(Err(code)),
     };
-    let slug = app.slug;
+    let identity = app.resource_identity();
     let draft = match loaded.normalize_verified(
-        app.display_name,
+        app.display_name.clone(),
         release.source_image_ref.clone(),
         release.credential_ref,
         app.auto_deploy_enabled,
@@ -920,8 +954,7 @@ fn validate_v2_release(
     }
     let (canonical, _) = generate(
         ComposeInput {
-            app_id,
-            slug: &slug,
+            resource_identity: identity,
             release_id,
             image_ref: &release.runnable_image_ref,
             revision_directory: &canonical_app_directory
@@ -1074,7 +1107,7 @@ fn read_release_header(
         return Ok(Err("RELEASE_HEADER_INVALID"));
     }
     match release.schema_version {
-        3 | 4 => {
+        3..=5 => {
             let Some(key) = integrity_key else {
                 return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
             };
@@ -1189,6 +1222,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -1218,9 +1252,8 @@ mod tests {
             .create_app(
                 app_id,
                 "managed",
-                first_revision,
                 Uuid::new_v4(),
-                &first,
+                Some((first_revision, &first)),
                 now,
             )
             .unwrap();
@@ -1256,7 +1289,7 @@ mod tests {
         store
             .update_draft(
                 app_id,
-                first_revision,
+                Some(first_revision),
                 second_revision,
                 Uuid::new_v4(),
                 &managed_file_draft(&key, "second"),
@@ -1289,14 +1322,15 @@ mod tests {
         );
 
         let report = store.scan().unwrap();
-        assert_eq!(report.valid_apps.len(), 1);
+        assert_eq!(report.valid_apps.len(), 1, "{:?}", report.issues);
         for path in [&first_public, &first_secret, &second_public] {
             assert_eq!(
                 fs::metadata(path).unwrap().permissions().mode() & 0o777,
                 MANAGED_FILE_MODE
             );
         }
-        assert_eq!(store.scan().unwrap().valid_apps.len(), 1);
+        let first_scan = store.scan().unwrap();
+        assert_eq!(first_scan.valid_apps.len(), 1, "{:?}", first_scan.issues);
 
         fs::set_permissions(&first_public, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
@@ -1335,6 +1369,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -1348,8 +1383,7 @@ mod tests {
                 app_id,
                 "canonical",
                 revision_id,
-                revision_id,
-                &draft,
+                Some((revision_id, &draft)),
                 OffsetDateTime::now_utc(),
             )
             .unwrap();
@@ -1450,6 +1484,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![crate::domain::NetworkInput::OwnedDefault],
                 health: Default::default(),
             },
@@ -1464,8 +1499,7 @@ mod tests {
                 app_id,
                 slug,
                 revision_id,
-                revision_id,
-                &draft,
+                Some((revision_id, &draft)),
                 OffsetDateTime::now_utc(),
             )
             .unwrap();
@@ -1497,6 +1531,46 @@ mod tests {
         assert_eq!(store.read_metadata(app_id).unwrap().slug, "example");
 
         let valid_header = fs::read_to_string(&app_path).unwrap();
+        let mut schema3_legacy_identity: toml::Value = toml::from_str(&valid_header).unwrap();
+        schema3_legacy_identity.as_table_mut().unwrap().insert(
+            "resource_name_schema_version".into(),
+            toml::Value::Integer(1),
+        );
+        fs::write(
+            &app_path,
+            toml::to_string(&schema3_legacy_identity).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(scan(root.path()).unwrap().valid_apps.len(), 1);
+        assert_eq!(
+            store
+                .read_metadata(app_id)
+                .unwrap()
+                .resource_names()
+                .bridge_name,
+            "sd-example"
+        );
+
+        let mut schema2_current_identity: toml::Value = toml::from_str(&valid_header).unwrap();
+        let table = schema2_current_identity.as_table_mut().unwrap();
+        table.insert("schema_version".into(), toml::Value::Integer(2));
+        table.insert(
+            "resource_name_schema_version".into(),
+            toml::Value::Integer(2),
+        );
+        fs::write(
+            &app_path,
+            toml::to_string(&schema2_current_identity).unwrap(),
+        )
+        .unwrap();
+        let report = scan(root.path()).unwrap();
+        assert!(report.valid_apps.is_empty());
+        assert_eq!(report.issues[0].code, "APP_HEADER_INVALID");
+        assert!(matches!(
+            store.read_metadata(app_id),
+            Err(crate::app_store::StoreError::ContentInvalid)
+        ));
+
         fs::write(
             &app_path,
             format!("{valid_header}\nfuture_field = 'rejected'\n"),
@@ -1618,6 +1692,7 @@ mod tests {
                 volumes: vec![],
                 binds: vec![],
                 owned_default_network: true,
+                service_discovery_enabled: true,
                 networks: vec![],
                 health: crate::domain::HealthPolicy::default(),
             },
@@ -1633,8 +1708,7 @@ mod tests {
                 app_id,
                 "read-only",
                 referenced,
-                referenced,
-                &draft,
+                Some((referenced, &draft)),
                 OffsetDateTime::now_utc(),
             )
             .unwrap();
