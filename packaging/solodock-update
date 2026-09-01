@@ -40,7 +40,9 @@ for command in gh sudo sha256sum mktemp curl systemctl readlink; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 gh auth status --hostname github.com >/dev/null 2>&1 || fail 'GitHub CLI is not authenticated'
-sudo -v
+if ! sudo -n true 2>/dev/null; then
+  sudo true
+fi
 sudo systemctl is-active --quiet solodock.service || fail 'solodock.service must be active before updating'
 
 run_data=$(gh run list \
