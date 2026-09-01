@@ -28,6 +28,8 @@ pub struct DraftInput {
     pub auto_deploy_acknowledged: bool,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u32,
+    #[serde(default = "default_stop_grace_period_seconds")]
+    pub stop_grace_period_seconds: u16,
     #[serde(default)]
     pub environment: EnvironmentInput,
     #[serde(default)]
@@ -53,6 +55,12 @@ pub const fn default_owned_default_network() -> bool {
 pub const fn default_poll_interval() -> u32 {
     300
 }
+
+pub const fn default_stop_grace_period_seconds() -> u16 {
+    10
+}
+
+pub const MAX_STOP_GRACE_PERIOD_SECONDS: u16 = 600;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

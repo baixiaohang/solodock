@@ -19,6 +19,7 @@ pub struct ComposeInput<'a> {
     pub image_ref: &'a str,
     pub revision_directory: &'a Path,
     pub draft: &'a NormalizedDraft,
+    pub include_stop_grace_period: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -26,6 +27,7 @@ pub struct ComposePlan {
     pub service: &'static str,
     pub image_ref: String,
     pub runnable: bool,
+    pub stop_grace_period_seconds: u16,
     pub ports: usize,
     pub mounts: usize,
     pub networks: usize,
@@ -220,6 +222,9 @@ pub fn generate(
         ports,
         networks: service_networks,
         restart,
+        stop_grace_period: input
+            .include_stop_grace_period
+            .then(|| format!("{}s", input.draft.stop_grace_period_seconds)),
         healthcheck,
     };
     let mount_count = service.volumes.len();
@@ -252,6 +257,7 @@ pub fn generate(
             service: "app",
             image_ref: input.image_ref.to_owned(),
             runnable,
+            stop_grace_period_seconds: input.draft.stop_grace_period_seconds,
             ports: port_count,
             mounts: mount_count,
             networks: network_count,
@@ -367,6 +373,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![],
                 ports: vec![],
@@ -393,6 +400,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 60,
                 environment: crate::domain::EnvironmentInput {
                     public: vec![],
                     secrets: vec![crate::domain::SecretEnvInput {
@@ -423,13 +431,17 @@ mod tests {
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
                 draft: &draft,
+                include_stop_grace_period: true,
             },
             false,
         )
         .unwrap();
         assert!(yaml.contains("app:"));
+        assert!(yaml.contains("stop_grace_period:"));
+        assert!(yaml.contains("60s"));
         assert!(!yaml.contains("canary-secret"));
         assert!(!plan.runnable);
+        assert_eq!(plan.stop_grace_period_seconds, 60);
     }
 
     #[test]
@@ -446,6 +458,7 @@ mod tests {
             auto_deploy_enabled: false,
             auto_deploy_acknowledged: false,
             poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
             environment: crate::domain::EnvironmentInput::default(),
             files: vec![],
             ports: vec![],
@@ -479,6 +492,7 @@ mod tests {
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
                 draft: &draft,
+                include_stop_grace_period: true,
             },
             false,
         )
@@ -507,6 +521,7 @@ mod tests {
             image_ref: &draft.discovery_image_ref,
             revision_directory: Path::new("/var/lib/solodock/apps/revision"),
             draft: &draft,
+            include_stop_grace_period: true,
         };
         let (first, plan) = generate(input, true).unwrap();
         let (second, _) = generate(
@@ -517,6 +532,7 @@ mod tests {
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
                 draft: &draft,
+                include_stop_grace_period: true,
             },
             true,
         )
@@ -548,6 +564,7 @@ mod tests {
                 image_ref: &draft.discovery_image_ref,
                 revision_directory: Path::new("/var/lib/solodock/apps/revision"),
                 draft: &draft,
+                include_stop_grace_period: true,
             },
             true,
         )

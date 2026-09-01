@@ -19,6 +19,8 @@ pub struct Service {
     pub networks: ServiceNetworks,
     pub restart: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_grace_period: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<Healthcheck>,
 }
 

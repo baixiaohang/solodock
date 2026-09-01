@@ -16,6 +16,8 @@ describe('new app resource preview', () => {
     const user = userEvent.setup()
     render(NewApp)
 
+    expect((screen.getByLabelText(/^停机宽限（秒）/) as HTMLInputElement).value).toBe('10')
+
     await user.type(screen.getByLabelText(/^Slug/), 'demo')
     expect(screen.getByText('solodock-demo-app-1')).toBeTruthy()
     expect(screen.getByText('solodock-demo-default')).toBeTruthy()

@@ -38,7 +38,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
 
-`POST /api/v1/apps` 的顶层 slug 是 1–12 字符的不可变创建身份；draft update/validate DTO 不含 slug，提交该未知字段会校验失败。Draft 输入包含默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`。Compose 预检除 network mode、attachment 与 warning 外，还返回 owned Docker network name 和 bridge name；external-only 时该 identity 为 `null`。
+`POST /api/v1/apps` 的顶层 slug 是 1–12 字符的不可变创建身份；draft update/validate DTO 不含 slug，提交该未知字段会校验失败。Draft 输入包含 `1..=600` 的 `stop_grace_period_seconds`（缺失默认 `10`）、默认启用的 `owned_default_network` 和结构化 external attachment `{kind,name,aliases}`。Compose 预检返回最终停机宽限、network mode、attachment、warning、owned Docker network name 和 bridge name；external-only 时该 identity 为 `null`。应用详情与 mutation 响应展示 draft 生效值，deployment detail 展示 candidate release 固定值。
 
 应用详情返回 slug 派生的 project/network/bridge 名称，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
 

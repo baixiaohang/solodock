@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen } from '@testing-library/svelte'
+import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import AppDetail from './AppDetail.svelte'
@@ -41,6 +42,7 @@ describe('app detail resource identity', () => {
         credential_ref: null,
         auto_deploy_enabled: false,
         poll_interval_seconds: 300,
+        stop_grace_period_seconds: 10,
         public_environment: [],
         secret_keys: [],
         files: [],
@@ -80,5 +82,8 @@ describe('app detail resource identity', () => {
     expect(await screen.findByText('solodock-demo-app-1')).toBeTruthy()
     expect(screen.queryByText('solodock-demo-default')).toBeNull()
     expect(screen.queryByText('sd-demo')).toBeNull()
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: '配置' }))
+    expect(await screen.findByText('10 秒')).toBeTruthy()
   })
 })

@@ -68,6 +68,7 @@ export interface ComposePlan {
   service: 'app'
   image_ref: string
   runnable: boolean
+  stop_grace_period_seconds: number
   ports: number
   mounts: number
   networks: number
@@ -114,6 +115,7 @@ export interface DraftInput {
   auto_deploy_enabled: boolean
   auto_deploy_acknowledged: boolean
   poll_interval_seconds: number
+  stop_grace_period_seconds: number
   environment: {
     public: Array<{ key: string; value: string }>
     secrets: Array<{ key: string } & SecretOperation>
@@ -189,6 +191,7 @@ export interface DraftResponse {
   credential_ref: string | null
   auto_deploy_enabled: boolean
   poll_interval_seconds: number
+  stop_grace_period_seconds: number
   public_environment: Array<{ key: string; value: string }>
   secret_keys: string[]
   files: Array<{ logical_name: string; target_path: string; sensitive: boolean; readonly: boolean; content?: string }>
@@ -235,7 +238,7 @@ export interface PollState {
 }
 
 export interface AppMutationResponse {
-  app: { id: string; slug: string; display_name: string; config_revision: string; deployment_status: string; warnings: string[] }
+  app: { id: string; slug: string; display_name: string; config_revision: string; stop_grace_period_seconds: number; deployment_status: string; warnings: string[] }
   idempotency_replayed: boolean
   projection_warning?: string
 }
@@ -295,6 +298,7 @@ export interface Deployment {
   transitions?: Array<{ seq: number; phase: string; result: string; code: string | null; created_at: string }>
   available_actions: Array<'rollback'>
   safe_release_id?: string | null
+  candidate_stop_grace_period_seconds?: number | null
   current_active_release_id?: string | null
   current_pending_release_id?: string | null
   current_actual_release_id?: string | null

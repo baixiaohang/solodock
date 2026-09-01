@@ -62,7 +62,7 @@ unset SOLODOCK_ADMIN_PASSWORD
 
 SQLite 保存管理员凭据、session、登录节流和真实审计历史；应用及 release 的权威事实保存在文件系统，`active` symlink 是 active release 的唯一事实源。只有 HTTP listen 前的启动恢复会清理 crash 遗留的临时目录和未引用 revision；运行期 catalog/reconciliation 扫描严格只读，不能与正在发布的 revision 竞争。SQLite 丢失后，启动扫描会重建应用查询索引，但不能恢复管理员、session 或审计历史，因此必须重新执行 bootstrap。损坏的 SQLite 不会被自动替换。
 
-SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，并通过唯一后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。管理员可显式确认开启有界 Registry 轮询自动部署；busy 不排队，坏 target 会被抑制。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
+SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，并通过唯一后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。每个应用可配置 `1–600` 秒的停机宽限，默认 `10` 秒；该值固定进 release，服务提前退出时部署立即继续。管理员可显式确认开启有界 Registry 轮询自动部署；busy 不排队，坏 target 会被抑制。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
 
 Registry credential 位于 `state/registry-credentials/<uuid>/`，metadata 与 immutable secret revision 分离；API 只返回 registry、username、revision 和时间，不回显 token。Docker pull 使用 `/run/solodock/docker-config/<deployment-id>/config.json` 的 operation-scoped 私有配置，并且命令参数只包含 digest-pinned image reference。启动会精确清理遗留 runtime credential 目录，并将 SQLite 中的 queued/running deployment 标记为 interrupted。
 

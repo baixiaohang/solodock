@@ -34,6 +34,7 @@
   let editName = $state('')
   let editImage = $state('')
   let editPoll = $state(300)
+  let editStopGrace = $state(10)
   let editAutoDeploy = $state(false)
   let editPublicEnv = $state('')
   let editSecretReplace = $state('')
@@ -151,6 +152,7 @@
     if (!app?.draft || !app.draft_revision) return
     editName = app.display_name; editImage = app.draft.discovery_image_ref
     editPoll = app.draft.poll_interval_seconds
+    editStopGrace = app.draft.stop_grace_period_seconds
     editAutoDeploy = app.draft.auto_deploy_enabled
     editPublicEnv = serializeDotenv(app.draft.public_environment)
     editSecretReplace = ''; editSecretDelete = ''
@@ -197,6 +199,7 @@
     return {
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
       auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !app.draft.auto_deploy_enabled, poll_interval_seconds: editPoll,
+      stop_grace_period_seconds: editStopGrace,
       environment: { public: parseLines(editPublicEnv), secrets: secretEnvironment },
       files: [...publicFiles, ...keptSecretFiles, ...secretFiles],
       ports: jsonArray(editPorts) as unknown as DraftInput['ports'],
@@ -259,7 +262,7 @@
       <section class="detail-grid">{#each deployments as deployment}<a class="panel" href={`#/deployments/${deployment.id}`}><h2>{deployment.status} · {deployment.phase}</h2><p><code>{deployment.source_image_ref ?? deployment.candidate_release_id ?? 'resolving'}</code></p><p class="muted">{deployment.created_at} · {deployment.error_code ?? '无错误'}</p></a>{:else}<article class="panel wide"><p class="muted">尚无部署历史。</p></article>{/each}</section>
     {:else if tab === 'configuration'}
       <section class="detail-grid">
-        <article class="panel wide"><h2>不可变 draft revision</h2><dl class="fact-list"><div><dt>Revision</dt><dd><code>{app.draft_revision ?? '—'}</code></dd></div><div><dt>配置摘要</dt><dd><code>{app.draft_config_sha256?.slice(0, 16) ?? '—'}…</code></dd></div><div><dt>发现镜像</dt><dd><code>{app.draft?.discovery_image_ref ?? '—'}</code></dd></div><div><dt>期望状态</dt><dd>{app.desired_state}</dd></div></dl></article>
+        <article class="panel wide"><h2>不可变 draft revision</h2><dl class="fact-list"><div><dt>Revision</dt><dd><code>{app.draft_revision ?? '—'}</code></dd></div><div><dt>配置摘要</dt><dd><code>{app.draft_config_sha256?.slice(0, 16) ?? '—'}…</code></dd></div><div><dt>发现镜像</dt><dd><code>{app.draft?.discovery_image_ref ?? '—'}</code></dd></div><div><dt>停机宽限</dt><dd>{app.draft?.stop_grace_period_seconds ?? '—'} 秒</dd></div><div><dt>期望状态</dt><dd>{app.desired_state}</dd></div></dl></article>
         <article class="panel"><h2>环境变量</h2>{#each app.draft?.public_environment ?? [] as entry}<p><code>{entry.key}</code> = {entry.value}</p>{/each}{#each app.draft?.secret_keys ?? [] as key}<p><code>{key}</code> · <span class="tag">write-only</span></p>{/each}</article>
         <article class="panel"><h2>资源</h2><p>{app.draft?.ports.length ?? 0} 个端口</p><p>{app.draft?.volumes.length ?? 0} 个 named volume</p><p>{app.draft?.binds.length ?? 0} 个受限 bind</p><p>{app.draft?.networks.length ?? 0} 个附加网络</p><p>{app.draft?.files.length ?? 0} 个托管文件</p></article>
         <article class="panel wide"><h2>编辑策略</h2><p class="muted">更新必须提交完整配置、携带当前 revision，并对每个既有 secret 显式选择 keep/replace/delete。Secret 内容永不回显。</p><button onclick={startEditing}>编辑完整配置…</button></article>
@@ -269,6 +272,7 @@
         <form class="panel form-grid" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
           <label>Slug（不可修改）<input value={app.slug} readonly /></label><label>显示名称<input bind:value={editName} required /></label>
           <label class="wide">发现镜像 tag<input bind:value={editImage} required /></label><label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={editPoll} /></label>
+          <label>停机宽限（秒）<input type="number" min="1" max="600" bind:value={editStopGrace} /><span class="muted">最大等待时间，服务提前退出时不会空等。</span></label>
           <label class="wide checkbox"><input type="checkbox" bind:checked={editAutoDeploy} /> 自动部署 tag 的新 digest</label>
           {#if editAutoDeploy}<p class="wide notice warning">启用后，新 digest 会自动替换容器并在健康失败时恢复旧 release；volume/bind 数据不会回滚。禁用不会取消已经 durable claim 的部署。</p>{/if}
           <label class="wide">Registry credential<select bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
@@ -283,7 +287,7 @@
           <label class="wide">健康策略 JSON<textarea rows="5" bind:value={editHealth}></textarea></label>
           <p class="wide notice warning">读写 bind 必须显式设置 acknowledge_non_rollbackable；SoloDock 永不修改或删除其源目录。敏感输入只保留在当前表单内，成功后立即清空。</p>
           <div class="wide actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError}>发布新 draft revision</button><button type="button" class="ghost" onclick={() => { editSecretReplace = ''; editSecretFiles = '[]'; editing = false }}>取消</button></div>
-          {#if validation}<article class="wide notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络 · {validation.plan.network_mode}</p>{#if validation.plan.owned_default_network}<p>Owned network：<code>{validation.plan.owned_default_network.docker_name}</code> · bridge：<code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{#if validation.plan.external_networks.length}<p>External network 不由 SoloDock 创建、修改或删除。</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
+          {#if validation}<article class="wide notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · 停机宽限 {validation.plan.stop_grace_period_seconds} 秒 · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络 · {validation.plan.network_mode}</p>{#if validation.plan.owned_default_network}<p>Owned network：<code>{validation.plan.owned_default_network.docker_name}</code> · bridge：<code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{#if validation.plan.external_networks.length}<p>External network 不由 SoloDock 创建、修改或删除。</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
         </form>
       {/if}
     {:else}

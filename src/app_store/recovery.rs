@@ -68,6 +68,8 @@ struct AppSchemaHeader {
 #[derive(Debug, Deserialize)]
 struct ReleaseHeader {
     schema_version: u32,
+    #[serde(default)]
+    compose_schema_version: u32,
     id: Uuid,
     app_id: Uuid,
     runnable_image_ref: String,
@@ -523,20 +525,16 @@ fn scan_app(
     let draft = match load_revision(path, header.draft_revision, integrity_key) {
         Ok(loaded) if loaded.metadata.config_sha256 == header.draft_config_sha256 => {
             if let Some(key) = integrity_key {
-                let input = loaded.input(
+                match loaded.normalize_verified(
                     header.display_name.clone(),
                     header.discovery_image_ref.clone(),
                     header.credential_ref,
                     header.auto_deploy_enabled,
                     header.poll_interval_seconds,
-                );
-                match crate::domain::normalize_draft(
-                    input,
-                    &loaded.secrets,
                     key,
                     allowed_bind_roots,
                 ) {
-                    Ok(normalized) if normalized.metadata == loaded.metadata => {}
+                    Ok(_) => {}
                     _ => return Ok(Err("CONFIG_REVISION_INVALID")),
                 }
             }
@@ -603,16 +601,22 @@ fn scan_app(
         },
         None => None,
     };
-    let (active_release_id, active_image_ref, active_config_revision, active_config_sha256) =
-        match active {
-            Some(release) => (
-                Some(release.id),
-                Some(release.runnable_image_ref),
-                release.config_revision,
-                release.config_sha256,
-            ),
-            None => (None, None, None, None),
-        };
+    let (
+        active_release_id,
+        active_image_ref,
+        active_config_revision,
+        active_config_sha256,
+        active_compose_schema_version,
+    ) = match active {
+        Some(release) => (
+            Some(release.id),
+            Some(release.runnable_image_ref),
+            release.config_revision,
+            release.config_sha256,
+            Some(release.compose_schema_version),
+        ),
+        None => (None, None, None, None, None),
+    };
     let (pending_release_id, pending_image_ref, pending_config_revision) = match pending {
         Some(release) => (
             Some(release.id),
@@ -664,6 +668,7 @@ fn scan_app(
             image,
             revision,
             expected_hash,
+            active_compose_schema_version.is_some_and(|version| version >= 3),
             integrity_key,
             allowed_bind_roots,
         )? {
@@ -711,6 +716,7 @@ fn validate_active_compose(
     image_ref: &str,
     revision_id: Uuid,
     expected_hash: &str,
+    include_stop_grace_period: bool,
     integrity_key: Option<&[u8]>,
     allowed_bind_roots: &[PathBuf],
 ) -> Result<Result<(), &'static str>, StoreError> {
@@ -730,18 +736,18 @@ fn validate_active_compose(
         }
         Err(error) => return Err(error),
     };
-    let input = loaded.input(
+    let draft = match loaded.normalize_verified(
         app.display_name.clone(),
         app.discovery_image_ref.clone(),
         app.credential_ref,
         app.auto_deploy_enabled,
         app.poll_interval_seconds,
-    );
-    let draft =
-        match crate::domain::normalize_draft(input, &loaded.secrets, key, allowed_bind_roots) {
-            Ok(draft) if draft.metadata == loaded.metadata => draft,
-            _ => return Ok(Err("ACTIVE_CONFIG_REVISION_INVALID")),
-        };
+        key,
+        allowed_bind_roots,
+    ) {
+        Ok(draft) => draft,
+        _ => return Ok(Err("ACTIVE_CONFIG_REVISION_INVALID")),
+    };
     let revision_directory = canonical_app_directory
         .join("config-revisions")
         .join(revision_id.to_string());
@@ -753,6 +759,7 @@ fn validate_active_compose(
             image_ref,
             revision_directory: &revision_directory,
             draft: &draft,
+            include_stop_grace_period,
         },
         true,
     )
@@ -818,7 +825,7 @@ fn collect_release_revisions(
             Ok(release) => release,
             Err(code) => return Ok(Err(code)),
         };
-        if release.schema_version != 3 {
+        if !matches!(release.schema_version, 3 | 4) {
             return Ok(Err("RELEASE_SCHEMA_UNSUPPORTED"));
         }
         match validate_v2_release(
@@ -862,7 +869,7 @@ fn validate_v2_release(
         return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
     };
     let directory = app_directory.join("releases").join(release_id.to_string());
-    let release: super::releases::ReleaseV2 = match read_toml(
+    let mut release: super::releases::ReleaseV2 = match read_toml(
         &directory.join("release.toml"),
         "RELEASE_HEADER_MISSING",
         "RELEASE_HEADER_INVALID",
@@ -870,9 +877,11 @@ fn validate_v2_release(
         Ok(value) => value,
         Err(code) => return Ok(Err(code)),
     };
-    if release.schema_version != 3
-        || release.compose_schema_version != 2
-        || release.app_id != app_id
+    release.apply_schema_defaults();
+    if !matches!(
+        (release.schema_version, release.compose_schema_version),
+        (3, 2) | (4, 3)
+    ) || release.app_id != app_id
         || release.id != release_id
         || super::releases::sign(&release, key) != release.integrity_hmac
     {
@@ -894,18 +903,21 @@ fn validate_v2_release(
         Err(code) => return Ok(Err(code)),
     };
     let slug = app.slug;
-    let input = loaded.input(
+    let draft = match loaded.normalize_verified(
         app.display_name,
         release.source_image_ref.clone(),
         release.credential_ref,
         app.auto_deploy_enabled,
         app.poll_interval_seconds,
-    );
-    let draft =
-        match crate::domain::normalize_draft(input, &loaded.secrets, key, allowed_bind_roots) {
-            Ok(value) if value.metadata == loaded.metadata => value,
-            _ => return Ok(Err("RELEASE_CONFIG_REVISION_INVALID")),
-        };
+        key,
+        allowed_bind_roots,
+    ) {
+        Ok(value) => value,
+        _ => return Ok(Err("RELEASE_CONFIG_REVISION_INVALID")),
+    };
+    if release.stop_grace_period_seconds != loaded.metadata.stop_grace_period_seconds {
+        return Ok(Err("RELEASE_CONFIG_REVISION_INVALID"));
+    }
     let (canonical, _) = generate(
         ComposeInput {
             app_id,
@@ -916,6 +928,7 @@ fn validate_v2_release(
                 .join("config-revisions")
                 .join(release.config_revision.to_string()),
             draft: &draft,
+            include_stop_grace_period: release.compose_schema_version >= 3,
         },
         true,
     )
@@ -1061,11 +1074,11 @@ fn read_release_header(
         return Ok(Err("RELEASE_HEADER_INVALID"));
     }
     match release.schema_version {
-        3 => {
+        3 | 4 => {
             let Some(key) = integrity_key else {
                 return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
             };
-            let value: super::releases::ReleaseV2 = match read_toml(
+            let mut value: super::releases::ReleaseV2 = match read_toml(
                 &release_path,
                 "RELEASE_HEADER_MISSING",
                 "RELEASE_HEADER_INVALID",
@@ -1073,6 +1086,7 @@ fn read_release_header(
                 Ok(value) => value,
                 Err(code) => return Ok(Err(code)),
             };
+            value.apply_schema_defaults();
             if super::releases::sign(&value, key) != value.integrity_hmac {
                 return Ok(Err("RELEASE_INTEGRITY_INVALID"));
             }
@@ -1145,6 +1159,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![
                     crate::domain::ManagedFileInput {
@@ -1313,6 +1328,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![],
                 ports: vec![],
@@ -1427,6 +1443,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: Default::default(),
                 files: vec![],
                 ports: vec![],
@@ -1594,6 +1611,7 @@ mod tests {
                 auto_deploy_enabled: false,
                 auto_deploy_acknowledged: false,
                 poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
                 environment: crate::domain::EnvironmentInput::default(),
                 files: vec![],
                 ports: vec![],

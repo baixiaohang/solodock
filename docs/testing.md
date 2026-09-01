@@ -74,6 +74,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - classic image store 的 config ID 与 descriptor-absent 兼容路径；Docker 29.7.2 containerd image store 必须硬断言原始 `ImageInspect.Descriptor` digest 存在、platform 缺失且顶层 OS/architecture 完整，adapter 形成 effective observation 后首次部署和同 release no-op 均成功；descriptor 错误、冲突或补全后仍不完整继续 fail closed；
 - resolve→pull之间tag移动仍运行已解析digest；
 - candidate durable-before-effect；首次 post-effect observation 用唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim，并写入 exact `post_container_id`；
+- 停机宽限默认值、`1..=600` 边界、Compose `stop_grace_period`、stop/restart argv、stop-before-remove、predecessor/candidate 各自 release 值，以及缺字段旧 config/release 的 canonical hash/HMAC 兼容；
 - pre-marker canonical candidate claim 后的 semantic mismatch 进入确定性补偿；post-marker 不同 full ID 才是 replacement，必须保留 pending/替代容器且不能伪造 `failed`/`rolled_back`；
 - 首次部署的 remove 失败、remove 后 observation 失败或仍有 container 必须保留 pending 和原始 `candidate_failed` history，只能记录 `CANDIDATE_CLEANUP_FAILED`，不能写 `failed`；
 - health failure自动恢复、manual rollback和rollback failure；

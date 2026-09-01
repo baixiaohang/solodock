@@ -585,6 +585,7 @@ pub struct DeploymentDetail {
     transitions: Vec<DeploymentTransition>,
     available_actions: Vec<&'static str>,
     safe_release_id: Option<Uuid>,
+    candidate_stop_grace_period_seconds: Option<u16>,
     current_active_release_id: Option<Uuid>,
     current_pending_release_id: Option<Uuid>,
     current_actual_release_id: Option<Uuid>,
@@ -632,13 +633,13 @@ pub async fn detail(
         .into_iter()
         .next()
         .is_some_and(|value| !value.status.is_terminal());
-    let safe_release_id = deployment.candidate_release_id.filter(|release_id| {
-        state.m3.as_ref().is_some_and(|m3| {
-            m3.store
-                .load_v2_release(deployment.app_id, *release_id)
-                .is_ok()
-        })
+    let safe_release = deployment.candidate_release_id.and_then(|release_id| {
+        state
+            .m3
+            .as_ref()
+            .and_then(|m3| m3.store.load_v2_release(deployment.app_id, release_id).ok())
     });
+    let safe_release_id = safe_release.as_ref().map(|release| release.id);
     let rollback_available = deployment.status.is_terminal()
         && !nonterminal
         && pending.is_none()
@@ -667,6 +668,8 @@ pub async fn detail(
             Vec::new()
         },
         safe_release_id,
+        candidate_stop_grace_period_seconds: safe_release
+            .map(|release| release.stop_grace_period_seconds),
         current_active_release_id: active,
         current_pending_release_id: pending,
         current_actual_release_id: actual.map(|value| value.0),
