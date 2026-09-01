@@ -14,6 +14,20 @@ sudo ./packaging/install.sh --version 0.1.0 --binary target/release/solodock
 
 installer 使用 versioned directory 和原子 symlink，默认不启动服务、不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`。完成配置和离线备份后，才显式运行 `systemctl enable --now solodock.service`；也可在首次安装使用 `--enable-now`。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
 
+### 从 GitHub 构建一键升级
+
+installer 同时安装 `/usr/local/bin/solodock-update`。私有仓库需要先由日常管理员账号完成一次 GitHub CLI 登录，令牌只需读取仓库与 Actions artifact；不要把 token 写入脚本、配置或命令行：
+
+```bash
+gh auth login --hostname github.com
+sudo -v
+solodock-update
+```
+
+updater 只选择目标分支最新一次成功的 `push` CI，下载 `solodock-embedded-package` 并校验包内 `SHA256SUMS`。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
+
+这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数。
+
 ## 安全前置条件
 
 服务只监听 loopback，`public_origin` 必须是 HTTPS。Cloudflare Tunnel/WAF、访问白名单和 TLS 是外部前置条件，不由 SoloDock 配置。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。

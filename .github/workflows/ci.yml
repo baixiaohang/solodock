@@ -100,7 +100,7 @@ jobs:
         if: env.RUN_QUALITY_CHECKS == 'true'
       - run: cargo build --release --locked --features embed-ui
       - run: chmod +x scripts/smoke-embedded-http.sh && scripts/smoke-embedded-http.sh target/release/solodock
-      - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/smoke-test.sh && packaging/smoke-test.sh
+      - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update packaging/smoke-test.sh && packaging/smoke-test.sh
       - run: chmod +x packaging/verify-unit.sh && packaging/verify-unit.sh
       - name: Measure control-plane resource baseline
         run: |
@@ -110,7 +110,7 @@ jobs:
         run: |
           package="$RUNNER_TEMP/solodock-package"
           install -d "$package/docs"
-          install -m 0755 target/release/solodock packaging/install.sh packaging/solodock-backup packaging/solodock-restore "$package/"
+          install -m 0755 target/release/solodock packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update "$package/"
           install -m 0644 packaging/systemd/solodock.service packaging/solodock.toml.example README.md "$package/"
           install -m 0644 docs/architecture.md docs/operations.md docs/recovery.md docs/threat-model.md docs/resource-budget.md "$package/docs/"
           cp "$RUNNER_TEMP/resource-report.json" "$package/resource-report.json"

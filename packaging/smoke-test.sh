@@ -6,6 +6,7 @@ fake="$fixture/solodock"
 printf '#!/bin/sh\nexit 0\n' >"$fake"
 chmod 0755 "$fake"
 ./packaging/install.sh --version 0.1.0-test --binary "$fake" --destdir "$fixture/root" >/dev/null
+[[ $(readlink "$fixture/root/usr/local/bin/solodock-update") == /usr/local/lib/solodock/0.1.0-test/solodock-update ]]
 printf '# retained\n' >>"$fixture/root/etc/solodock/config.toml"
 ./packaging/install.sh --version 0.1.1-test --binary "$fake" --destdir "$fixture/root" >/dev/null
 grep -q retained "$fixture/root/etc/solodock/config.toml"
@@ -22,11 +23,20 @@ package="$fixture/package"
 mkdir -- "$package"
 install -m 0755 "$fake" "$package/solodock"
 install -m 0755 packaging/install.sh "$package/install.sh"
+install -m 0755 packaging/solodock-update "$package/solodock-update"
 install -m 0644 packaging/systemd/solodock.service "$package/solodock.service"
 install -m 0644 packaging/solodock.toml.example "$package/solodock.toml.example"
 (cd "$fixture" && "$package/install.sh" --version 0.1.3-test --destdir "$fixture/package-root" >/dev/null)
 [[ -x $fixture/package-root/usr/local/lib/solodock/0.1.3-test/solodock ]]
 [[ $(readlink "$fixture/package-root/usr/local/bin/solodock") == /usr/local/lib/solodock/0.1.3-test/solodock ]]
+[[ $(readlink "$fixture/package-root/usr/local/bin/solodock-update") == /usr/local/lib/solodock/0.1.3-test/solodock-update ]]
+
+./packaging/solodock-update --help >/dev/null
+if ./packaging/solodock-update --health-url 'http://0.0.0.0:8080/healthz' >"$fixture/update.stdout" 2>"$fixture/update.stderr"; then
+  printf '%s\n' 'updater accepted a non-loopback health URL' >&2
+  exit 1
+fi
+[[ ! -s $fixture/update.stdout ]]
 mkdir -m 0700 -p "$fixture/root/var/lib/solodock/apps"
 mkdir -m 0700 -p "$fixture/root/var/lib/solodock/secrets"
 head -c 32 /dev/zero >"$fixture/root/var/lib/solodock/secrets/idempotency.key"

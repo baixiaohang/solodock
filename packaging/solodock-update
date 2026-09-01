@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+usage() {
+  printf '%s\n' \
+    'usage: solodock-update [--repo OWNER/REPO] [--branch BRANCH] [--workflow WORKFLOW]' \
+    '                       [--backup-dir PATH] [--health-url URL]'
+}
+
+fail() {
+  printf '%s\n' "$1" >&2
+  exit 1
+}
+
+repo='baixiaohang/solodock'
+branch='main'
+workflow='CI'
+backup_dir='/var/backups/solodock'
+health_url='http://127.0.0.1:8080/healthz'
+while (($#)); do
+  case "$1" in
+    --repo) repo=${2-}; shift 2 ;;
+    --branch) branch=${2-}; shift 2 ;;
+    --workflow) workflow=${2-}; shift 2 ;;
+    --backup-dir) backup_dir=${2-}; shift 2 ;;
+    --health-url) health_url=${2-}; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+[[ $repo =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || fail 'invalid GitHub repository'
+[[ -n $branch && $branch != -* && $branch != *$'\r'* && $branch != *$'\n'* ]] || fail 'invalid GitHub branch'
+[[ -n $workflow && $workflow != -* && $workflow != *$'\r'* && $workflow != *$'\n'* ]] || fail 'invalid GitHub workflow'
+[[ $backup_dir = /* && $backup_dir != / && $backup_dir != *$'\r'* && $backup_dir != *$'\n'* ]] || fail 'invalid backup directory'
+[[ $health_url =~ ^http://127\.0\.0\.1:[0-9]{1,5}/healthz$ ]] || fail 'health URL must be an explicit loopback HTTP /healthz URL'
+((EUID != 0)) || fail 'run solodock-update as an administrator account, not root'
+
+for command in gh sudo sha256sum mktemp curl systemctl readlink; do
+  command -v "$command" >/dev/null || fail "required command is missing: $command"
+done
+gh auth status --hostname github.com >/dev/null 2>&1 || fail 'GitHub CLI is not authenticated'
+sudo -v
+sudo systemctl is-active --quiet solodock.service || fail 'solodock.service must be active before updating'
+
+run_data=$(gh run list \
+  --repo "$repo" \
+  --branch "$branch" \
+  --workflow "$workflow" \
+  --event push \
+  --status success \
+  --limit 1 \
+  --json databaseId,headSha,headBranch,conclusion \
+  --jq '.[0] | [.databaseId, .headSha, .headBranch, .conclusion] | @tsv')
+IFS=$'\t' read -r run_id head_sha head_branch conclusion <<<"$run_data"
+[[ $run_id =~ ^[0-9]+$ && $head_sha =~ ^[0-9a-f]{40}$ ]] || fail 'latest successful CI run is missing or invalid'
+[[ $head_branch == "$branch" && $conclusion == success ]] || fail 'latest CI run does not match the requested branch'
+
+update_dir=$(mktemp -d /tmp/solodock-update.XXXXXX)
+chmod 0700 "$update_dir"
+cleanup() {
+  rm -rf -- "$update_dir"
+}
+trap cleanup EXIT
+
+gh run download "$run_id" \
+  --repo "$repo" \
+  --name solodock-embedded-package \
+  --dir "$update_dir"
+package="$update_dir/solodock-package"
+for file in SHA256SUMS solodock install.sh solodock-backup solodock-update solodock.service solodock.toml.example; do
+  [[ -f $package/$file && ! -L $package/$file ]] || fail "artifact is missing a safe $file"
+done
+(cd "$package" && sha256sum -c SHA256SUMS)
+
+[[ -L /usr/local/bin/solodock ]] || fail 'installed SoloDock binary target is not a managed symlink'
+old_link=$(readlink -- /usr/local/bin/solodock)
+[[ $old_link == /usr/local/lib/solodock/*/solodock ]] || fail 'installed SoloDock binary target is outside the managed version directory'
+new_digest=$(sha256sum "$package/solodock" | awk '{print $1}')
+current_digest=$(sudo sha256sum /usr/local/bin/solodock | awk '{print $1}')
+if [[ $new_digest == "$current_digest" ]]; then
+  curl --fail --silent "$health_url" >/dev/null || fail 'installed SoloDock matches the latest build but is unhealthy'
+  printf 'SoloDock is already current at %s (%s).\n' "${head_sha:0:12}" "$run_id"
+  exit 0
+fi
+
+version="main-${head_sha:0:12}"
+sudo install -d -m 0700 -- "$backup_dir"
+backup="$backup_dir/solodock-before-$version-$(date -u +%Y%m%dT%H%M%SZ).tar"
+service_stopped=0
+new_invocation=0
+on_error() {
+  status=$?
+  trap - ERR
+  if ((service_stopped)); then
+    if ((!new_invocation)); then
+      current_link=$(readlink -- /usr/local/bin/solodock 2>/dev/null || true)
+      if [[ $current_link != "$old_link" ]]; then
+        rollback_link="/usr/local/bin/.solodock-rollback-$$"
+        sudo ln -s -- "$old_link" "$rollback_link"
+        sudo mv -Tf -- "$rollback_link" /usr/local/bin/solodock
+        sudo systemctl daemon-reload
+      fi
+      sudo systemctl start solodock.service || true
+    else
+      printf '%s\n' 'new binary was invoked; automatic binary rollback is disabled because migrations are forward-only' >&2
+    fi
+  fi
+  exit "$status"
+}
+trap on_error ERR
+
+sudo systemctl stop solodock.service
+service_stopped=1
+sudo bash "$package/solodock-backup" --output "$backup"
+backup_name=$(basename -- "$backup")
+sudo bash -c 'cd "$1" && sha256sum -c "$2"' _ "$backup_dir" "$backup_name.sha256"
+sudo bash "$package/install.sh" --version "$version" --binary "$package/solodock"
+new_invocation=1
+sudo systemctl start solodock.service
+service_stopped=0
+
+healthy=0
+for _ in $(seq 1 30); do
+  if curl --fail --silent "$health_url" >/dev/null; then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+[[ $healthy == 1 ]] || fail 'updated SoloDock did not pass its health check; automatic binary rollback is disabled because migrations are forward-only'
+favicon_url=${health_url%/healthz}/favicon.svg
+favicon_type=$(curl --fail --silent --output /dev/null --write-out '%{content_type}' "$favicon_url")
+[[ $favicon_type == image/svg+xml ]] || fail 'updated SoloDock did not serve favicon.svg correctly; automatic binary rollback is disabled because migrations are forward-only'
+sudo systemctl is-active --quiet solodock.service
+trap - ERR
+
+printf 'SoloDock updated to %s from CI run %s.\n' "$version" "$run_id"
+printf 'Offline backup: %s\n' "$backup"
