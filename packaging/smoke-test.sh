@@ -37,6 +37,37 @@ if ./packaging/solodock-update --health-url 'http://0.0.0.0:8080/healthz' >"$fix
   exit 1
 fi
 [[ ! -s $fixture/update.stdout ]]
+
+update_package="$fixture/update-package"
+fake_bin="$fixture/fake-bin"
+mkdir -p "$update_package" "$fake_bin"
+for file in solodock install.sh solodock-backup solodock-update; do
+  install -m 0755 "$fake" "$update_package/$file"
+done
+install -m 0644 packaging/systemd/solodock.service "$update_package/solodock.service"
+install -m 0644 packaging/solodock.toml.example "$update_package/solodock.toml.example"
+printf '%040d\n' 1 >"$update_package/SOURCE_SHA"
+(cd "$update_package" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum >SHA256SUMS)
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ $1 == auth && $2 == status ]]; then exit 0; fi' \
+  "if [[ \$1 == run && \$2 == list ]]; then printf '%s\\t%s\\t%s\\t%s\\n' 123 $(printf '%040d' 0) main success; exit 0; fi" \
+  'if [[ $1 == run && $2 == download ]]; then' \
+  '  while (($#)); do if [[ $1 == --dir ]]; then destination=$2; break; fi; shift; done' \
+  '  mkdir -p "$destination/solodock-package"' \
+  '  cp -a "$SOLODOCK_SMOKE_PACKAGE/." "$destination/solodock-package/"' \
+  '  exit 0' \
+  'fi' \
+  'exit 1' >"$fake_bin/gh"
+printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_bin/sudo"
+chmod 0755 "$fake_bin/gh" "$fake_bin/sudo"
+if PATH="$fake_bin:$PATH" SOLODOCK_SMOKE_PACKAGE="$update_package" ./packaging/solodock-update >"$fixture/source-sha.stdout" 2>"$fixture/source-sha.stderr"; then
+  printf '%s\n' 'updater accepted an artifact from a different source commit' >&2
+  exit 1
+fi
+grep -qx 'artifact source SHA does not match its workflow run' "$fixture/source-sha.stderr"
+
 mkdir -m 0700 -p "$fixture/root/var/lib/solodock/apps"
 mkdir -m 0700 -p "$fixture/root/var/lib/solodock/secrets"
 head -c 32 /dev/zero >"$fixture/root/var/lib/solodock/secrets/idempotency.key"

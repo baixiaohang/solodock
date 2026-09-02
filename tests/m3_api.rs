@@ -908,7 +908,7 @@ async fn interrupted_create_reconciles_the_filesystem_commit_without_a_second_ap
 #[tokio::test]
 async fn unconfigured_app_first_revision_is_nullable_and_docker_actions_fail_closed() {
     let harness = Harness::new().await;
-    let request = json!({"slug":"insight-agent"});
+    let request = json!({"slug":"example-app"});
     let (status, created) = body(
         harness
             .mutate(
