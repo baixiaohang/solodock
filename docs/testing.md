@@ -15,7 +15,7 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 非认证 integration/API 与 Docker E2E fixture 直接写入格式有效、期限受控的测试管理员与 session，不重复执行生产参数 Argon2。认证 API 仍完整覆盖 bootstrap、密码 hash/verify、login、cookie、CSRF、logout、revoke 和 audit；AuthService 的生产参数 bootstrap/login 单元路径也保留。测试 session helper 不进入 production binary，且保留 bootstrap/login 两条 fixture audit，使业务用例的审计计数语义不变。
 
-普通 PR 先运行前后端静态检查、非 Docker Rust tests、release/package smoke；只有 Docker、Compose、deployment、Registry、受管存储或相关 workflow 路径变化时才继续运行 DinD。Docker job 依赖普通 checks 成功，避免已失败提交继续消耗 DinD runner。PR 上 classic suite 使用 1 秒 SSE hold 验证连接与 permit 释放；相关 PR 的 Docker 29 job 继续运行 descriptor deployment/no-op 与两个 compensation 场景。完整资源窗口由每周一及手动触发的 `Extended CI` 运行，后者也周期性复验三个 `containerd_` 场景。
+普通 PR 由 `classify` 区分纯文档变更与代码变更。代码变更会并行运行 Web 检查、Rust lint、Rust tests、release/package smoke 和安全策略检查；只有明确的文档、Web 或 CI 安全工具路径可以跳过 DinD，未识别的非文档路径默认运行 Docker E2E。`ci-gate` 按分类结果逐项核对所有分支，只接受预期的成功或安全跳过，并拒绝意外 skip、失败或取消的 run；`main` push 始终运行完整检查。安全策略检查会结构化解析 workflow，验证 action 固定版本、危险触发器与权限、依赖差异，以及 Rust advisory、license 和来源策略；CodeQL 在独立 workflow 中分析 Rust 与 JavaScript/TypeScript。PR 上 classic suite 使用 1 秒 SSE hold 验证连接与 permit 释放；相关 PR 的 Docker 29 job 继续运行 descriptor deployment/no-op 与两个 compensation 场景。完整资源窗口由每周一及手动触发的 `Extended CI` 运行，后者也周期性复验三个 `containerd_` 场景。
 
 ## Docker 隔离
 
