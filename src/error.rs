@@ -22,6 +22,7 @@ pub struct ApiError {
     message: &'static str,
     request_id: Uuid,
     retry_after: Option<i64>,
+    issues: Vec<crate::domain::ValidationIssue>,
 }
 
 #[derive(Serialize)]
@@ -29,6 +30,8 @@ struct ErrorEnvelope {
     code: &'static str,
     message: &'static str,
     request_id: Uuid,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    issues: Vec<crate::domain::ValidationIssue>,
 }
 
 impl ApiError {
@@ -47,6 +50,7 @@ impl ApiError {
             message,
             request_id: request_id.0,
             retry_after: None,
+            issues: Vec::new(),
         }
     }
 
@@ -165,6 +169,15 @@ impl ApiError {
             "The application configuration is invalid",
             request_id,
         )
+    }
+
+    pub fn draft_validation(
+        error: crate::domain::DraftValidationError,
+        request_id: RequestId,
+    ) -> Self {
+        let mut response = Self::domain(error.error, request_id);
+        response.issues = error.issues;
+        response
     }
 
     pub fn idempotency(error: IdempotencyError, request_id: RequestId) -> Self {
@@ -329,6 +342,7 @@ impl IntoResponse for ApiError {
                 code: self.code,
                 message: self.message,
                 request_id: self.request_id,
+                issues: self.issues,
             }),
         )
             .into_response();
@@ -338,5 +352,34 @@ impl IntoResponse for ApiError {
             response.headers_mut().insert(RETRY_AFTER, value);
         }
         response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{body::to_bytes, response::IntoResponse};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn draft_validation_response_adds_safe_optional_issues() {
+        let error = ApiError::draft_validation(
+            crate::domain::DraftValidationError {
+                error: DomainError::ConfigInvalid,
+                issues: vec![crate::domain::ValidationIssue {
+                    path: "health.http.retries".into(),
+                    code: "OUT_OF_RANGE",
+                    message: "Must be between 1 and 10".to_owned(),
+                }],
+            },
+            RequestId(Uuid::nil()),
+        );
+        let response = error.into_response();
+        let body = to_bytes(response.into_body(), 16 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "CONFIG_INVALID");
+        assert_eq!(body["message"], "The application configuration is invalid");
+        assert_eq!(body["issues"][0]["path"], "health.http.retries");
+        assert_eq!(body["issues"][0]["code"], "OUT_OF_RANGE");
     }
 }

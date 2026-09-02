@@ -11,7 +11,7 @@
   import { encodeWebhookSecret } from '../lib/webhookSecret'
   import { networkDraft, networkEditorError, networkEditorState } from '../lib/networks'
   import { formatTimestamp, timeSettings } from '../lib/time'
-  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, RegistryCredential, SettingsResponse, StatsSample, WebhookStatus } from '../lib/types'
+  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, HealthConfigurationLimits, RegistryCredential, SettingsResponse, StatsSample, WebhookStatus } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   import DeletionWebhookNotice from '../components/DeletionWebhookNotice.svelte'
   import NetworkEditor from '../components/NetworkEditor.svelte'
@@ -21,8 +21,9 @@
   import HealthLifecycleEditor from '../components/HealthLifecycleEditor.svelte'
   import ManagedFileEditor from '../components/ManagedFileEditor.svelte'
   import ImageSuggestions from '../components/ImageSuggestions.svelte'
-  import { buildEnvironment, clearSensitiveEnvironmentValues, environmentRowsFromDraft, type EnvironmentRow } from '../lib/environmentRows'
-  import { buildManagedFiles, managedFileRowsFromDraft, type ManagedFileRow } from '../lib/managedFileRows'
+  import { buildEnvironmentProjection, clearSensitiveEnvironmentValues, environmentRowsFromDraft, type EnvironmentRow } from '../lib/environmentRows'
+  import { buildManagedFileProjection, managedFileRowsFromDraft, type ManagedFileRow } from '../lib/managedFileRows'
+  import { errorPresentation, FormValidationError, issuesUnder, issueSummary, remapIndexedIssues, type FormIssue } from '../lib/formErrors'
   let { appId }: { appId: string } = $props()
   let app = $state<AppDetailResponse | null>(null)
   let stats = $state<StatsSample | null>(null)
@@ -53,6 +54,12 @@
   let editServiceDiscovery = $state(true)
   let editNetworks = $state<ExternalNetworkAttachment[]>([])
   let editHealth = $state<DraftInput['health']>({ policy: 'running', stable_window_seconds: 15 })
+  let healthLimits = $state<HealthConfigurationLimits | null>(null)
+  let formIssues = $state<FormIssue[]>([])
+  let formIssueRequestId = $state<string | undefined>()
+  let fileRequestRowIndexes = $state<number[]>([])
+  let secretRequestRowIndexes = $state<number[]>([])
+  let environmentClientIssue = $state<FormIssue | null>(null)
   let allowedBindRoots = $state<string[]>([])
   let credentials = $state<RegistryCredential[]>([])
   let editCredential = $state<string | null>(null)
@@ -80,9 +87,11 @@
       api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
       api<RegistryCredential[]>('/api/v1/registry-credentials'),
       api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`).catch(() => null),
-      api<SettingsResponse>('/api/v1/settings').catch(() => ({ revision: '', display_timezone: 'UTC', supported_timezones: ['UTC'], allowed_bind_roots: [], slug_max_length: 20, supported_mount_types: ['owned_volume', 'external_volume', 'bind'] })),
+      api<SettingsResponse>('/api/v1/settings').catch(() => null),
     ])
-    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook; allowedBindRoots = loadedSettings.allowed_bind_roots
+    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook
+    allowedBindRoots = loadedSettings?.allowed_bind_roots ?? []
+    healthLimits = loadedSettings?.configuration_limits?.health ?? null
   }
 
   function prepareWebhookSecret() {
@@ -170,17 +179,31 @@
     editOwnedDefaultNetwork = networkState.ownedDefaultNetwork
     editServiceDiscovery = app.draft?.service_discovery_enabled ?? true
     editNetworks = networkState.externalNetworks
-    editHealth = JSON.parse(JSON.stringify(app.draft?.health ?? { policy: 'running', stable_window_seconds: 15 })); editRetry = undefined; validation = null; editing = true
+    editHealth = JSON.parse(JSON.stringify(app.draft?.health ?? { policy: 'running', stable_window_seconds: healthLimits?.running_stable_window_seconds.default ?? 15 })); editRetry = undefined; validation = null; editing = true
+    formIssues = []; formIssueRequestId = undefined; environmentClientIssue = null
+    fileRequestRowIndexes = []; secretRequestRowIndexes = []
     editCredential = app.draft?.credential_ref ?? null
   }
   function buildDraft(): DraftInput {
     if (!app) throw new Error('missing app')
+    if (!healthLimits) throw new FormValidationError([{ path: 'health', code: 'CAPABILITIES_UNAVAILABLE', message: '无法获取后端健康检查限制，请刷新后重试' }])
+    if (environmentClientIssue) throw new FormValidationError([environmentClientIssue])
+    const unacknowledgedBind = editBinds.findIndex((bind) => !bind.readonly && !bind.acknowledge_non_rollbackable)
+    if (unacknowledgedBind >= 0) throw new FormValidationError([{
+      path: `binds[${unacknowledgedBind}].acknowledge_non_rollbackable`,
+      code: 'BIND_RW_ACK_REQUIRED',
+      message: '请确认该读写目录的内容不会随 release 回滚',
+    }])
+    const fileProjection = buildManagedFileProjection(editFileRows)
+    fileRequestRowIndexes = fileProjection.requestRowIndexes
+    const environmentProjection = buildEnvironmentProjection(editEnvironmentRows)
+    secretRequestRowIndexes = environmentProjection.secretRequestRowIndexes
     return {
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
       auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !(app.draft?.auto_deploy_enabled ?? false), poll_interval_seconds: editPoll,
       stop_grace_period_seconds: editStopGrace,
-      environment: buildEnvironment(editEnvironmentRows),
-      files: buildManagedFiles(editFileRows),
+      environment: environmentProjection.environment,
+      files: fileProjection.files,
       ports: editPorts,
       volumes: editVolumes,
       binds: editBinds,
@@ -188,6 +211,38 @@
       service_discovery_enabled: editServiceDiscovery,
       health: editHealth,
     }
+  }
+  function setFormError(cause: unknown, fallback: string) {
+    const presentation = errorPresentation(cause, fallback)
+    formIssues = cause instanceof FormValidationError
+      ? presentation.issues
+      : remapIndexedIssues(
+          remapIndexedIssues(presentation.issues, 'files', fileRequestRowIndexes),
+          'environment.secrets',
+          secretRequestRowIndexes,
+        )
+    formIssueRequestId = presentation.requestId
+    error = formIssues[0]
+      ? `${issueSummary(formIssues[0])}${formIssueRequestId ? `（request ${formIssueRequestId}）` : ''}`
+      : presentation.message
+  }
+  function clearFormIssuePath(path: string) {
+    if (!formIssues.length) return
+    formIssues = formIssues.filter((issue) => !(
+      issue.path === path
+      || issue.path.startsWith(`${path}.`)
+      || issue.path.startsWith(`${path}[`)
+      || path.startsWith(`${issue.path}.`)
+      || path.startsWith(`${issue.path}[`)
+    ))
+    error = formIssues[0]
+      ? `${issueSummary(formIssues[0])}${formIssueRequestId ? `（request ${formIssueRequestId}）` : ''}`
+      : ''
+    if (!formIssues.length) formIssueRequestId = undefined
+  }
+  function handleFormInput(event: Event) {
+    const path = (event.target as HTMLElement).dataset.issuePath
+    if (path) clearFormIssuePath(path)
   }
   async function deploy() {
     if (!app) return
@@ -210,19 +265,23 @@
     } catch { error = '部署 facts 已变化、Registry/Docker 不可用或已有部署正在运行。' } finally { actionBusy = false }
   }
   async function validateDraft() {
-    actionBusy = true; error = ''
+    actionBusy = true; error = ''; formIssues = []
     try { validation = await mutation(`/api/v1/apps/${appId}/validate`, { draft: buildDraft() }); error = '' }
-    catch { error = '配置预检失败，请检查资源、路径与 Compose 能力。' } finally { actionBusy = false }
+    catch (cause) {
+      setFormError(cause, '配置预检失败；请检查 Docker/Compose 状态后重试。')
+    } finally { actionBusy = false }
   }
   async function saveDraft() {
     if (!app) return
-    actionBusy = true; error = ''
+    actionBusy = true; error = ''; formIssues = []
     try {
       const request = { expected_revision: app.draft_revision, draft: buildDraft() }
       editRetry = retryIdentity(editRetry, request)
       await mutation(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
       clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = editFileRows.map((row) => ({ ...row, value: row.sensitive ? '' : row.value })); editRetry = undefined
-    } catch { error = '保存失败；可修正后重试，同一请求会复用幂等键。' } finally { actionBusy = false }
+    } catch (cause) {
+      setFormError(cause, '保存失败；网络结果不明确时，同一请求会复用幂等键。')
+    } finally { actionBusy = false }
     if (error) return
     try { await load(); startEditing() }
     catch { error = '配置已保存，但刷新失败；请重新打开应用页面获取最新 revision。' }
@@ -258,22 +317,21 @@
       </section>
     {:else if tab === 'configuration'}
       {#if editing}
-        <form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
+        <form class="panel configuration-stack" oninput={handleFormInput} onchange={handleFormInput} onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
           <header><h2>Draft 配置</h2><p class="muted">Revision <code>{app.draft_revision ?? '尚未创建'}</code> · 保存会原子创建新的不可变 revision。</p></header>
-          <label>Slug（不可修改）<input value={app.slug} readonly /></label><label>显示名称<input bind:value={editName} required /></label>
-          <label>发现镜像 tag<input bind:value={editImage} required /></label><label>检查间隔（秒）<input type="number" min="60" max="86400" bind:value={editPoll} /></label>
-          <label class="checkbox"><input type="checkbox" bind:checked={editAutoDeploy} /> 自动部署 tag 的新 digest</label>
+          <label>Slug（不可修改）<input value={app.slug} readonly /></label><label>显示名称<input data-issue-path="display_name" bind:value={editName} required /></label>
+          <label>发现镜像 tag<input data-issue-path="discovery_image_ref" bind:value={editImage} aria-invalid={formIssues.some((issue) => issue.path === 'discovery_image_ref') ? 'true' : undefined} required /></label><label>检查间隔（秒）<input data-issue-path="poll_interval_seconds" type="number" min="60" max="86400" bind:value={editPoll} aria-invalid={formIssues.some((issue) => issue.path === 'poll_interval_seconds') ? 'true' : undefined} /></label>
+          <label class="checkbox"><input data-issue-path="auto_deploy_enabled" type="checkbox" bind:checked={editAutoDeploy} /> 自动部署 tag 的新 digest</label>
           {#if editAutoDeploy}<p class="notice warning">启用后，新 digest 会自动替换容器并在健康失败时恢复旧 release；volume/bind 数据不会回滚。禁用不会取消已经 durable claim 的部署。</p>{/if}
-          <label>Registry credential<select bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
-          <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} />
-          <EnvironmentEditor bind:rows={editEnvironmentRows} />
-          <ManagedFileEditor bind:rows={editFileRows} />
-          <PortEditor bind:ports={editPorts} />
-          <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} />
-          <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:serviceDiscoveryEnabled={editServiceDiscovery} bind:externalNetworks={editNetworks} />
-          <HealthLifecycleEditor bind:health={editHealth} bind:stopGrace={editStopGrace} />
-          <p class="notice warning">读写 bind 必须显式设置 acknowledge_non_rollbackable；SoloDock 永不修改或删除其源目录。敏感输入只保留在当前表单内，成功后立即清空。</p>
-          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError}>保存新 revision</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; tab = 'overview' }}>取消</button></div>
+          <label>Registry credential<select data-issue-path="credential_ref" bind:value={editCredential}><option value={null}>匿名</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
+          <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} onStructureChange={clearFormIssuePath} />
+          <EnvironmentEditor bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />
+          <ManagedFileEditor bind:rows={editFileRows} issues={issuesUnder(formIssues, 'files')} onStructureChange={clearFormIssuePath} />
+          <PortEditor bind:ports={editPorts} issues={issuesUnder(formIssues, 'ports')} onStructureChange={clearFormIssuePath} />
+          <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} issues={[...issuesUnder(formIssues, 'volumes'), ...issuesUnder(formIssues, 'binds')]} onStructureChange={clearFormIssuePath} />
+          <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:serviceDiscoveryEnabled={editServiceDiscovery} bind:externalNetworks={editNetworks} issues={issuesUnder(formIssues, 'networks')} onStructureChange={clearFormIssuePath} />
+          <HealthLifecycleEditor bind:health={editHealth} bind:stopGrace={editStopGrace} limits={healthLimits} issues={[...issuesUnder(formIssues, 'health'), ...issuesUnder(formIssues, 'stop_grace_period_seconds')]} />
+          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError || !healthLimits} onclick={() => void validateDraft()}>仅预检</button><button disabled={actionBusy || !!editNetworkError || !healthLimits}>保存新 revision</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; tab = 'overview' }}>取消</button></div>
           {#if validation}<article class="notice"><h3>Compose 预检</h3><p>{validation.plan.runnable ? '可运行' : '仅预览'} · 停机宽限 {validation.plan.stop_grace_period_seconds} 秒 · {validation.plan.ports} 端口 · {validation.plan.mounts} 挂载 · {validation.plan.networks} 网络 · {validation.plan.network_mode}</p>{#if validation.plan.owned_default_network}<p>Owned network：<code>{validation.plan.owned_default_network.docker_name}</code> · bridge：<code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{network.aliases.length ? ` · aliases: ${network.aliases.join(', ')}` : ''}</p>{/each}{#if validation.plan.external_networks.length}<p>External network 不由 SoloDock 创建、修改或删除。</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
         </form>
         {#if app.draft && webhook}<article class="panel webhook-panel"><h2>Registry recheck webhook</h2><p><span class="tag">{webhook.degraded ? '配置损坏：请生成新 secret 修复' : webhook.configured ? '已配置' : '未配置'}</span> · {webhook.algorithm}</p><p><code>{webhook.public_origin}{webhook.public_path}</code></p><p class="muted">Webhook 只触发一次 durable Registry recheck；不会信任 payload 中的镜像信息，也不会绕过自动部署、退避、drift 或健康门禁。</p>{#if webhookSecret}<p class="notice warning">这是 secret 唯一一次显示机会，请保存到 CI secret store：<code>{webhookSecret}</code></p><label class="checkbox"><input type="checkbox" bind:checked={webhookSaved} /> 我已安全保存该 secret</label><div class="actions"><button disabled={actionBusy || !webhookSaved} onclick={() => void saveWebhook()}>{webhook.configured ? '确认轮换' : '确认配置'}</button><button class="ghost" onclick={() => { webhookSecret = ''; webhookSaved = false; webhookRetry = undefined }}>取消</button></div>{:else}<div class="actions"><button disabled={actionBusy} onclick={prepareWebhookSecret}>{webhook.configured ? '生成轮换 secret' : '生成 webhook secret'}</button>{#if webhook.configured}<button class="danger" disabled={actionBusy} onclick={() => void revokeWebhook()}>撤销 webhook</button>{/if}</div>{/if}</article>{/if}

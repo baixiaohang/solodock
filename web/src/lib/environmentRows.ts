@@ -1,4 +1,6 @@
 import type { DraftInput, DraftResponse } from './types'
+import { FormValidationError } from './formErrors'
+import type { PublicEnvironmentEntry } from './environmentText'
 
 export interface EnvironmentRow {
   id: string
@@ -22,6 +24,35 @@ export function emptyEnvironmentRow(): EnvironmentRow {
   }
 }
 
+export function emptySecretEnvironmentRow(): EnvironmentRow {
+  return { ...emptyEnvironmentRow(), sensitive: true }
+}
+
+export function publicEnvironmentEntries(rows: EnvironmentRow[]): PublicEnvironmentEntry[] {
+  return rows
+    .filter((row) => !row.removed && !row.sensitive)
+    .map((row) => ({ key: row.key, value: row.value }))
+}
+
+export function replacePublicEnvironmentRows(rows: EnvironmentRow[], entries: PublicEnvironmentEntry[]): EnvironmentRow[] {
+  const publicRows = rows.filter((row) => !row.removed && !row.sensitive)
+  const retainedSecrets = rows.filter((row) => row.sensitive || (row.removed && row.originalSensitive))
+  const projected = entries.map(({ key, value }, index) => {
+    const existing = publicRows[index]
+    return existing
+      ? { ...existing, key, value, sensitive: false, removed: false }
+      : {
+          id: rowId(), key, value, sensitive: false,
+          originalKey: key, originalSensitive: false, storedSecret: false, removed: false,
+        }
+  })
+  const removedSecretConversions = publicRows
+    .slice(entries.length)
+    .filter((row) => row.originalSensitive)
+    .map((row) => ({ ...row, removed: true }))
+  return [...projected, ...retainedSecrets, ...removedSecretConversions]
+}
+
 export function environmentRowsFromDraft(draft: Pick<DraftResponse, 'public_environment' | 'secret_keys'>): EnvironmentRow[] {
   return [
     ...draft.public_environment.map(({ key, value }) => ({
@@ -35,16 +66,26 @@ export function environmentRowsFromDraft(draft: Pick<DraftResponse, 'public_envi
   ]
 }
 
-export function buildEnvironment(rows: EnvironmentRow[]): DraftInput['environment'] {
+export interface EnvironmentProjection {
+  environment: DraftInput['environment']
+  secretRequestRowIndexes: number[]
+}
+
+export function buildEnvironmentProjection(rows: EnvironmentRow[]): EnvironmentProjection {
   const active = rows.filter((row) => !row.removed)
+  const visibleSecretRows = active.filter((row) => row.sensitive)
   const finalByKey = new Map<string, EnvironmentRow>()
+  let publicIndex = 0
+  let secretIndex = 0
   for (const row of active) {
     row.key = row.key.trim()
-    if (!row.key) throw new Error('environment key required')
-    if (finalByKey.has(row.key)) throw new Error('duplicate environment key')
+    const index = row.sensitive ? secretIndex++ : publicIndex++
+    const path = row.sensitive ? `environment.secrets[${index}].key` : `environment.public[${index}].key`
+    if (!row.key) throw new FormValidationError([{ path, code: 'ENV_KEY_REQUIRED', message: '变量名不能为空' }])
+    if (finalByKey.has(row.key)) throw new FormValidationError([{ path, code: 'ENV_DUPLICATE', message: '变量名不能重复' }])
     finalByKey.set(row.key, row)
     if (row.originalSensitive && !row.sensitive && !row.value) {
-      throw new Error('secret to public conversion requires a replacement value')
+      throw new FormValidationError([{ path: `environment.public[${index}].value`, code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 转为普通变量时必须输入新值' }])
     }
   }
 
@@ -52,6 +93,7 @@ export function buildEnvironment(rows: EnvironmentRow[]): DraftInput['environmen
     .filter((row) => !row.sensitive)
     .map((row) => ({ key: row.key, value: row.value }))
   const secretOperations: DraftInput['environment']['secrets'] = []
+  const secretRequestRowIndexes: number[] = []
   const originalSecretKeys = new Set(
     rows
       .filter((row) => row.originalSensitive && row.originalKey !== null)
@@ -61,6 +103,7 @@ export function buildEnvironment(rows: EnvironmentRow[]): DraftInput['environmen
     const finalRow = finalByKey.get(key)
     if (!finalRow || !finalRow.sensitive) {
       secretOperations.push({ key, operation: 'delete' })
+      secretRequestRowIndexes.push(-1)
       continue
     }
     const canKeep = finalRow.originalSensitive
@@ -69,16 +112,25 @@ export function buildEnvironment(rows: EnvironmentRow[]): DraftInput['environmen
       && !finalRow.value
     if (canKeep) secretOperations.push({ key, operation: 'keep' })
     else {
-      if (!finalRow.value) throw new Error('secret replacement value required')
+      if (!finalRow.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 改名或变更类型时必须输入新值' }])
       secretOperations.push({ key, operation: 'replace', value: finalRow.value })
     }
+    secretRequestRowIndexes.push(visibleSecretRows.indexOf(finalRow))
   }
   for (const row of active) {
     if (!row.sensitive || originalSecretKeys.has(row.key)) continue
-    if (!row.value) throw new Error('secret replacement value required')
+    if (!row.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: '新 Secret 必须输入值' }])
     secretOperations.push({ key: row.key, operation: 'replace', value: row.value })
+    secretRequestRowIndexes.push(visibleSecretRows.indexOf(row))
   }
-  return { public: publicEntries, secrets: secretOperations }
+  return {
+    environment: { public: publicEntries, secrets: secretOperations },
+    secretRequestRowIndexes,
+  }
+}
+
+export function buildEnvironment(rows: EnvironmentRow[]): DraftInput['environment'] {
+  return buildEnvironmentProjection(rows).environment
 }
 
 export function clearSensitiveEnvironmentValues(rows: EnvironmentRow[]): void {

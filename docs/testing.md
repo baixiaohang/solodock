@@ -42,7 +42,9 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 - bootstrap 至多一次、Origin/CSRF/session/revoke/heartbeat；
 - public/secret 分类和 `keep`/`replace`/`delete`；
-- 统一环境变量逐行编辑、Secret 掩码、分类转换、rename、重复/空 key，以及敏感输入成功后清空；
+- public 环境变量逐行/批量 `KEY=VALUE` 无损切换，覆盖 CRLF、空行、第一个 `=`、重复/非法 key 与行号错误；Secret 不进入文本框，并继续覆盖掩码、分类转换、rename、keep/replace/delete 和成功后清空；
+- 镜像建议 POST 的 JSON `Content-Type`、CSRF、credential reference、allowlist 成功投影及脱敏错误展示；
+- 配置字段级 `issues` 可定位对应区块/行，响应与 UI 不泄露 public 值、Secret、credential 或宿主路径；
 - Registry/webhook secret write-only、zeroize、rotation/revoke/finalizer；
 - secret canary 不进入 API、SSE、audit、tracing、error、Compose、release、SQLite 或 argv；
 - degraded inventory保留旧 redactor，冷启动不完整 inventory fail closed。
@@ -71,7 +73,8 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - owned-only、owned+external、external-only 的 canonical YAML，旧无 alias 短语法逐字节兼容，以及 typed alias 长语法；
 - external network 缺失、无关成员 alias 冲突、精确 predecessor full ID 放行、不完整成员 observation fail closed；
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
-- bind allowlist、symlink/device/inode/data-root revalidation；
+- bind allowlist、symlink/device/inode/data-root revalidation，以及每条 read-write bind 未确认、只读切换和重新确认；
+- HTTP health 五组数值范围与运行稳定窗口由 settings capability 驱动，Web 与 Rust domain 边界一致且 capability 缺失时 fail closed；
 - SQLite bind roots 一次 bootstrap、revision 更新、引用保护与扫描失败关闭；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
 - `/proc/meminfo` 正常、缺失、非法和 overflow，system health 五列状态条与 pull 门禁共用同一 parser；

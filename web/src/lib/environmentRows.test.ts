@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { buildEnvironment, emptyEnvironmentRow, environmentRowsFromDraft } from './environmentRows'
+import { buildEnvironment, buildEnvironmentProjection, emptyEnvironmentRow, environmentRowsFromDraft, replacePublicEnvironmentRows } from './environmentRows'
 
 vi.stubGlobal('crypto', { randomUUID: () => '00000000-0000-4000-8000-000000000001' })
 
@@ -38,10 +38,27 @@ describe('environment row projection', () => {
   it('rejects duplicate keys and secret-to-public without a new value', () => {
     const duplicate = [emptyEnvironmentRow(), emptyEnvironmentRow()]
     duplicate[0].key = 'A'; duplicate[1].key = 'A'
-    expect(() => buildEnvironment(duplicate)).toThrow('duplicate')
+    expect(() => buildEnvironment(duplicate)).toThrow('变量名不能重复')
     const secret = environmentRowsFromDraft({ public_environment: [], secret_keys: ['TOKEN'] })
     secret[0].sensitive = false
-    expect(() => buildEnvironment(secret)).toThrow('replacement')
+    expect(() => buildEnvironment(secret)).toThrow('必须输入新值')
+  })
+
+  it('preserves secret conversion identity while batch-editing public rows', () => {
+    const rows = environmentRowsFromDraft({ public_environment: [], secret_keys: ['TOKEN'] })
+    rows[0].sensitive = false
+    rows[0].value = 'visible'
+    const projected = replacePublicEnvironmentRows(rows, [{ key: 'RENAMED', value: 'visible' }])
+
+    expect(projected).toHaveLength(1)
+    expect(projected[0]).toMatchObject({ key: 'RENAMED', originalKey: 'TOKEN', originalSensitive: true })
+    expect(buildEnvironment(projected)).toEqual({
+      public: [{ key: 'RENAMED', value: 'visible' }],
+      secrets: [{ key: 'TOKEN', operation: 'delete' }],
+    })
+
+    const removed = replacePublicEnvironmentRows(projected, [])
+    expect(buildEnvironment(removed)).toEqual({ public: [], secrets: [{ key: 'TOKEN', operation: 'delete' }] })
   })
 
   it('lets a renamed secret take over a deleted secret key without duplicate operations', () => {
@@ -89,6 +106,27 @@ describe('environment row projection', () => {
         { key: 'A', operation: 'replace', value: 'from-b' },
         { key: 'B', operation: 'replace', value: 'from-a' },
       ],
+    })
+  })
+
+  it('maps Secret request operations back to visible Secret rows', () => {
+    const rows = environmentRowsFromDraft({ public_environment: [], secret_keys: ['OLD'] })
+    rows[0].removed = true
+    const replacement = emptyEnvironmentRow()
+    replacement.key = 'NEW'
+    replacement.value = 'replacement'
+    replacement.sensitive = true
+    rows.push(replacement)
+
+    expect(buildEnvironmentProjection(rows)).toEqual({
+      environment: {
+        public: [],
+        secrets: [
+          { key: 'OLD', operation: 'delete' },
+          { key: 'NEW', operation: 'replace', value: 'replacement' },
+        ],
+      },
+      secretRequestRowIndexes: [-1, 0],
     })
   })
 })

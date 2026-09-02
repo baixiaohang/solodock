@@ -26,7 +26,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 ## 环境变量
 
-环境变量只有一份规范数据。注册页和配置页共用逐行编辑器，public 与 Secret 使用同一种行布局，不再分成两套输入区。
+环境变量只有一份规范数据。配置页的 public 环境变量可以在逐行编辑器与批量 `KEY=VALUE` 文本之间无损切换；批量模式按第一个 `=` 分隔，忽略空行，并对缺少分隔符、非法或重复 key 给出行号。Secret 始终留在独立的 write-only 逐行区域，不进入批量文本，也不使用可被误提交的占位值。
 
 - public 值可以读取和编辑；
 - 已保存的 secret 只显示“已保存”占位且 value 保持空白；留空、输入新值和删除行分别投影为 `keep`、`replace`、`delete`；
@@ -64,7 +64,7 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 - source 必须是 root 的严格子目录，不能直接挂载整个 root；
 - root/source 不能与 state、runtime、Docker socket、敏感系统目录或 daemon 实际 data-root 重叠；
 - validate、preview 和每次 Docker effect 前都会重新检查 canonical path、symlink、device/inode 和 data-root；
-- 默认只读，read-write 必须显式确认“不能随 release 回滚”；
+- 默认只读；每一条 read-write bind 都必须在对应行显式确认“不能随 release 回滚”，改回只读或重新切为读写会重置该确认；
 - SoloDock 不创建、`chown`、`chmod`、备份或删除 source。
 
 ### Network
@@ -89,6 +89,8 @@ volume、bind 和受管文件的容器 target path 必须互不冲突。preview 
 - `disabled`：显式确认降低安全性，只证明容器达到有限运行条件。
 
 健康策略用于 deployment commit 和 rollback verification。更改 draft policy 不会追溯改变既有 release。
+
+健康检查的数值范围与默认值由 Rust domain 常量定义，并通过 `GET /api/v1/settings` 的 `configuration_limits.health` 投影给 Web；前端不复制另一套边界。capability 不可用时配置编辑 fail closed，避免浏览器接受后端必然拒绝的值。
 
 ## 生命周期与删除
 

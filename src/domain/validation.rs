@@ -19,6 +19,37 @@ pub const MAX_FILES: usize = 32;
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
 pub const MAX_FILE_TOTAL_BYTES: usize = 2 * 1024 * 1024;
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ValidationIssue {
+    pub path: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+#[derive(Debug)]
+pub struct DraftValidationError {
+    pub error: DomainError,
+    pub issues: Vec<ValidationIssue>,
+}
+
+impl DraftValidationError {
+    fn at(
+        error: DomainError,
+        path: impl Into<String>,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            error,
+            issues: vec![ValidationIssue {
+                path: path.into(),
+                code,
+                message: message.into(),
+            }],
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigMetadata {
     pub schema_version: u32,
@@ -92,18 +123,54 @@ pub fn normalize_draft(
     hmac_key: &[u8],
     allowed_bind_roots: &[PathBuf],
 ) -> Result<NormalizedDraft, DomainError> {
-    validate_display_name(&input.display_name)?;
-    validate_discovery_image(&input.discovery_image_ref)?;
+    normalize_draft_with_issues(input, existing, hmac_key, allowed_bind_roots)
+        .map_err(|error| error.error)
+}
+
+pub fn normalize_draft_with_issues(
+    input: DraftInput,
+    existing: &ExistingSecrets,
+    hmac_key: &[u8],
+    allowed_bind_roots: &[PathBuf],
+) -> Result<NormalizedDraft, DraftValidationError> {
+    validate_display_name(&input.display_name).map_err(|error| {
+        DraftValidationError::at(
+            error,
+            "display_name",
+            "INVALID_VALUE",
+            "Must be 1 to 80 characters without surrounding whitespace",
+        )
+    })?;
+    validate_discovery_image(&input.discovery_image_ref).map_err(|error| {
+        DraftValidationError::at(
+            error,
+            "discovery_image_ref",
+            "INVALID_IMAGE_REFERENCE",
+            "Must be a valid tagged OCI image reference",
+        )
+    })?;
     if !(60..=86_400).contains(&input.poll_interval_seconds) {
-        return Err(DomainError::ConfigInvalid);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigInvalid,
+            "poll_interval_seconds",
+            "OUT_OF_RANGE",
+            "Must be between 60 and 86400",
+        ));
     }
-    if !(1..=super::MAX_STOP_GRACE_PERIOD_SECONDS).contains(&input.stop_grace_period_seconds) {
-        return Err(DomainError::ConfigInvalid);
+    let stop_grace = health_configuration_limits().stop_grace_period_seconds;
+    if !(stop_grace.min..=stop_grace.max).contains(&input.stop_grace_period_seconds) {
+        return Err(DraftValidationError::at(
+            DomainError::ConfigInvalid,
+            "stop_grace_period_seconds",
+            "OUT_OF_RANGE",
+            range_message(stop_grace.min, stop_grace.max),
+        ));
     }
 
     let (public_environment, secret_environment) =
         normalize_environment(input.environment, existing, hmac_key)?;
-    let (files, public_files, secret_files) = normalize_files(input.files, existing, hmac_key)?;
+    let (files, file_request_indexes, public_files, secret_files) =
+        normalize_files(input.files, existing, hmac_key)?;
     let mut ports = input.ports;
     validate_ports(&ports)?;
     ports.sort_by(|left, right| {
@@ -122,18 +189,21 @@ pub fn normalize_draft(
     });
     let mut volumes = input.volumes;
     validate_volumes(&volumes)?;
-    volumes.sort_by_key(volume_sort_key);
     let mut binds = input.binds;
-    validate_binds(&binds, allowed_bind_roots)?;
+    validate_binds_detailed(&binds, allowed_bind_roots)?;
+    validate_mount_target_conflicts(&files, &file_request_indexes, &volumes, &binds)?;
+    volumes.sort_by_key(volume_sort_key);
     binds.sort_by(|left, right| left.target_path.cmp(&right.target_path));
     let mut networks = input.networks;
-    normalize_networks(
+    normalize_networks_with_issues(
         input.owned_default_network,
         input.service_discovery_enabled,
         &mut networks,
-    )?;
+    )
+    .map_err(|error| {
+        DraftValidationError::at(error.error, error.path, error.code, error.message)
+    })?;
     validate_health(&input.health)?;
-    validate_mount_target_conflicts(&files, &volumes, &binds)?;
 
     let public_env_keys = public_environment
         .iter()
@@ -143,7 +213,15 @@ pub fn normalize_draft(
     let secret_hmacs = secret_environment
         .iter()
         .map(|(key, value)| Ok((key.clone(), hmac_hex(hmac_key, value.expose().as_bytes())?)))
-        .collect::<Result<_, DomainError>>()?;
+        .collect::<Result<_, DomainError>>()
+        .map_err(|error| {
+            DraftValidationError::at(
+                error,
+                "environment.secrets",
+                "CONFIG_INVALID",
+                "Secret integrity metadata could not be generated",
+            )
+        })?;
     let public_file_sha256s = public_files
         .iter()
         .map(|(name, content)| {
@@ -156,7 +234,15 @@ pub fn normalize_draft(
     let secret_file_hmacs = secret_files
         .iter()
         .map(|(key, value)| Ok((key.clone(), hmac_hex(hmac_key, value.expose().as_bytes())?)))
-        .collect::<Result<_, DomainError>>()?;
+        .collect::<Result<_, DomainError>>()
+        .map_err(|error| {
+            DraftValidationError::at(
+                error,
+                "files",
+                "CONFIG_INVALID",
+                "Secret file integrity metadata could not be generated",
+            )
+        })?;
     let mut metadata = ConfigMetadata {
         schema_version: 3,
         stop_grace_period_seconds: input.stop_grace_period_seconds,
@@ -175,7 +261,15 @@ pub fn normalize_draft(
         health: input.health.clone(),
         config_sha256: String::new(),
     };
-    let canonical = canonical_non_secret(&metadata, &public_environment, &public_files)?;
+    let canonical =
+        canonical_non_secret(&metadata, &public_environment, &public_files).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                "draft",
+                "CONFIG_INVALID",
+                "The normalized configuration cannot be serialized",
+            )
+        })?;
     let digest = Sha256::digest(canonical);
     metadata.config_sha256 = hex(&digest);
     Ok(NormalizedDraft {
@@ -206,57 +300,127 @@ fn normalize_environment(
     input: EnvironmentInput,
     existing: &ExistingSecrets,
     _hmac_key: &[u8],
-) -> Result<(Vec<PublicEnvInput>, SecretMap), DomainError> {
+) -> Result<(Vec<PublicEnvInput>, SecretMap), DraftValidationError> {
     if input.public.len() + input.secrets.len() > MAX_ENV_ENTRIES {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "environment",
+            "CONFIG_QUOTA_EXCEEDED",
+            format!("At most {MAX_ENV_ENTRIES} environment entries are allowed"),
+        ));
     }
     let mut public_keys = HashSet::new();
     let mut total = 0usize;
     let mut public = Vec::with_capacity(input.public.len());
-    for entry in input.public {
-        validate_env_key(&entry.key)?;
-        validate_text(&entry.value)?;
-        validate_env_value(&entry.value)?;
+    for (index, entry) in input.public.into_iter().enumerate() {
+        validate_env_key(&entry.key).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("environment.public[{index}].key"),
+                "INVALID_ENV_KEY",
+                "Must be a valid environment variable name",
+            )
+        })?;
+        validate_text(&entry.value)
+            .and_then(|()| validate_env_value(&entry.value))
+            .map_err(|error| {
+                DraftValidationError::at(
+                    error,
+                    format!("environment.public[{index}].value"),
+                    "INVALID_ENV_VALUE",
+                    "Must not contain control characters or newlines",
+                )
+            })?;
         if entry.value.len() > MAX_ENV_VALUE_BYTES {
-            return Err(DomainError::ConfigQuotaExceeded);
+            return Err(DraftValidationError::at(
+                DomainError::ConfigQuotaExceeded,
+                format!("environment.public[{index}].value"),
+                "CONFIG_QUOTA_EXCEEDED",
+                format!("Must not exceed {MAX_ENV_VALUE_BYTES} bytes"),
+            ));
         }
         if !public_keys.insert(entry.key.clone()) {
-            return Err(DomainError::EnvDuplicate);
+            return Err(DraftValidationError::at(
+                DomainError::EnvDuplicate,
+                format!("environment.public[{index}].key"),
+                "ENV_DUPLICATE",
+                "Environment variable names must be unique",
+            ));
         }
         total = total.saturating_add(entry.value.len());
         public.push(entry);
     }
     let mut secret = BTreeMap::new();
     let mut operations = HashSet::new();
-    for entry in input.secrets {
-        validate_env_key(&entry.key)?;
+    for (index, entry) in input.secrets.into_iter().enumerate() {
+        let base = format!("environment.secrets[{index}]");
+        validate_env_key(&entry.key).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("{base}.key"),
+                "INVALID_ENV_KEY",
+                "Must be a valid environment variable name",
+            )
+        })?;
         if !operations.insert(entry.key.clone()) {
-            return Err(DomainError::EnvDuplicate);
+            return Err(DraftValidationError::at(
+                DomainError::EnvDuplicate,
+                format!("{base}.key"),
+                "ENV_DUPLICATE",
+                "Secret operations must be unique by key",
+            ));
         }
         if public_keys.contains(&entry.key) && !matches!(entry.operation, SecretOperation::Delete) {
-            return Err(DomainError::EnvDuplicate);
+            return Err(DraftValidationError::at(
+                DomainError::EnvDuplicate,
+                format!("{base}.key"),
+                "ENV_DUPLICATE",
+                "A key cannot be public and secret at the same time",
+            ));
         }
         match entry.operation {
             SecretOperation::Keep => {
-                let value = existing
-                    .environment
-                    .get(&entry.key)
-                    .ok_or(DomainError::SecretOperationRequired)?;
+                let value = existing.environment.get(&entry.key).ok_or_else(|| {
+                    DraftValidationError::at(
+                        DomainError::SecretOperationRequired,
+                        format!("{base}.operation"),
+                        "SECRET_OPERATION_REQUIRED",
+                        "The stored Secret no longer exists; provide a replacement",
+                    )
+                })?;
                 total = total.saturating_add(value.len());
                 secret.insert(entry.key, SecretMaterial::new(value.clone()));
             }
             SecretOperation::Replace { value } => {
-                validate_text(&value)?;
-                validate_env_value(&value)?;
+                validate_text(&value)
+                    .and_then(|()| validate_env_value(&value))
+                    .map_err(|error| {
+                        DraftValidationError::at(
+                            error,
+                            format!("{base}.value"),
+                            "INVALID_ENV_VALUE",
+                            "Must not contain control characters or newlines",
+                        )
+                    })?;
                 if value.len() > MAX_ENV_VALUE_BYTES {
-                    return Err(DomainError::ConfigQuotaExceeded);
+                    return Err(DraftValidationError::at(
+                        DomainError::ConfigQuotaExceeded,
+                        format!("{base}.value"),
+                        "CONFIG_QUOTA_EXCEEDED",
+                        format!("Must not exceed {MAX_ENV_VALUE_BYTES} bytes"),
+                    ));
                 }
                 total = total.saturating_add(value.len());
                 secret.insert(entry.key, SecretMaterial::new(value));
             }
             SecretOperation::Delete => {
                 if !existing.environment.contains_key(&entry.key) {
-                    return Err(DomainError::SecretOperationRequired);
+                    return Err(DraftValidationError::at(
+                        DomainError::SecretOperationRequired,
+                        format!("{base}.operation"),
+                        "SECRET_OPERATION_REQUIRED",
+                        "The stored Secret no longer exists",
+                    ));
                 }
             }
         }
@@ -266,10 +430,20 @@ fn normalize_environment(
         .keys()
         .any(|key| !operations.contains(key))
     {
-        return Err(DomainError::SecretOperationRequired);
+        return Err(DraftValidationError::at(
+            DomainError::SecretOperationRequired,
+            "environment.secrets",
+            "SECRET_OPERATION_REQUIRED",
+            "Every stored Secret requires an explicit keep, replace, or delete operation",
+        ));
     }
     if total > MAX_ENV_TOTAL_BYTES {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "environment",
+            "CONFIG_QUOTA_EXCEEDED",
+            format!("Environment values must not exceed {MAX_ENV_TOTAL_BYTES} bytes in total"),
+        ));
     }
     public.sort_by(|left, right| left.key.cmp(&right.key));
     Ok((public, secret))
@@ -284,6 +458,7 @@ fn validate_env_value(value: &str) -> Result<(), DomainError> {
 
 type NormalizedFiles = (
     Vec<ManagedFileMetadata>,
+    Vec<usize>,
     BTreeMap<String, String>,
     SecretMap,
 );
@@ -292,9 +467,14 @@ fn normalize_files(
     input: Vec<ManagedFileInput>,
     existing: &ExistingSecrets,
     _hmac_key: &[u8],
-) -> Result<NormalizedFiles, DomainError> {
+) -> Result<NormalizedFiles, DraftValidationError> {
     if input.len() > MAX_FILES {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "files",
+            "CONFIG_QUOTA_EXCEEDED",
+            format!("At most {MAX_FILES} managed files are allowed"),
+        ));
     }
     let mut final_names = HashSet::new();
     let mut targets = HashSet::new();
@@ -304,11 +484,31 @@ fn normalize_files(
     let mut public = BTreeMap::new();
     let mut secret = BTreeMap::new();
     let mut total = 0usize;
-    for item in input {
-        validate_logical_name(&item.logical_name)?;
-        validate_container_target(&item.target_path)?;
+    for (index, item) in input.into_iter().enumerate() {
+        let base = format!("files[{index}]");
+        validate_logical_name(&item.logical_name).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("{base}.logical_name"),
+                "INVALID_FILE_NAME",
+                "Must be a valid managed-file name",
+            )
+        })?;
+        validate_container_target(&item.target_path).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("{base}.target_path"),
+                "INVALID_MOUNT_TARGET",
+                "Must be a safe absolute container path",
+            )
+        })?;
         if !item.readonly {
-            return Err(DomainError::ConfigInvalid);
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                format!("{base}.readonly"),
+                "READONLY_REQUIRED",
+                "Managed files must be read-only",
+            ));
         }
         let descriptor = ManagedFileMetadata {
             logical_name: item.logical_name.clone(),
@@ -320,55 +520,151 @@ fn normalize_files(
             (false, ManagedFileContent::Public(PublicFileContent { content })) => {
                 if !public_names.insert(item.logical_name.clone())
                     || !final_names.insert(item.logical_name.clone())
-                    || !targets.insert(descriptor.target_path.clone())
                 {
-                    return Err(DomainError::FileTargetConflict);
+                    return Err(DraftValidationError::at(
+                        DomainError::FileTargetConflict,
+                        format!("{base}.logical_name"),
+                        "FILE_TARGET_CONFLICT",
+                        "Managed-file names must be unique",
+                    ));
                 }
-                validate_content(&content)?;
-                check_file_quota(&content, &mut total)?;
+                if !targets.insert(descriptor.target_path.clone()) {
+                    return Err(DraftValidationError::at(
+                        DomainError::FileTargetConflict,
+                        format!("{base}.target_path"),
+                        "FILE_TARGET_CONFLICT",
+                        "Managed-file targets must be unique",
+                    ));
+                }
+                validate_content(&content).map_err(|error| {
+                    DraftValidationError::at(
+                        error,
+                        format!("{base}.content"),
+                        "INVALID_FILE_CONTENT",
+                        "File content must not contain NUL bytes",
+                    )
+                })?;
+                check_file_quota(&content, &mut total).map_err(|error| {
+                    DraftValidationError::at(
+                        error,
+                        format!("{base}.content"),
+                        "CONFIG_QUOTA_EXCEEDED",
+                        format!("Managed files must not exceed {MAX_FILE_BYTES} bytes each"),
+                    )
+                })?;
                 public.insert(item.logical_name, content);
-                metadata.push(descriptor);
+                metadata.push((descriptor, index));
             }
             (true, ManagedFileContent::Secret(operation)) => {
                 if !secret_operations.insert(item.logical_name.clone()) {
-                    return Err(DomainError::FileTargetConflict);
+                    return Err(DraftValidationError::at(
+                        DomainError::FileTargetConflict,
+                        format!("{base}.logical_name"),
+                        "FILE_TARGET_CONFLICT",
+                        "Secret operations must be unique by file name",
+                    ));
                 }
                 match operation {
                     SecretOperation::Keep => {
-                        let value = existing
-                            .files
-                            .get(&item.logical_name)
-                            .ok_or(DomainError::SecretOperationRequired)?;
+                        let value = existing.files.get(&item.logical_name).ok_or_else(|| {
+                            DraftValidationError::at(
+                                DomainError::SecretOperationRequired,
+                                format!("{base}.content"),
+                                "SECRET_OPERATION_REQUIRED",
+                                "The stored Secret file no longer exists; provide a replacement",
+                            )
+                        })?;
                         if public_names.contains(&item.logical_name)
                             || !final_names.insert(item.logical_name.clone())
-                            || !targets.insert(descriptor.target_path.clone())
                         {
-                            return Err(DomainError::FileTargetConflict);
+                            return Err(DraftValidationError::at(
+                                DomainError::FileTargetConflict,
+                                format!("{base}.logical_name"),
+                                "FILE_TARGET_CONFLICT",
+                                "Managed-file names must be unique",
+                            ));
                         }
-                        check_file_quota(value, &mut total)?;
+                        if !targets.insert(descriptor.target_path.clone()) {
+                            return Err(DraftValidationError::at(
+                                DomainError::FileTargetConflict,
+                                format!("{base}.target_path"),
+                                "FILE_TARGET_CONFLICT",
+                                "Managed-file targets must be unique",
+                            ));
+                        }
+                        check_file_quota(value, &mut total).map_err(|error| {
+                            DraftValidationError::at(
+                                error,
+                                format!("{base}.content"),
+                                "CONFIG_QUOTA_EXCEEDED",
+                                format!(
+                                    "Managed files must not exceed {MAX_FILE_BYTES} bytes each"
+                                ),
+                            )
+                        })?;
                         secret.insert(item.logical_name, SecretMaterial::new(value.clone()));
-                        metadata.push(descriptor);
+                        metadata.push((descriptor, index));
                     }
                     SecretOperation::Replace { value } => {
                         if public_names.contains(&item.logical_name)
                             || !final_names.insert(item.logical_name.clone())
-                            || !targets.insert(descriptor.target_path.clone())
                         {
-                            return Err(DomainError::FileTargetConflict);
+                            return Err(DraftValidationError::at(
+                                DomainError::FileTargetConflict,
+                                format!("{base}.logical_name"),
+                                "FILE_TARGET_CONFLICT",
+                                "Managed-file names must be unique",
+                            ));
                         }
-                        validate_content(&value)?;
-                        check_file_quota(&value, &mut total)?;
+                        if !targets.insert(descriptor.target_path.clone()) {
+                            return Err(DraftValidationError::at(
+                                DomainError::FileTargetConflict,
+                                format!("{base}.target_path"),
+                                "FILE_TARGET_CONFLICT",
+                                "Managed-file targets must be unique",
+                            ));
+                        }
+                        validate_content(&value).map_err(|error| {
+                            DraftValidationError::at(
+                                error,
+                                format!("{base}.content"),
+                                "INVALID_FILE_CONTENT",
+                                "File content must not contain NUL bytes",
+                            )
+                        })?;
+                        check_file_quota(&value, &mut total).map_err(|error| {
+                            DraftValidationError::at(
+                                error,
+                                format!("{base}.content"),
+                                "CONFIG_QUOTA_EXCEEDED",
+                                format!(
+                                    "Managed files must not exceed {MAX_FILE_BYTES} bytes each"
+                                ),
+                            )
+                        })?;
                         secret.insert(item.logical_name, SecretMaterial::new(value));
-                        metadata.push(descriptor);
+                        metadata.push((descriptor, index));
                     }
                     SecretOperation::Delete => {
                         if !existing.files.contains_key(&item.logical_name) {
-                            return Err(DomainError::SecretOperationRequired);
+                            return Err(DraftValidationError::at(
+                                DomainError::SecretOperationRequired,
+                                format!("{base}.content"),
+                                "SECRET_OPERATION_REQUIRED",
+                                "The stored Secret file no longer exists",
+                            ));
                         }
                     }
                 }
             }
-            _ => return Err(DomainError::ConfigInvalid),
+            _ => {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    format!("{base}.sensitive"),
+                    "FILE_SENSITIVITY_MISMATCH",
+                    "File content must match its sensitivity classification",
+                ));
+            }
         }
     }
     if existing
@@ -376,15 +672,25 @@ fn normalize_files(
         .keys()
         .any(|name| !secret_operations.contains(name))
     {
-        return Err(DomainError::SecretOperationRequired);
+        return Err(DraftValidationError::at(
+            DomainError::SecretOperationRequired,
+            "files",
+            "SECRET_OPERATION_REQUIRED",
+            "Every stored Secret file requires an explicit keep, replace, or delete operation",
+        ));
     }
     if total > MAX_FILE_TOTAL_BYTES {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "files",
+            "CONFIG_QUOTA_EXCEEDED",
+            format!("Managed files must not exceed {MAX_FILE_TOTAL_BYTES} bytes in total"),
+        ));
     }
-    metadata.sort_by(|left, right| left.logical_name.cmp(&right.logical_name));
-    Ok((metadata, public, secret))
+    metadata.sort_by(|(left, _), (right, _)| left.logical_name.cmp(&right.logical_name));
+    let (metadata, request_indexes) = metadata.into_iter().unzip();
+    Ok((metadata, request_indexes, public, secret))
 }
-
 fn check_file_quota(value: &str, total: &mut usize) -> Result<(), DomainError> {
     if value.len() > MAX_FILE_BYTES {
         return Err(DomainError::ConfigQuotaExceeded);
@@ -555,18 +861,42 @@ pub fn validate_container_target(value: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn validate_ports(ports: &[PortInput]) -> Result<(), DomainError> {
+fn validate_ports(ports: &[PortInput]) -> Result<(), DraftValidationError> {
     if ports.len() > 32 {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "ports",
+            "CONFIG_QUOTA_EXCEEDED",
+            "At most 32 published ports are allowed",
+        ));
     }
     let mut published = HashSet::new();
     let mut normalized = HashSet::new();
-    for port in ports {
-        if !matches!(port.host_ip.as_str(), "127.0.0.1" | "::1")
-            || port.host_port == 0
-            || port.container_port == 0
-        {
-            return Err(DomainError::ConfigInvalid);
+    for (index, port) in ports.iter().enumerate() {
+        let base = format!("ports[{index}]");
+        if !matches!(port.host_ip.as_str(), "127.0.0.1" | "::1") {
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                format!("{base}.host_ip"),
+                "LOOPBACK_REQUIRED",
+                "Host IP must be 127.0.0.1 or ::1",
+            ));
+        }
+        if port.host_port == 0 {
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                format!("{base}.host_port"),
+                "OUT_OF_RANGE",
+                "Host port must be between 1 and 65535",
+            ));
+        }
+        if port.container_port == 0 {
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                format!("{base}.container_port"),
+                "OUT_OF_RANGE",
+                "Container port must be between 1 and 65535",
+            ));
         }
         if !published.insert((port.host_ip.clone(), port.host_port, port.protocol))
             || !normalized.insert((
@@ -576,36 +906,71 @@ fn validate_ports(ports: &[PortInput]) -> Result<(), DomainError> {
                 port.protocol,
             ))
         {
-            return Err(DomainError::PortConflict);
+            return Err(DraftValidationError::at(
+                DomainError::PortConflict,
+                format!("{base}.host_port"),
+                "PORT_CONFLICT",
+                "Published host IP, port, and protocol must be unique",
+            ));
         }
     }
     Ok(())
 }
-
-fn validate_volumes(volumes: &[VolumeInput]) -> Result<(), DomainError> {
+fn validate_volumes(volumes: &[VolumeInput]) -> Result<(), DraftValidationError> {
     if volumes.len() > 16 {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "volumes",
+            "CONFIG_QUOTA_EXCEEDED",
+            "At most 16 volumes are allowed",
+        ));
     }
     let mut names = HashSet::new();
-    for volume in volumes {
-        validate_container_target(volume.target_path())?;
-        let name = match volume {
+    for (index, volume) in volumes.iter().enumerate() {
+        let base = format!("volumes[{index}]");
+        validate_container_target(volume.target_path()).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("{base}.target_path"),
+                "INVALID_MOUNT_TARGET",
+                "Must be a safe absolute container path",
+            )
+        })?;
+        let (name, field) = match volume {
             VolumeInput::Owned { logical_name, .. } => {
-                validate_logical_name(logical_name)?;
-                logical_name
+                validate_logical_name(logical_name).map_err(|error| {
+                    DraftValidationError::at(
+                        error,
+                        format!("{base}.logical_name"),
+                        "INVALID_VALUE",
+                        "Must be a valid managed-volume name",
+                    )
+                })?;
+                (logical_name, "logical_name")
             }
             VolumeInput::External { name, .. } => {
-                validate_docker_name(name)?;
-                name
+                validate_docker_name(name).map_err(|error| {
+                    DraftValidationError::at(
+                        error,
+                        format!("{base}.name"),
+                        "INVALID_VALUE",
+                        "Must be a valid Docker volume name",
+                    )
+                })?;
+                (name, "name")
             }
         };
         if !names.insert(name.clone()) {
-            return Err(DomainError::ConfigInvalid);
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                format!("{base}.{field}"),
+                "VOLUME_DUPLICATE",
+                "Volume names must be unique",
+            ));
         }
     }
     Ok(())
 }
-
 fn validate_docker_name(value: &str) -> Result<(), DomainError> {
     validate_text(value)?;
     if value.is_empty()
@@ -623,22 +988,71 @@ pub fn validate_binds(
     binds: &[BindMountInput],
     allowed_roots: &[PathBuf],
 ) -> Result<Vec<BindIdentity>, DomainError> {
+    validate_binds_detailed(binds, allowed_roots).map_err(|error| error.error)
+}
+
+fn validate_binds_detailed(
+    binds: &[BindMountInput],
+    allowed_roots: &[PathBuf],
+) -> Result<Vec<BindIdentity>, DraftValidationError> {
     if binds.len() > 16 {
-        return Err(DomainError::ConfigQuotaExceeded);
+        return Err(DraftValidationError::at(
+            DomainError::ConfigQuotaExceeded,
+            "binds",
+            "CONFIG_QUOTA_EXCEEDED",
+            "At most 16 bind mounts are allowed",
+        ));
     }
     if !binds.is_empty() && allowed_roots.is_empty() {
-        return Err(DomainError::BindDisabled);
+        return Err(DraftValidationError::at(
+            DomainError::BindDisabled,
+            "binds",
+            "BIND_DISABLED",
+            "Bind mounts are disabled until an allowed root is configured",
+        ));
     }
     let mut result = Vec::with_capacity(binds.len());
-    for bind in binds {
-        validate_container_target(&bind.target_path)?;
+    for (index, bind) in binds.iter().enumerate() {
+        let base = format!("binds[{index}]");
+        validate_container_target(&bind.target_path).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                format!("{base}.target_path"),
+                "INVALID_MOUNT_TARGET",
+                "Must be a safe absolute container path",
+            )
+        })?;
         if !bind.readonly && !bind.acknowledge_non_rollbackable {
-            return Err(DomainError::BindRwAckRequired);
+            return Err(DraftValidationError::at(
+                DomainError::BindRwAckRequired,
+                format!("{base}.acknowledge_non_rollbackable"),
+                "BIND_RW_ACK_REQUIRED",
+                "Confirm that read-write bind data is not rolled back with a release",
+            ));
         }
-        result.push(validate_bind_source(
-            Path::new(&bind.source),
-            allowed_roots,
-        )?);
+        result.push(
+            validate_bind_source(Path::new(&bind.source), allowed_roots).map_err(|error| {
+                let (code, message) = match error {
+                    DomainError::BindDisabled => (
+                        "BIND_DISABLED",
+                        "Bind mounts are disabled until an allowed root is configured",
+                    ),
+                    DomainError::BindOutsideAllowedRoot => (
+                        "BIND_OUTSIDE_ALLOWED_ROOT",
+                        "Must be an existing directory below an allowed bind root",
+                    ),
+                    DomainError::BindSymlink => (
+                        "BIND_SYMLINK",
+                        "Bind source path components must not be symbolic links",
+                    ),
+                    _ => (
+                        "BIND_SOURCE_INVALID",
+                        "Must be an existing accessible directory",
+                    ),
+                };
+                DraftValidationError::at(error, format!("{base}.source"), code, message)
+            })?,
+        );
     }
     Ok(result)
 }
@@ -724,57 +1138,158 @@ pub fn revalidate_bind_identity(
     Ok(())
 }
 
-fn validate_health(health: &HealthPolicy) -> Result<(), DomainError> {
+fn validate_health(health: &HealthPolicy) -> Result<(), DraftValidationError> {
+    let limits = health_configuration_limits();
     match health {
         HealthPolicy::Healthy { http: None } | HealthPolicy::Completed => Ok(()),
         HealthPolicy::Running {
             stable_window_seconds,
-        } if (5..=300).contains(stable_window_seconds) => Ok(()),
-        HealthPolicy::Disabled {
-            acknowledge_reduced_safety: true,
-        } => Ok(()),
-        HealthPolicy::Healthy { http: Some(http) } => {
-            if http.scheme != "http"
-                || !matches!(http.host.as_str(), "127.0.0.1" | "localhost" | "::1")
-                || http.port == 0
-                || !http.path.starts_with('/')
-                || http.path.contains(char::is_control)
-                || !(1..=300).contains(&http.interval_seconds)
-                || !(1..=60).contains(&http.timeout_seconds)
-                || !(1..=10).contains(&http.retries)
-                || http.start_period_seconds > 300
-            {
-                return Err(DomainError::ConfigInvalid);
+        } => {
+            let limit = limits.running_stable_window_seconds;
+            if !(limit.min..=limit.max).contains(stable_window_seconds) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.stable_window_seconds",
+                    "OUT_OF_RANGE",
+                    range_message(limit.min, limit.max),
+                ));
             }
             Ok(())
         }
-        _ => Err(DomainError::ConfigInvalid),
+        HealthPolicy::Disabled {
+            acknowledge_reduced_safety,
+        } => {
+            if !acknowledge_reduced_safety {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.acknowledge_reduced_safety",
+                    "ACK_REQUIRED",
+                    "Confirm reduced safety before disabling health checks",
+                ));
+            }
+            Ok(())
+        }
+        HealthPolicy::Healthy { http: Some(http) } => {
+            if http.scheme != "http" {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.scheme",
+                    "INVALID_VALUE",
+                    "Only http is supported",
+                ));
+            }
+            if !matches!(http.host.as_str(), "127.0.0.1" | "localhost" | "::1") {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.host",
+                    "INVALID_VALUE",
+                    "Only loopback health hosts are allowed",
+                ));
+            }
+            if http.port == 0 {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.port",
+                    "OUT_OF_RANGE",
+                    "Must be between 1 and 65535",
+                ));
+            }
+            if !http.path.starts_with('/') || http.path.contains(char::is_control) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.path",
+                    "INVALID_VALUE",
+                    "Must be an absolute HTTP path without control characters",
+                ));
+            }
+            let limit = limits.http_interval_seconds;
+            if !(limit.min..=limit.max).contains(&http.interval_seconds) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.interval_seconds",
+                    "OUT_OF_RANGE",
+                    range_message(limit.min, limit.max),
+                ));
+            }
+            let limit = limits.http_timeout_seconds;
+            if !(limit.min..=limit.max).contains(&http.timeout_seconds) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.timeout_seconds",
+                    "OUT_OF_RANGE",
+                    range_message(limit.min, limit.max),
+                ));
+            }
+            let limit = limits.http_retries;
+            if !(limit.min..=limit.max).contains(&http.retries) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.retries",
+                    "OUT_OF_RANGE",
+                    range_message(limit.min, limit.max),
+                ));
+            }
+            let limit = limits.http_start_period_seconds;
+            if !(limit.min..=limit.max).contains(&http.start_period_seconds) {
+                return Err(DraftValidationError::at(
+                    DomainError::ConfigInvalid,
+                    "health.http.start_period_seconds",
+                    "OUT_OF_RANGE",
+                    range_message(limit.min, limit.max),
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
+fn range_message<T: std::fmt::Display>(min: T, max: T) -> String {
+    format!("Must be between {min} and {max}")
+}
 fn validate_mount_target_conflicts(
     files: &[ManagedFileMetadata],
+    file_request_indexes: &[usize],
     volumes: &[VolumeInput],
     binds: &[BindMountInput],
-) -> Result<(), DomainError> {
-    let targets: Vec<&str> = files
+) -> Result<(), DraftValidationError> {
+    let targets = files
         .iter()
-        .map(|file| file.target_path.as_str())
-        .chain(volumes.iter().map(VolumeInput::target_path))
-        .chain(binds.iter().map(|bind| bind.target_path.as_str()))
-        .collect();
-    for (index, left) in targets.iter().enumerate() {
-        for right in targets.iter().skip(index + 1) {
+        .zip(file_request_indexes)
+        .map(|(file, request_index)| {
+            (
+                format!("files[{request_index}].target_path"),
+                file.target_path.as_str(),
+            )
+        })
+        .chain(volumes.iter().enumerate().map(|(index, volume)| {
+            (
+                format!("volumes[{index}].target_path"),
+                volume.target_path(),
+            )
+        }))
+        .chain(binds.iter().enumerate().map(|(index, bind)| {
+            (
+                format!("binds[{index}].target_path"),
+                bind.target_path.as_str(),
+            )
+        }))
+        .collect::<Vec<_>>();
+    for (index, (_, left)) in targets.iter().enumerate() {
+        for (path, right) in targets.iter().skip(index + 1) {
             let left = Path::new(left);
             let right = Path::new(right);
             if left == right || left.starts_with(right) || right.starts_with(left) {
-                return Err(DomainError::FileTargetConflict);
+                return Err(DraftValidationError::at(
+                    DomainError::FileTargetConflict,
+                    path.clone(),
+                    "FILE_TARGET_CONFLICT",
+                    "Mount targets must not overlap",
+                ));
             }
         }
     }
     Ok(())
 }
-
 fn validate_text(value: &str) -> Result<(), DomainError> {
     if value.chars().any(|character| character.is_control()) {
         return Err(DomainError::ConfigInvalid);
@@ -1112,6 +1627,218 @@ mod tests {
     }
 
     #[test]
+    fn health_capabilities_are_the_validation_source_of_truth() {
+        let limits = health_configuration_limits();
+        assert_eq!(limits.running_stable_window_seconds.min, 5);
+        assert_eq!(limits.running_stable_window_seconds.max, 300);
+        assert_eq!(limits.http_interval_seconds.max, 300);
+        assert_eq!(limits.http_timeout_seconds.max, 60);
+        assert_eq!(limits.http_retries.max, 10);
+        assert_eq!(limits.http_start_period_seconds.max, 300);
+        assert_eq!(limits.stop_grace_period_seconds.max, 600);
+
+        let mut invalid = input();
+        invalid.health = HealthPolicy::Healthy {
+            http: Some(HttpHealthcheck {
+                client: HttpClient::Curl,
+                scheme: "http".into(),
+                host: "127.0.0.1".into(),
+                port: 3000,
+                path: "/readyz".into(),
+                interval_seconds: limits.http_interval_seconds.default,
+                timeout_seconds: limits.http_timeout_seconds.default,
+                retries: limits.http_retries.max + 1,
+                start_period_seconds: limits.http_start_period_seconds.default,
+            }),
+        };
+        let error = normalize_draft_with_issues(invalid, &ExistingSecrets::default(), b"key", &[])
+            .err()
+            .unwrap();
+        assert_eq!(error.error, DomainError::ConfigInvalid);
+        assert!(error.issues.iter().any(|issue| {
+            issue.path == "health.http.retries"
+                && issue.code == "OUT_OF_RANGE"
+                && issue.message == "Must be between 1 and 10"
+        }));
+    }
+
+    #[test]
+    fn detailed_validation_locates_safe_field_issues() {
+        let directory = tempfile::tempdir().unwrap();
+        let bind_root = directory.path().join("allowed");
+        let bind_source = bind_root.join("app");
+        std::fs::create_dir_all(&bind_source).unwrap();
+
+        let mut invalid = input();
+        invalid.environment.public = vec![
+            PublicEnvInput {
+                key: "TOKEN".into(),
+                value: "public-canary-one".into(),
+            },
+            PublicEnvInput {
+                key: "TOKEN".into(),
+                value: "public-canary-two".into(),
+            },
+        ];
+        invalid.ports = vec![
+            PortInput {
+                host_ip: "127.0.0.1".into(),
+                host_port: 3000,
+                container_port: 3000,
+                protocol: PortProtocol::Tcp,
+            },
+            PortInput {
+                host_ip: "127.0.0.1".into(),
+                host_port: 3000,
+                container_port: 4000,
+                protocol: PortProtocol::Tcp,
+            },
+        ];
+        invalid.volumes.push(VolumeInput::Owned {
+            logical_name: "data".into(),
+            target_path: "/app/data".into(),
+        });
+        invalid.binds.push(BindMountInput {
+            source: bind_source.to_string_lossy().into_owned(),
+            target_path: "/app/data/cache".into(),
+            readonly: false,
+            acknowledge_non_rollbackable: false,
+        });
+        let error = normalize_draft_with_issues(
+            invalid,
+            &ExistingSecrets::default(),
+            b"key",
+            std::slice::from_ref(&bind_root),
+        )
+        .err()
+        .unwrap();
+        let paths = error
+            .issues
+            .iter()
+            .map(|issue| issue.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&"environment.public[1].key"));
+        assert_eq!(paths, ["environment.public[1].key"]);
+        let serialized = serde_json::to_string(&error.issues).unwrap();
+        assert!(!serialized.contains("public-canary"));
+        assert!(!serialized.contains(bind_source.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn detailed_validation_uses_variant_and_row_specific_paths() {
+        let mut owned = input();
+        owned.volumes = vec![VolumeInput::Owned {
+            logical_name: "INVALID!".into(),
+            target_path: "/data".into(),
+        }];
+        let error =
+            match normalize_draft_with_issues(owned, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("invalid managed volume was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "volumes[0].logical_name");
+
+        let mut external = input();
+        external.volumes = vec![VolumeInput::External {
+            name: "INVALID!".into(),
+            target_path: "/data".into(),
+        }];
+        let error =
+            match normalize_draft_with_issues(external, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("invalid external volume was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "volumes[0].name");
+
+        let mut network = input();
+        network.networks = vec![NetworkInput::External {
+            name: "INVALID!".into(),
+            aliases: Vec::new(),
+        }];
+        let error =
+            match normalize_draft_with_issues(network, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("invalid external network was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "networks[0].name");
+
+        let mut alias = input();
+        alias.networks = vec![NetworkInput::External {
+            name: "shared".into(),
+            aliases: vec!["INVALID!".into()],
+        }];
+        let error =
+            match normalize_draft_with_issues(alias, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("invalid network alias was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "networks[0].aliases[0]");
+    }
+
+    #[test]
+    fn mount_conflict_paths_use_the_original_request_index() {
+        let mut value = input();
+        value.files.push(ManagedFileInput {
+            logical_name: "config".into(),
+            target_path: "/app/config".into(),
+            sensitive: false,
+            readonly: true,
+            content: ManagedFileContent::Public(PublicFileContent {
+                content: "public-file".into(),
+            }),
+        });
+        value.volumes = vec![
+            VolumeInput::Owned {
+                logical_name: "z-data".into(),
+                target_path: "/safe".into(),
+            },
+            VolumeInput::Owned {
+                logical_name: "a-data".into(),
+                target_path: "/app".into(),
+            },
+        ];
+
+        let error =
+            match normalize_draft_with_issues(value, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("overlapping mount target was accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "volumes[1].target_path");
+    }
+
+    #[test]
+    fn managed_file_overlap_uses_the_exact_request_row() {
+        let mut value = input();
+        value.files = vec![
+            ManagedFileInput {
+                logical_name: "config".into(),
+                target_path: "/etc/app".into(),
+                sensitive: false,
+                readonly: true,
+                content: ManagedFileContent::Public(PublicFileContent {
+                    content: "root".into(),
+                }),
+            },
+            ManagedFileInput {
+                logical_name: "settings".into(),
+                target_path: "/etc/app/config.json".into(),
+                sensitive: false,
+                readonly: true,
+                content: ManagedFileContent::Public(PublicFileContent {
+                    content: "nested".into(),
+                }),
+            },
+        ];
+
+        let error =
+            match normalize_draft_with_issues(value, &ExistingSecrets::default(), b"key", &[]) {
+                Ok(_) => panic!("overlapping managed-file targets were accepted"),
+                Err(error) => error,
+            };
+        assert_eq!(error.issues[0].path, "files[1].target_path");
+    }
+
+    #[test]
     fn slug_is_short_ascii_and_stable_resource_safe() {
         for valid in ["a", "app-1", "abcdefghijkl", "abcdefghijklmnopqrst"] {
             assert!(validate_slug(valid).is_ok(), "{valid}");
@@ -1278,6 +2005,62 @@ mod tests {
         })
         .unwrap();
         assert!(!response.contains("file-secret"));
+    }
+
+    #[test]
+    fn valid_secret_to_public_file_conversion_does_not_create_false_issues() {
+        let existing = ExistingSecrets {
+            files: BTreeMap::from([("config".into(), "file-secret".into())]),
+            file_metadata: BTreeMap::from([(
+                "config".into(),
+                ManagedFileMetadata {
+                    logical_name: "config".into(),
+                    target_path: "/app/config".into(),
+                    sensitive: true,
+                    readonly: true,
+                },
+            )]),
+            ..ExistingSecrets::default()
+        };
+        let mut value = input();
+        value.files = vec![
+            ManagedFileInput {
+                logical_name: "config".into(),
+                target_path: "/app/config".into(),
+                sensitive: true,
+                readonly: true,
+                content: ManagedFileContent::Secret(SecretOperation::Delete),
+            },
+            ManagedFileInput {
+                logical_name: "config".into(),
+                target_path: "/app/config".into(),
+                sensitive: false,
+                readonly: true,
+                content: ManagedFileContent::Public(PublicFileContent {
+                    content: "public-file".into(),
+                }),
+            },
+        ];
+        value.health = HealthPolicy::Healthy {
+            http: Some(HttpHealthcheck {
+                client: HttpClient::Curl,
+                scheme: "http".into(),
+                host: "127.0.0.1".into(),
+                port: 3000,
+                path: "/readyz".into(),
+                interval_seconds: 10,
+                timeout_seconds: 5,
+                retries: 11,
+                start_period_seconds: 30,
+            }),
+        };
+
+        let error = match normalize_draft_with_issues(value, &existing, b"key", &[]) {
+            Ok(_) => panic!("invalid health configuration was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(error.issues.len(), 1);
+        assert_eq!(error.issues[0].path, "health.http.retries");
     }
 
     #[test]
