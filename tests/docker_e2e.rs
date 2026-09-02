@@ -1244,7 +1244,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
                         endpoints_config: Some(HashMap::from([(
                             network_name.clone(),
                             EndpointSettings {
-                                aliases: Some(vec!["postgres".into()]),
+                                aliases: Some(vec!["database".into()]),
                                 ..Default::default()
                             },
                         )])),
