@@ -10,6 +10,8 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 受管 public/secret file 的宿主 leaf 为 `0444`，用于让显式 bind mount 的非 root 容器读取；其全部宿主 ancestor 仍为 `0700 solodock:solodock`，容器只看到 Compose 明确挂入的单个 leaf。该边界不隔离宿主 root、Docker daemon 控制者或拥有 Docker socket 的主体，也不允许受管容器浏览完整 state tree。只读性由 Compose `read_only: true` 和 immutable revision 共同执行；其他控制面 secret 不因该例外放宽。
 
+受管 state reader 在拼接或读取 leaf 前先验证来自 metadata 的文件名；root-relative 路径只接受普通组件，拒绝 `.`、`..`、absolute/prefix 和 symlink boundary。HMAC 负责内容完整性，不被当作延迟执行的路径消毒器；路径不合法时必须在读取目标内容前 fail closed。
+
 部署只信任严格解析并校验 digest/header/body/platform 的 Registry 结果，不验证 Cosign/Sigstore 签名。tag race 不能改变已调度 candidate，但 Registry/镜像供应链仍可能提供恶意内容。容器 capabilities、mount 和 Compose 由 typed generator 限制；bind allowlist 和 Docker data-root overlap 每次 effect 前 fail closed。
 
 资源防护包括请求/body/stream/log buffer 上限、单一 Compose mutation、最多两个 Registry resolve、poll jitter/backoff、busy coalescing 和失败 target suppression。它不承诺抵御拥有宿主 root、Docker daemon控制权或合法管理员 session 的攻击者，也不提供多租户隔离。

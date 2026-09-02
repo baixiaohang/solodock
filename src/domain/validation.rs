@@ -817,7 +817,7 @@ fn validate_env_key(value: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-fn validate_logical_name(value: &str) -> Result<(), DomainError> {
+pub(crate) fn validate_logical_name(value: &str) -> Result<(), DomainError> {
     if value.is_empty()
         || value.len() > 64
         || matches!(value, "." | "..")
