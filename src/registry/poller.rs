@@ -24,6 +24,7 @@ use crate::{
         ScheduleResult, ScheduledResolvedTarget,
     },
     docker::ownership::validate_syntactic_identity,
+    mutation::AppMutationCoordinator,
 };
 
 use super::{
@@ -139,13 +140,15 @@ impl PollCoordinator {
     }
 
     async fn run(&self, state: AppState, m3: Arc<M3Services>, m4: Arc<M4Services>) {
-        loop {
+        'coordinator: loop {
             if self.shutdown.is_cancelled() {
                 break;
             }
+            let catalog_guard = m3.coordinator.catalog_lock().await;
             let snapshot = state.observer.catalog.snapshot();
             let ids = snapshot.apps.iter().map(|app| app.id).collect::<Vec<_>>();
             if snapshot.recovery_issues.is_empty() && self.store.retain_apps(&ids).await.is_err() {
+                drop(catalog_guard);
                 self.health.degraded.store(true, Ordering::Release);
                 tokio::select! { () = self.shutdown.cancelled() => break, () = tokio::time::sleep(Duration::from_secs(30)) => continue }
             }
@@ -161,7 +164,13 @@ impl PollCoordinator {
                     inventory_degraded = true;
                     continue;
                 };
-                let current = self.store.get(app.id).await.ok().flatten();
+                let mut current = match self.store.get(app.id).await {
+                    Ok(value) => value,
+                    Err(_) => {
+                        inventory_degraded = true;
+                        continue;
+                    }
+                };
                 if !metadata.auto_deploy_enabled {
                     if self
                         .store
@@ -193,13 +202,53 @@ impl PollCoordinator {
                         && current.webhook_sequence > current.webhook_processed_sequence
                         && self
                             .store
-                            .mark_webhook_processed(app.id, current.webhook_sequence)
+                            .mark_webhook_processed(app.id, &generation, current.webhook_sequence)
                             .await
                             .is_err()
                     {
                         inventory_degraded = true;
                     }
                     continue;
+                }
+                if current
+                    .as_ref()
+                    .is_none_or(|value| value.generation != generation)
+                {
+                    let initial_due = now
+                        + time::Duration::seconds(i64::from(initial_jitter(
+                            &m3.store,
+                            app.id,
+                            &generation,
+                            metadata.poll_interval_seconds,
+                        )));
+                    let observed_generation =
+                        current.as_ref().map(|value| value.generation.as_str());
+                    let initialized = match self
+                        .store
+                        .try_initialize_generation(
+                            app.id,
+                            observed_generation,
+                            &generation,
+                            initial_due,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(_) => {
+                            inventory_degraded = true;
+                            continue;
+                        }
+                    };
+                    if !initialized {
+                        continue 'coordinator;
+                    }
+                    current = match self.store.get(app.id).await {
+                        Ok(value) => value,
+                        Err(_) => {
+                            inventory_degraded = true;
+                            continue;
+                        }
+                    };
                 }
                 let pending_webhook = current.as_ref().filter(|value| {
                     value.generation == generation
@@ -243,6 +292,7 @@ impl PollCoordinator {
                     webhook_sequence: pending_webhook.map_or(0, |value| value.webhook_sequence),
                 }));
             }
+            drop(catalog_guard);
             self.health.due.store(heap.len(), Ordering::Release);
             self.health
                 .degraded
@@ -273,16 +323,23 @@ impl PollCoordinator {
                 .map(|due| async {
                     self.health.inflight.fetch_add(1, Ordering::AcqRel);
                     let app_id = due.app_id;
+                    let generation = due.generation.clone();
                     let webhook_sequence = due.webhook_sequence;
                     let mut result = self.poll_one(&state, &m3, &m4, due).await;
                     if result.is_ok()
                         && !self.shutdown.is_cancelled()
                         && webhook_sequence > 0
-                        && self
-                            .store
-                            .mark_webhook_processed(app_id, webhook_sequence)
-                            .await
-                            .is_err()
+                        && acknowledge_webhook_if_current(
+                            &m3.coordinator,
+                            &m3.store,
+                            &m4.credentials,
+                            &self.store,
+                            app_id,
+                            &generation,
+                            webhook_sequence,
+                        )
+                        .await
+                        .is_err()
                     {
                         result = Err(());
                     }
@@ -834,6 +891,27 @@ impl PollCoordinator {
     }
 }
 
+async fn acknowledge_webhook_if_current(
+    coordinator: &AppMutationCoordinator,
+    app_store: &AppStore,
+    credentials: &CredentialStore,
+    poll_states: &PollStateStore,
+    app_id: Uuid,
+    generation: &str,
+    captured: i64,
+) -> Result<(), ()> {
+    let _catalog = coordinator.catalog_lock().await;
+    let metadata = app_store.read_metadata(app_id).map_err(|_| ())?;
+    let current = poll_generation(app_store, credentials, &metadata).map_err(|_| ())?;
+    if metadata.auto_deploy_enabled && current == generation {
+        poll_states
+            .mark_webhook_processed(app_id, generation, captured)
+            .await
+            .map_err(|_| ())?;
+    }
+    Ok(())
+}
+
 fn webhook_must_respect_backoff(state: &PollState, now: OffsetDateTime) -> bool {
     state
         .next_check_not_before
@@ -1000,6 +1078,7 @@ async fn poll_actual_fact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test(start_paused = true)]
     async fn failed_attempt_backoff_is_bounded_and_cancellation_aware() {
@@ -1046,6 +1125,108 @@ mod tests {
         assert_eq!(
             clamp_persisted_due(now - time::Duration::hours(1), now, 300),
             now
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_poll_does_not_ack_webhook_after_metadata_generation_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = vec![9; 32];
+        let app_store =
+            AppStore::initialize_managed(root.path().join("apps"), key.clone(), Vec::new())
+                .unwrap();
+        let credentials =
+            CredentialStore::initialize(root.path().join("credentials"), key.clone()).unwrap();
+        let coordinator = AppMutationCoordinator::new(root.path().join("runtime")).unwrap();
+        let database = crate::db::Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let poll_states = PollStateStore::new(database);
+        let app_id = Uuid::new_v4();
+        let first_revision = Uuid::new_v4();
+        let draft = |stop_grace_period_seconds| {
+            crate::domain::normalize_draft(
+                crate::domain::DraftInput {
+                    display_name: "Example".into(),
+                    discovery_image_ref: "registry.example/app:stable".into(),
+                    credential_ref: None,
+                    auto_deploy_enabled: true,
+                    auto_deploy_acknowledged: true,
+                    poll_interval_seconds: 120,
+                    stop_grace_period_seconds,
+                    environment: Default::default(),
+                    files: vec![],
+                    ports: vec![],
+                    volumes: vec![],
+                    binds: vec![],
+                    owned_default_network: true,
+                    service_discovery_enabled: true,
+                    networks: vec![],
+                    health: Default::default(),
+                },
+                &Default::default(),
+                &key,
+                &[],
+            )
+            .unwrap()
+        };
+        let first = app_store
+            .create_app(
+                app_id,
+                "example",
+                Uuid::new_v4(),
+                Some((first_revision, &draft(10))),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let first_generation = poll_generation(&app_store, &credentials, &first).unwrap();
+        assert_eq!(
+            poll_states
+                .accept_webhook(
+                    app_id,
+                    Uuid::new_v4(),
+                    &[9; 32],
+                    Uuid::new_v4(),
+                    &first_generation,
+                    true,
+                )
+                .await
+                .unwrap(),
+            crate::registry::WebhookAccept::Accepted
+        );
+
+        let second = app_store
+            .update_draft(
+                app_id,
+                Some(first_revision),
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                &draft(60),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        assert_ne!(
+            poll_generation(&app_store, &credentials, &second).unwrap(),
+            first_generation
+        );
+        acknowledge_webhook_if_current(
+            &coordinator,
+            &app_store,
+            &credentials,
+            &poll_states,
+            app_id,
+            &first_generation,
+            1,
+        )
+        .await
+        .unwrap();
+
+        let state = poll_states.get(app_id).await.unwrap().unwrap();
+        assert_eq!(state.generation, first_generation);
+        assert_eq!(
+            (state.webhook_sequence, state.webhook_processed_sequence),
+            (1, 0)
         );
     }
 
