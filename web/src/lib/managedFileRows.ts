@@ -1,4 +1,5 @@
 import type { DraftInput, DraftResponse } from './types'
+import { FormValidationError } from './formErrors'
 
 export interface ManagedFileRow {
   logicalName: string
@@ -34,17 +35,23 @@ export function managedFileRowsFromDraft(draft: DraftResponse): ManagedFileRow[]
   }))
 }
 
-export function buildManagedFiles(rows: ManagedFileRow[]): DraftInput['files'] {
+export interface ManagedFileProjection {
+  files: DraftInput['files']
+  requestRowIndexes: number[]
+}
+
+export function buildManagedFileProjection(rows: ManagedFileRow[]): ManagedFileProjection {
   const active = rows.filter((row) => !row.removed)
   const finalByName = new Map<string, ManagedFileRow>()
-  for (const row of active) {
+  for (const [index, row] of active.entries()) {
     row.logicalName = row.logicalName.trim()
     row.targetPath = row.targetPath.trim()
-    if (!row.logicalName || !row.targetPath) throw new Error('managed file name and target are required')
-    if (finalByName.has(row.logicalName)) throw new Error('duplicate managed file name')
+    if (!row.logicalName) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_NAME_REQUIRED', message: '托管文件逻辑名称不能为空' }])
+    if (!row.targetPath) throw new FormValidationError([{ path: `files[${index}].target_path`, code: 'FILE_TARGET_REQUIRED', message: '托管文件容器路径不能为空' }])
+    if (finalByName.has(row.logicalName)) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_TARGET_CONFLICT', message: '托管文件逻辑名称不能重复' }])
     finalByName.set(row.logicalName, row)
     if (row.originalSensitive && !row.sensitive && !row.value) {
-      throw new Error('secret to public conversion requires replacement content')
+      throw new FormValidationError([{ path: `files[${index}].content`, code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 文件转为普通文件时必须输入新内容' }])
     }
   }
 
@@ -57,6 +64,7 @@ export function buildManagedFiles(rows: ManagedFileRow[]): DraftInput['files'] {
       readonly: true,
       content: row.value,
     }))
+  const requestRowIndexes = active.flatMap((row, index) => row.sensitive ? [] : [index])
   const originalSecretNames = new Set(
     rows
       .filter((row) => row.originalSensitive && row.originalLogicalName !== null)
@@ -67,6 +75,7 @@ export function buildManagedFiles(rows: ManagedFileRow[]): DraftInput['files'] {
     if (!finalRow || !finalRow.sensitive) {
       const original = rows.find((row) => row.originalSensitive && row.originalLogicalName === name)!
       result.push({ logical_name: name, target_path: original.originalTargetPath!, sensitive: true, readonly: true, operation: 'delete' })
+      requestRowIndexes.push(finalRow ? active.indexOf(finalRow) : active.indexOf(original))
       continue
     }
     const canKeep = finalRow.originalSensitive
@@ -75,14 +84,20 @@ export function buildManagedFiles(rows: ManagedFileRow[]): DraftInput['files'] {
       && !finalRow.value
     if (canKeep) result.push({ logical_name: name, target_path: finalRow.targetPath, sensitive: true, readonly: true, operation: 'keep' })
     else {
-      if (!finalRow.value) throw new Error('secret replacement content required')
+      if (!finalRow.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 文件改名或变更类型时必须输入新内容' }])
       result.push({ logical_name: name, target_path: finalRow.targetPath, sensitive: true, readonly: true, operation: 'replace', value: finalRow.value })
     }
+    requestRowIndexes.push(active.indexOf(finalRow))
   }
   for (const row of active) {
     if (!row.sensitive || originalSecretNames.has(row.logicalName)) continue
-    if (!row.value) throw new Error('secret replacement content required')
+    if (!row.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: '新 Secret 文件必须输入内容' }])
     result.push({ logical_name: row.logicalName, target_path: row.targetPath, sensitive: true, readonly: true, operation: 'replace', value: row.value })
+    requestRowIndexes.push(active.indexOf(row))
   }
-  return result
+  return { files: result, requestRowIndexes }
+}
+
+export function buildManagedFiles(rows: ManagedFileRow[]): DraftInput['files'] {
+  return buildManagedFileProjection(rows).files
 }

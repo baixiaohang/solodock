@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildManagedFiles, managedFileRowsFromDraft } from './managedFileRows'
+import { buildManagedFileProjection, buildManagedFiles, managedFileRowsFromDraft } from './managedFileRows'
 
 function rows() {
   return managedFileRowsFromDraft({
@@ -42,8 +42,18 @@ describe('managed file row projection', () => {
       { logical_name: 'secret-b', target_path: '/run/b', sensitive: true, readonly: true, operation: 'keep' },
     ])
     const renamed = rows(); renamed[1].logicalName = 'renamed'
-    expect(() => buildManagedFiles(renamed)).toThrow('replacement')
+    expect(() => buildManagedFiles(renamed)).toThrow('必须输入内容')
     const missing = rows(); missing[1].sensitive = false
-    expect(() => buildManagedFiles(missing)).toThrow('replacement')
+    expect(() => buildManagedFiles(missing)).toThrow('必须输入新内容')
+  })
+
+  it('returns request-index mapping for mixed public and Secret rows', () => {
+    const input = rows()
+    input.splice(0, 3, input[1], input[0], input[2])
+    const projection = buildManagedFileProjection(input)
+    expect(projection.files.map((file) => file.logical_name)).toEqual([
+      'public', 'secret-a', 'secret-b',
+    ])
+    expect(projection.requestRowIndexes).toEqual([1, 0, 2])
   })
 })

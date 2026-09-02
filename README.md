@@ -64,7 +64,7 @@ SQLite 保存管理员凭据、session、登录节流和真实审计历史；应
 
 SoloDock 可以管理 write-only Registry credential，把 draft tag 解析为当前 Docker 平台的具体 manifest digest，并通过唯一后台 deployment 状态机完成 pull、force-recreate、健康门禁、active 原子切换和失败回滚。每个应用可配置 `1–600` 秒的停机宽限，默认 `10` 秒；该值固定进 release，服务提前退出时部署立即继续。管理员可显式确认开启有界 Registry 轮询自动部署；busy 不排队，坏 target 会被抑制。所有持久业务 mutation 都要求 `Idempotency-Key`，并继续要求精确 Origin、session 与 double-submit CSRF。
 
-控制台状态条同时展示主机 `MemAvailable` 与状态盘可用空间。系统设置可从后端认可的 IANA 时区下拉列表中选择全局显示时区，默认 UTC，保存后立即刷新 Web 时间；SQLite、API、SSE、cursor 与下载日志始终保留 UTC。应用配置页使用单列直接编辑表单，public 与 write-only Secret 环境变量统一逐行管理；部署历史固定一项一行。
+控制台状态条同时展示主机 `MemAvailable` 与状态盘可用空间。系统设置可从后端认可的 IANA 时区下拉列表中选择全局显示时区，默认 UTC，保存后立即刷新 Web 时间；SQLite、API、SSE、cursor 与下载日志始终保留 UTC。应用配置页使用单列直接编辑表单：public 环境变量可在逐行与批量 `KEY=VALUE` 模式间切换，Secret 保持 write-only 逐行管理；每条 read-write bind 就地确认不随 release 回滚。健康字段使用后端 capability 边界，配置错误会安全地定位到对应区块/行。部署历史固定一项一行。
 
 新服务默认加入 SoloDock 管理的内部服务发现网络，服务间可使用 `<slug>:<container-port>` 互通且无需发布数据库宿主端口；旧 release 不会因升级被自动加入。内置“快速部署 → PostgreSQL”会生成普通 immutable draft，默认使用 `postgres:18`、owned data volume、自动生成的 write-only 密码和内部网络，然后通过正常 deployment 状态机部署；它不引入任意 Compose 或远程模板执行。
 

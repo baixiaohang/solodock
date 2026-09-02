@@ -40,6 +40,21 @@ describe('NetworkEditor', () => {
 
     expect(screen.queryByRole('alert')).toBeNull()
   })
+
+  it('把 network name 和 alias issue 定位到对应控件', () => {
+    render(NetworkEditor, {
+      ownedDefaultNetwork: true,
+      externalNetworks: [{ name: 'shared', aliases: ['postgres'] }],
+      issues: [
+        { path: 'networks[0].name', code: 'INVALID_VALUE', message: '网络名称无效' },
+        { path: 'networks[0].aliases[0]', code: 'INVALID_VALUE', message: 'Alias 无效' },
+      ],
+    })
+    expect(screen.getByLabelText('External network 1').getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByLabelText('Network 1 alias 1').getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByText('网络名称无效')).toBeTruthy()
+    expect(screen.getByText('Alias 无效')).toBeTruthy()
+  })
 })
 
 describe('network form projection', () => {

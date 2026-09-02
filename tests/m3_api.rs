@@ -2216,6 +2216,98 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
 }
 
 #[tokio::test]
+async fn draft_validation_returns_safe_field_issues_for_preview_and_save() {
+    let harness = Harness::new().await;
+    let (_, created) = body(
+        harness
+            .create(Some("field-issues-create"), &draft("stored-secret"))
+            .await,
+    )
+    .await;
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id = created["app"]["id"].as_str().unwrap();
+    let revision = created["app"]["config_revision"].clone();
+    let mut overlapping_files = mutable_draft("replacement-secret");
+    overlapping_files["files"] = json!([
+        {
+            "logical_name":"config", "target_path":"/etc/app",
+            "sensitive":false, "readonly":true, "content":"root"
+        },
+        {
+            "logical_name":"settings", "target_path":"/etc/app/config.json",
+            "sensitive":false, "readonly":true, "content":"nested"
+        }
+    ]);
+    let overlap = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/validate"),
+            None,
+            &json!({"draft":overlapping_files}),
+        )
+        .await;
+    let (status, overlap) = body(overlap).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{overlap}");
+    let overlap: Value = serde_json::from_str(&overlap).unwrap();
+    assert_eq!(overlap["issues"][0]["path"], "files[1].target_path");
+
+    let mut candidate = mutable_draft("secret-canary-must-not-leak");
+    candidate["health"] = json!({
+        "policy":"healthy",
+        "http":{
+            "client":"curl", "scheme":"http", "host":"127.0.0.1",
+            "port":3000, "path":"/readyz", "interval_seconds":10,
+            "timeout_seconds":5, "retries":11, "start_period_seconds":30
+        }
+    });
+
+    let preview = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/validate"),
+            None,
+            &json!({"draft":candidate.clone()}),
+        )
+        .await;
+    let (status, preview) = body(preview).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{preview}");
+    assert!(!preview.contains("secret-canary-must-not-leak"));
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+    assert_eq!(preview["code"], "CONFIG_INVALID");
+    assert_eq!(preview["issues"][0]["path"], "health.http.retries");
+    assert_eq!(preview["issues"][0]["code"], "OUT_OF_RANGE");
+
+    let saved = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some("field-issues-save"),
+            &json!({"expected_revision":revision,"draft":candidate.clone()}),
+        )
+        .await;
+    let (status, saved) = body(saved).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{saved}");
+    assert!(!saved.contains("secret-canary-must-not-leak"));
+    let saved: Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(saved["issues"][0]["path"], "health.http.retries");
+
+    let replay = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{app_id}/draft"),
+            Some("field-issues-save"),
+            &json!({"expected_revision":revision,"draft":candidate}),
+        )
+        .await;
+    let (status, replay) = body(replay).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{replay}");
+    assert!(!replay.contains("secret-canary-must-not-leak"));
+    let replay: Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(replay["issues"], saved["issues"]);
+    assert_eq!(replay["idempotency_replayed"], true);
+}
+
+#[tokio::test]
 async fn signed_webhook_is_host_isolated_write_only_and_durably_coalesced() {
     fn signed_request(
         app_id: Uuid,
@@ -2583,6 +2675,14 @@ async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
     let initial: Value = serde_json::from_str(&initial).unwrap();
     assert_eq!(initial["display_timezone"], "UTC");
     assert_eq!(initial["supported_timezones"][0], "UTC");
+    assert_eq!(
+        initial["configuration_limits"]["health"]["http_retries"]["max"],
+        10
+    );
+    assert_eq!(
+        initial["configuration_limits"]["health"]["http_timeout_seconds"]["max"],
+        60
+    );
     let request = json!({
         "expected_revision": initial["revision"],
         "display_timezone": "Asia/Shanghai",

@@ -38,7 +38,8 @@ use crate::{
         ownership::validate_identity,
     },
     domain::{
-        DesiredState, DraftInput, ExistingSecrets, NormalizedDraft, normalize_draft, validate_slug,
+        DesiredState, DraftInput, DraftValidationError, ExistingSecrets, NormalizedDraft,
+        normalize_draft_with_issues, validate_slug,
     },
     error::{ApiError, RequestId},
     mutation::{
@@ -407,7 +408,7 @@ pub async fn update_draft(
         },
         None => ExistingSecrets::default(),
     };
-    let draft = match normalize_draft(
+    let draft = match normalize_draft_with_issues(
         payload.draft,
         &existing,
         &services.idempotency.fingerprint(b"config"),
@@ -415,15 +416,8 @@ pub async fn update_draft(
     ) {
         Ok(draft) => draft,
         Err(error) => {
-            return finish_error(
-                services,
-                &route,
-                raw_key,
-                error.public_code(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                request_id,
-            )
-            .await;
+            return finish_draft_validation_error(services, &route, raw_key, error, request_id)
+                .await;
         }
     };
     validate_registry_credential(&state, &draft, request_id)?;
@@ -532,7 +526,7 @@ pub async fn validate(
         (None, None) => return Err(ApiError::conflict("APP_UNCONFIGURED", request_id)),
     };
     let empty_secrets = ExistingSecrets::default();
-    let draft = normalize_draft(
+    let draft = normalize_draft_with_issues(
         input,
         loaded
             .as_ref()
@@ -541,7 +535,7 @@ pub async fn validate(
         &services.idempotency.fingerprint(b"config"),
         &services.store.allowed_bind_roots(),
     )
-    .map_err(|error| ApiError::domain(error, request_id))?;
+    .map_err(|error| ApiError::draft_validation(error, request_id))?;
     validate_registry_credential(&state, &draft, request_id)?;
     let bind_identities = validate_runtime_paths(&state, services, &draft.metadata)
         .await
@@ -1886,6 +1880,43 @@ pub(crate) async fn finish_error(
         return Err(ApiError::internal(request_id));
     }
     replay(status.as_u16(), body)
+}
+
+async fn finish_draft_validation_error(
+    services: &M3Services,
+    route: &str,
+    key: &str,
+    error: DraftValidationError,
+    request_id: RequestId,
+) -> Result<Response, ApiError> {
+    let code = error.error.public_code();
+    let body = serde_json::json!({
+        "code": code,
+        "message": "The application configuration is invalid",
+        "request_id": request_id.0,
+        "issues": error.issues,
+    })
+    .to_string();
+    if services
+        .idempotency
+        .finish(
+            route,
+            key,
+            StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            &body,
+            Some(code),
+            request_id.0,
+        )
+        .await
+        .is_err()
+    {
+        let _ = services
+            .idempotency
+            .mark_interrupted(route, key, request_id.0)
+            .await;
+        return Err(ApiError::internal(request_id));
+    }
+    replay(StatusCode::UNPROCESSABLE_ENTITY.as_u16(), body)
 }
 
 pub(crate) async fn interrupt_internal(

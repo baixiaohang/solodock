@@ -61,6 +61,14 @@ pub struct NetworkPlan {
     pub external: Vec<ExternalNetworkAttachment>,
 }
 
+#[derive(Debug)]
+pub struct NetworkValidationError {
+    pub error: DomainError,
+    pub path: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
 impl NetworkPlan {
     pub fn expected_networks(
         &self,
@@ -101,29 +109,32 @@ pub fn normalize_networks(
     service_discovery_enabled: bool,
     networks: &mut [NetworkInput],
 ) -> Result<NetworkPlan, DomainError> {
+    normalize_networks_with_issues(owned_default_network, service_discovery_enabled, networks)
+        .map_err(|error| error.error)
+}
+
+pub fn normalize_networks_with_issues(
+    owned_default_network: bool,
+    service_discovery_enabled: bool,
+    networks: &mut [NetworkInput],
+) -> Result<NetworkPlan, NetworkValidationError> {
+    validate_network_inputs(
+        owned_default_network,
+        service_discovery_enabled,
+        networks,
+        true,
+    )?;
     for network in networks.iter_mut() {
-        if let NetworkInput::External { name, aliases } = network {
-            // Current revisions reserve the platform-owned service network.
-            // The lower-level reader intentionally remains permissive so an
-            // already signed legacy artifact can still be verified.
-            if name == PLATFORM_NETWORK_NAME {
-                return Err(DomainError::ConfigInvalid);
-            }
-            let mut seen = HashSet::new();
-            for alias in aliases.iter() {
-                validate_alias(alias)?;
-                if !seen.insert(alias.clone()) {
-                    return Err(DomainError::ConfigInvalid);
-                }
-            }
-            if aliases.len() > MAX_NETWORK_ALIASES {
-                return Err(DomainError::ConfigQuotaExceeded);
-            }
+        if let NetworkInput::External { aliases, .. } = network {
             aliases.sort();
         }
     }
     networks.sort_by(|left, right| network_sort_key(left).cmp(&network_sort_key(right)));
-    network_plan(owned_default_network, service_discovery_enabled, networks)
+    Ok(build_network_plan(
+        owned_default_network,
+        service_discovery_enabled,
+        networks,
+    ))
 }
 
 pub fn network_plan(
@@ -131,45 +142,131 @@ pub fn network_plan(
     service_discovery_enabled: bool,
     networks: &[NetworkInput],
 ) -> Result<NetworkPlan, DomainError> {
+    validate_network_inputs(
+        owned_default_network,
+        service_discovery_enabled,
+        networks,
+        false,
+    )
+    .map_err(|error| error.error)?;
+    Ok(build_network_plan(
+        owned_default_network,
+        service_discovery_enabled,
+        networks,
+    ))
+}
+
+fn validate_network_inputs(
+    owned_default_network: bool,
+    service_discovery_enabled: bool,
+    networks: &[NetworkInput],
+    reserve_platform_name: bool,
+) -> Result<(), NetworkValidationError> {
     let mut names = HashSet::new();
     let mut owned_markers = 0usize;
-    let mut external = Vec::new();
     for (source_index, network) in networks.iter().enumerate() {
         match network {
             NetworkInput::OwnedDefault => owned_markers += 1,
             NetworkInput::External { name, aliases } => {
-                validate_docker_name(name)?;
+                if reserve_platform_name && name == PLATFORM_NETWORK_NAME {
+                    return Err(network_error(
+                        DomainError::ConfigInvalid,
+                        format!("networks[{source_index}].name"),
+                        "NETWORK_NAME_RESERVED",
+                        "The platform service-discovery network name is reserved",
+                    ));
+                }
+                validate_docker_name(name).map_err(|error| {
+                    network_error(
+                        error,
+                        format!("networks[{source_index}].name"),
+                        "INVALID_VALUE",
+                        "Must be a valid Docker network name",
+                    )
+                })?;
                 if !names.insert(name.clone()) {
-                    return Err(DomainError::ConfigInvalid);
+                    return Err(network_error(
+                        DomainError::ConfigInvalid,
+                        format!("networks[{source_index}].name"),
+                        "NETWORK_DUPLICATE",
+                        "External network names must be unique",
+                    ));
                 }
                 if aliases.len() > MAX_NETWORK_ALIASES {
-                    return Err(DomainError::ConfigQuotaExceeded);
+                    return Err(network_error(
+                        DomainError::ConfigQuotaExceeded,
+                        format!("networks[{source_index}].aliases"),
+                        "CONFIG_QUOTA_EXCEEDED",
+                        format!("At most {MAX_NETWORK_ALIASES} aliases are allowed"),
+                    ));
                 }
-                let mut previous: Option<&str> = None;
-                for alias in aliases {
-                    validate_alias(alias)?;
-                    if previous == Some(alias) {
-                        return Err(DomainError::ConfigInvalid);
+                let mut seen_aliases = HashSet::new();
+                for (alias_index, alias) in aliases.iter().enumerate() {
+                    validate_alias(alias).map_err(|error| {
+                        network_error(
+                            error,
+                            format!("networks[{source_index}].aliases[{alias_index}]"),
+                            "INVALID_VALUE",
+                            "Must be a valid lowercase DNS alias",
+                        )
+                    })?;
+                    if !seen_aliases.insert(alias) {
+                        return Err(network_error(
+                            DomainError::ConfigInvalid,
+                            format!("networks[{source_index}].aliases[{alias_index}]"),
+                            "NETWORK_ALIAS_DUPLICATE",
+                            "Aliases must be unique within a network",
+                        ));
                     }
-                    previous = Some(alias);
                 }
-                external.push(ExternalNetworkAttachment {
-                    name: name.clone(),
-                    aliases: aliases.clone(),
-                    source_index,
-                });
             }
         }
     }
-    if external.len() > MAX_EXTERNAL_NETWORKS {
-        return Err(DomainError::ConfigQuotaExceeded);
+    let external_count = networks.len().saturating_sub(owned_markers);
+    if external_count > MAX_EXTERNAL_NETWORKS {
+        return Err(network_error(
+            DomainError::ConfigQuotaExceeded,
+            "networks",
+            "CONFIG_QUOTA_EXCEEDED",
+            format!("At most {MAX_EXTERNAL_NETWORKS} external networks are allowed"),
+        ));
     }
     if owned_markers > 1 || (!owned_default_network && owned_markers != 0) {
-        return Err(DomainError::ConfigInvalid);
+        return Err(network_error(
+            DomainError::ConfigInvalid,
+            "networks",
+            "NETWORK_INVALID",
+            "The legacy owned-network marker is inconsistent",
+        ));
     }
-    if !owned_default_network && !service_discovery_enabled && external.is_empty() {
-        return Err(DomainError::ConfigInvalid);
+    if !owned_default_network && !service_discovery_enabled && external_count == 0 {
+        return Err(network_error(
+            DomainError::ConfigInvalid,
+            "networks",
+            "NETWORK_REQUIRED",
+            "At least one network must be enabled",
+        ));
     }
+    Ok(())
+}
+
+fn build_network_plan(
+    owned_default_network: bool,
+    service_discovery_enabled: bool,
+    networks: &[NetworkInput],
+) -> NetworkPlan {
+    let mut external = networks
+        .iter()
+        .enumerate()
+        .filter_map(|(source_index, network)| match network {
+            NetworkInput::OwnedDefault => None,
+            NetworkInput::External { name, aliases } => Some(ExternalNetworkAttachment {
+                name: name.clone(),
+                aliases: aliases.clone(),
+                source_index,
+            }),
+        })
+        .collect::<Vec<_>>();
     external.sort_by(|left, right| left.name.cmp(&right.name));
     let mode = match (
         owned_default_network,
@@ -183,14 +280,28 @@ pub fn network_plan(
         (true, true, false) => NetworkMode::OwnedPlatformAndExternal,
         (false, true, false) => NetworkMode::PlatformAndExternal,
         (false, true, true) => NetworkMode::PlatformOnly,
-        (false, false, true) => return Err(DomainError::ConfigInvalid),
+        (false, false, true) => unreachable!("network inputs were validated"),
     };
-    Ok(NetworkPlan {
+    NetworkPlan {
         owned_default_network,
         service_discovery_enabled,
         mode,
         external,
-    })
+    }
+}
+
+fn network_error(
+    error: DomainError,
+    path: impl Into<String>,
+    code: &'static str,
+    message: impl Into<String>,
+) -> NetworkValidationError {
+    NetworkValidationError {
+        error,
+        path: path.into(),
+        code,
+        message: message.into(),
+    }
 }
 
 pub const PLATFORM_NETWORK_NAME: &str = "solodock-services";

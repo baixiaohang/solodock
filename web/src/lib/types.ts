@@ -2,6 +2,7 @@ export interface ApiErrorBody {
   code: string
   message: string
   request_id: string
+  issues?: Array<{ path: string; code: string; message: string }>
 }
 
 export interface MeResponse {
@@ -16,7 +17,18 @@ export interface SettingsResponse {
   allowed_bind_roots: string[]
   slug_max_length: number
   supported_mount_types: Array<'owned_volume' | 'external_volume' | 'bind'>
+  configuration_limits: { health: HealthConfigurationLimits }
   idempotency_replayed?: boolean
+}
+
+export interface NumericLimit { min: number; max: number; default: number }
+export interface HealthConfigurationLimits {
+  running_stable_window_seconds: NumericLimit
+  http_interval_seconds: NumericLimit
+  http_timeout_seconds: NumericLimit
+  http_retries: NumericLimit
+  http_start_period_seconds: NumericLimit
+  stop_grace_period_seconds: NumericLimit
 }
 
 export type DockerStatus = 'starting' | 'ready' | 'unavailable' | 'permission_denied' | 'incompatible'

@@ -15,12 +15,18 @@ use super::{
     mutations::M3Services,
 };
 use crate::{
+    domain::{HealthConfigurationLimits, health_configuration_limits},
     error::{ApiError, RequestId},
     mutation::{ClaimResult, IdempotencyError},
     settings::{
         GlobalSettings, SettingsError, SettingsStore, supported_timezones, validate_timezone,
     },
 };
+
+#[derive(Serialize)]
+struct ConfigurationLimits {
+    health: HealthConfigurationLimits,
+}
 
 const ROUTE: &str = "/api/v1/settings";
 
@@ -32,6 +38,7 @@ pub struct SettingsResponse {
     allowed_bind_roots: Vec<PathBuf>,
     slug_max_length: usize,
     supported_mount_types: [&'static str; 3],
+    configuration_limits: ConfigurationLimits,
     #[serde(skip_serializing_if = "Option::is_none")]
     idempotency_replayed: Option<bool>,
 }
@@ -216,6 +223,9 @@ fn response(settings: GlobalSettings, replayed: Option<bool>) -> SettingsRespons
         allowed_bind_roots: settings.allowed_bind_roots,
         slug_max_length: 20,
         supported_mount_types: ["owned_volume", "external_volume", "bind"],
+        configuration_limits: ConfigurationLimits {
+            health: health_configuration_limits(),
+        },
         idempotency_replayed: replayed,
     }
 }
