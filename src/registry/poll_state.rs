@@ -172,6 +172,42 @@ impl PollStateStore {
         Ok(())
     }
 
+    /// Persists a stable first due only while the row still matches the
+    /// scheduler's observation. A concurrent writer makes this return false.
+    pub async fn try_initialize_generation(
+        &self,
+        app_id: Uuid,
+        observed_generation: Option<&str>,
+        generation: &str,
+        next_check_not_before: OffsetDateTime,
+    ) -> Result<bool, PollStateError> {
+        let now = OffsetDateTime::now_utc();
+        let due = format_time(next_check_not_before)?;
+        let now = format_time(now)?;
+        let result = match observed_generation {
+            Some(observed) => sqlx::query(
+                "UPDATE poll_states SET generation=?,enabled=1,consecutive_transient_failures=0,next_check_not_before=?,last_checked_at=NULL,last_success_at=NULL,last_source_descriptor_digest=NULL,last_etag=NULL,last_manifest_digest=NULL,last_platform=NULL,last_outcome='scheduled',last_error_class=NULL,last_error_code=NULL,suppressed_target_key=NULL,suppressed_deployment_id=NULL,updated_at=? WHERE app_id=? AND generation=?",
+            )
+            .bind(generation)
+            .bind(&due)
+            .bind(&now)
+            .bind(app_id.to_string())
+            .bind(observed)
+            .execute(self.database.pool())
+            .await?,
+            None => sqlx::query(
+                "INSERT OR IGNORE INTO poll_states (app_id,generation,enabled,next_check_not_before,last_outcome,updated_at) VALUES (?,?,1,?,'scheduled',?)",
+            )
+            .bind(app_id.to_string())
+            .bind(generation)
+            .bind(&due)
+            .bind(&now)
+            .execute(self.database.pool())
+            .await?,
+        };
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn retain_apps(&self, app_ids: &[Uuid]) -> Result<(), PollStateError> {
         let mut transaction = self.database.pool().begin().await?;
         let ids = app_ids.iter().map(ToString::to_string).collect::<Vec<_>>();
@@ -318,13 +354,15 @@ impl PollStateStore {
     pub async fn mark_webhook_processed(
         &self,
         app_id: Uuid,
+        generation: &str,
         captured: i64,
     ) -> Result<(), PollStateError> {
-        sqlx::query("UPDATE poll_states SET webhook_processed_sequence=MIN(webhook_sequence,MAX(webhook_processed_sequence,?)),last_wake_source=CASE WHEN webhook_sequence>? THEN 'webhook' ELSE last_wake_source END,updated_at=? WHERE app_id=?")
+        sqlx::query("UPDATE poll_states SET webhook_processed_sequence=MIN(webhook_sequence,MAX(webhook_processed_sequence,?)),last_wake_source=CASE WHEN webhook_sequence>? THEN 'webhook' ELSE last_wake_source END,updated_at=? WHERE app_id=? AND generation=?")
             .bind(captured)
             .bind(captured)
             .bind(format_time(OffsetDateTime::now_utc())?)
             .bind(app_id.to_string())
+            .bind(generation)
             .execute(self.database.pool())
             .await?;
         Ok(())
@@ -523,6 +561,168 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generation_initial_due_survives_scheduler_rebuilds() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let store = PollStateStore::new(database);
+        let app = Uuid::new_v4();
+        store
+            .publish(
+                app,
+                PollObservation {
+                    generation: "old-generation",
+                    enabled: true,
+                    next_check_not_before: None,
+                    checked_at: Some(OffsetDateTime::now_utc()),
+                    success: true,
+                    replace_observed_fields: true,
+                    source_descriptor_digest: Some("sha256:old-source"),
+                    etag: Some("old-etag"),
+                    manifest_digest: Some("sha256:old-manifest"),
+                    platform: Some("linux/amd64"),
+                    outcome: PollOutcome::Unchanged,
+                    error_class: None,
+                    error_code: None,
+                    transient_failures: 0,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .suppress(app, "old-target", Uuid::new_v4())
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .accept_webhook(
+                    app,
+                    Uuid::new_v4(),
+                    &[7; 32],
+                    Uuid::new_v4(),
+                    "old-generation",
+                    true,
+                )
+                .await
+                .unwrap(),
+            WebhookAccept::Accepted
+        );
+
+        let first_due = OffsetDateTime::now_utc() + time::Duration::seconds(130);
+        assert!(
+            store
+                .try_initialize_generation(
+                    app,
+                    Some("old-generation"),
+                    "new-generation",
+                    first_due,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .try_initialize_generation(
+                    app,
+                    Some("old-generation"),
+                    "new-generation",
+                    first_due + time::Duration::seconds(114),
+                )
+                .await
+                .unwrap()
+        );
+
+        let state = store.get(app).await.unwrap().unwrap();
+        assert_eq!(state.generation, "new-generation");
+        assert_eq!(state.next_check_not_before, Some(first_due));
+        assert_eq!(state.last_outcome, PollOutcome::Scheduled);
+        assert!(state.last_checked_at.is_none());
+        assert!(state.last_success_at.is_none());
+        assert!(state.last_source_descriptor_digest.is_none());
+        assert!(state.last_etag.is_none());
+        assert!(state.last_manifest_digest.is_none());
+        assert!(state.last_platform.is_none());
+        assert!(state.suppressed_target_key.is_none());
+        assert_eq!(
+            (state.webhook_sequence, state.webhook_processed_sequence),
+            (1, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_initializer_cannot_replace_or_ack_newer_webhook_generation() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let store = PollStateStore::new(database);
+        let app = Uuid::new_v4();
+        store
+            .publish(
+                app,
+                PollObservation {
+                    generation: "observed-generation",
+                    enabled: true,
+                    next_check_not_before: None,
+                    checked_at: Some(OffsetDateTime::now_utc()),
+                    success: true,
+                    replace_observed_fields: true,
+                    source_descriptor_digest: Some("sha256:observed"),
+                    etag: Some("observed-etag"),
+                    manifest_digest: Some("sha256:observed"),
+                    platform: Some("linux/amd64"),
+                    outcome: PollOutcome::Unchanged,
+                    error_class: None,
+                    error_code: None,
+                    transient_failures: 0,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .accept_webhook(
+                    app,
+                    Uuid::new_v4(),
+                    &[8; 32],
+                    Uuid::new_v4(),
+                    "newer-generation",
+                    true,
+                )
+                .await
+                .unwrap(),
+            WebhookAccept::Accepted
+        );
+        assert!(
+            !store
+                .try_initialize_generation(
+                    app,
+                    Some("observed-generation"),
+                    "stale-generation",
+                    OffsetDateTime::now_utc() + time::Duration::seconds(120),
+                )
+                .await
+                .unwrap()
+        );
+        store
+            .mark_webhook_processed(app, "stale-generation", 1)
+            .await
+            .unwrap();
+
+        let state = store.get(app).await.unwrap().unwrap();
+        assert_eq!(state.generation, "newer-generation");
+        assert_eq!(state.last_outcome, PollOutcome::Scheduled);
+        assert_eq!(
+            (state.webhook_sequence, state.webhook_processed_sequence),
+            (1, 0)
+        );
+    }
+
+    #[tokio::test]
     async fn webhook_nonce_wake_and_audit_commit_atomically_and_coalesce() {
         let root = tempfile::tempdir().unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -588,7 +788,10 @@ mod tests {
             (state.webhook_sequence, state.webhook_processed_sequence),
             (2, 0)
         );
-        store.mark_webhook_processed(app, 1).await.unwrap();
+        store
+            .mark_webhook_processed(app, "generation", 1)
+            .await
+            .unwrap();
         let state = store.get(app).await.unwrap().unwrap();
         assert_eq!(
             (state.webhook_sequence, state.webhook_processed_sequence),
