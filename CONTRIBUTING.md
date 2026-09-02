@@ -8,7 +8,7 @@
 2. 保持改动小而可审查；行为变化应更新最低层级的确定性测试和相关文档。
 3. 只运行与改动直接相关的本地验证；Docker E2E 必须使用隔离 daemon 或明确的测试 context。
 4. 创建 Pull Request，说明行为、风险和已运行的验证。
-5. 等待必需检查通过并解决 review 意见。外部 fork 的 workflow 需要维护者人工批准后才会运行。
+5. 等待 `ci-gate` 和其他必需检查通过并解决 review 意见。外部 fork 的 workflow 需要维护者人工批准后才会运行。
 
 常用验证命令见 [README](README.md)。测试并发度不得大于 2。
 
