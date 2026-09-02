@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode, header};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
@@ -17,6 +18,7 @@ use crate::security::secret::SecretValue;
 const MANIFEST_LIMIT: usize = 8 * 1024 * 1024;
 const CONFIG_LIMIT: usize = 2 * 1024 * 1024;
 const TOKEN_LIMIT: usize = 64 * 1024;
+const BLOB_REDIRECT_LIMIT: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Platform {
@@ -461,16 +463,67 @@ impl RegistryResolver {
         } else {
             "https"
         };
-        let url = format!(
+        let initial_url = Url::parse(&format!(
             "{scheme}://{}/v2/{}/blobs/{digest}",
             image.transport_registry, image.repository
-        );
-        let mut request = self.client.get(url);
-        if let Some(token) = bearer {
-            request = request.bearer_auth(token);
+        ))
+        .map_err(|_| RegistryError::Protocol)?;
+        let mut url = initial_url.clone();
+        for redirects in 0..=BLOB_REDIRECT_LIMIT {
+            let mut request = self.client.get(url.clone());
+            if same_origin(&url, &initial_url)
+                && let Some(token) = bearer
+            {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.map_err(classify_transport)?;
+            if !is_followable_redirect(response.status()) {
+                return Ok(response);
+            }
+            if redirects == BLOB_REDIRECT_LIMIT {
+                return Err(RegistryError::Protocol);
+            }
+            url = blob_redirect_target(&response, self.allow_http_loopback)?;
         }
-        request.send().await.map_err(classify_transport)
+        Err(RegistryError::Protocol)
     }
+}
+
+fn is_followable_redirect(status: StatusCode) -> bool {
+    matches!(status, StatusCode::FOUND | StatusCode::TEMPORARY_REDIRECT)
+}
+
+fn blob_redirect_target(
+    response: &Response,
+    allow_http_loopback: bool,
+) -> Result<Url, RegistryError> {
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.len() <= 8 * 1024)
+        .ok_or(RegistryError::Protocol)?;
+    let target = response
+        .url()
+        .join(location)
+        .map_err(|_| RegistryError::Protocol)?;
+    let loopback_http = allow_http_loopback
+        && target.scheme() == "http"
+        && matches!(target.host_str(), Some("127.0.0.1" | "localhost"));
+    if (target.scheme() != "https" && !loopback_http)
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.fragment().is_some()
+    {
+        return Err(RegistryError::Protocol);
+    }
+    Ok(target)
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
 }
 
 fn parse_image_config(
@@ -802,6 +855,124 @@ mod tests {
         assert!(!serialized.contains("SECRET_CANARY"));
         assert!(!serialized.contains("must-not-project"));
         assert!(!serialized.contains("/bin/private"));
+    }
+
+    #[tokio::test]
+    async fn image_config_follows_blob_redirect_without_forwarding_bearer() {
+        let config = serde_json::json!({
+            "config": {
+                "ExposedPorts": {"3000/tcp": {}},
+                "Volumes": {"/var/lib/data": {}},
+                "User": "10001:10001",
+                "StopSignal": "SIGTERM"
+            }
+        })
+        .to_string();
+        let config_digest = digest(config.as_bytes());
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST,
+            "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest },
+            "layers": []
+        })
+        .to_string();
+        let manifest_digest = digest(manifest.as_bytes());
+        let registry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry_address = registry.local_addr().unwrap();
+        let storage = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let storage_address = storage.local_addr().unwrap();
+        let registry_seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = registry_seen.clone();
+        let server_manifest = manifest.clone();
+        let server_manifest_digest = manifest_digest.clone();
+        let registry_server = tokio::spawn(async move {
+            for sequence in 0..6 {
+                let (mut stream, _) = registry.accept().await.unwrap();
+                let mut bytes = vec![0; 8192];
+                let read = stream.read(&mut bytes).await.unwrap();
+                let request = String::from_utf8_lossy(&bytes[..read]).to_string();
+                server_seen.lock().await.push(request);
+                let response = match sequence {
+                    0 | 3 => format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{registry_address}/token\",service=\"fixture\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                    1 | 4 => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 25\r\nConnection: close\r\n\r\n{\"token\":\"fixture-token\"}".into(),
+                    2 => format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {OCI_MANIFEST}\r\nDocker-Content-Digest: {server_manifest_digest}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{server_manifest}",
+                        server_manifest.len()
+                    ),
+                    _ => format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{storage_address}/signed/config?key=fixture\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    ),
+                };
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let storage_seen = Arc::new(Mutex::new(String::new()));
+        let server_storage_seen = storage_seen.clone();
+        let storage_server = tokio::spawn(async move {
+            let (mut stream, _) = storage.accept().await.unwrap();
+            let mut bytes = vec![0; 8192];
+            let read = stream.read(&mut bytes).await.unwrap();
+            *server_storage_seen.lock().await = String::from_utf8_lossy(&bytes[..read]).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{config}",
+                config.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let image = ImageReference::parse(&format!("{registry_address}/team/app:latest")).unwrap();
+        let credential = SecretValue::new("canary-password".into());
+        let suggestion = RegistryResolver::for_test_http()
+            .unwrap()
+            .inspect_config(
+                &image,
+                &Platform::canonical("linux", "amd64", None).unwrap(),
+                Some(("fixture-user", &credential)),
+            )
+            .await
+            .unwrap();
+        registry_server.await.unwrap();
+        storage_server.await.unwrap();
+
+        assert_eq!(suggestion.resolved_digest, manifest_digest);
+        assert_eq!(suggestion.exposed_ports[0].container_port, 3000);
+        assert_eq!(suggestion.volume_targets, vec!["/var/lib/data"]);
+        let registry_requests = registry_seen.lock().await;
+        assert!(registry_requests[5].contains("authorization: Bearer fixture-token"));
+        let storage_request = storage_seen.lock().await;
+        assert!(storage_request.starts_with("GET /signed/config?key=fixture "));
+        assert!(
+            !storage_request
+                .to_ascii_lowercase()
+                .contains("authorization:")
+        );
+        assert!(!storage_request.contains("fixture-token"));
+        assert!(!storage_request.contains("canary-password"));
+    }
+
+    #[tokio::test]
+    async fn blob_redirect_rejects_cleartext_non_loopback_target() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 307 Temporary Redirect\r\nLocation: http://registry.example/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let image = ImageReference::parse(&format!("{address}/team/app:latest")).unwrap();
+        let error = RegistryResolver::for_test_http()
+            .unwrap()
+            .fetch_blob(&image, &format!("sha256:{}", "a".repeat(64)), None)
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, RegistryError::Protocol));
     }
 
     #[tokio::test]
