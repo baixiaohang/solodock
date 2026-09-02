@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (( $# != 3 )); then
-  echo "usage: $0 <run-core> <run-docker-e2e> <needs-json>" >&2
+if (( $# != 4 )); then
+  echo "usage: $0 <run-core> <run-docker-e2e> <event-name> <needs-json>" >&2
   exit 2
 fi
 
 run_core=$1
 run_docker_e2e=$2
-needs_json=$3
+event_name=$3
+needs_json=$4
 
 require_boolean() {
   local name=$1
@@ -37,6 +38,10 @@ require_result() {
 
 require_boolean run_core "$run_core"
 require_boolean run_docker_e2e "$run_docker_e2e"
+if [[ $event_name != pull_request && $event_name != push ]]; then
+  echo "invalid workflow event: $event_name" >&2
+  exit 1
+fi
 
 failed=false
 require_result classify success
@@ -49,6 +54,12 @@ fi
 for job in web rust-lint rust-test package-smoke; do
   require_result "$job" "$core_expected"
 done
+
+attestation_expected=skipped
+if [[ $event_name == push ]]; then
+  attestation_expected=success
+fi
+require_result attest-package "$attestation_expected"
 
 docker_expected=skipped
 if [[ $run_docker_e2e == true ]]; then

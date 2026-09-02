@@ -16,7 +16,7 @@ installer 使用 versioned directory 和原子 symlink，默认不启动服务�
 
 ### 从 GitHub 构建一键升级
 
-installer 同时安装 `/usr/local/bin/solodock-update`。先由日常管理员账号完成一次 GitHub CLI 登录，令牌只需读取仓库与 Actions artifact；不要把 token 写入脚本、配置或命令行：
+installer 同时安装 `/usr/local/bin/solodock-update`。先确认 GitHub CLI 支持 `gh attestation verify`，再由日常管理员账号完成一次登录；令牌只需读取仓库、Actions artifact 与 artifact attestation，不要把 token 写入脚本、配置或命令行：
 
 ```bash
 gh auth login --hostname github.com
@@ -25,9 +25,9 @@ solodock-update
 
 updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交互终端提示一次。无 TTY 且未配置非交互 `sudo` 的调用会在修改服务前失败。
 
-updater 只选择目标分支最新一次成功的 `push` CI，下载该 run 重新构建并验证的 `solodock-embedded-package`，校验包内 `SHA256SUMS`，并确认 `SOURCE_SHA` 与 workflow run 的 commit SHA 完全一致。artifact 缺失、过期、校验失败或来源 commit 不匹配时，升级会在修改服务前失败。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
+updater 只选择目标分支最新一次成功的 `push` CI，下载该 run 重新构建并验证的 `solodock-embedded-package`。在任何备份、停服务或安装动作前，它使用 GitHub CLI 验证 `SHA256SUMS` 的 GitHub artifact attestation：签名 workflow 必须是目标仓库的 `.github/workflows/ci.yml`，source ref 与 commit 必须和所选 run 完全一致，并拒绝 self-hosted runner 生成的证明；随后校验包内全部 SHA-256，并确认 `SOURCE_SHA` 与 workflow run 的 commit SHA 完全一致。artifact、attestation 缺失或过期，以及签名身份、来源 commit 或 checksum 不匹配时，升级都会 fail closed。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
 
-这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数。
+这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow 选择器、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数；workflow 选择器仍必须指向可信的 `.github/workflows/ci.yml`，不能改用任意 workflow 作为发布来源。
 
 ## 安全前置条件
 
