@@ -1,6 +1,6 @@
 use std::{
     fs::{self, OpenOptions},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use thiserror::Error;
@@ -74,6 +74,12 @@ pub fn check_private_tree(
     let relative = target
         .strip_prefix(root)
         .map_err(|_| PermissionError::UnexpectedType(target.to_owned()))?;
+    if relative
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(PermissionError::UnexpectedType(target.to_owned()));
+    }
     check_private(root, true)?;
     let mut current = root.to_owned();
     let components = relative.components().collect::<Vec<_>>();
@@ -198,6 +204,24 @@ mod tests {
         assert!(matches!(
             ensure_private_directory(&link.join("nested")),
             Err(PermissionError::UnexpectedType(_))
+        ));
+    }
+
+    #[test]
+    fn check_private_tree_rejects_parent_directory_components() {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let child = root.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let managed = root.path().join("managed");
+        fs::write(&managed, "value").unwrap();
+        fs::set_permissions(&managed, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let escaped = child.join("..").join("managed");
+        assert!(matches!(
+            check_private_tree(root.path(), &escaped, false),
+            Err(PermissionError::UnexpectedType(path)) if path == escaped
         ));
     }
 

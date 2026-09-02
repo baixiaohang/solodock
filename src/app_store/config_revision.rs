@@ -283,7 +283,11 @@ pub fn load(app_directory: &Path, revision_id: Uuid) -> Result<LoadedRevision, S
     })?;
     let mut metadata: ConfigMetadata =
         toml::from_str(&config).map_err(|_| StoreError::ContentInvalid)?;
-    if !matches!(metadata.schema_version, 1..=3) {
+    if !matches!(metadata.schema_version, 1..=3)
+        || metadata.files.iter().any(|file| {
+            crate::domain::validation::validate_logical_name(&file.logical_name).is_err()
+        })
+    {
         return Err(StoreError::ContentInvalid);
     }
     if metadata.schema_version == 1 {
@@ -652,6 +656,55 @@ mod tests {
             load_verified(root.path(), revision, key),
             Err(StoreError::ManagedFilePermissionInvalid)
         ));
+    }
+
+    #[test]
+    fn load_rejects_unsafe_managed_file_names_before_path_access() {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let key = b"managed-file-integrity-key";
+        let input = DraftInput {
+            display_name: "Managed files".into(),
+            discovery_image_ref: "registry.example/app:stable".into(),
+            credential_ref: None,
+            auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
+            poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
+            environment: EnvironmentInput::default(),
+            files: vec![ManagedFileInput {
+                logical_name: "public".into(),
+                target_path: "/app/public".into(),
+                sensitive: false,
+                readonly: true,
+                content: ManagedFileContent::Public(crate::domain::PublicFileContent {
+                    content: "public-value".into(),
+                }),
+            }],
+            ports: vec![],
+            volumes: vec![],
+            binds: vec![],
+            owned_default_network: true,
+            service_discovery_enabled: true,
+            networks: vec![],
+            health: crate::domain::HealthPolicy::default(),
+        };
+        let draft =
+            crate::domain::normalize_draft(input, &ExistingSecrets::default(), key, &[]).unwrap();
+        let revision = Uuid::new_v4();
+        let directory = publish(root.path(), revision, &draft).unwrap();
+        let config_path = directory.join("config.toml");
+        let original = fs::read_to_string(&config_path).unwrap();
+
+        for invalid in ["../secret", "nested/name"] {
+            let mut metadata: ConfigMetadata = toml::from_str(&original).unwrap();
+            metadata.files[0].logical_name = invalid.into();
+            fs::write(&config_path, toml::to_string(&metadata).unwrap()).unwrap();
+            assert!(matches!(
+                load(root.path(), revision),
+                Err(StoreError::ContentInvalid)
+            ));
+        }
     }
 
     #[test]
