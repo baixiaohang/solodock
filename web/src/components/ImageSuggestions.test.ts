@@ -32,7 +32,7 @@ describe('ImageSuggestions', () => {
 
     const user = userEvent.setup()
     render(ImageSuggestions, {
-      image: 'ghcr.io/baixiaohang/insight-agent:staging',
+      image: 'ghcr.io/example/example-app:staging',
       credentialRef: '00000000-0000-0000-0000-000000000001',
       ports: [],
       volumes: [],
@@ -50,7 +50,7 @@ describe('ImageSuggestions', () => {
     expect(headers.get('Content-Type')).toBe('application/json')
     expect(headers.get('X-CSRF-Token')).toBe('csrf-token')
     expect(JSON.parse(String(request.init?.body))).toEqual({
-      discovery_image_ref: 'ghcr.io/baixiaohang/insight-agent:staging',
+      discovery_image_ref: 'ghcr.io/example/example-app:staging',
       credential_ref: '00000000-0000-0000-0000-000000000001',
     })
   })
