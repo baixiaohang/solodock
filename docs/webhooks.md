@@ -4,7 +4,7 @@ Webhook 只表达“配置的 Registry tag 可能已变化”。它不会接收�
 
 ## 能力边界
 
-Webhook 是可选增强，不是部署 API。当前不支持 provider-specific payload、unsigned compatibility、直接 deploy action、绕过 auto-deploy policy 的事件、Cosign/Sigstore、Cloudflare 自动配置、通用 import 或多主机编排。完整 deployment 状态与 backoff/suppression 语义见 [部署与回滚](deployments.md)。
+Webhook 是可选增强，不是部署 API。当前不支持 provider-specific payload、unsigned compatibility、直接 deploy action、绕过 auto-deploy policy 的事件、Cosign/Sigstore、外部入口自动配置、通用 import 或多主机编排。完整 deployment 状态与 backoff/suppression 语义见 [部署与回滚](deployments.md)。
 
 ## 入口隔离
 
@@ -14,7 +14,7 @@ Webhook 是可选增强，不是部署 API。当前不支持 provider-specific p
 webhook_public_origin = "https://solodock-hooks.example.com"
 ```
 
-它必须与 `public_origin` 使用不同 authority。SoloDock 仍只监听 loopback；Cloudflare Tunnel、DNS、TLS 和 WAF 由管理员在外部配置。Webhook hostname 只应允许精确的 `POST /hooks/v1/apps/*/registry`，其它 path/method 均拒绝；管理 hostname 不应路由 `/hooks/**`。SoloDock 忽略 `Forwarded` 和 `X-Forwarded-*` 进行安全判断。
+它必须与 `public_origin` 使用不同 authority。SoloDock 仍只监听 loopback；外部 tunnel 或 reverse proxy、DNS、TLS 和 WAF 由管理员配置。Webhook hostname 只应允许精确的 `POST /hooks/v1/apps/*/registry`，其它 path/method 均拒绝；管理 hostname 不应路由 `/hooks/**`。SoloDock 忽略 `Forwarded` 和 `X-Forwarded-*` 进行安全判断。
 
 ## v1 签名协议
 

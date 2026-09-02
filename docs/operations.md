@@ -16,7 +16,7 @@ installer 使用 versioned directory 和原子 symlink，默认不启动服务�
 
 ### 从 GitHub 构建一键升级
 
-installer 同时安装 `/usr/local/bin/solodock-update`。私有仓库需要先由日常管理员账号完成一次 GitHub CLI 登录，令牌只需读取仓库与 Actions artifact；不要把 token 写入脚本、配置或命令行：
+installer 同时安装 `/usr/local/bin/solodock-update`。先由日常管理员账号完成一次 GitHub CLI 登录，令牌只需读取仓库与 Actions artifact；不要把 token 写入脚本、配置或命令行：
 
 ```bash
 gh auth login --hostname github.com
@@ -25,13 +25,13 @@ solodock-update
 
 updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交互终端提示一次。无 TTY 且未配置非交互 `sudo` 的调用会在修改服务前失败。
 
-updater 只选择目标分支最新一次成功的 `push` CI，下载 `solodock-embedded-package` 并校验包内 `SHA256SUMS`。当前 main Git tree 与近期成功 PR CI 的已验证 tree 完全一致，且同一次 run 的已验证 tree 与 package artifact 均未过期时，`push` CI 会原样重新发布该 package；没有匹配、artifact 缺失或过期时重新构建并完整验证，artifact 无法安全读取时分类直接失败。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
+updater 只选择目标分支最新一次成功的 `push` CI，下载该 run 重新构建并验证的 `solodock-embedded-package`，校验包内 `SHA256SUMS`，并确认 `SOURCE_SHA` 与 workflow run 的 commit SHA 完全一致。artifact 缺失、过期、校验失败或来源 commit 不匹配时，升级会在修改服务前失败。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
 
 这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数。
 
 ## 安全前置条件
 
-服务只监听 loopback，`public_origin` 必须是 HTTPS。Cloudflare Tunnel/WAF、访问白名单和 TLS 是外部前置条件，不由 SoloDock 配置。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
+服务只监听 loopback，`public_origin` 必须是 HTTPS。外部 tunnel 或 reverse proxy、访问控制和 TLS 是部署前置条件，不由 SoloDock 配置。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
 
 启用 webhook 时还需设置不同 authority 的 `webhook_public_origin`，并在外部 WAF 只放行精确 POST path。签名、timestamp/nonce、重试和 202 语义见 [Webhook 说明](webhooks.md)。
 

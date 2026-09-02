@@ -13,7 +13,7 @@ SoloDock 不是通用 Docker 管理面板或完整 PaaS。严格收窄产品模�
 - Ubuntu 24.04 单机；
 - 单管理员，不提供多租户或 RBAC；
 - Docker Engine 和 Docker Compose v2.24+；
-- 服务只监听 loopback，公网访问由外部 Cloudflare Tunnel、WAF 和 TLS 提供；
+- 服务只监听 loopback，公网访问由外部 tunnel 或 reverse proxy、访问控制和 TLS 提供；
 - 典型资源上限为 2 vCPU、4 GiB，控制面部署并发固定受限。
 
 访问 Docker socket 或加入 `docker` group 在效果上等同宿主 root 权限。专用 system user、loopback 监听和 systemd hardening 是纵深防御，不是低权限隔离。
@@ -41,7 +41,7 @@ SoloDock 不提供：
 
 - 源码仓库 clone、Dockerfile/buildpack 构建或 `docker compose build`；
 - 任意 Compose 导入、原始 YAML 编辑、多 service、多副本或已有项目接管；
-- Nginx、Traefik、DNS、TLS、Cloudflare 或宿主防火墙自动配置；
+- reverse proxy、tunnel、DNS、TLS、WAF 或宿主防火墙自动配置；
 - Docker Swarm、Kubernetes、多主机、高可用、多租户或 RBAC；
 - 浏览器 shell、容器 exec、宿主命令执行器或用户自定义 Compose 参数；
 - privileged、host namespace、device、Docker socket mount 等通用容器能力；

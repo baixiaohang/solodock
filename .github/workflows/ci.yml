@@ -16,28 +16,21 @@ jobs:
   classify:
     runs-on: ubuntu-24.04
     permissions:
-      actions: read
       contents: read
       pull-requests: read
     outputs:
-      merged_pr: ${{ steps.classify.outputs.merged_pr }}
-      validated_run_id: ${{ steps.classify.outputs.validated_run_id }}
       run_docker_e2e: ${{ steps.classify.outputs.run_docker_e2e }}
     steps:
-      - name: Classify the change and reusable PR artifact
+      - name: Classify Docker E2E scope
         id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          COMMIT_SHA: ${{ github.sha }}
         run: |
-          merged_pr=false
-          validated_run_id=''
-          run_docker_e2e=false
-
           if [[ $EVENT_NAME == pull_request ]]; then
+            run_docker_e2e=false
             changed_paths=$(gh api --paginate "/repos/$REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
               --jq '.[] | .filename, (.previous_filename // empty)')
             while read -r path; do
@@ -50,46 +43,23 @@ jobs:
             done <<<"$changed_paths"
           else
             run_docker_e2e=true
-            current_tree=$(gh api "/repos/$REPOSITORY/git/commits/$COMMIT_SHA" --jq .tree.sha)
-            runs=$(gh api "/repos/$REPOSITORY/actions/workflows/ci.yml/runs?event=pull_request&status=success&per_page=20")
-            run_ids=$(jq -r '.workflow_runs[] | select(.conclusion == "success") | .id' <<<"$runs")
-            while read -r run_id; do
-              [[ -n $run_id ]] || continue
-              artifacts=$(gh api "/repos/$REPOSITORY/actions/runs/$run_id/artifacts")
-              tree_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-validated-tree" and .expired == false)] | first | .id // empty' <<<"$artifacts")
-              package_artifact_id=$(jq -r '[.artifacts[] | select(.name == "solodock-embedded-package" and .expired == false)] | first | .id // empty' <<<"$artifacts")
-              [[ -n $tree_artifact_id && -n $package_artifact_id ]] || continue
-              gh api "/repos/$REPOSITORY/actions/artifacts/$tree_artifact_id/zip" >"$RUNNER_TEMP/validated-tree.zip"
-              validated_tree=$(unzip -p "$RUNNER_TEMP/validated-tree.zip" validated-tree | tr -d '\r\n')
-              if [[ $validated_tree == "$current_tree" ]]; then
-                merged_pr=true
-                validated_run_id=$run_id
-                run_docker_e2e=false
-                break
-              fi
-            done <<<"$run_ids"
           fi
 
-          {
-            echo "merged_pr=$merged_pr"
-            echo "validated_run_id=$validated_run_id"
-            echo "run_docker_e2e=$run_docker_e2e"
-          } >>"$GITHUB_OUTPUT"
+          echo "run_docker_e2e=$run_docker_e2e" >>"$GITHUB_OUTPUT"
 
   checks:
     needs: classify
-    if: needs.classify.outputs.merged_pr != 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
         with:
           components: clippy,rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: checks
           save-if: ${{ github.event_name == 'push' }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 24
           cache: npm
@@ -119,6 +89,7 @@ jobs:
           chmod +x scripts/measure-resources.sh
           scripts/measure-resources.sh target/release/solodock "$RUNNER_TEMP/resource-report.json"
       - name: Stage package artifact
+        if: github.event_name == 'push'
         run: |
           package="$RUNNER_TEMP/solodock-package"
           install -d "$package/docs"
@@ -126,45 +97,15 @@ jobs:
           install -m 0644 packaging/systemd/solodock.service packaging/solodock.toml.example README.md "$package/"
           install -m 0644 docs/architecture.md docs/operations.md docs/recovery.md docs/threat-model.md docs/resource-budget.md "$package/docs/"
           cp "$RUNNER_TEMP/resource-report.json" "$package/resource-report.json"
+          printf '%s\n' "$GITHUB_SHA" >"$package/SOURCE_SHA"
           (cd "$package" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: github.event_name == 'push'
         with:
           name: solodock-embedded-package
           path: |
             ${{ runner.temp }}/solodock-package
             ${{ runner.temp }}/resource-report.json
-          retention-days: 30
-      - name: Record validated source tree
-        if: github.event_name == 'pull_request'
-        run: git rev-parse 'HEAD^{tree}' >"$RUNNER_TEMP/validated-tree"
-      - uses: actions/upload-artifact@v4
-        if: github.event_name == 'pull_request'
-        with:
-          name: solodock-validated-tree
-          path: ${{ runner.temp }}/validated-tree
-          if-no-files-found: error
-          retention-days: 30
-
-  reuse-validated-package:
-    needs: classify
-    if: needs.classify.outputs.merged_pr == 'true'
-    runs-on: ubuntu-24.04
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: solodock-embedded-package
-          path: ${{ runner.temp }}/validated-package
-          repository: ${{ github.repository }}
-          run-id: ${{ needs.classify.outputs.validated_run_id }}
-          github-token: ${{ github.token }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: solodock-embedded-package
-          path: ${{ runner.temp }}/validated-package
-          if-no-files-found: error
           retention-days: 30
 
   docker-e2e:
@@ -192,9 +133,9 @@ jobs:
       SOLODOCK_E2E_SHARED_FIXTURE_ROOT: ${{ github.workspace }}/.solodock-e2e-fixtures
       SOLODOCK_E2E_STREAM_HOLD_SECONDS: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: checks
           save-if: false
@@ -218,7 +159,7 @@ jobs:
           chmod +x scripts/measure-dind-daemon.sh
           scripts/measure-dind-daemon.sh '${{ job.services.docker.id }}' "$RUNNER_TEMP/docker-daemon-resource-report.json" -- \
             cargo test --features docker-e2e --test docker_e2e -- --ignored --nocapture --test-threads=2 --skip containerd_
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
           name: solodock-docker-e2e-resource-report
@@ -251,9 +192,9 @@ jobs:
       SOLODOCK_TEST_DOCKER_HOST: tcp://127.0.0.1:2375
       SOLODOCK_EXPECT_CONTAINERD: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable 2026-09-02
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: checks
           save-if: false

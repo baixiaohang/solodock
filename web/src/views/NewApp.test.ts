@@ -15,7 +15,7 @@ describe('new app onboarding', () => {
     vi.stubGlobal('fetch', fetch); vi.stubGlobal('crypto', { randomUUID: () => '00000000-0000-4000-8000-000000000002' })
     render(NewApp); const input = screen.getByLabelText(/^服务名/) as HTMLInputElement
     expect(input.maxLength).toBe(20); expect(screen.queryByText(/JSON/)).toBeNull(); expect(screen.getByText('PostgreSQL')).toBeTruthy()
-    const user = userEvent.setup(); await user.type(input, 'insight-agent'); await user.click(screen.getByRole('button', { name: '创建空白服务' }))
+    const user = userEvent.setup(); await user.type(input, 'example-app'); await user.click(screen.getByRole('button', { name: '创建空白服务' }))
     expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(1)
   })
 })

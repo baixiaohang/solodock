@@ -70,10 +70,13 @@ gh run download "$run_id" \
   --name solodock-embedded-package \
   --dir "$update_dir"
 package="$update_dir/solodock-package"
-for file in SHA256SUMS solodock install.sh solodock-backup solodock-update solodock.service solodock.toml.example; do
+for file in SHA256SUMS SOURCE_SHA solodock install.sh solodock-backup solodock-update solodock.service solodock.toml.example; do
   [[ -f $package/$file && ! -L $package/$file ]] || fail "artifact is missing a safe $file"
 done
 (cd "$package" && sha256sum -c SHA256SUMS)
+source_sha=$(<"$package/SOURCE_SHA")
+[[ $source_sha =~ ^[0-9a-f]{40}$ ]] || fail 'artifact source SHA is missing or invalid'
+[[ $source_sha == "$head_sha" ]] || fail 'artifact source SHA does not match its workflow run'
 
 [[ -L /usr/local/bin/solodock ]] || fail 'installed SoloDock binary target is not a managed symlink'
 old_link=$(readlink -- /usr/local/bin/solodock)

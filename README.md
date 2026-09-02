@@ -9,7 +9,7 @@ SoloDock 提供聚焦的 Web 界面，用不可变镜像 digest 部署预构建�
 
 新建空白服务只需填写全局唯一、创建后不可修改的 1–20 字符服务名；服务会以 `UNCONFIGURED` 状态登记，随后再在详情页逐行配置镜像、端口、存储、健康检查和受管文件。SoloDock 仍以 UUID 作为 API、目录和 ownership label 的安全身份，并通过版本化 naming helper 派生 Docker 资源。旧应用保留原 `sd-<slug>` bridge，新应用使用 UUID 派生的稳定短 bridge，升级不会重命名已有资源。
 
-本仓库是私有项目，未授予公开使用、复制或分发许可。
+SoloDock 采用 [Apache License 2.0](LICENSE) 开源。
 
 ## 环境要求
 
@@ -103,7 +103,7 @@ npm ci
 npm run dev
 ```
 
-Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过配置的 HTTPS Cloudflare hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。生产构建把 Vite产物嵌入单一 Rust binary，不运行 Node服务。
+Vite 将 `/api` 和 `/healthz` same-origin proxy 到 `SOLODOCK_API_ORIGIN`（默认 `http://127.0.0.1:8080`）。浏览器仍应通过外部 tunnel 或 reverse proxy 提供的 HTTPS hostname 访问 Vite/proxy，Secure cookie 没有开发降级开关。生产构建把 Vite 产物嵌入单一 Rust binary，不运行 Node 服务。
 
 运行前端验证：
 
@@ -120,7 +120,10 @@ Node/npm 只用于开发和构建 Web UI。
 - 产品与配置：[产品范围](docs/product-scope.md)、[应用模型](docs/application-model.md)；
 - 系统与发布：[架构](docs/architecture.md)、[部署与回滚](docs/deployments.md)、[API 与实时流](docs/api-and-streams.md)；
 - 生产运行：[运维](docs/operations.md)、[恢复](docs/recovery.md)、[威胁模型](docs/threat-model.md)、[资源预算](docs/resource-budget.md)；
-- 专题与验收：[Webhook](docs/webhooks.md)、[测试与安全护栏](docs/testing.md)；
-- 一次性迁移 runbook：[`docs/migrations/`](docs/migrations/)。
+- 专题与验收：[Webhook](docs/webhooks.md)、[测试与安全护栏](docs/testing.md)。
 
 这些专题文档描述当前实现。历史设计与交付计划由 Git 保留，不作为当前行为的事实来源。
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).

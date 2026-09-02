@@ -1102,10 +1102,10 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
             .map_err(|error| format!("create external network: {error}"))?;
         network_id = Some(created_network.id);
 
-        for alias in ["postgres", "sologrove"] {
+        for alias in ["database", "webapp"] {
             let slug = match alias {
-                "postgres" => format!("pg{}", &run_token.simple().to_string()[..8]),
-                "sologrove" => format!("sg{}", &run_token.simple().to_string()[..8]),
+                "database" => format!("db{}", &run_token.simple().to_string()[..8]),
+                "webapp" => format!("web{}", &run_token.simple().to_string()[..8]),
                 _ => unreachable!(),
             };
             let draft = json!({
@@ -1197,7 +1197,7 @@ async fn external_only_apps_keep_stable_aliases_on_one_unmanaged_network() {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "external network disappeared".to_string())?;
         if snapshot.members.len() != 2
-            || !["postgres", "sologrove"].iter().all(|alias| {
+            || !["database", "webapp"].iter().all(|alias| {
                 snapshot
                     .members
                     .iter()

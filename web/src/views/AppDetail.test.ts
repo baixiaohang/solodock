@@ -18,8 +18,8 @@ afterEach(() => {
 describe('app detail resource identity', () => {
   it('creates the first draft from an unconfigured service with a null revision', async () => {
     const app = {
-      id: '00000000-0000-4000-8000-000000000021', slug: 'insight-agent', display_name: 'insight-agent',
-      resource_names: { project_name: 'solodock-insight-agent', owned_default_network_name: 'solodock-insight-agent-default', bridge_name: 'sd-0123456789ab' },
+      id: '00000000-0000-4000-8000-000000000021', slug: 'example-app', display_name: 'example-app',
+      resource_names: { project_name: 'solodock-example-app', owned_default_network_name: 'solodock-example-app-default', bridge_name: 'sd-0123456789ab' },
       active_release: null, actual_release_id: null, actual: null, expected_network_plan: null,
       expected_owned_default_network: null, actual_owned_default_network: null, drift_codes: [], draft: null,
       draft_revision: null, draft_config_sha256: null, active_config_revision: null, pending_release_id: null,
@@ -45,7 +45,7 @@ describe('app detail resource identity', () => {
     expect(await screen.findByText('尚未配置')).toBeTruthy()
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: '配置' }))
-    await user.type(screen.getByLabelText('发现镜像 tag'), 'ghcr.io/example/insight-agent:stable')
+    await user.type(screen.getByLabelText('发现镜像 tag'), 'ghcr.io/example/app:stable')
     await user.click(screen.getByRole('button', { name: '保存新 revision' }))
     await waitFor(() => expect(saved).toBeDefined())
     expect(saved?.expected_revision).toBeNull()

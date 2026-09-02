@@ -32,7 +32,7 @@ Docker/Compose E2E 必须使用隔离 daemon 或显式 test-only endpoint。生�
 - 通配 container/image/volume/network 删除；
 - `docker compose down -v` 或任何 volume 删除参数；
 - 扫描并删除不带本次 run token 的对象；
-- 把真实 SoloGrove、PostgreSQL、pgAdmin、insight-agent 或业务 volume/network放入 selector。
+- 把真实业务服务、数据库、管理工具或其 volume/network 放入 selector。
 
 bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数据保留成功”误实现为删除 canary source。
 
@@ -96,7 +96,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - poll no-op、busy coalescing、backoff、ETag generation隔离和failed-target suppression；
 - production coordinator heap/dispatch、durable webhook wake、cancel和TaskTracker join。
 
-完整 DinD 验收还应快速部署 PostgreSQL，用第二个新应用通过 `<slug>:5432` 写入 canary，Recreate 后再次读取；不得为了测试暴露 PostgreSQL host port。Insight Agent 的三个既有宿主目录、UID/GID、deploy key 与旧 systemd 单 writer 切换仍属于生产维护窗口人工验收，不进入 CI fixture。
+完整 DinD 验收还应快速部署 PostgreSQL，用第二个新应用通过 `<slug>:5432` 写入 canary，Recreate 后再次读取；不得为了测试暴露 PostgreSQL host port。具体业务应用的既有宿主目录、UID/GID、deploy key 与旧单 writer 切换仍属于生产维护窗口人工验收，不进入 CI fixture。
 
 ### 删除
 
