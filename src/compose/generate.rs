@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, path::Path};
 
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::model::*;
@@ -20,6 +21,8 @@ pub struct ComposeInput<'a> {
     pub draft: &'a NormalizedDraft,
     pub include_stop_grace_period: bool,
 }
+
+pub(crate) const CURRENT_COMPOSE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ComposePlan {
@@ -45,7 +48,7 @@ pub struct OwnedDefaultNetworkIdentity {
 pub fn generate(
     input: ComposeInput<'_>,
     runnable: bool,
-) -> Result<(String, ComposePlan), serde_yml::Error> {
+) -> Result<(String, ComposePlan), yaml_serde::Error> {
     let resource_names = input.resource_identity.resource_names();
     let ownership = service_labels(input.resource_identity.app_id, input.release_id);
     let resource_ownership =
@@ -263,7 +266,7 @@ pub fn generate(
         volumes,
         networks,
     };
-    let yaml = serde_yml::to_string(&document)?;
+    let yaml = yaml_serde::to_string(&document)?;
     let mut warnings = Vec::new();
     if !runnable {
         warnings.push("PREVIEW_IMAGE_NOT_PINNED");
@@ -298,6 +301,37 @@ pub fn generate(
             warnings,
         },
     ))
+}
+
+pub(crate) fn matches_canonical(
+    input: ComposeInput<'_>,
+    runnable: bool,
+    compose_schema_version: u32,
+    expected_sha256: &str,
+    actual: &[u8],
+) -> Result<bool, yaml_serde::Error> {
+    if format!("{:x}", Sha256::digest(actual)) != expected_sha256 {
+        return Ok(false);
+    }
+    let (canonical, _) = generate(input, runnable)?;
+    if compose_schema_version == CURRENT_COMPOSE_SCHEMA_VERSION {
+        return Ok(actual == canonical.as_bytes());
+    }
+    if !matches!(compose_schema_version, 2..CURRENT_COMPOSE_SCHEMA_VERSION) {
+        return Ok(false);
+    }
+
+    // Legacy releases were serialized with serde_yml, whose quoting rules
+    // differ from yaml_serde for otherwise equivalent strings such as UUIDs,
+    // durations, and YAML 1.1 boolean spellings. The signed compose hash still
+    // protects the exact persisted bytes; this comparison additionally proves
+    // that those bytes describe the canonical document for the signed draft.
+    let actual = match yaml_serde::from_slice::<yaml_serde::Value>(actual) {
+        Ok(actual) => actual,
+        Err(_) => return Ok(false),
+    };
+    let canonical: yaml_serde::Value = yaml_serde::from_str(&canonical)?;
+    Ok(actual == canonical)
 }
 
 fn literal(value: &str) -> String {
@@ -575,6 +609,53 @@ mod tests {
         assert!(!first.contains("solodock-00000000000000000000000000000000-default"));
         assert!(first.contains("aliases:\n        - api\n        - server"));
         assert!(plan.warnings.contains(&"EXTERNAL_NETWORK_UNMANAGED"));
+    }
+
+    #[test]
+    fn legacy_serde_yml_compose_remains_canonical_by_signed_schema() {
+        const LEGACY_COMPOSE: &str = "services:\n  app:\n    image: registry.example/app:stable\n    labels:\n      com.solodock.app-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.managed: 'true'\n      com.solodock.release-id: '00000000-0000-0000-0000-000000000000'\n      com.solodock.schema-version: '1'\n    env_file:\n    - path: /var/lib/solodock/apps/revision/env/public.env\n      required: true\n    - path: /var/lib/solodock/apps/revision/secrets/runtime.env\n      required: true\n    volumes: []\n    ports: []\n    networks:\n      solodock-network-0:\n        aliases:\n        - api\n        - 'on'\n        - server\n    restart: unless-stopped\n    stop_grace_period: '10s'\nvolumes: {}\nnetworks:\n  solodock-network-0:\n    external: true\n    name: 'on'\n";
+
+        let app_id = Uuid::nil();
+        let draft = network_draft(
+            false,
+            vec![crate::domain::NetworkInput::External {
+                name: "on".into(),
+                aliases: vec!["server".into(), "api".into(), "on".into()],
+            }],
+        );
+        let input = || ComposeInput {
+            resource_identity: identity(app_id, "example"),
+            release_id: Uuid::nil(),
+            image_ref: &draft.discovery_image_ref,
+            revision_directory: Path::new("/var/lib/solodock/apps/revision"),
+            draft: &draft,
+            include_stop_grace_period: true,
+        };
+        let legacy_sha256 = format!("{:x}", Sha256::digest(LEGACY_COMPOSE.as_bytes()));
+
+        assert!(
+            matches_canonical(input(), true, 4, &legacy_sha256, LEGACY_COMPOSE.as_bytes(),)
+                .unwrap()
+        );
+        assert!(
+            !matches_canonical(input(), true, 4, &"0".repeat(64), LEGACY_COMPOSE.as_bytes(),)
+                .unwrap()
+        );
+        assert!(
+            !matches_canonical(
+                input(),
+                true,
+                CURRENT_COMPOSE_SCHEMA_VERSION,
+                &legacy_sha256,
+                LEGACY_COMPOSE.as_bytes(),
+            )
+            .unwrap()
+        );
+        let altered = LEGACY_COMPOSE.replace("name: 'on'", "name: 'off'");
+        let altered_sha256 = format!("{:x}", Sha256::digest(altered.as_bytes()));
+        assert!(
+            !matches_canonical(input(), true, 4, &altered_sha256, altered.as_bytes(),).unwrap()
+        );
     }
 
     #[test]

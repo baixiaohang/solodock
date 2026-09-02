@@ -25,7 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 rust-embed = { version = "8", optional = true, features = ["compression"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yml = "0.0.12"
+yaml_serde = "0.10.7"
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 subtle = "2"

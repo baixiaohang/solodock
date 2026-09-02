@@ -22,6 +22,6 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 
 恢复后先重建所有 immutable active/pending revision 引用但 daemon 中缺失的 external network；平台网络由首次 deployment 在精确 identity 预检下重建。再逐项验证 active digest、容器 full ID、health、端口、volume/bind/network canary、platform slug DNS 与 external alias。SoloDock 的 release 回滚不回滚数据库或持久化数据。
 
-旧 naming/config/release schema 保持可读和可回滚：旧应用继续使用原 bridge 且不会自动加入平台网络。不要手工向历史 artifact 注入新字段；reader 会忽略旧签名域之外的控制值。SQLite global settings 备份必须与 filesystem state 同一恢复点，否则 bind roots revision 可能与应用引用不一致并使恢复 fail closed。
+旧 naming/config/release schema 保持可读和可回滚：旧应用继续使用原 bridge 且不会自动加入平台网络。旧 Compose schema 仍先验证 release HMAC 和它签名覆盖的精确文件 hash，再按对应 schema 校验 canonical 文档；serializer 引号表示变化不会把合法旧 release 误判为损坏，也不会放宽内容或结构校验。不要手工向历史 artifact 注入新字段；reader 会忽略旧签名域之外的控制值。SQLite global settings 备份必须与 filesystem state 同一恢复点，否则 bind roots revision 可能与应用引用不一致并使恢复 fail closed。
 
 日常安装、备份和 health 检查入口见 [运维](operations.md)；资源保留与删除语义见 [应用模型](application-model.md)。
