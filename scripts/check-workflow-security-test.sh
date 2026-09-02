@@ -10,6 +10,35 @@ fixture_dir() {
   local name=$1
   local directory="$fixture_root/$name/.github/workflows"
   mkdir -p "$directory"
+  cat >"$directory/ci.yml" <<EOF
+on: [push]
+jobs:
+  attest-package:
+    needs: package-smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-embedded-package
+          path: \${{ runner.temp }}/attested-package
+      - name: Attest package checksums
+        uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+  printf '%s\n' "$directory"
+}
+
+fixture_dir_without_ci() {
+  local name=$1
+  local directory="$fixture_root/$name/.github/workflows"
+  mkdir -p "$directory"
   printf '%s\n' "$directory"
 }
 
@@ -23,6 +52,8 @@ expect_failure() {
 
 pinned_checkout='actions/checkout@11d5960a326750d5838078e36cf38b85af677262'
 pinned_codeql='github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938'
+pinned_download='actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c'
+pinned_attest='actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6'
 
 directory=$(fixture_dir safe)
 cat >"$directory/test.yml" <<EOF
@@ -56,6 +87,64 @@ jobs:
       - uses: $pinned_codeql
 EOF
 "$checker" "$fixture_root/safe-codeql" >/dev/null
+
+directory=$(fixture_dir safe-attestation)
+cat >"$directory/ci.yml" <<EOF
+name: Safe attestation
+on: [push]
+permissions:
+  contents: read
+jobs:
+  attest-package:
+    needs: package-smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-embedded-package
+          path: \${{ runner.temp }}/attested-package
+      - name: Attest package checksums
+        uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+"$checker" "$fixture_root/safe-attestation" >/dev/null
+
+directory=$(fixture_dir_without_ci missing-ci-workflow)
+cat >"$directory/other.yml" <<'EOF'
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps: []
+EOF
+expect_failure missing-ci-workflow
+
+directory=$(fixture_dir_without_ci renamed-ci-workflow)
+cat >"$directory/ci.yaml" <<'EOF'
+on: [push]
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps: []
+EOF
+expect_failure renamed-ci-workflow
+
+directory=$(fixture_dir missing-attestation)
+cat >"$directory/ci.yml" <<'EOF'
+on: [push]
+jobs:
+  package-smoke:
+    runs-on: ubuntu-24.04
+    steps: []
+EOF
+expect_failure missing-attestation
 
 directory=$(fixture_dir unpinned)
 cat >"$directory/test.yml" <<'EOF'
@@ -163,6 +252,92 @@ jobs:
     steps: []
 EOF
 expect_failure misplaced-security-events
+
+directory=$(fixture_dir misplaced-attestation-permission)
+cat >"$directory/test.yml" <<'EOF'
+on: [pull_request]
+jobs:
+  test:
+    permissions:
+      id-token: write
+    runs-on: ubuntu-24.04
+    steps: []
+EOF
+expect_failure misplaced-attestation-permission
+
+directory=$(fixture_dir attestation-on-pr)
+cat >"$directory/ci.yml" <<EOF
+on: [pull_request]
+jobs:
+  attest-package:
+    needs: package-smoke
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-embedded-package
+          path: \${{ runner.temp }}/attested-package
+      - uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+expect_failure attestation-on-pr
+
+directory=$(fixture_dir attestation-custom-runner)
+cat >"$directory/ci.yml" <<EOF
+on: [push]
+jobs:
+  attest-package:
+    needs: package-smoke
+    if: github.event_name == 'push'
+    runs-on: private-runner
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-embedded-package
+          path: \${{ runner.temp }}/attested-package
+      - name: Attest package checksums
+        uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+expect_failure attestation-custom-runner
+
+directory=$(fixture_dir attestation-extra-step)
+cat >"$directory/ci.yml" <<EOF
+on: [push]
+jobs:
+  attest-package:
+    needs: package-smoke
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - run: env
+      - uses: $pinned_download
+        with:
+          name: solodock-embedded-package
+          path: \${{ runner.temp }}/attested-package
+      - uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+expect_failure attestation-extra-step
 
 directory=$(fixture_dir continue-on-error)
 cat >"$directory/test.yml" <<'EOF'

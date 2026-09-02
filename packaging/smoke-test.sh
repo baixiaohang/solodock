@@ -52,6 +52,12 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   'if [[ $1 == auth && $2 == status ]]; then exit 0; fi' \
+  'if [[ $1 == attestation && $2 == verify ]]; then' \
+  '  if [[ ${3-} == --help ]]; then [[ ${SOLODOCK_SMOKE_ATTESTATION_SUPPORTED:-yes} == yes ]]; exit; fi' \
+  '  printf "%s\n" "${@:3}" >"$SOLODOCK_SMOKE_ATTESTATION_ARGS"' \
+  '  [[ ${SOLODOCK_SMOKE_ATTESTATION_RESULT:-success} == success ]]' \
+  '  exit 0' \
+  'fi' \
   "if [[ \$1 == run && \$2 == list ]]; then printf '%s\\t%s\\t%s\\t%s\\n' 123 $(printf '%040d' 0) main success; exit 0; fi" \
   'if [[ $1 == run && $2 == download ]]; then' \
   '  while (($#)); do if [[ $1 == --dir ]]; then destination=$2; break; fi; shift; done' \
@@ -62,7 +68,39 @@ printf '%s\n' \
   'exit 1' >"$fake_bin/gh"
 printf '%s\n' '#!/bin/sh' 'exit 0' >"$fake_bin/sudo"
 chmod 0755 "$fake_bin/gh" "$fake_bin/sudo"
-if PATH="$fake_bin:$PATH" SOLODOCK_SMOKE_PACKAGE="$update_package" ./packaging/solodock-update >"$fixture/source-sha.stdout" 2>"$fixture/source-sha.stderr"; then
+attestation_args="$fixture/attestation.args"
+if PATH="$fake_bin:$PATH" \
+  SOLODOCK_SMOKE_ATTESTATION_SUPPORTED=no \
+  ./packaging/solodock-update >"$fixture/attestation-support.stdout" 2>"$fixture/attestation-support.stderr"; then
+  printf '%s\n' 'updater accepted a GitHub CLI without attestation support' >&2
+  exit 1
+fi
+grep -qx 'GitHub CLI does not support artifact attestation verification' "$fixture/attestation-support.stderr"
+
+if PATH="$fake_bin:$PATH" \
+  SOLODOCK_SMOKE_PACKAGE="$update_package" \
+  SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
+  SOLODOCK_SMOKE_ATTESTATION_RESULT=failure \
+  ./packaging/solodock-update >"$fixture/attestation.stdout" 2>"$fixture/attestation.stderr"; then
+  printf '%s\n' 'updater accepted an artifact without valid provenance' >&2
+  exit 1
+fi
+grep -qx 'artifact provenance attestation verification failed' "$fixture/attestation.stderr"
+grep -Fxq -- "$update_package/SHA256SUMS" "$attestation_args"
+grep -Fxq -- '--repo' "$attestation_args"
+grep -Fxq -- 'baixiaohang/solodock' "$attestation_args"
+grep -Fxq -- '--signer-workflow' "$attestation_args"
+grep -Fxq -- 'baixiaohang/solodock/.github/workflows/ci.yml' "$attestation_args"
+grep -Fxq -- '--source-ref' "$attestation_args"
+grep -Fxq -- 'refs/heads/main' "$attestation_args"
+grep -Fxq -- '--source-digest' "$attestation_args"
+grep -Fxq -- "$(printf '%040d' 0)" "$attestation_args"
+grep -Fxq -- '--deny-self-hosted-runners' "$attestation_args"
+
+if PATH="$fake_bin:$PATH" \
+  SOLODOCK_SMOKE_PACKAGE="$update_package" \
+  SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
+  ./packaging/solodock-update >"$fixture/source-sha.stdout" 2>"$fixture/source-sha.stderr"; then
   printf '%s\n' 'updater accepted an artifact from a different source commit' >&2
   exit 1
 fi

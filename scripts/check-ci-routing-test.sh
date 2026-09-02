@@ -34,6 +34,7 @@ success_needs='{
   "rust-lint":{"result":"success"},
   "rust-test":{"result":"success"},
   "package-smoke":{"result":"success"},
+  "attest-package":{"result":"success"},
   "security-policy":{"result":"success"},
   "docker-e2e":{"result":"success"},
   "docker-containerd-e2e":{"result":"success"}
@@ -44,6 +45,7 @@ docs_needs='{
   "rust-lint":{"result":"skipped"},
   "rust-test":{"result":"skipped"},
   "package-smoke":{"result":"skipped"},
+  "attest-package":{"result":"skipped"},
   "security-policy":{"result":"success"},
   "docker-e2e":{"result":"skipped"},
   "docker-containerd-e2e":{"result":"skipped"}
@@ -54,30 +56,35 @@ core_needs='{
   "rust-lint":{"result":"success"},
   "rust-test":{"result":"success"},
   "package-smoke":{"result":"success"},
+  "attest-package":{"result":"skipped"},
   "security-policy":{"result":"success"},
   "docker-e2e":{"result":"skipped"},
   "docker-containerd-e2e":{"result":"skipped"}
 }'
 
-"$gate" true true "$success_needs" >/dev/null
-"$gate" true false "$core_needs" >/dev/null
-"$gate" false false "$docs_needs" >/dev/null
+"$gate" true true push "$success_needs" >/dev/null
+"$gate" true false pull_request "$core_needs" >/dev/null
+"$gate" false false pull_request "$docs_needs" >/dev/null
 
 expect_gate_failure() {
   local name=$1
   local run_core=$2
   local run_docker=$3
-  local needs=$4
-  if "$gate" "$run_core" "$run_docker" "$needs" >/dev/null 2>&1; then
+  local event_name=$4
+  local needs=$5
+  if "$gate" "$run_core" "$run_docker" "$event_name" "$needs" >/dev/null 2>&1; then
     echo "expected CI gate failure: $name" >&2
     exit 1
   fi
 }
 
-expect_gate_failure invalid-classify-output maybe true "$success_needs"
-expect_gate_failure unexpected-core-skip true false "$docs_needs"
-expect_gate_failure unexpected-failure true true "$(jq -c '."rust-test".result = "failure"' <<<"$success_needs")"
-expect_gate_failure unexpected-cancellation true true "$(jq -c '."docker-e2e".result = "cancelled"' <<<"$success_needs")"
-expect_gate_failure unexpected-core-run false false "$success_needs"
+expect_gate_failure invalid-classify-output maybe true push "$success_needs"
+expect_gate_failure invalid-event true true schedule "$success_needs"
+expect_gate_failure unexpected-core-skip true false pull_request "$docs_needs"
+expect_gate_failure unexpected-failure true true push "$(jq -c '."rust-test".result = "failure"' <<<"$success_needs")"
+expect_gate_failure unexpected-cancellation true true push "$(jq -c '."docker-e2e".result = "cancelled"' <<<"$success_needs")"
+expect_gate_failure unexpected-core-run false false pull_request "$success_needs"
+expect_gate_failure missing-push-attestation true true push "$(jq -c '."attest-package".result = "skipped"' <<<"$success_needs")"
+expect_gate_failure unexpected-pr-attestation true false pull_request "$(jq -c '."attest-package".result = "success"' <<<"$core_needs")"
 
 echo "CI routing and gate tests passed"

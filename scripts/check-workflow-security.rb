@@ -5,6 +5,15 @@ require "yaml"
 
 PINNED_ACTION = %r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z}
 DANGEROUS_TRIGGERS = %w[pull_request_target workflow_run].freeze
+ATTEST_JOB = "attest-package"
+DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+ATTEST_ACTION = "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
+ATTEST_PERMISSIONS = {
+  "contents" => "read",
+  "id-token" => "write",
+  "attestations" => "write",
+  "artifact-metadata" => "write"
+}.freeze
 
 root = File.expand_path(ARGV.fetch(0, "."))
 workflow_dir = File.join(root, ".github", "workflows")
@@ -14,6 +23,10 @@ workflow_files = Dir.glob(File.join(workflow_dir, "*.{yml,yaml}")).sort
 abort "no workflow files found in #{workflow_dir}" if workflow_files.empty?
 
 errors = []
+required_ci_file = File.join(workflow_dir, "ci.yml")
+unless File.file?(required_ci_file) && !File.symlink?(required_ci_file)
+  errors << "#{required_ci_file}: required workflow must exist as a regular file"
+end
 
 scalar_strings = lambda do |value, &block|
   case value
@@ -48,7 +61,12 @@ permission_errors = lambda do |permissions, file, scope|
 
     allowed_codeql_upload =
       File.basename(file) == "codeql.yml" && scope == "job analyze" && name.to_s == "security-events"
-    errors << "#{file}: unapproved write permission in #{scope}: #{name}" unless allowed_codeql_upload
+    allowed_package_attestation =
+      File.basename(file) == "ci.yml" && scope == "job #{ATTEST_JOB}" &&
+      %w[id-token attestations artifact-metadata].include?(name.to_s)
+    unless allowed_codeql_upload || allowed_package_attestation
+      errors << "#{file}: unapproved write permission in #{scope}: #{name}"
+    end
   end
 end
 
@@ -89,6 +107,9 @@ workflow_files.each do |file|
   unless jobs.is_a?(Hash)
     errors << "#{file}: jobs must be a mapping"
     next
+  end
+  if File.basename(file) == "ci.yml" && !jobs.key?(ATTEST_JOB)
+    errors << "#{file}: required #{ATTEST_JOB} job is missing"
   end
 
   jobs.each do |job_id, job|
@@ -133,8 +154,12 @@ workflow_files.each do |file|
       end
     end
 
+    attestation_job = File.basename(file) == "ci.yml" && job_id.to_s == ATTEST_JOB
     steps = job["steps"]
-    next if steps.nil?
+    if steps.nil?
+      errors << "#{file}: #{ATTEST_JOB} must define its fixed action steps" if attestation_job
+      next
+    end
     unless steps.is_a?(Array)
       errors << "#{file}: steps in job #{job_id} must be a sequence"
       next
@@ -169,6 +194,46 @@ workflow_files.each do |file|
       unless persist_credentials == false || persist_credentials.to_s.casecmp("false").zero?
         errors << "#{file}: checkout step #{job_id}[#{index}] must set persist-credentials: false"
       end
+    end
+
+    next unless attestation_job
+
+    expected_job_keys = %w[needs if runs-on permissions steps].sort
+    unless job.keys.map(&:to_s).sort == expected_job_keys
+      errors << "#{file}: #{ATTEST_JOB} contains unsupported job configuration"
+    end
+
+    unless job["if"].to_s.strip == "github.event_name == 'push'"
+      errors << "#{file}: #{ATTEST_JOB} must be restricted to push events"
+    end
+    unless job["needs"].to_s == "package-smoke"
+      errors << "#{file}: #{ATTEST_JOB} must depend directly on package-smoke"
+    end
+    unless job["runs-on"] == "ubuntu-24.04"
+      errors << "#{file}: #{ATTEST_JOB} must run on ubuntu-24.04"
+    end
+    unless job["permissions"] == ATTEST_PERMISSIONS
+      errors << "#{file}: #{ATTEST_JOB} must use the exact attestation permissions"
+    end
+
+    expected_steps = [
+      {
+        "uses" => DOWNLOAD_ARTIFACT_ACTION,
+        "with" => {
+          "name" => "solodock-embedded-package",
+          "path" => "${{ runner.temp }}/attested-package"
+        }
+      },
+      {
+        "name" => "Attest package checksums",
+        "uses" => ATTEST_ACTION,
+        "with" => {
+          "subject-path" => "${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS"
+        }
+      }
+    ]
+    unless steps == expected_steps
+      errors << "#{file}: #{ATTEST_JOB} must contain only the pinned download and attestation actions"
     end
   end
 end

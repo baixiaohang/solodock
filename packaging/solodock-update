@@ -40,6 +40,7 @@ for command in gh sudo sha256sum mktemp curl systemctl readlink; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 gh auth status --hostname github.com >/dev/null 2>&1 || fail 'GitHub CLI is not authenticated'
+gh attestation verify --help >/dev/null 2>&1 || fail 'GitHub CLI does not support artifact attestation verification'
 if ! sudo -n true 2>/dev/null; then
   sudo true
 fi
@@ -73,6 +74,14 @@ package="$update_dir/solodock-package"
 for file in SHA256SUMS SOURCE_SHA solodock install.sh solodock-backup solodock-update solodock.service solodock.toml.example; do
   [[ -f $package/$file && ! -L $package/$file ]] || fail "artifact is missing a safe $file"
 done
+if ! gh attestation verify "$package/SHA256SUMS" \
+  --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/ci.yml" \
+  --source-ref "refs/heads/$branch" \
+  --source-digest "$head_sha" \
+  --deny-self-hosted-runners >/dev/null; then
+  fail 'artifact provenance attestation verification failed'
+fi
 (cd "$package" && sha256sum -c SHA256SUMS)
 source_sha=$(<"$package/SOURCE_SHA")
 [[ $source_sha =~ ^[0-9a-f]{40}$ ]] || fail 'artifact source SHA is missing or invalid'
