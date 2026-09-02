@@ -29,7 +29,7 @@ use crate::{
     app_store::{AppStore, StoreError, config_revision},
     compose::{
         ComposeAction, ComposeCapability, ComposeInput, ComposeRunner, ComposeStatus, RunContext,
-        generate,
+        generate, matches_canonical,
     },
     db::Database,
     docker::{
@@ -2672,7 +2672,15 @@ fn verify_active_compose(
         .app_directory(app.id)
         .join("config-revisions")
         .join(revision.to_string());
-    let (canonical, _) = generate(
+    let compose_file = services
+        .store
+        .app_directory(app.id)
+        .join("releases")
+        .join(release_id.to_string())
+        .join("compose.yaml");
+    crate::security::permissions::check_private(&compose_file, false).map_err(|_| ())?;
+    let actual = std::fs::read(compose_file).map_err(|_| ())?;
+    matches_canonical(
         ComposeInput {
             resource_identity: app.resource_identity(),
             release_id,
@@ -2682,17 +2690,13 @@ fn verify_active_compose(
             include_stop_grace_period: release.compose_schema_version >= 3,
         },
         true,
+        release.compose_schema_version,
+        &release.compose_sha256,
+        &actual,
     )
-    .map_err(|_| ())?;
-    let compose_file = services
-        .store
-        .app_directory(app.id)
-        .join("releases")
-        .join(release_id.to_string())
-        .join("compose.yaml");
-    crate::security::permissions::check_private(&compose_file, false).map_err(|_| ())?;
-    let actual = std::fs::read(compose_file).map_err(|_| ())?;
-    (actual == canonical.as_bytes()).then_some(()).ok_or(())
+    .map_err(|_| ())?
+    .then_some(())
+    .ok_or(())
 }
 
 fn compose_unready_code(status: ComposeStatus) -> Option<&'static str> {

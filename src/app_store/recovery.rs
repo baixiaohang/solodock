@@ -5,13 +5,12 @@ use std::{
 };
 
 use serde::{Deserialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{StoreError, atomic::is_internal_temp_name};
 use crate::{
-    compose::{ComposeInput, generate},
+    compose::{CURRENT_COMPOSE_SCHEMA_VERSION, ComposeInput, matches_canonical},
     domain::{
         DesiredState, NetworkPlan, dto::DraftResponse, network_plan, validate_runnable_image,
     },
@@ -78,6 +77,8 @@ struct ReleaseHeader {
     config_revision: Option<Uuid>,
     #[serde(default)]
     config_sha256: Option<String>,
+    #[serde(default)]
+    compose_sha256: String,
     #[serde(with = "time::serde::rfc3339")]
     created_at: OffsetDateTime,
 }
@@ -636,6 +637,7 @@ fn scan_app(
         active_config_revision,
         active_config_sha256,
         active_compose_schema_version,
+        active_compose_sha256,
     ) = match active {
         Some(release) => (
             Some(release.id),
@@ -643,8 +645,9 @@ fn scan_app(
             release.config_revision,
             release.config_sha256,
             Some(release.compose_schema_version),
+            Some(release.compose_sha256),
         ),
-        None => (None, None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
     let (pending_release_id, pending_image_ref, pending_config_revision) = match pending {
         Some(release) => (
@@ -684,11 +687,18 @@ fn scan_app(
     };
     let active_network_plan = load_network_plan(active_config_revision)?;
     let pending_network_plan = load_network_plan(pending_config_revision)?;
-    if let (Some(release_id), Some(image), Some(revision), Some(expected_hash)) = (
+    if let (
+        Some(release_id),
+        Some(image),
+        Some(revision),
+        Some(expected_hash),
+        Some(expected_compose_hash),
+    ) = (
         active_release_id,
         active_image_ref.as_deref(),
         active_config_revision,
         active_config_sha256.as_deref(),
+        active_compose_sha256.as_deref(),
     ) {
         match validate_active_compose(
             path,
@@ -698,7 +708,8 @@ fn scan_app(
             image,
             revision,
             expected_hash,
-            active_compose_schema_version.is_some_and(|version| version >= 3),
+            active_compose_schema_version.unwrap_or_default(),
+            expected_compose_hash,
             integrity_key,
             allowed_bind_roots,
         )? {
@@ -749,7 +760,8 @@ fn validate_active_compose(
     image_ref: &str,
     revision_id: Uuid,
     expected_hash: &str,
-    include_stop_grace_period: bool,
+    compose_schema_version: u32,
+    expected_compose_sha256: &str,
     integrity_key: Option<&[u8]>,
     allowed_bind_roots: &[PathBuf],
 ) -> Result<Result<(), &'static str>, StoreError> {
@@ -786,24 +798,30 @@ fn validate_active_compose(
     let revision_directory = canonical_app_directory
         .join("config-revisions")
         .join(revision_id.to_string());
-    let (expected, _) = generate(
-        ComposeInput {
-            resource_identity: app.resource_identity(),
-            release_id,
-            image_ref,
-            revision_directory: &revision_directory,
-            draft: &draft,
-            include_stop_grace_period,
-        },
-        true,
-    )
-    .map_err(|_| StoreError::ContentInvalid)?;
     let compose_path = app_directory
         .join("releases")
         .join(release_id.to_string())
         .join("compose.yaml");
     match fs::read(compose_path) {
-        Ok(actual) if actual == expected.as_bytes() => Ok(Ok(())),
+        Ok(actual)
+            if matches_canonical(
+                ComposeInput {
+                    resource_identity: app.resource_identity(),
+                    release_id,
+                    image_ref,
+                    revision_directory: &revision_directory,
+                    draft: &draft,
+                    include_stop_grace_period: compose_schema_version >= 3,
+                },
+                true,
+                compose_schema_version,
+                expected_compose_sha256,
+                &actual,
+            )
+            .map_err(|_| StoreError::ContentInvalid)? =>
+        {
+            Ok(Ok(()))
+        }
         Ok(_) => Ok(Err("ACTIVE_COMPOSE_INVALID")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(Err("ACTIVE_COMPOSE_MISSING"))
@@ -859,7 +877,7 @@ fn collect_release_revisions(
             Ok(release) => release,
             Err(code) => return Ok(Err(code)),
         };
-        if !matches!(release.schema_version, 3..=5) {
+        if !matches!(release.schema_version, 3..=6) {
             return Ok(Err("RELEASE_SCHEMA_UNSUPPORTED"));
         }
         match validate_v2_release(
@@ -914,7 +932,7 @@ fn validate_v2_release(
     release.apply_schema_defaults();
     if !matches!(
         (release.schema_version, release.compose_schema_version),
-        (3, 2) | (4, 3) | (5, 4)
+        (3, 2) | (4, 3) | (5, 4) | (6, CURRENT_COMPOSE_SCHEMA_VERSION)
     ) || release.app_id != app_id
         || release.id != release_id
         || super::releases::sign(&release, key) != release.integrity_hmac
@@ -952,7 +970,14 @@ fn validate_v2_release(
     if release.stop_grace_period_seconds != loaded.metadata.stop_grace_period_seconds {
         return Ok(Err("RELEASE_CONFIG_REVISION_INVALID"));
     }
-    let (canonical, _) = generate(
+    let compose = match fs::read(directory.join("compose.yaml")) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Err("RELEASE_COMPOSE_MISSING"));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let canonical = matches_canonical(
         ComposeInput {
             resource_identity: identity,
             release_id,
@@ -964,18 +989,12 @@ fn validate_v2_release(
             include_stop_grace_period: release.compose_schema_version >= 3,
         },
         true,
+        release.compose_schema_version,
+        &release.compose_sha256,
+        &compose,
     )
     .map_err(|_| StoreError::ContentInvalid)?;
-    let compose = match fs::read(directory.join("compose.yaml")) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Err("RELEASE_COMPOSE_MISSING"));
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if compose != canonical.as_bytes()
-        || format!("{:x}", Sha256::digest(&compose)) != release.compose_sha256
-    {
+    if !canonical {
         return Ok(Err("RELEASE_COMPOSE_INVALID"));
     }
     Ok(Ok(()))
@@ -1107,7 +1126,7 @@ fn read_release_header(
         return Ok(Err("RELEASE_HEADER_INVALID"));
     }
     match release.schema_version {
-        3..=5 => {
+        3..=6 => {
             let Some(key) = integrity_key else {
                 return Ok(Err("RELEASE_INTEGRITY_UNVERIFIED"));
             };

@@ -2,9 +2,6 @@
 all-features = true
 
 [advisories]
-ignore = [
-  { id = "RUSTSEC-2025-0068", reason = "Existing serde_yml serializer dependency; replace it in a focused follow-up change" },
-]
 
 [licenses]
 confidence-threshold = 0.8

@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{AppStore, StoreError, atomic::AtomicWriter, config_revision};
 use crate::{
-    compose::{ComposeInput, generate},
+    compose::{CURRENT_COMPOSE_SCHEMA_VERSION, ComposeInput, generate, matches_canonical},
     domain::{AppMetadata, DesiredState},
     registry::ResolvedImage,
     security::permissions::check_private_tree,
@@ -125,8 +125,8 @@ impl AppStore {
         .map_err(|_| StoreError::ContentInvalid)?;
         let compose_sha256 = format!("{:x}", Sha256::digest(compose.as_bytes()));
         let mut release = ReleaseV2 {
-            schema_version: 5,
-            compose_schema_version: 4,
+            schema_version: 6,
+            compose_schema_version: CURRENT_COMPOSE_SCHEMA_VERSION,
             id: release_id,
             app_id: app.id,
             config_revision: draft_revision,
@@ -178,7 +178,7 @@ impl AppStore {
         release.apply_schema_defaults();
         if !matches!(
             (release.schema_version, release.compose_schema_version),
-            (3, 2) | (4, 3) | (5, 4)
+            (3, 2) | (4, 3) | (5, 4) | (6, CURRENT_COMPOSE_SCHEMA_VERSION)
         ) || release.id != release_id
             || release.app_id != app_id
             || sign(&release, self.integrity_key()?) != release.integrity_hmac
@@ -188,9 +188,6 @@ impl AppStore {
         crate::domain::validate_runnable_image(&release.runnable_image_ref)
             .map_err(|_| StoreError::ContentInvalid)?;
         let compose = fs::read(&compose_path)?;
-        if format!("{:x}", Sha256::digest(&compose)) != release.compose_sha256 {
-            return Err(StoreError::ContentInvalid);
-        }
         let loaded = config_revision::load_verified(
             &self.app_directory(app_id),
             release.config_revision,
@@ -221,7 +218,7 @@ impl AppStore {
             .app_directory(app_id)
             .join("config-revisions")
             .join(release.config_revision.to_string());
-        let (canonical, _) = generate(
+        let canonical = matches_canonical(
             ComposeInput {
                 resource_identity: app.resource_identity(),
                 release_id,
@@ -231,9 +228,12 @@ impl AppStore {
                 include_stop_grace_period: release.compose_schema_version >= 3,
             },
             true,
+            release.compose_schema_version,
+            &release.compose_sha256,
+            &compose,
         )
         .map_err(|_| StoreError::ContentInvalid)?;
-        if compose != canonical.as_bytes() {
+        if !canonical {
             return Err(StoreError::ContentInvalid);
         }
         Ok(release)
@@ -447,7 +447,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        domain::{DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy, normalize_draft},
+        domain::{
+            DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy, NetworkInput,
+            normalize_draft,
+        },
         registry::Platform,
     };
 
@@ -455,8 +458,8 @@ mod tests {
     fn serialized_current_release_round_trips_with_compose_schema_marker() {
         let manifest = format!("sha256:{}", "a".repeat(64));
         let mut release = ReleaseV2 {
-            schema_version: 4,
-            compose_schema_version: 3,
+            schema_version: 6,
+            compose_schema_version: CURRENT_COMPOSE_SCHEMA_VERSION,
             id: Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap(),
             app_id: Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap(),
             config_revision: Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap(),
@@ -487,7 +490,7 @@ mod tests {
         assert_eq!(release.integrity_hmac.len(), 64);
         let serialized = toml::to_string(&release).unwrap();
         assert!(serialized.contains("local_image_id = "));
-        assert!(serialized.contains("compose_schema_version = 3"));
+        assert!(serialized.contains("compose_schema_version = 5"));
         assert!(serialized.contains("stop_grace_period_seconds = 60"));
 
         let parsed: ReleaseV2 = toml::from_str(&serialized).unwrap();
@@ -558,6 +561,8 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let key = b"legacy-config-release-key".to_vec();
         let store = AppStore::initialize_verified(root.path().join("apps"), key.clone()).unwrap();
+        let app_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let revision_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let mut draft = normalize_draft(
             DraftInput {
                 display_name: "Legacy".into(),
@@ -572,9 +577,12 @@ mod tests {
                 ports: vec![],
                 volumes: vec![],
                 binds: vec![],
-                owned_default_network: true,
+                owned_default_network: false,
                 service_discovery_enabled: false,
-                networks: vec![],
+                networks: vec![NetworkInput::External {
+                    name: "on".into(),
+                    aliases: vec!["on".into()],
+                }],
                 health: HealthPolicy::default(),
             },
             &ExistingSecrets::default(),
@@ -588,13 +596,11 @@ mod tests {
             &draft.public_environment,
             &draft.public_files,
         );
-        let app_id = Uuid::new_v4();
-        let revision_id = Uuid::new_v4();
         let metadata = store
             .create_app(
                 app_id,
                 "legacy",
-                Uuid::new_v4(),
+                Uuid::parse_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap(),
                 Some((revision_id, &draft)),
                 OffsetDateTime::now_utc(),
             )
@@ -625,7 +631,7 @@ mod tests {
             local_image_id: digest,
         };
 
-        let legacy_release_id = Uuid::new_v4();
+        let legacy_release_id = Uuid::parse_str("33333333-3333-4333-8333-333333333333").unwrap();
         let mut legacy_release = store
             .publish_v2_release(
                 &metadata,
@@ -639,18 +645,24 @@ mod tests {
             .app_directory(app_id)
             .join("config-revisions")
             .join(revision_id.to_string());
-        let (legacy_compose, _) = generate(
-            ComposeInput {
-                resource_identity: metadata.resource_identity(),
-                release_id: legacy_release_id,
-                image_ref: &resolved.runnable_image_ref,
-                revision_directory: &revision_directory,
-                draft: &draft,
-                include_stop_grace_period: false,
-            },
-            true,
-        )
-        .unwrap();
+        // Frozen serde_yml 0.0.12 output: legacy schema validation must retain
+        // quoted YAML 1.1 boolean spellings without keeping libyml installed.
+        let legacy_compose_fixture = |release_id: Uuid, include_stop_grace_period: bool| {
+            let stop_grace_period = if include_stop_grace_period {
+                "    stop_grace_period: '10s'\n"
+            } else {
+                ""
+            };
+            format!(
+                "services:\n  app:\n    image: {}\n    labels:\n      com.solodock.app-id: '{}'\n      com.solodock.managed: 'true'\n      com.solodock.release-id: '{}'\n      com.solodock.schema-version: '1'\n    env_file:\n    - path: {}/env/public.env\n      required: true\n    - path: {}/secrets/runtime.env\n      required: true\n    volumes: []\n    ports: []\n    networks:\n      solodock-network-0:\n        aliases:\n        - 'on'\n    restart: unless-stopped\n{stop_grace_period}volumes: {{}}\nnetworks:\n  solodock-network-0:\n    external: true\n    name: 'on'\n",
+                resolved.runnable_image_ref,
+                app_id,
+                release_id,
+                revision_directory.display(),
+                revision_directory.display(),
+            )
+        };
+        let legacy_compose = legacy_compose_fixture(legacy_release_id, false);
         legacy_release.schema_version = 3;
         legacy_release.compose_schema_version = 2;
         legacy_release.compose_sha256 = format!("{:x}", Sha256::digest(legacy_compose.as_bytes()));
@@ -666,7 +678,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         fs::write(legacy_directory.join("release.toml"), &legacy_release_toml).unwrap();
-        fs::write(legacy_directory.join("compose.yaml"), legacy_compose).unwrap();
+        fs::write(legacy_directory.join("compose.yaml"), &legacy_compose).unwrap();
 
         assert_eq!(
             store
@@ -682,6 +694,35 @@ mod tests {
         let recovered = store.scan().unwrap();
         assert!(recovered.issues.is_empty(), "{:?}", recovered.issues);
         assert_eq!(recovered.valid_apps.len(), 1);
+
+        let previous_release_id = Uuid::parse_str("55555555-5555-4555-8555-555555555555").unwrap();
+        let mut previous_release = store
+            .publish_v2_release(
+                &metadata,
+                previous_release_id,
+                &resolved,
+                ReleaseTrigger::Manual,
+                Some(legacy_release_id),
+            )
+            .unwrap();
+        let previous_compose = legacy_compose_fixture(previous_release_id, true);
+        previous_release.schema_version = 5;
+        previous_release.compose_schema_version = 4;
+        previous_release.compose_sha256 =
+            format!("{:x}", Sha256::digest(previous_compose.as_bytes()));
+        previous_release.integrity_hmac = sign(&previous_release, &key);
+        let previous_directory = store
+            .app_directory(app_id)
+            .join("releases")
+            .join(previous_release_id.to_string());
+        fs::write(
+            previous_directory.join("release.toml"),
+            toml::to_string(&previous_release).unwrap(),
+        )
+        .unwrap();
+        fs::write(previous_directory.join("compose.yaml"), previous_compose).unwrap();
+        store.load_v2_release(app_id, previous_release_id).unwrap();
+        assert!(store.scan().unwrap().issues.is_empty());
 
         // Neither legacy signature covered the new field. Injecting it must
         // therefore never change the effective lifecycle control value.
@@ -717,7 +758,7 @@ mod tests {
         );
         assert!(store.scan().unwrap().issues.is_empty());
 
-        let current_release_id = Uuid::new_v4();
+        let current_release_id = Uuid::parse_str("44444444-4444-4444-8444-444444444444").unwrap();
         let current = store
             .publish_v2_release(
                 &metadata,
@@ -729,12 +770,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             (current.schema_version, current.compose_schema_version),
-            (5, 4)
+            (6, CURRENT_COMPOSE_SCHEMA_VERSION)
         );
         let current_compose =
             fs::read_to_string(store.release_compose_path(app_id, current_release_id)).unwrap();
         assert!(current_compose.contains("stop_grace_period:"));
         assert!(current_compose.contains("10s"));
+        assert!(current_compose.contains("name: on"));
+        assert!(!current_compose.contains("name: 'on'"));
         store.load_v2_release(app_id, current_release_id).unwrap();
     }
 
