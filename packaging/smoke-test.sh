@@ -86,7 +86,8 @@ if PATH="$fake_bin:$PATH" \
   exit 1
 fi
 grep -qx 'artifact provenance attestation verification failed' "$fixture/attestation.stderr"
-grep -Fxq -- "$update_package/SHA256SUMS" "$attestation_args"
+attested_subject=$(head -n 1 "$attestation_args")
+[[ $attested_subject == /tmp/solodock-update.*/solodock-package/SHA256SUMS ]]
 grep -Fxq -- '--repo' "$attestation_args"
 grep -Fxq -- 'baixiaohang/solodock' "$attestation_args"
 grep -Fxq -- '--signer-workflow' "$attestation_args"
