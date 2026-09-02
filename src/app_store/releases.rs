@@ -648,9 +648,11 @@ mod tests {
         // Frozen serde_yml 0.0.12 output: legacy schema validation must retain
         // quoted YAML 1.1 boolean spellings without keeping libyml installed.
         let legacy_compose_fixture = |release_id: Uuid, include_stop_grace_period: bool| {
-            let stop_grace_period = include_stop_grace_period
-                .then_some("    stop_grace_period: '10s'\n")
-                .unwrap_or_default();
+            let stop_grace_period = if include_stop_grace_period {
+                "    stop_grace_period: '10s'\n"
+            } else {
+                ""
+            };
             format!(
                 "services:\n  app:\n    image: {}\n    labels:\n      com.solodock.app-id: '{}'\n      com.solodock.managed: 'true'\n      com.solodock.release-id: '{}'\n      com.solodock.schema-version: '1'\n    env_file:\n    - path: {}/env/public.env\n      required: true\n    - path: {}/secrets/runtime.env\n      required: true\n    volumes: []\n    ports: []\n    networks:\n      solodock-network-0:\n        aliases:\n        - 'on'\n    restart: unless-stopped\n{stop_grace_period}volumes: {{}}\nnetworks:\n  solodock-network-0:\n    external: true\n    name: 'on'\n",
                 resolved.runnable_image_ref,
