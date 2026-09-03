@@ -10,6 +10,13 @@ export interface MeResponse {
   session: { created_at: string; expires_at: string }
 }
 
+export interface InstallationIdentity {
+  channel: 'stable' | 'main' | 'development' | 'unknown'
+  version: string | null
+  source_sha: string | null
+  package_identity: string | null
+}
+
 export interface SettingsResponse {
   revision: string
   display_timezone: string

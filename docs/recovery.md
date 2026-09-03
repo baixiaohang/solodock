@@ -6,9 +6,25 @@ This document covers recovery of the control plane and managed state only. See [
 
 ## Offline recovery
 
-Recovery is supported only while the service is stopped. Verify the SHA-256 file beside the archive, extract into a private temporary directory, and reject absolute paths, `..`, hard links, special files, and unexpected top-level entries. The only allowed symlinks are SoloDock-owned canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>` links. In private staging, the restore helper normalizes legacy `0400`/`0600` modes on canonical managed leaves to `0444`, then invokes the same package binary to validate owner/mode, link boundaries, HMACs, config revisions, and canonical Compose. It does not repair `0644`, owner drift, symlinks, or special files. Never overwrite live state. Atomically rename the current `/var/lib/solodock` to a recoverable backup before switching in the complete validated state/config. Keep directories at `0700`, ordinary control-plane files at `0600`, and direct `files/{public,secret}` leaves at `0444`, then start the service and inspect the journal, `/healthz`, and authenticated system health.
+Recovery is supported only while the service is stopped. The installer keeps `/usr/local/bin/solodock-restore` as a managed symlink into the same immutable package generation as its default validator binary. Use it to verify the SHA-256 file beside the archive and extract only into a new private staging directory:
+
+```bash
+sudo systemctl stop solodock.service
+sudo /usr/local/bin/solodock-restore \
+  --archive /secure/solodock-control-plane.tar \
+  --checksum /secure/solodock-control-plane.tar.sha256 \
+  --output /secure/solodock-restored
+```
+
+The helper rejects absolute paths, `..`, hard links, special files, and unexpected top-level entries. The only allowed symlinks are SoloDock-owned canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>` links. In private staging, it normalizes legacy `0400`/`0600` modes on canonical managed leaves to `0444`, then invokes its version-bound package binary to validate owner/mode, link boundaries, HMACs, config revisions, and canonical Compose. It does not repair `0644`, owner drift, symlinks, or special files. Never overwrite live state. Atomically rename the current `/var/lib/solodock` to a recoverable backup before switching in the complete validated state/config. Keep directories at `0700`, ordinary control-plane files at `0600`, and direct `files/{public,secret}` leaves at `0444`, then start the service and inspect the journal, `/healthz`, and authenticated system health.
 
 Binary, configuration, and state must come from one compatible backup set. SQLite migrations are forward-only; reverting only the binary after migration is unsafe.
+
+## Update failure
+
+`solodock-update` follows the channel recorded by the current version-bound `INSTALL_MANIFEST`, unless an administrator explicitly switches tracks with `--channel`. It verifies either the stable Release identity or main CI identity, provenance attestation, source commit, package version, full package identity, and checksums before applying anything. Failures in that preflight leave the installed package, service, and state unchanged and remove the temporary download. Stable and main then share one apply path. A package/helper or channel-identity change with identical binary bytes is installed and health-checked without stopping the service or invoking the binary. A changed binary uses the shared stop, offline backup, install, start, `/healthz`, and `/favicon.svg` path. An installed stable manifest also prevents automatic downgrade below its SemVer even if GitHub's Latest Release fact regresses.
+
+Before the new binary is invoked, the installer transaction restores and verifies the previous binary, helpers, unit, and manifest as one package generation, and only then may the updater restart the old service. Failure injection covers every staged asset and public-link commit point for both package-only and stopped-service updates. Separate rollback-operation injection covers the binary commit marker, a helper, and the unit: an incomplete rollback has a distinct status, retains the generation and transaction scene, and leaves the service stopped with manual recovery instructions. Do not start the service until all four public entries, the unit, and the manifest point to one verified generation and `systemctl daemon-reload` succeeds. After the new binary has been invoked, automatic binary rollback is deliberately disabled because a forward-only SQLite migration may already have run. Preserve the updater output, journal, offline `solodock-before-<version>-<timestamp>.tar` backup and checksum, current generation and `INSTALL_MANIFEST`, and failed installation scene. Diagnose compatibility and health before choosing a recovery; do not manually repoint one public symlink or edit its manifest. The manifest records either the stable Release SemVer or the main `main-<commit SHA prefix>` label, while the generation path also binds the complete package identity.
 
 ## Failure categories
 

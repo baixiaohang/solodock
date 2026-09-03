@@ -3,7 +3,8 @@ set -Eeuo pipefail
 
 usage() {
   printf '%s\n' \
-    'usage: solodock-update [--repo OWNER/REPO] [--branch BRANCH] [--workflow WORKFLOW]' \
+    'usage: solodock-update [--channel stable|main] [--repo OWNER/REPO]' \
+    '                       [--branch BRANCH] [--workflow WORKFLOW]' \
     '                       [--backup-dir PATH] [--health-url URL]'
 }
 
@@ -12,16 +13,21 @@ fail() {
   exit 1
 }
 
+channel=''
+channel_set=0
 repo='baixiaohang/solodock'
 branch='main'
 workflow='CI'
+branch_set=0
+workflow_set=0
 backup_dir='/var/backups/solodock'
 health_url='http://127.0.0.1:8080/healthz'
 while (($#)); do
   case "$1" in
+    --channel) channel=${2-}; channel_set=1; shift 2 ;;
     --repo) repo=${2-}; shift 2 ;;
-    --branch) branch=${2-}; shift 2 ;;
-    --workflow) workflow=${2-}; shift 2 ;;
+    --branch) branch=${2-}; branch_set=1; shift 2 ;;
+    --workflow) workflow=${2-}; workflow_set=1; shift 2 ;;
     --backup-dir) backup_dir=${2-}; shift 2 ;;
     --health-url) health_url=${2-}; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -29,6 +35,12 @@ while (($#)); do
   esac
 done
 
+if ((channel_set)); then
+  [[ $channel == stable || $channel == main ]] || fail 'channel must be stable or main'
+  if [[ $channel != main && ($branch_set == 1 || $workflow_set == 1) ]]; then
+    fail '--branch and --workflow are valid only with --channel main'
+  fi
+fi
 [[ $repo =~ ^[0-9A-Za-z_.-]+/[0-9A-Za-z_.-]+$ ]] || fail 'invalid GitHub repository'
 [[ -n $branch && $branch != -* && $branch != *$'\r'* && $branch != *$'\n'* ]] || fail 'invalid GitHub branch'
 [[ -n $workflow && $workflow != -* && $workflow != *$'\r'* && $workflow != *$'\n'* ]] || fail 'invalid GitHub workflow'
@@ -36,7 +48,87 @@ done
 [[ $health_url =~ ^http://127\.0\.0\.1:[0-9]{1,5}/healthz$ ]] || fail 'health URL must be an explicit loopback HTTP /healthz URL'
 ((EUID != 0)) || fail 'run solodock-update as an administrator account, not root'
 
-for command in gh sudo sha256sum mktemp curl systemctl readlink; do
+root=${SOLODOCK_UPDATE_TEST_ROOT:-}
+if [[ -n $root ]]; then
+  [[ ${SOLODOCK_UPDATE_TEST_MODE:-} == 1 ]] || fail 'test root requires explicit test mode'
+  [[ $root = /* && $root != / && -d $root && ! -L $root ]] || fail 'unsafe updater test root'
+  root=${root%/}
+fi
+installed_bin="$root/usr/local/bin/solodock"
+installed_unit="$root/etc/systemd/system/solodock.service"
+command -v readlink >/dev/null || fail 'required command is missing: readlink'
+[[ -d $root/usr/local/bin && ! -L $root/usr/local/bin ]] || fail 'installed SoloDock binary directory is unsafe'
+[[ -d $root/usr/local/lib/solodock && ! -L $root/usr/local/lib/solodock ]] || fail 'installed SoloDock library directory is unsafe'
+[[ -L $installed_bin ]] || fail 'installed SoloDock binary target is not a managed symlink'
+old_link=$(readlink -- "$installed_bin")
+installed_generation=''
+legacy_directory=''
+if [[ $old_link =~ ^/usr/local/lib/solodock/generations/([0-9A-Za-z._-]+\.[0-9a-f]{64}\.[0-9A-Za-z]{12})/solodock$ ]]; then
+  installed_generation=${BASH_REMATCH[1]}
+  installed_version_directory="$root/usr/local/lib/solodock/generations/$installed_generation"
+  installed_link_prefix="/usr/local/lib/solodock/generations/$installed_generation"
+elif [[ $old_link =~ ^/usr/local/lib/solodock/([^/]+)/solodock$ ]]; then
+  legacy_directory=${BASH_REMATCH[1]}
+  installed_version_directory="$root/usr/local/lib/solodock/$legacy_directory"
+  installed_link_prefix="/usr/local/lib/solodock/$legacy_directory"
+else
+  fail 'installed SoloDock binary target is outside a managed generation'
+fi
+installed_binary_path="$installed_version_directory/solodock"
+[[ -d $installed_version_directory && ! -L $installed_version_directory ]] || fail 'installed SoloDock version directory is unsafe'
+[[ -f $installed_binary_path && ! -L $installed_binary_path ]] || fail 'installed SoloDock binary is unsafe'
+installed_manifest="$installed_version_directory/INSTALL_MANIFEST"
+current_channel=''
+current_version=''
+current_source_sha=''
+current_package_identity=''
+if [[ -e $installed_manifest || -L $installed_manifest ]]; then
+  [[ -f $installed_manifest && ! -L $installed_manifest ]] || fail 'installed SoloDock manifest is unsafe'
+  mapfile -t current_manifest <"$installed_manifest"
+  [[ ${#current_manifest[@]} == 5 ]] || fail 'installed SoloDock manifest has an invalid shape'
+  [[ ${current_manifest[0]} == 'FORMAT=solodock-install-v1' ]] || fail 'installed SoloDock manifest format is unsupported'
+  [[ ${current_manifest[1]} =~ ^CHANNEL=(stable|main)$ ]] || fail 'installed SoloDock manifest channel is invalid'
+  current_channel=${BASH_REMATCH[1]}
+  [[ ${current_manifest[2]} =~ ^VERSION=([0-9A-Za-z][0-9A-Za-z._-]{0,63})$ ]] || fail 'installed SoloDock manifest version is invalid'
+  current_version=${BASH_REMATCH[1]}
+  [[ ${current_manifest[3]} =~ ^SOURCE_SHA=([0-9a-f]{40})$ ]] || fail 'installed SoloDock manifest source SHA is invalid'
+  current_source_sha=${BASH_REMATCH[1]}
+  [[ ${current_manifest[4]} =~ ^PACKAGE_IDENTITY=([0-9a-f]{64})$ ]] || fail 'installed SoloDock manifest package identity is invalid'
+  current_package_identity=${BASH_REMATCH[1]}
+  if [[ $current_channel == stable ]]; then
+    [[ $current_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'installed stable manifest version is invalid'
+  else
+    [[ $current_version == "main-${current_source_sha:0:12}" ]] || fail 'installed main manifest version does not match its source SHA'
+  fi
+  if [[ -n $installed_generation ]]; then
+    generation_prefix="$current_version.$current_package_identity."
+    [[ $installed_generation == "$generation_prefix"* ]] || fail 'installed generation does not match its package identity'
+    generation_nonce=${installed_generation#"$generation_prefix"}
+    [[ $generation_nonce =~ ^[0-9A-Za-z]{12}$ ]] || fail 'installed generation has an invalid nonce'
+  else
+    [[ $current_version == "$legacy_directory" ]] || fail 'installed SoloDock manifest does not match its legacy version directory'
+  fi
+elif [[ -n $installed_generation ]]; then
+  fail 'installed SoloDock generation is missing its manifest'
+elif [[ $legacy_directory =~ ^main-[0-9a-f]{12}$ ]]; then
+  current_channel=main
+  current_version=$legacy_directory
+elif [[ $legacy_directory =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  current_channel=stable
+  current_version=$legacy_directory
+elif ((!channel_set)); then
+  fail 'cannot infer the update channel from this legacy installation; pass --channel stable or --channel main explicitly'
+fi
+if ((!channel_set)); then
+  channel=$current_channel
+fi
+if [[ $channel != main && ($branch_set == 1 || $workflow_set == 1) ]]; then
+  fail '--branch and --workflow are valid only with --channel main'
+fi
+
+required_commands=(gh sudo sha256sum mktemp curl systemctl readlink)
+[[ $channel == stable ]] && required_commands+=(tar)
+for command in "${required_commands[@]}"; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
 gh auth status --hostname github.com >/dev/null 2>&1 || fail 'GitHub CLI is not authenticated'
@@ -46,19 +138,6 @@ if ! sudo -n true 2>/dev/null; then
 fi
 sudo systemctl is-active --quiet solodock.service || fail 'solodock.service must be active before updating'
 
-run_data=$(gh run list \
-  --repo "$repo" \
-  --branch "$branch" \
-  --workflow "$workflow" \
-  --event push \
-  --status success \
-  --limit 1 \
-  --json databaseId,headSha,headBranch,conclusion \
-  --jq '.[0] | [.databaseId, .headSha, .headBranch, .conclusion] | @tsv')
-IFS=$'\t' read -r run_id head_sha head_branch conclusion <<<"$run_data"
-[[ $run_id =~ ^[0-9]+$ && $head_sha =~ ^[0-9a-f]{40}$ ]] || fail 'latest successful CI run is missing or invalid'
-[[ $head_branch == "$branch" && $conclusion == success ]] || fail 'latest CI run does not match the requested branch'
-
 update_dir=$(mktemp -d /tmp/solodock-update.XXXXXX)
 chmod 0700 "$update_dir"
 cleanup() {
@@ -66,39 +145,191 @@ cleanup() {
 }
 trap cleanup EXIT
 
-gh run download "$run_id" \
-  --repo "$repo" \
-  --name solodock-embedded-package \
-  --dir "$update_dir"
-package="$update_dir/solodock-package"
-for file in SHA256SUMS SOURCE_SHA solodock install.sh solodock-backup solodock-update solodock.service solodock.toml.example; do
-  [[ -f $package/$file && ! -L $package/$file ]] || fail "artifact is missing a safe $file"
-done
-if ! gh attestation verify "$package/SHA256SUMS" \
-  --repo "$repo" \
-  --signer-workflow "$repo/.github/workflows/ci.yml" \
-  --source-ref "refs/heads/$branch" \
-  --source-digest "$head_sha" \
-  --deny-self-hosted-runners >/dev/null; then
-  fail 'artifact provenance attestation verification failed'
-fi
-(cd "$package" && sha256sum -c SHA256SUMS)
-source_sha=$(<"$package/SOURCE_SHA")
-[[ $source_sha =~ ^[0-9a-f]{40}$ ]] || fail 'artifact source SHA is missing or invalid'
-[[ $source_sha == "$head_sha" ]] || fail 'artifact source SHA does not match its workflow run'
+head_sha=''
+version=''
+source_description=''
+package=''
+semver_less_than() {
+  local -a left right
+  local index
+  local LC_ALL=C
+  IFS=. read -r -a left <<<"$1"
+  IFS=. read -r -a right <<<"$2"
+  for index in 0 1 2; do
+    if ((${#left[$index]} < ${#right[$index]})); then
+      return 0
+    fi
+    if ((${#left[$index]} > ${#right[$index]})); then
+      return 1
+    fi
+    if [[ ${left[$index]} != "${right[$index]}" ]]; then
+      [[ ${left[$index]} < ${right[$index]} ]]
+      return
+    fi
+  done
+  return 1
+}
+if [[ $channel == main ]]; then
+  run_data=$(gh run list \
+    --repo "$repo" \
+    --branch "$branch" \
+    --workflow "$workflow" \
+    --event push \
+    --status success \
+    --limit 1 \
+    --json databaseId,headSha,headBranch,conclusion \
+    --jq '.[0] | [.databaseId, .headSha, .headBranch, .conclusion] | @tsv')
+  IFS=$'\t' read -r run_id head_sha head_branch conclusion <<<"$run_data"
+  [[ $run_id =~ ^[0-9]+$ && $head_sha =~ ^[0-9a-f]{40}$ ]] || fail 'latest successful CI run is missing or invalid'
+  [[ $head_branch == "$branch" && $conclusion == success ]] || fail 'latest CI run does not match the requested branch'
 
-[[ -L /usr/local/bin/solodock ]] || fail 'installed SoloDock binary target is not a managed symlink'
-old_link=$(readlink -- /usr/local/bin/solodock)
-[[ $old_link == /usr/local/lib/solodock/*/solodock ]] || fail 'installed SoloDock binary target is outside the managed version directory'
+  gh run download "$run_id" \
+    --repo "$repo" \
+    --name solodock-embedded-package \
+    --dir "$update_dir"
+  package="$update_dir/solodock-package"
+  if ! gh attestation verify "$package/SHA256SUMS" \
+    --repo "$repo" \
+    --signer-workflow "$repo/.github/workflows/ci.yml" \
+    --source-ref "refs/heads/$branch" \
+    --source-digest "$head_sha" \
+    --deny-self-hosted-runners >/dev/null; then
+    fail 'artifact provenance attestation verification failed'
+  fi
+  version="main-${head_sha:0:12}"
+  source_description="CI run $run_id"
+else
+  release_data=$(gh release view \
+    --repo "$repo" \
+    --json tagName,isDraft,isPrerelease \
+    --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+  IFS=$'\t' read -r release_tag release_draft release_prerelease <<<"$release_data"
+  [[ $release_tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || fail 'latest stable Release tag is missing or invalid'
+  [[ $release_draft == false && $release_prerelease == false ]] || fail 'latest Release is not a published stable Release'
+  version=${release_tag#v}
+  if [[ $current_channel == stable && $current_version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] && semver_less_than "$version" "$current_version"; then
+    fail "latest stable Release $version is older than installed stable version $current_version"
+  fi
+  release_data=$(gh release view "$release_tag" \
+    --repo "$repo" \
+    --json tagName,isDraft,isPrerelease \
+    --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+  IFS=$'\t' read -r viewed_tag viewed_draft viewed_prerelease <<<"$release_data"
+  [[ $viewed_tag == "$release_tag" && $viewed_draft == false && $viewed_prerelease == false ]] || fail 'selected Release identity changed or is not stable'
+  head_sha=$(gh api "repos/$repo/commits/$release_tag" --jq .sha)
+  [[ $head_sha =~ ^[0-9a-f]{40}$ ]] || fail 'Release tag does not resolve to a valid source commit'
+
+  asset="solodock-${release_tag}-ubuntu-24.04-x86_64.tar.gz"
+  gh release download "$release_tag" \
+    --repo "$repo" \
+    --pattern "$asset" \
+    --pattern SHA256SUMS \
+    --pattern SOURCE_SHA \
+    --dir "$update_dir"
+  for file in "$asset" SHA256SUMS SOURCE_SHA; do
+    [[ -f $update_dir/$file && ! -L $update_dir/$file ]] || fail "Release is missing a safe $file asset"
+  done
+  if ! gh attestation verify "$update_dir/SHA256SUMS" \
+    --repo "$repo" \
+    --signer-workflow "$repo/.github/workflows/release.yml" \
+    --source-ref "refs/tags/$release_tag" \
+    --source-digest "$head_sha" \
+    --deny-self-hosted-runners >/dev/null; then
+    fail 'Release provenance attestation verification failed'
+  fi
+  (cd -- "$update_dir" && sha256sum -c SHA256SUMS)
+  release_source_sha=$(<"$update_dir/SOURCE_SHA")
+  [[ $release_source_sha == "$head_sha" ]] || fail 'Release source SHA does not match its tag commit'
+  while IFS= read -r entry; do
+    [[ $entry == solodock-package || $entry == solodock-package/* ]] || fail 'Release archive contains an unexpected path'
+    [[ /$entry/ != */../* && $entry != /* ]] || fail 'Release archive contains an unsafe path'
+  done < <(tar -tzf "$update_dir/$asset")
+  tar -xzf "$update_dir/$asset" -C "$update_dir"
+  package="$update_dir/solodock-package"
+  source_description="Release $release_tag"
+fi
+
+for file in SHA256SUMS SOURCE_SHA VERSION INSTALL_MANIFEST solodock install.sh solodock-backup solodock-restore solodock-update verify-package.sh solodock.service solodock.toml.example; do
+  [[ -f $package/$file && ! -L $package/$file ]] || fail "package is missing a safe $file"
+done
+(cd -- "$package" && sha256sum --strict -c SHA256SUMS >/dev/null) || fail 'package checksum verification failed'
+package_data=$("$package/verify-package.sh" "$package") || fail 'verified package manifest is invalid'
+IFS=$'\t' read -r package_channel package_version source_sha package_identity <<<"$package_data"
+[[ $package_channel == "$channel" ]] || fail 'package channel does not match the selected update channel'
+[[ $source_sha == "$head_sha" ]] || fail 'package source SHA does not match its trusted source'
+[[ $package_version == "$version" ]] || fail 'package version does not match its trusted source'
+
 new_digest=$(sha256sum "$package/solodock" | awk '{print $1}')
-current_digest=$(sudo sha256sum /usr/local/bin/solodock | awk '{print $1}')
-if [[ $new_digest == "$current_digest" ]]; then
-  curl --fail --silent "$health_url" >/dev/null || fail 'installed SoloDock matches the latest build but is unhealthy'
-  printf 'SoloDock is already current at %s (%s).\n' "${head_sha:0:12}" "$run_id"
+current_digest=$(sudo sha256sum "$installed_binary_path" | awk '{print $1}')
+
+package_is_current=1
+if [[ ! -f $installed_manifest || -L $installed_manifest ]] || ! cmp -s -- "$package/INSTALL_MANIFEST" "$installed_manifest"; then
+  package_is_current=0
+fi
+for name in solodock solodock-update solodock-backup solodock-restore; do
+  expected_target="$installed_link_prefix/$name"
+  installed_target="$installed_version_directory/$name"
+  installed_link="$root/usr/local/bin/$name"
+  if [[ ! -f $installed_target || -L $installed_target || ! -L $installed_link ]] || \
+    [[ $(readlink -- "$installed_link") != "$expected_target" ]] || \
+    [[ $(sha256sum "$installed_target" | awk '{print $1}') != $(sha256sum "$package/$name" | awk '{print $1}') ]]; then
+    package_is_current=0
+  fi
+done
+installed_verifier="$installed_version_directory/verify-package.sh"
+if [[ ! -f $installed_verifier || -L $installed_verifier ]] || ! cmp -s -- "$package/verify-package.sh" "$installed_verifier"; then
+  package_is_current=0
+fi
+if [[ ! -L $installed_unit ]] || \
+  [[ $(readlink -- "$installed_unit") != "$installed_link_prefix/solodock.service" ]] || \
+  [[ ! -f $installed_version_directory/solodock.service || -L $installed_version_directory/solodock.service ]] || \
+  [[ $(sha256sum "$installed_version_directory/solodock.service" | awk '{print $1}') != $(sha256sum "$package/solodock.service" | awk '{print $1}') ]]; then
+  package_is_current=0
+fi
+
+verify_running_health() {
+  local healthy=0
+  for _ in $(seq 1 30); do
+    if curl --fail --silent "$health_url" >/dev/null; then
+      healthy=1
+      break
+    fi
+    sleep 1
+  done
+  [[ $healthy == 1 ]] || return 1
+  local favicon_url=${health_url%/healthz}/favicon.svg
+  local favicon_type
+  favicon_type=$(curl --fail --silent --output /dev/null --write-out '%{content_type}' "$favicon_url")
+  [[ $favicon_type == image/svg+xml ]] || return 1
+  sudo systemctl is-active --quiet solodock.service
+}
+
+if ((package_is_current)); then
+  verify_running_health || fail 'installed SoloDock matches the selected package but is unhealthy'
+  printf 'SoloDock is already current at %s.\n' "$source_description"
   exit 0
 fi
 
-version="main-${head_sha:0:12}"
+install_args=(--version "$version")
+[[ -n $root ]] && install_args+=(--destdir "$root")
+if [[ $new_digest == "$current_digest" ]]; then
+  set +e
+  sudo bash "$package/install.sh" "${install_args[@]}"
+  install_status=$?
+  set -e
+  if ((install_status != 0)); then
+    if ((install_status == 70)); then
+      sudo systemctl stop solodock.service || true
+      printf '%s\n' 'installer rollback was incomplete; solodock.service was stopped to prevent a later restart from invoking a mixed or unverified package' >&2
+      printf '%s\n' 'inspect the preserved installer scene, restore all managed links and the unit to one verified generation, run systemctl daemon-reload, then start the service manually' >&2
+    fi
+    exit "$install_status"
+  fi
+  verify_running_health || fail 'refreshed SoloDock package did not pass its health check'
+  printf 'SoloDock package refreshed to %s without restarting the unchanged binary.\n' "$source_description"
+  exit 0
+fi
+
 sudo install -d -m 0700 -- "$backup_dir"
 backup="$backup_dir/solodock-before-$version-$(date -u +%Y%m%dT%H%M%SZ).tar"
 service_stopped=0
@@ -108,12 +339,15 @@ on_error() {
   trap - ERR
   if ((service_stopped)); then
     if ((!new_invocation)); then
-      current_link=$(readlink -- /usr/local/bin/solodock 2>/dev/null || true)
+      if ((status == 70)); then
+        printf '%s\n' 'installer rollback was incomplete; solodock.service remains stopped to prevent invoking a mixed or unverified package' >&2
+        printf '%s\n' 'inspect the preserved installer scene, restore all managed links and the unit to one verified generation, run systemctl daemon-reload, then start the service manually' >&2
+        exit "$status"
+      fi
+      current_link=$(readlink -- "$installed_bin" 2>/dev/null || true)
       if [[ $current_link != "$old_link" ]]; then
-        rollback_link="/usr/local/bin/.solodock-rollback-$$"
-        sudo ln -s -- "$old_link" "$rollback_link"
-        sudo mv -Tf -- "$rollback_link" /usr/local/bin/solodock
-        sudo systemctl daemon-reload
+        printf '%s\n' 'installer did not confirm the previous installation identity; solodock.service remains stopped for manual recovery' >&2
+        exit 70
       fi
       sudo systemctl start solodock.service || true
     else
@@ -126,28 +360,18 @@ trap on_error ERR
 
 sudo systemctl stop solodock.service
 service_stopped=1
-sudo bash "$package/solodock-backup" --output "$backup"
+backup_args=(--output "$backup")
+[[ -n $root ]] && backup_args=(--root "$root" "${backup_args[@]}")
+sudo bash "$package/solodock-backup" "${backup_args[@]}"
 backup_name=$(basename -- "$backup")
 sudo bash -c 'cd "$1" && sha256sum -c "$2"' _ "$backup_dir" "$backup_name.sha256"
-sudo bash "$package/install.sh" --version "$version" --binary "$package/solodock"
+sudo bash "$package/install.sh" "${install_args[@]}"
 new_invocation=1
 sudo systemctl start solodock.service
 service_stopped=0
 
-healthy=0
-for _ in $(seq 1 30); do
-  if curl --fail --silent "$health_url" >/dev/null; then
-    healthy=1
-    break
-  fi
-  sleep 1
-done
-[[ $healthy == 1 ]] || fail 'updated SoloDock did not pass its health check; automatic binary rollback is disabled because migrations are forward-only'
-favicon_url=${health_url%/healthz}/favicon.svg
-favicon_type=$(curl --fail --silent --output /dev/null --write-out '%{content_type}' "$favicon_url")
-[[ $favicon_type == image/svg+xml ]] || fail 'updated SoloDock did not serve favicon.svg correctly; automatic binary rollback is disabled because migrations are forward-only'
-sudo systemctl is-active --quiet solodock.service
+verify_running_health || fail 'updated SoloDock did not pass its health and asset checks; automatic binary rollback is disabled because migrations are forward-only'
 trap - ERR
 
-printf 'SoloDock updated to %s from CI run %s.\n' "$version" "$run_id"
+printf 'SoloDock updated to %s from %s.\n' "$version" "$source_description"
 printf 'Offline backup: %s\n' "$backup"

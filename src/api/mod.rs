@@ -158,6 +158,10 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/api/v1/me", get(auth::me))
         .route("/api/v1/system/health", get(system::health))
+        .route(
+            "/api/v1/system/installation",
+            get(system::installation_identity),
+        )
         .route("/api/v1/system/drift", get(system::drift))
         .route("/api/v1/apps", get(apps::list))
         .route("/api/v1/apps/{id}", get(apps::detail))

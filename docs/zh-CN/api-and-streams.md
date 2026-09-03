@@ -44,7 +44,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 - deployment schedule、history、detail 和 rollback；
 - per-app webhook status/configure/revoke；
 - 全局显示设置 `GET/PUT /api/v1/settings`；
-- system health 和 drift；
+- system health、drift 和 installation identity；
 - events、logs 和 stats SSE。
 
 具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
@@ -57,7 +57,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 应用详情返回版本化 naming helper 基于不可变 slug 和 UUID 生成的 resource name，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
 
-`GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、主机 `MemAvailable`、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
+`GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、主机 `MemAvailable`、disk、credential 和 stream 状态。`GET /api/v1/system/installation` 同样要求认证，只返回经过规范校验的 `stable`、`main`、`development` 或 `unknown` channel 以及 canonical version/source/package identity 字段。它在每次请求时读取固定的 `/usr/local/bin/solodock` 受管 symlink 与所选身份限定 generation 的 `INSTALL_MANIFEST`，且 generation name 必须绑定 manifest 的 version 与 package identity；它不接受 request path，也不反射未校验文件内容。正常源码运行且没有受管安装时返回 `development`；受管 manifest 缺失、不安全、损坏或不一致时返回 `unknown`，两种情况都不阻断控制台其他能力。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
 
 `GET /api/v1/settings` 返回 revision、显示时区、IANA 列表、动态 `allowed_bind_roots`、`slug_max_length`、支持的 mount 类型，以及由 Rust domain 定义的 `configuration_limits.health`。Web 只使用这份 capability 设置健康字段的 min/max/default；缺少 capability 时禁止保存配置。`PUT` 原子更新时区与 bind roots；被 revision 引用的 root 不得删除，扫描或 artifact 读取失败时 fail closed。设置 mutation要求 `expected_revision`、`Idempotency-Key`、精确 Origin、session 与 CSRF。显示设置只影响 Web formatter，所有 API/SSE timestamp 继续返回 RFC3339 UTC。
 

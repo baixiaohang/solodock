@@ -78,6 +78,23 @@ impl Harness {
 async fn bootstrap_login_me_and_logout_follow_security_contract() {
     let harness = Harness::new().await;
     let password = "correct horse battery";
+    let unauthenticated_installation = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("GET", "/api/v1/system/installation", json!({}))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(
+        unauthenticated_installation,
+        StatusCode::UNAUTHORIZED,
+        "SESSION_REQUIRED",
+    )
+    .await;
     let response = harness.bootstrap(password).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(response.headers().contains_key("x-request-id"));
@@ -162,6 +179,28 @@ async fn bootstrap_login_me_and_logout_follow_security_contract() {
     let body: Value =
         serde_json::from_slice(&me.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["username"], "admin");
+
+    let installation = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("GET", "/api/v1/system/installation", json!({}))
+                .header(header::COOKIE, &cookie_header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(installation.status(), StatusCode::OK);
+    assert_eq!(installation.headers()[header::CACHE_CONTROL], "no-store");
+    let installation_body: Value =
+        serde_json::from_slice(&installation.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert!(matches!(
+        installation_body["channel"].as_str(),
+        Some("stable" | "main" | "development" | "unknown")
+    ));
 
     let missing_csrf = harness
         .app

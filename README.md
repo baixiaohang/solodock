@@ -71,19 +71,13 @@ These projects solve adjacent problems with different operating models. This is 
 | [Watchtower](https://github.com/containrrr/watchtower) | Automated updates for running containers | Focused on image-update automation rather than an application configuration console with immutable release history and manual rollback |
 | [Coolify](https://github.com/coollabsio/coolify) | A broader self-hosting platform | Includes a wider application/platform workflow; SoloDock deliberately excludes source builds, integrated proxy/TLS, and multi-server orchestration |
 
-## Build and install from source
+## Install a stable release
 
-Verified, long-lived GitHub Release assets are planned but are not available yet. The current honest installation path requires Rust stable, Node.js 24, npm, and Git on the build machine. The production host must be Ubuntu 24.04 with Docker Engine, the `docker` group/socket, systemd, and Docker Compose v2.24+.
+Published Releases provide a long-lived, attested package for Ubuntu 24.04 x86_64. The production host also needs Docker Engine, the `docker` group/socket, systemd, Docker Compose v2.24+, and an authenticated GitHub CLI with `gh attestation verify`. No Rust or Node.js toolchain is required. The complete verification and installation commands are in [operations](docs/operations.md).
 
-```bash
-git clone https://github.com/baixiaohang/solodock.git
-cd solodock
-cd web && npm ci && npm run build && cd ..
-cargo build --release --locked --features embed-ui
-sudo ./packaging/install.sh --version 0.1.0 --binary target/release/solodock
-```
+The versioned archive contains the embedded SoloDock binary, installer, updater, backup/restore helpers, package verifier and install manifest, systemd unit, configuration example, checksums, source identity, and operator documentation. Verify the Release `SHA256SUMS` attestation and checksums before running the packaged installer.
 
-The installer creates a dedicated `solodock` system account, installs a systemd unit and example `/etc/solodock/config.toml`, and preserves existing configuration and state. It does not start the service by default.
+The installer creates a dedicated `solodock` system account, installs the binary, updater, backup/restore helpers, manifest, and systemd unit as one identity-qualified generation, and preserves existing configuration and state. It does not start the service by default.
 
 Before startup:
 
@@ -98,7 +92,7 @@ sudo systemctl status solodock.service
 sudo cat /run/solodock/bootstrap.token
 ```
 
-Open the configured `public_origin`, complete bootstrap, and then create an application. For exact upgrade, backup, authentication, and troubleshooting requirements, read [operations](docs/operations.md) and [recovery](docs/recovery.md). The current `solodock-update` command uses expiring, attested `main` workflow artifacts and is a development channel rather than a stable release channel.
+Open the configured `public_origin`, complete bootstrap, and then create an application. For exact upgrade, backup, authentication, and troubleshooting requirements, read [operations](docs/operations.md) and [recovery](docs/recovery.md). `solodock-update` follows the current installation source: Release installations stay on `stable`, while maintainer installations from CI stay on `main`. Use `--channel stable|main` once only when intentionally switching tracks.
 
 ## Security prerequisites
 

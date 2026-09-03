@@ -6,6 +6,8 @@ require "yaml"
 PINNED_ACTION = %r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z}
 DANGEROUS_TRIGGERS = %w[pull_request_target workflow_run].freeze
 ATTEST_JOB = "attest-package"
+RELEASE_ATTEST_JOB = "attest-release"
+RELEASE_PUBLISH_JOB = "publish-release"
 DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
 ATTEST_ACTION = "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6"
 ATTEST_PERMISSIONS = {
@@ -26,6 +28,10 @@ errors = []
 required_ci_file = File.join(workflow_dir, "ci.yml")
 unless File.file?(required_ci_file) && !File.symlink?(required_ci_file)
   errors << "#{required_ci_file}: required workflow must exist as a regular file"
+end
+required_release_file = File.join(workflow_dir, "release.yml")
+unless File.file?(required_release_file) && !File.symlink?(required_release_file)
+  errors << "#{required_release_file}: required workflow must exist as a regular file"
 end
 
 scalar_strings = lambda do |value, &block|
@@ -64,7 +70,13 @@ permission_errors = lambda do |permissions, file, scope|
     allowed_package_attestation =
       File.basename(file) == "ci.yml" && scope == "job #{ATTEST_JOB}" &&
       %w[id-token attestations artifact-metadata].include?(name.to_s)
-    unless allowed_codeql_upload || allowed_package_attestation
+    allowed_release_attestation =
+      File.basename(file) == "release.yml" && scope == "job #{RELEASE_ATTEST_JOB}" &&
+      %w[id-token attestations artifact-metadata].include?(name.to_s)
+    allowed_release_publish =
+      File.basename(file) == "release.yml" && scope == "job #{RELEASE_PUBLISH_JOB}" &&
+      name.to_s == "contents"
+    unless allowed_codeql_upload || allowed_package_attestation || allowed_release_attestation || allowed_release_publish
       errors << "#{file}: unapproved write permission in #{scope}: #{name}"
     end
   end
@@ -95,6 +107,14 @@ workflow_files.each do |file|
     errors << "#{file}: forbidden trigger: #{trigger}" if triggers.include?(trigger)
   end
 
+  if File.basename(file) == "release.yml"
+    expected_trigger = { "push" => { "tags" => ["v[0-9]+.[0-9]+.[0-9]+"] } }
+    errors << "#{file}: release workflow must use only the fixed version-tag trigger" unless trigger_node == expected_trigger
+    errors << "#{file}: release workflow must default to contents: read" unless document["permissions"] == { "contents" => "read" }
+    expected_concurrency = { "group" => "release-${{ github.ref }}", "cancel-in-progress" => false }
+    errors << "#{file}: release workflow must use non-cancelling per-ref concurrency" unless document["concurrency"] == expected_concurrency
+  end
+
   permission_errors.call(document["permissions"], file, "workflow")
 
   scalar_strings.call(document) do |value|
@@ -110,6 +130,11 @@ workflow_files.each do |file|
   end
   if File.basename(file) == "ci.yml" && !jobs.key?(ATTEST_JOB)
     errors << "#{file}: required #{ATTEST_JOB} job is missing"
+  end
+  if File.basename(file) == "release.yml"
+    ["build-release", RELEASE_ATTEST_JOB, RELEASE_PUBLISH_JOB].each do |required_job|
+      errors << "#{file}: required #{required_job} job is missing" unless jobs.key?(required_job)
+    end
   end
 
   jobs.each do |job_id, job|
@@ -154,10 +179,13 @@ workflow_files.each do |file|
       end
     end
 
-    attestation_job = File.basename(file) == "ci.yml" && job_id.to_s == ATTEST_JOB
+    ci_attestation_job = File.basename(file) == "ci.yml" && job_id.to_s == ATTEST_JOB
+    release_attestation_job = File.basename(file) == "release.yml" && job_id.to_s == RELEASE_ATTEST_JOB
+    release_publish_job = File.basename(file) == "release.yml" && job_id.to_s == RELEASE_PUBLISH_JOB
+    protected_job = ci_attestation_job || release_attestation_job || release_publish_job
     steps = job["steps"]
     if steps.nil?
-      errors << "#{file}: #{ATTEST_JOB} must define its fixed action steps" if attestation_job
+      errors << "#{file}: #{job_id} must define its fixed steps" if protected_job
       next
     end
     unless steps.is_a?(Array)
@@ -196,44 +224,104 @@ workflow_files.each do |file|
       end
     end
 
-    next unless attestation_job
+    if ci_attestation_job
+      expected_job_keys = %w[needs if runs-on permissions steps].sort
+      unless job.keys.map(&:to_s).sort == expected_job_keys
+        errors << "#{file}: #{ATTEST_JOB} contains unsupported job configuration"
+      end
 
-    expected_job_keys = %w[needs if runs-on permissions steps].sort
-    unless job.keys.map(&:to_s).sort == expected_job_keys
-      errors << "#{file}: #{ATTEST_JOB} contains unsupported job configuration"
-    end
+      unless job["if"].to_s.strip == "github.event_name == 'push'"
+        errors << "#{file}: #{ATTEST_JOB} must be restricted to push events"
+      end
+      unless job["needs"].to_s == "package-smoke"
+        errors << "#{file}: #{ATTEST_JOB} must depend directly on package-smoke"
+      end
+      unless job["runs-on"] == "ubuntu-24.04"
+        errors << "#{file}: #{ATTEST_JOB} must run on ubuntu-24.04"
+      end
+      unless job["permissions"] == ATTEST_PERMISSIONS
+        errors << "#{file}: #{ATTEST_JOB} must use the exact attestation permissions"
+      end
 
-    unless job["if"].to_s.strip == "github.event_name == 'push'"
-      errors << "#{file}: #{ATTEST_JOB} must be restricted to push events"
-    end
-    unless job["needs"].to_s == "package-smoke"
-      errors << "#{file}: #{ATTEST_JOB} must depend directly on package-smoke"
-    end
-    unless job["runs-on"] == "ubuntu-24.04"
-      errors << "#{file}: #{ATTEST_JOB} must run on ubuntu-24.04"
-    end
-    unless job["permissions"] == ATTEST_PERMISSIONS
-      errors << "#{file}: #{ATTEST_JOB} must use the exact attestation permissions"
-    end
-
-    expected_steps = [
-      {
-        "uses" => DOWNLOAD_ARTIFACT_ACTION,
-        "with" => {
-          "name" => "solodock-embedded-package",
-          "path" => "${{ runner.temp }}/attested-package"
+      expected_steps = [
+        {
+          "uses" => DOWNLOAD_ARTIFACT_ACTION,
+          "with" => {
+            "name" => "solodock-embedded-package",
+            "path" => "${{ runner.temp }}/attested-package"
+          }
+        },
+        {
+          "name" => "Attest package checksums",
+          "uses" => ATTEST_ACTION,
+          "with" => {
+            "subject-path" => "${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS"
+          }
         }
-      },
-      {
-        "name" => "Attest package checksums",
-        "uses" => ATTEST_ACTION,
-        "with" => {
-          "subject-path" => "${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS"
-        }
+      ]
+      unless steps == expected_steps
+        errors << "#{file}: #{ATTEST_JOB} must contain only the pinned download and attestation actions"
+      end
+    end
+
+    if release_attestation_job
+      expected = {
+        "needs" => "build-release",
+        "runs-on" => "ubuntu-24.04",
+        "permissions" => ATTEST_PERMISSIONS,
+        "steps" => [
+          {
+            "uses" => DOWNLOAD_ARTIFACT_ACTION,
+            "with" => {
+              "name" => "solodock-release-package",
+              "path" => "${{ runner.temp }}/release"
+            }
+          },
+          {
+            "name" => "Attest release checksums",
+            "uses" => ATTEST_ACTION,
+            "with" => {
+              "subject-path" => "${{ runner.temp }}/release/SHA256SUMS"
+            }
+          }
+        ]
       }
-    ]
-    unless steps == expected_steps
-      errors << "#{file}: #{ATTEST_JOB} must contain only the pinned download and attestation actions"
+      errors << "#{file}: #{RELEASE_ATTEST_JOB} must use the fixed isolated attestation job" unless job == expected
+    end
+
+    if release_publish_job
+      publish_command = <<~'BASH'
+        release_dir="$RUNNER_TEMP/release"
+        asset="solodock-${GITHUB_REF_NAME}-ubuntu-24.04-x86_64.tar.gz"
+        gh release create "$GITHUB_REF_NAME" \
+          "$release_dir/$asset" \
+          "$release_dir/SHA256SUMS" \
+          "$release_dir/SOURCE_SHA" \
+          --repo "$GITHUB_REPOSITORY" \
+          --verify-tag \
+          --generate-notes \
+          --title "$GITHUB_REF_NAME"
+      BASH
+      expected = {
+        "needs" => ["build-release", "attest-release"],
+        "runs-on" => "ubuntu-24.04",
+        "permissions" => { "contents" => "write" },
+        "steps" => [
+          {
+            "uses" => DOWNLOAD_ARTIFACT_ACTION,
+            "with" => {
+              "name" => "solodock-release-package",
+              "path" => "${{ runner.temp }}/release"
+            }
+          },
+          {
+            "name" => "Publish release assets",
+            "env" => { "GH_TOKEN" => "${{ github.token }}" },
+            "run" => publish_command
+          }
+        ]
+      }
+      errors << "#{file}: #{RELEASE_PUBLISH_JOB} must use the fixed isolated publishing job" unless job == expected
     end
   end
 end

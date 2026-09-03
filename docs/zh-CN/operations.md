@@ -6,32 +6,68 @@
 
 ## 安装与升级
 
-生产目标为 Ubuntu 24.04、Docker Engine 和 Docker Compose v2.24+。先构建 Web 与嵌入式 binary：
+生产目标为 Ubuntu 24.04 x86_64，并需要 Docker Engine、`docker` group/socket、systemd 与 Docker Compose v2.24+。稳定 GitHub Release 提供长期保留的 package，需要已登录且支持 `gh attestation verify` 的 GitHub CLI；宿主机不需要 Rust、Node.js、npm 或 Git。
+
+以下 Bash 命令读取 GitHub 的实际 Latest Release，验证它已正式发布且稳定，要求 canonical `vMAJOR.MINOR.PATCH` tag，把 tag 解析为不可变 commit，下载三个精确 asset，验证 `SHA256SUMS` provenance 与 source identity，校验内外两层 checksum，然后安装 package 内 binary：
 
 ```bash
-cd web && npm ci && npm run build && cd ..
-cargo build --release --locked --features embed-ui
-sudo ./packaging/install.sh --version 0.1.0 --binary target/release/solodock
+set -euo pipefail
+repo=baixiaohang/solodock
+release_data=$(gh release view --repo "$repo" --json tagName,isDraft,isPrerelease \
+  --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+IFS=$'\t' read -r tag is_draft is_prerelease <<<"$release_data"
+[[ $is_draft == false && $is_prerelease == false ]]
+[[ $tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+source_sha=$(gh api "repos/$repo/commits/$tag" --jq .sha)
+[[ $source_sha =~ ^[0-9a-f]{40}$ ]]
+asset="solodock-${tag}-ubuntu-24.04-x86_64.tar.gz"
+download_dir=$(mktemp -d)
+trap 'rm -rf -- "$download_dir"' EXIT
+gh release download "$tag" --repo "$repo" --dir "$download_dir" \
+  --pattern "$asset" --pattern SHA256SUMS --pattern SOURCE_SHA
+gh attestation verify "$download_dir/SHA256SUMS" \
+  --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/release.yml" \
+  --source-ref "refs/tags/$tag" \
+  --source-digest "$source_sha" \
+  --deny-self-hosted-runners
+(cd "$download_dir" && sha256sum -c SHA256SUMS)
+[[ $(<"$download_dir/SOURCE_SHA") == "$source_sha" ]]
+tar -xzf "$download_dir/$asset" -C "$download_dir"
+package="$download_dir/solodock-package"
+(cd "$package" && sha256sum -c SHA256SUMS)
+[[ $(<"$package/SOURCE_SHA") == "$source_sha" ]]
+[[ $(<"$package/VERSION") == "${tag#v}" ]]
+"$package/verify-package.sh" "$package"
+sudo "$package/install.sh" --version "${tag#v}"
 ```
 
-installer 使用 versioned directory 和原子 symlink，默认不启动服务、不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`。完成配置和离线备份后，才显式运行 `systemctl enable --now solodock.service`；也可在首次安装使用 `--enable-now`。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
+package 中经过 checksum 绑定的 `INSTALL_MANIFEST` 记录其 `stable` channel、版本、source commit 与完整 package 内容身份。installer 验证 manifest 后，会准备一个不可变且以身份限定的 generation，其中同时包含 binary、manifest、updater、package verifier、backup/restore helper 与 systemd unit。它先快照所有现有公开入口，再切换 helper 和 unit，最后以 `/usr/local/bin/solodock` 作为安装身份 commit marker；事务提交前任何失败都会恢复全部入口并移除不完整 generation，确保可见 binary、helper、unit 与 manifest 始终来自同一个 package。`/usr/local/bin/solodock-restore` 默认解析同 generation 的 `solodock` sibling binary 作为 validator。除非首次安装显式使用 `--enable-now`，installer 不启动服务，也不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`；应完成配置与离线备份后再启动。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
 
-### 从 GitHub 构建一键升级
+### 已验证的 stable 与 main 升级
 
-installer 同时安装 `/usr/local/bin/solodock-update`。先确认 GitHub CLI 支持 `gh attestation verify`，再由日常管理员账号完成一次登录；令牌只需读取仓库、Actions artifact 与 artifact attestation，不要把 token 写入脚本、配置或命令行：
+installer 同时安装 `/usr/local/bin/solodock-update`。先由日常管理员账号完成一次登录；令牌只需具备读取仓库、Release 或 Actions artifact 与 artifact attestation 所需的权限。不要把 token 写入脚本、配置或命令行：
 
 ```bash
 gh auth login --hostname github.com
 solodock-update
 ```
 
-当前 updater 使用会过期的 `main` workflow artifact，属于开发 channel，不是稳定 release channel。
+不传 `--channel` 时，updater 读取当前带版本的 `INSTALL_MANIFEST`：Release 安装继续使用 `stable`，CI 安装继续使用 `main`。显式传入一次 `--channel stable|main` 可主动换轨；成功安装的新 package 会记录新 channel，之后无参数运行会继续沿用。对没有 manifest 的旧安装，只能从精确的受管 `main-<12 位十六进制>` 或 canonical SemVer 目录推断；其他格式 fail closed，并要求显式 channel。`--branch` 与 `--workflow` 只适用于 main，非法组合会在认证、下载、`sudo` 或服务变更前被拒绝。
+
+`stable` channel 读取 GitHub 的实际 Latest Release，并要求其已正式发布、非 draft、非 prerelease。Release workflow 让 GitHub 使用其版本感知默认规则确定 Latest，不会强制每个后来创建的旧版本线 Release 成为 Latest。如果 GitHub 返回的 stable 版本低于当前已安装 stable manifest，updater 会在下载或 mutation 前拒绝降级。
 
 updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交互终端提示一次。无 TTY 且未配置非交互 `sudo` 的调用会在修改服务前失败。
 
-updater 只选择目标分支最新一次成功的 `push` CI，下载该 run 重新构建并验证的 `solodock-embedded-package`。在任何备份、停服务或安装动作前，它使用 GitHub CLI 验证 `SHA256SUMS` 的 GitHub artifact attestation：签名 workflow 必须是目标仓库的 `.github/workflows/ci.yml`，source ref 与 commit 必须和所选 run 完全一致，并拒绝 self-hosted runner 生成的证明；随后校验包内全部 SHA-256，并确认 `SOURCE_SHA` 与 workflow run 的 commit SHA 完全一致。artifact、attestation 缺失或过期，以及签名身份、来源 commit 或 checksum 不匹配时，升级都会 fail closed。新 binary 与当前 binary 相同时不停止服务；确有更新时才停止 SoloDock，创建 `/var/backups/solodock/` 下的离线控制面备份，以 `main-<commit SHA>` 版本目录安装、启动并检查 loopback `/healthz` 与 `/favicon.svg`。临时 artifact 在所有退出路径清理，应用容器、volume 和 bind 数据不在操作范围内。
+stable discovery 下载精确命名的 Ubuntu archive、`SHA256SUMS` 与 `SOURCE_SHA`；它把 Release tag 解析到 commit，要求 canonical tag 与 package version 一致，并针对 `.github/workflows/release.yml`、精确 tag ref、commit 与 GitHub-hosted runner 验证 checksum attestation。main discovery 则选择最新成功的 `push` CI，保留既有 `.github/workflows/ci.yml`、branch、commit 与 GitHub-hosted runner attestation policy。artifact/attestation 缺失或过期、Release identity 变化或非法，以及任何 source、version 或 checksum 不匹配都会 fail closed。
 
-这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。非默认仓库、分支、workflow 选择器、备份目录或 loopback 端口可通过 `solodock-update --help` 查看参数；workflow 选择器仍必须指向可信的 `.github/workflows/ci.yml`，不能改用任意 workflow 作为发布来源。
+discovery 之后，两个 channel 进入同一个 package validation 与 apply 路径。currentness 要求已安装 manifest 中的完整 package identity、当前不可变 generation、binary、updater、package verifier、backup/restore helper、对应受管 symlink 与 systemd unit 全部和已验证 package 一致。若只有 package identity 或 helper 变化而 binary digest 不变（包括 main→stable），updater 会事务性发布新 generation 并检查运行中服务，不停服务也不调用 binary。binary 确有变化时才停止 SoloDock，在 `/var/backups/solodock/` 创建离线控制面备份，事务性发布 stable SemVer 或 `main-<commit SHA prefix>` generation，启动并检查 loopback `/healthz` 与 `/favicon.svg`。调用新 binary 前安装失败时，只有完整恢复并验收旧 package generation 后，updater 才会重启旧服务；任何 rollback 操作或验收失败都会让 installer 返回可区分的不完整回滚状态、保留事务现场，并由 updater 保持或置为停服并给出人工恢复指引，绝不启动当前残留 link 指向的 binary。新 binary 被调用后则遵守 forward-only 门禁。临时下载在所有退出路径清理，应用容器、volume 和 bind 数据始终不在操作范围内。
+
+认证后，sidebar 会读取 `/api/v1/system/installation` 并显示同一安装身份。stable 安装显示 SemVer、channel 与短 source commit；main 安装显示 `main` 与 source commit。展开条目可查看完整 source SHA 和 package identity，便于提交 issue。endpoint 每次请求都会读取固定受管 symlink 与 manifest，因此 package-only channel 变更无需重启 SoloDock，下一次页面加载即可看到。正常本地源码运行显示 `development`；受管 manifest 缺失、损坏或格式不规范时显示 `unknown`，但不会让其他控制面能力降级。公开 `/healthz` 与未认证登录页不会暴露该指纹。
+
+这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。channel、repository、main selector、备份目录或 loopback 端口细节见 `solodock-update --help`。
+
+GitHub **Release asset** 是长期保留的稳定分发；**Actions artifact** 是 main channel 使用、保留 30 天的开发产物；**GitHub Packages** 是 container 与语言 package 的另一套 registry，SoloDock 不向其发布，也不依赖它。
 
 ## 安全前置条件
 
@@ -79,7 +115,7 @@ Web UI 可在 bootstrap/login 页面和登录后的 header 中切换 English 与
 
 ```bash
 sudo systemctl stop solodock.service
-sudo ./packaging/solodock-backup --output /secure/new/solodock-control-plane.tar
+sudo /usr/local/bin/solodock-backup --output /secure/new/solodock-control-plane.tar
 ```
 
 archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它保留 immutable revision 中的 network mode 与 aliases，但不包含业务 volume、bind 数据、Docker image/container 或 network；恢复前必须单独重建所需 external network，每个工作负载也必须有独立且验证过 restore 的数据备份。

@@ -3,6 +3,9 @@
   import type { Snippet } from 'svelte'
   import { loadTimeSettings, timeSettings } from '../lib/time'
   import { t } from '../lib/i18n'
+  import { api } from '../lib/api'
+  import { copyableInstallationIdentity, installationSummary, unknownInstallationIdentity } from '../lib/installationIdentity'
+  import type { InstallationIdentity } from '../lib/types'
   import LanguageSwitcher from './LanguageSwitcher.svelte'
 
   let {
@@ -20,12 +23,18 @@
   let menuOpen = $state(false)
   let mobile = $state(false)
   let menuButton = $state<HTMLButtonElement>()
+  let installation = $state<InstallationIdentity>(unknownInstallationIdentity)
+  let identityCopied = $state(false)
+  let compactIdentity = $derived(installationSummary(installation, $t))
   let applicationsActive = $derived(route === '' || route === '#/' || /^#\/(apps|deployments)(\/|$)/.test(route))
   let credentialsActive = $derived(route === '#/credentials')
   let settingsActive = $derived(route === '#/settings')
 
   onMount(() => {
     void loadTimeSettings().catch(() => {})
+    void api<InstallationIdentity>('/api/v1/system/installation')
+      .then((value) => { installation = value })
+      .catch(() => { installation = unknownInstallationIdentity })
     const media = window.matchMedia('(max-width: 800px)')
     const updateMobile = () => {
       mobile = media.matches
@@ -43,6 +52,15 @@
 
   function handleKeydown(event: KeyboardEvent) {
     if (event.key === 'Escape' && menuOpen) closeMenu(true)
+  }
+
+  async function copyIdentity() {
+    try {
+      await navigator.clipboard.writeText(copyableInstallationIdentity(installation))
+      identityCopied = true
+    } catch {
+      identityCopied = false
+    }
   }
 </script>
 
@@ -100,6 +118,16 @@
           {$t('System settings')}
         </a>
       </nav>
+      <details class="installation-identity">
+        <summary>{compactIdentity}</summary>
+        <dl>
+          <div><dt>{$t('Channel')}</dt><dd><code>{installation.channel}</code></dd></div>
+          <div><dt>{$t('Version')}</dt><dd><code>{installation.version ?? $t('Unknown')}</code></dd></div>
+          <div><dt>{$t('Source commit')}</dt><dd><code>{installation.source_sha ?? $t('Unknown')}</code></dd></div>
+          <div><dt>{$t('Package identity')}</dt><dd><code>{installation.package_identity ?? $t('Unknown')}</code></dd></div>
+        </dl>
+        <button class="ghost" type="button" onclick={() => void copyIdentity()}>{$t(identityCopied ? 'Copied' : 'Copy installation identity')}</button>
+      </details>
     </aside>
     {#if menuOpen}
       <button class="drawer-backdrop" type="button" aria-label={$t('Close primary navigation')} onclick={() => closeMenu(true)}></button>

@@ -71,19 +71,13 @@ SoloDock 可能适合以下情况：
 | [Watchtower](https://github.com/containrrr/watchtower) | 自动更新运行中的 container | 聚焦镜像更新自动化，而不是带不可变 release 历史和人工回滚的应用配置控制台 |
 | [Coolify](https://github.com/coollabsio/coolify) | 更广泛的自托管平台 | 包含更完整的应用/平台流程；SoloDock 刻意排除源码构建、集成 proxy/TLS 和多服务器编排 |
 
-## 从源码构建并安装
+## 安装稳定 Release
 
-可长期下载、可验证的 GitHub Release asset 尚在准备中。当前真实安装路径要求构建机具有 Rust stable、Node.js 24、npm 和 Git；生产主机必须是 Ubuntu 24.04，并安装 Docker Engine、`docker` group/socket、systemd 和 Docker Compose v2.24+。
+正式 Release 为 Ubuntu 24.04 x86_64 提供长期保留且带 attestation 的 package。生产主机还需安装 Docker Engine、`docker` group/socket、systemd、Docker Compose v2.24+，以及已登录并支持 `gh attestation verify` 的 GitHub CLI；不需要 Rust 或 Node.js 工具链。完整验证与安装命令见[运维文档](docs/zh-CN/operations.md)。
 
-```bash
-git clone https://github.com/baixiaohang/solodock.git
-cd solodock
-cd web && npm ci && npm run build && cd ..
-cargo build --release --locked --features embed-ui
-sudo ./packaging/install.sh --version 0.1.0 --binary target/release/solodock
-```
+带版本号的 archive 包含嵌入式 SoloDock binary、installer、updater、backup/restore helper、package verifier 与 install manifest、systemd unit、配置示例、checksum、source identity 与运维文档。运行 package 内的 installer 前，必须先验证 Release `SHA256SUMS` 的 attestation 和 checksum。
 
-installer 会创建专用 `solodock` system account，安装 systemd unit 和示例 `/etc/solodock/config.toml`，并保留已有配置与 state。默认不会启动服务。
+installer 会创建专用 `solodock` system account，把 binary、updater、backup/restore helper、manifest 与 systemd unit 作为一个身份限定 generation 安装，并保留已有配置与 state。默认不会启动服务。
 
 首次启动前：
 
@@ -98,7 +92,7 @@ sudo systemctl status solodock.service
 sudo cat /run/solodock/bootstrap.token
 ```
 
-打开配置的 `public_origin` 完成 bootstrap，然后创建应用。升级、备份、认证和故障处理的准确要求见[运维](docs/zh-CN/operations.md)与[恢复](docs/zh-CN/recovery.md)。当前 `solodock-update` 使用会过期、带 attestation 的 `main` workflow artifact，属于开发 channel，而不是稳定 release channel。
+打开配置的 `public_origin` 完成 bootstrap，然后创建应用。升级、备份、认证和故障处理的准确要求见[运维](docs/zh-CN/operations.md)与[恢复](docs/zh-CN/recovery.md)。`solodock-update` 会跟随当前安装来源：Release 安装继续使用 `stable`，维护者从 CI 安装的实例继续使用 `main`；只有主动换轨时才需使用一次 `--channel stable|main`。
 
 ## 安全前提
 
