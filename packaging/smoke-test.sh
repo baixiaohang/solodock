@@ -149,6 +149,7 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   '[[ -z ${SOLODOCK_SMOKE_GH_LOG:-} ]] || printf "%s\n" "$*" >>"$SOLODOCK_SMOKE_GH_LOG"' \
+  'if [[ $1 == --version ]]; then printf "%s\n" "${SOLODOCK_SMOKE_GH_VERSION:-gh version 2.40.1 (fixture)}"; exit 0; fi' \
   'if [[ $1 == auth && $2 == status ]]; then exit 0; fi' \
   'if [[ $1 == attestation && $2 == verify ]]; then' \
   '  if [[ ${3-} == --help ]]; then [[ ${SOLODOCK_SMOKE_ATTESTATION_SUPPORTED:-yes} == yes ]]; exit; fi' \
@@ -248,15 +249,33 @@ fi
 grep -qx 'channel must be stable or main' "$fixture/channel.stderr"
 [[ ! -e $gh_log ]]
 
+attestation_support_gh_log="$fixture/attestation-support-gh.log"
+attestation_support_sudo_log="$fixture/attestation-support-sudo.log"
+attestation_support_before="$fixture/attestation-support-before"
+attestation_support_after="$fixture/attestation-support-after"
+capture_install_snapshot "$preflight_root" >"$attestation_support_before"
+rm -f "$attestation_support_gh_log" "$attestation_support_sudo_log"
 if PATH="$fake_bin:$PATH" \
   SOLODOCK_SMOKE_ATTESTATION_SUPPORTED=no \
+  SOLODOCK_SMOKE_GH_VERSION='gh version 2.40.1 (fixture)' \
+  SOLODOCK_SMOKE_GH_LOG="$attestation_support_gh_log" \
+  SOLODOCK_SMOKE_SUDO_LOG="$attestation_support_sudo_log" \
   SOLODOCK_UPDATE_TEST_MODE=1 \
   SOLODOCK_UPDATE_TEST_ROOT="$preflight_root" \
   ./packaging/solodock-update --channel main >"$fixture/attestation-support.stdout" 2>"$fixture/attestation-support.stderr"; then
   printf '%s\n' 'updater accepted a GitHub CLI without attestation support' >&2
   exit 1
 fi
-grep -qx 'GitHub CLI does not support artifact attestation verification' "$fixture/attestation-support.stderr"
+grep -Fxq 'GitHub CLI is missing the required gh attestation verify capability.' "$fixture/attestation-support.stderr"
+grep -Fxq 'Current GitHub CLI: gh version 2.40.1 (fixture)' "$fixture/attestation-support.stderr"
+grep -Fxq 'https://github.com/cli/cli/blob/trunk/docs/install_linux.md' "$fixture/attestation-support.stderr"
+grep -Fxq '  gh attestation verify --help' "$fixture/attestation-support.stderr"
+grep -Fxq '  gh auth status' "$fixture/attestation-support.stderr"
+printf '%s\n' 'attestation verify --help' '--version' >"$fixture/attestation-support-gh.expected"
+cmp "$fixture/attestation-support-gh.expected" "$attestation_support_gh_log"
+[[ ! -e $attestation_support_sudo_log ]]
+capture_install_snapshot "$preflight_root" >"$attestation_support_after"
+cmp "$attestation_support_before" "$attestation_support_after"
 
 if PATH="$fake_bin:$PATH" \
   SOLODOCK_SMOKE_PACKAGE="$update_package" \

@@ -73,7 +73,7 @@ SoloDock 可能适合以下情况：
 
 ## 安装稳定 Release
 
-正式 Release 为 Ubuntu 24.04 x86_64 提供长期保留且带 attestation 的 package。生产主机还需安装 Docker Engine、`docker` group/socket、systemd、Docker Compose v2.24+，以及已登录并支持 `gh attestation verify` 的 GitHub CLI；不需要 Rust 或 Node.js 工具链。完整验证与安装命令见[运维文档](docs/zh-CN/operations.md)。
+正式 Release 为 Ubuntu 24.04 x86_64 提供长期保留且带 attestation 的 package。生产主机还需安装 Docker Engine、`docker` group/socket、systemd、Docker Compose v2.24+，以及已登录并具备 `gh attestation verify` 能力的 GitHub CLI。发行版自带 package 可能滞后于 GitHub CLI 的能力，因此安装或升级 `gh` 时应使用 GitHub 的[官方 Linux 说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)，并在安装或更新 SoloDock 前运行 `gh attestation verify --help` 和 `gh auth login --hostname github.com`。宿主机不需要 Rust 或 Node.js 工具链。完整验证与安装命令见[运维文档](docs/zh-CN/operations.md)。
 
 带版本号的 archive 包含嵌入式 SoloDock binary、installer、updater、backup/restore helper、package verifier 与 install manifest、systemd unit、配置示例、checksum、source identity 与运维文档。运行 package 内的 installer 前，必须先验证 Release `SHA256SUMS` 的 attestation 和 checksum。
 

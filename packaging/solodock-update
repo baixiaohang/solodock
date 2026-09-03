@@ -131,8 +131,21 @@ required_commands=(gh sudo sha256sum mktemp curl systemctl readlink)
 for command in "${required_commands[@]}"; do
   command -v "$command" >/dev/null || fail "required command is missing: $command"
 done
+if ! gh attestation verify --help >/dev/null 2>&1; then
+  gh_version=$(gh --version 2>&1 || true)
+  gh_version=${gh_version%%$'\n'*}
+  [[ -n $gh_version ]] || gh_version='unavailable'
+  printf '%s\n' \
+    'GitHub CLI is missing the required gh attestation verify capability.' \
+    "Current GitHub CLI: $gh_version" \
+    'Install or upgrade GitHub CLI using the official Linux instructions:' \
+    'https://github.com/cli/cli/blob/trunk/docs/install_linux.md' \
+    'Then verify the capability and authentication before retrying:' \
+    '  gh attestation verify --help' \
+    '  gh auth status' >&2
+  exit 1
+fi
 gh auth status --hostname github.com >/dev/null 2>&1 || fail 'GitHub CLI is not authenticated'
-gh attestation verify --help >/dev/null 2>&1 || fail 'GitHub CLI does not support artifact attestation verification'
 if ! sudo -n true 2>/dev/null; then
   sudo true
 fi

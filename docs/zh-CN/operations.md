@@ -6,7 +6,13 @@
 
 ## 安装与升级
 
-生产目标为 Ubuntu 24.04 x86_64，并需要 Docker Engine、`docker` group/socket、systemd 与 Docker Compose v2.24+。稳定 GitHub Release 提供长期保留的 package，需要已登录且支持 `gh attestation verify` 的 GitHub CLI；宿主机不需要 Rust、Node.js、npm 或 Git。
+生产目标为 Ubuntu 24.04 x86_64，并需要 Docker Engine、`docker` group/socket、systemd 与 Docker Compose v2.24+。稳定 GitHub Release 提供长期保留的 package，需要已登录且具备 `gh attestation verify` 能力的 GitHub CLI；宿主机不需要 Rust、Node.js、npm 或 Git。发行版自带 package 可能滞后于 GitHub CLI 的能力。安装或升级 `gh` 时应使用 GitHub 的[官方 Linux 说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)，并以以下能力检查而不是文档中永久写死的版本号作为判断依据：
+
+```bash
+gh attestation verify --help
+gh auth login --hostname github.com
+gh auth status
+```
 
 以下 Bash 命令读取 GitHub 的实际 Latest Release，验证它已正式发布且稳定，要求 canonical `vMAJOR.MINOR.PATCH` tag，把 tag 解析为不可变 commit，下载三个精确 asset，验证 `SHA256SUMS` provenance 与 source identity，校验内外两层 checksum，然后安装 package 内 binary：
 
@@ -49,7 +55,9 @@ package 中经过 checksum 绑定的 `INSTALL_MANIFEST` 记录其 `stable` chann
 installer 同时安装 `/usr/local/bin/solodock-update`。先由日常管理员账号完成一次登录；令牌只需具备读取仓库、Release 或 Actions artifact 与 artifact attestation 所需的权限。不要把 token 写入脚本、配置或命令行：
 
 ```bash
+gh attestation verify --help
 gh auth login --hostname github.com
+gh auth status
 solodock-update
 ```
 
