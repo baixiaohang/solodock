@@ -6,9 +6,25 @@
 
 ## 离线恢复
 
-只支持服务停止后的离线恢复。先校验 archive 旁的 SHA-256 文件，在私有临时目录解包并拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；restore helper 会在私有 staging 中把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，再调用同 package binary 严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。`0644`、owner drift、symlink 或特殊文件不会被自动修复。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
+只支持服务停止后的离线恢复。installer 把 `/usr/local/bin/solodock-restore` 保留为受管 symlink，其默认 validator binary 位于同一个不可变 package generation。用它校验 archive 旁的 SHA-256 文件，并且只解包到新的私有 staging directory：
+
+```bash
+sudo systemctl stop solodock.service
+sudo /usr/local/bin/solodock-restore \
+  --archive /secure/solodock-control-plane.tar \
+  --checksum /secure/solodock-control-plane.tar.sha256 \
+  --output /secure/solodock-restored
+```
+
+helper 会拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；它会在私有 staging 中把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，再调用版本绑定的同 package binary 严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。`0644`、owner drift、symlink 或特殊文件不会被自动修复。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
 
 binary、config 和 state 必须来自兼容的一组备份。SQLite migration 是 forward-only；迁移后仅回滚 binary 不安全。
+
+## 更新失败
+
+`solodock-update` 默认跟随当前版本绑定 `INSTALL_MANIFEST` 记录的 channel，只有管理员显式传入 `--channel` 才换轨。它会在 apply 前验证 stable Release identity 或 main CI identity、provenance attestation、source commit、package version、完整 package identity 与 checksum。preflight 失败不会改变已安装 package、服务或 state，并会清理临时下载；之后 stable 与 main 共用同一个 apply 路径。package/helper 或 channel identity 变化但 binary bytes 相同时，只安装这些资产并检查 health，不停服务也不调用 binary；binary 变化时则共用停止服务、离线备份、安装、启动、`/healthz` 与 `/favicon.svg` 路径。即使 GitHub 的 Latest Release 事实意外回退，已安装 stable manifest 也会阻止低于当前 SemVer 的自动降级。
+
+新 binary 被调用前发生错误时，installer transaction 会把先前的 binary、helper、unit 与 manifest 作为同一个 package generation 一起恢复并验收，只有通过后 updater 才能重启旧服务。package-only 与停服更新都通过 failure injection 覆盖每个 staged asset 和公开 link commit point；独立的 rollback-operation injection 还覆盖 binary commit marker、一个 helper 与 unit。回滚不完整时会返回可区分状态，保留 generation 与 transaction 现场，并保持服务停止和给出人工恢复指引；必须先确认四个公开入口、unit 与 manifest 同属一个已验证 generation，且 `systemctl daemon-reload` 成功，才能启动服务。新 binary 一旦被调用，SQLite forward-only migration 可能已经执行，因此明确禁止自动 binary rollback。保留 updater 输出、journal、离线 `solodock-before-<version>-<timestamp>.tar` 备份及 checksum、当前 generation、`INSTALL_MANIFEST` 和失败安装现场；先诊断兼容性与 health 再选择恢复方案，不要只手工重指向一个公开 symlink 或编辑 manifest。manifest 记录 stable Release SemVer 或 main 的 `main-<commit SHA prefix>` label，generation path 还绑定完整 package identity。
 
 ## 故障分类
 

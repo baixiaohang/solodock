@@ -144,8 +144,14 @@ jobs:
       - run: npm run build
         working-directory: web
       - run: cargo build --release --locked --features embed-ui
+      - name: Stamp verified-release package generation
+        run: |
+          chmod +x packaging/stamp-binary.sh
+          packaging/stamp-binary.sh \
+            --binary target/release/solodock \
+            --generation verified-release-v1
       - run: chmod +x scripts/smoke-embedded-http.sh && scripts/smoke-embedded-http.sh target/release/solodock
-      - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update packaging/smoke-test.sh && packaging/smoke-test.sh
+      - run: chmod +x packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update packaging/stage-package.sh packaging/verify-package.sh packaging/smoke-test.sh && packaging/smoke-test.sh
       - run: chmod +x packaging/verify-unit.sh && packaging/verify-unit.sh
       - name: Measure short control-plane resource smoke
         env:
@@ -158,13 +164,14 @@ jobs:
         if: github.event_name == 'push'
         run: |
           package="$RUNNER_TEMP/solodock-package"
-          install -d "$package/docs"
-          install -m 0755 target/release/solodock packaging/install.sh packaging/solodock-backup packaging/solodock-restore packaging/solodock-update "$package/"
-          install -m 0644 packaging/systemd/solodock.service packaging/solodock.toml.example README.md "$package/"
-          install -m 0644 docs/architecture.md docs/operations.md docs/recovery.md docs/threat-model.md docs/resource-budget.md "$package/docs/"
-          cp "$RUNNER_TEMP/resource-report.json" "$package/resource-report.json"
-          printf '%s\n' "$GITHUB_SHA" >"$package/SOURCE_SHA"
-          (cd "$package" && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS)
+          chmod +x packaging/stage-package.sh
+          packaging/stage-package.sh \
+            --binary target/release/solodock \
+            --output "$package" \
+            --source-sha "$GITHUB_SHA" \
+            --version "main-${GITHUB_SHA:0:12}" \
+            --channel main \
+            --resource-report "$RUNNER_TEMP/resource-report.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: github.event_name == 'push'
         with:
@@ -204,6 +211,8 @@ jobs:
           persist-credentials: false
       - name: Test workflow policy checker
         run: bash scripts/check-workflow-security-test.sh
+      - name: Test release tag gate
+        run: bash scripts/check-release-tag-test.sh
       - name: Test CI routing and gate
         run: bash scripts/check-ci-routing-test.sh
       - name: Enforce workflow security policy

@@ -6,30 +6,66 @@ Start with the [product scope](product-scope.md). See the [application model](ap
 
 ## Installation and upgrade
 
-The production target is Ubuntu 24.04 with Docker Engine and Docker Compose v2.24+. Until verified GitHub Releases are available, build the Web UI and embedded binary from source:
+The production target is Ubuntu 24.04 x86_64 with Docker Engine, the `docker` group/socket, systemd, and Docker Compose v2.24+. Stable GitHub Releases provide a long-lived package and require GitHub CLI authentication plus `gh attestation verify`; they do not require Rust, Node.js, npm, or Git on the host.
+
+The following Bash session selects GitHub's actual Latest Release, verifies that it is published and stable, requires its canonical `vMAJOR.MINOR.PATCH` tag, resolves the tag to an immutable commit, downloads the three exact assets, verifies the `SHA256SUMS` provenance and source identity, checks both checksum layers, and installs the packaged binary:
 
 ```bash
-cd web && npm ci && npm run build && cd ..
-cargo build --release --locked --features embed-ui
-sudo ./packaging/install.sh --version 0.1.0 --binary target/release/solodock
+set -euo pipefail
+repo=baixiaohang/solodock
+release_data=$(gh release view --repo "$repo" --json tagName,isDraft,isPrerelease \
+  --jq '[.tagName, .isDraft, .isPrerelease] | @tsv')
+IFS=$'\t' read -r tag is_draft is_prerelease <<<"$release_data"
+[[ $is_draft == false && $is_prerelease == false ]]
+[[ $tag =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+source_sha=$(gh api "repos/$repo/commits/$tag" --jq .sha)
+[[ $source_sha =~ ^[0-9a-f]{40}$ ]]
+asset="solodock-${tag}-ubuntu-24.04-x86_64.tar.gz"
+download_dir=$(mktemp -d)
+trap 'rm -rf -- "$download_dir"' EXIT
+gh release download "$tag" --repo "$repo" --dir "$download_dir" \
+  --pattern "$asset" --pattern SHA256SUMS --pattern SOURCE_SHA
+gh attestation verify "$download_dir/SHA256SUMS" \
+  --repo "$repo" \
+  --signer-workflow "$repo/.github/workflows/release.yml" \
+  --source-ref "refs/tags/$tag" \
+  --source-digest "$source_sha" \
+  --deny-self-hosted-runners
+(cd "$download_dir" && sha256sum -c SHA256SUMS)
+[[ $(<"$download_dir/SOURCE_SHA") == "$source_sha" ]]
+tar -xzf "$download_dir/$asset" -C "$download_dir"
+package="$download_dir/solodock-package"
+(cd "$package" && sha256sum -c SHA256SUMS)
+[[ $(<"$package/SOURCE_SHA") == "$source_sha" ]]
+[[ $(<"$package/VERSION") == "${tag#v}" ]]
+"$package/verify-package.sh" "$package"
+sudo "$package/install.sh" --version "${tag#v}"
 ```
 
-The installer uses versioned directories and an atomic symlink. By default, it neither starts the service nor overwrites `/etc/solodock/config.toml` or `/var/lib/solodock`. Complete configuration and an offline backup before explicitly running `systemctl enable --now solodock.service`; initial installation may instead use `--enable-now`. Upgrades containing new SQLite migrations are forward-only, so switching back only the old binary is unsafe.
+The package's checksummed `INSTALL_MANIFEST` binds its `stable` channel, version, source commit, and full package-content identity. The installer verifies that manifest and prepares an immutable, identity-qualified generation containing the binary, manifest, updater, package verifier, backup/restore helpers, and systemd unit. It snapshots every existing public entry, switches helpers and the unit first, and switches `/usr/local/bin/solodock` last as the installation-identity commit marker. Any failure before that transaction commits restores every entry and removes the incomplete generation, so the visible binary, helpers, unit, and manifest remain from one package. `/usr/local/bin/solodock-restore` resolves its generation-bound sibling `solodock` binary as the validator by default. The installer neither starts the service nor overwrites `/etc/solodock/config.toml` or `/var/lib/solodock` unless initial installation explicitly uses `--enable-now`. Complete configuration and an offline backup before starting. Upgrades containing new SQLite migrations are forward-only, so switching back only the old binary is unsafe.
 
-### One-command upgrade from a GitHub build
+### Verified stable and main upgrades
 
-The installer also installs `/usr/local/bin/solodock-update`. First confirm that GitHub CLI supports `gh attestation verify`, then log in once with the day-to-day administrator account. Its token needs only read access to the repository, Actions artifacts, and artifact attestations; never place the token in scripts, configuration, or command arguments:
+The installer also installs `/usr/local/bin/solodock-update`. Log in once with the day-to-day administrator account; its token needs only the read access required for the repository, Release or Actions artifact, and artifact attestation. Never place the token in scripts, configuration, or command arguments:
 
 ```bash
 gh auth login --hostname github.com
 solodock-update
 ```
 
-This updater is currently a development channel backed by expiring `main` workflow artifacts, not a stable release channel. It first reuses existing or passwordless `sudo` authorization and prompts once in an interactive terminal only if needed. Without a TTY or configured noninteractive `sudo`, it fails before modifying the service.
+With no `--channel`, the updater reads the current version-bound `INSTALL_MANIFEST`: a Release installation continues on `stable`, and a CI installation continues on `main`. Passing `--channel stable|main` explicitly switches tracks once; the successfully installed package records the new channel for later no-argument runs. A legacy installation without a manifest is inferred only from an exact managed `main-<12-hex>` or canonical SemVer directory; any other form fails closed and requires an explicit channel. The `--branch` and `--workflow` selectors are main-only, and invalid combinations are rejected before authentication, download, `sudo`, or service changes.
 
-The updater selects the latest successful `push` CI run on the target branch and downloads the run's rebuilt and verified `solodock-embedded-package`. Before backup, service stop, or installation, it uses GitHub CLI to verify the GitHub artifact attestation for `SHA256SUMS`: the signing workflow must be the target repository's `.github/workflows/ci.yml`, source ref and commit must exactly match the selected run, and proofs from self-hosted runners are rejected. It then verifies every SHA-256 in the package and requires `SOURCE_SHA` to exactly match the workflow run commit. Missing or expired artifacts/attestations, signing-identity or source-commit mismatches, and checksum failures all fail closed. If the new binary matches the current binary, the service is not stopped. Otherwise, the updater stops SoloDock, creates an offline control-plane backup under `/var/backups/solodock/`, installs to a `main-<commit SHA>` version directory, starts the service, and checks loopback `/healthz` and `/favicon.svg`. Temporary artifacts are cleaned on every exit path. Application containers, volumes, and bind data are outside its scope.
+The `stable` channel reads GitHub's actual Latest Release and requires it to be published, non-draft, and non-prerelease. The release workflow leaves Latest selection to GitHub's version-aware default instead of forcing every newly created older-line release to become Latest. If GitHub ever reports a stable version lower than the installed stable manifest, the updater refuses the downgrade before download or mutation. The updater reuses existing or passwordless `sudo` authorization and prompts once in an interactive terminal only if needed. Without a TTY or configured noninteractive `sudo`, it fails before modifying the service.
 
-Run the updater only as an explicit administrator maintenance operation, not from an unattended timer. After a new binary has been started, health failure does not automatically switch back because SQLite migrations are forward-only. Retain the backup and scene and follow this page and [recovery](recovery.md). Use `solodock-update --help` for nondefault repository, branch, workflow selector, backup directory, or loopback port. The workflow selector must still identify trusted `.github/workflows/ci.yml`; it cannot select an arbitrary workflow as a release source.
+Stable discovery downloads the exact versioned Ubuntu archive plus `SHA256SUMS` and `SOURCE_SHA`. It resolves the Release tag to a commit, requires canonical tag/package version agreement, and verifies the checksum attestation against `.github/workflows/release.yml`, the exact tag ref and commit, and a GitHub-hosted runner. Main discovery instead selects the latest successful `push` CI run and retains the existing `.github/workflows/ci.yml`, branch, commit, and GitHub-hosted-runner attestation policy. Missing or expired artifacts/attestations, a moving or invalid Release identity, and any source, version, or checksum mismatch fail closed.
+
+After discovery, both channels use the same package validation and apply path. Currentness requires the complete package identity in the installed manifest, the selected immutable generation, binary, updater, package verifier, backup/restore helpers, their managed symlinks, and systemd unit all to match the verified package. If only package identity or helpers changed while the binary digest is unchanged—including a main-to-stable transition—the updater transactionally publishes a new generation and verifies the running service without stopping or invoking the binary. If the binary changed, the updater stops SoloDock, creates an offline control-plane backup under `/var/backups/solodock/`, transactionally publishes a stable SemVer or `main-<commit SHA prefix>` generation, starts the service, and checks loopback `/healthz` and `/favicon.svg`. A pre-invocation install failure restores and verifies the complete old package generation before the updater restarts the old service. If any rollback operation or verification fails, the installer returns a distinct incomplete-rollback status, preserves the transaction scene, and the updater leaves or puts the service in the stopped state with manual recovery instructions; it never starts whichever binary remains linked. After the new binary is invoked, the forward-only rule applies. Temporary downloads are cleaned on every exit path. Application containers, volumes, and bind data remain outside its scope.
+
+After authentication, the sidebar reads `/api/v1/system/installation` and displays this same installation identity. Stable installations show the SemVer, channel, and short source commit; main installations show `main` and the source commit. Expanding the entry exposes the full source SHA and package identity for issue reports. The endpoint reads the fixed managed symlink and manifest on every request, so a package-only channel change is visible after the next page load without restarting SoloDock. Local source runs report `development`; a missing, damaged, or noncanonical managed manifest reports `unknown` without degrading other control-plane functions. The public `/healthz` and unauthenticated sign-in page do not expose this fingerprint.
+
+Run the updater only as an explicit administrator maintenance operation, not from an unattended timer. After a new binary has been started, health failure does not automatically switch back because SQLite migrations are forward-only. Retain the backup and scene and follow this page and [recovery](recovery.md). Use `solodock-update --help` for channel, repository, main selector, backup directory, or loopback port details.
+
+GitHub **Release assets** are the long-lived stable distribution. **Actions artifacts** are 30-day development outputs used by the main channel. **GitHub Packages** is a separate registry for containers and language packages; SoloDock publishes neither there and does not depend on it.
 
 ## Security prerequisites
 
@@ -77,7 +113,7 @@ Stop the service before backup:
 
 ```bash
 sudo systemctl stop solodock.service
-sudo ./packaging/solodock-backup --output /secure/new/solodock-control-plane.tar
+sudo /usr/local/bin/solodock-backup --output /secure/new/solodock-control-plane.tar
 ```
 
 The archive contains application, Registry credential, and webhook secrets. Restrict it as highly sensitive data and encrypt it independently. It retains the immutable revision's network mode and aliases but excludes business volumes, bind data, Docker images/containers, and networks. Recreate required external networks separately before recovery, and maintain an independent, tested restore-capable backup for each workload.

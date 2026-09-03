@@ -32,7 +32,69 @@ jobs:
         with:
           subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
 EOF
+  write_safe_release "$directory/release.yml"
   printf '%s\n' "$directory"
+}
+
+write_safe_release() {
+  local output=$1
+  cat >"$output" <<EOF
+name: Release
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+permissions:
+  contents: read
+concurrency:
+  group: release-\${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build-release:
+    runs-on: ubuntu-24.04
+    steps: []
+  attest-release:
+    needs: build-release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-release-package
+          path: \${{ runner.temp }}/release
+      - name: Attest release checksums
+        uses: $pinned_attest
+        with:
+          subject-path: \${{ runner.temp }}/release/SHA256SUMS
+  publish-release:
+    needs: [build-release, attest-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: $pinned_download
+        with:
+          name: solodock-release-package
+          path: \${{ runner.temp }}/release
+      - name: Publish release assets
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: |
+          release_dir="\$RUNNER_TEMP/release"
+          asset="solodock-\${GITHUB_REF_NAME}-ubuntu-24.04-x86_64.tar.gz"
+          gh release create "\$GITHUB_REF_NAME" \\
+            "\$release_dir/\$asset" \\
+            "\$release_dir/SHA256SUMS" \\
+            "\$release_dir/SOURCE_SHA" \\
+            --repo "\$GITHUB_REPOSITORY" \\
+            --verify-tag \\
+            --generate-notes \\
+            --title "\$GITHUB_REF_NAME"
+EOF
 }
 
 fixture_dir_without_ci() {
@@ -115,6 +177,34 @@ jobs:
           subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
 EOF
 "$checker" "$fixture_root/safe-attestation" >/dev/null
+
+directory=$(fixture_dir missing-release-workflow)
+rm -- "$directory/release.yml"
+expect_failure missing-release-workflow
+
+directory=$(fixture_dir release-pr-trigger)
+sed -i 's/^  push:$/  pull_request:/' "$directory/release.yml"
+expect_failure release-pr-trigger
+
+directory=$(fixture_dir release-unpinned-attestation)
+sed -i "s|$pinned_attest|actions/attest@v4|" "$directory/release.yml"
+expect_failure release-unpinned-attestation
+
+directory=$(fixture_dir release-extra-write)
+sed -i '/contents: write/a\      actions: write' "$directory/release.yml"
+expect_failure release-extra-write
+
+directory=$(fixture_dir release-publish-bypass)
+sed -i '/--verify-tag/d' "$directory/release.yml"
+expect_failure release-publish-bypass
+
+directory=$(fixture_dir release-forces-latest)
+sed -i '/--generate-notes/a\            --latest \\' "$directory/release.yml"
+expect_failure release-forces-latest
+
+directory=$(fixture_dir release-attestation-extra-step)
+sed -i '/^  attest-release:/,/^  publish-release:/ s/^    steps:$/    steps:\n      - run: env/' "$directory/release.yml"
+expect_failure release-attestation-extra-step
 
 directory=$(fixture_dir_without_ci missing-ci-workflow)
 cat >"$directory/other.yml" <<'EOF'

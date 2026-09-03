@@ -17,7 +17,7 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 
 非认证 integration/API 与 Docker E2E fixture 直接写入格式有效、期限受控的测试管理员与 session，不重复执行生产参数 Argon2。认证 API 仍完整覆盖 bootstrap、密码 hash/verify、login、cookie、CSRF、logout、revoke 和 audit；AuthService 的生产参数 bootstrap/login 单元路径也保留。测试 session helper 不进入 production binary，且保留 bootstrap/login 两条 fixture audit，使业务用例的审计计数语义不变。
 
-普通 PR 由 `classify` 区分纯文档变更与代码变更。代码变更会并行运行 Web 检查、Rust lint、Rust tests、release/package smoke 和安全策略检查；只有明确的文档、Web 或 CI 安全工具路径可以跳过 DinD，未识别的非文档路径默认运行 Docker E2E。`ci-gate` 按分类结果逐项核对所有分支，只接受预期的成功或安全跳过，并拒绝意外 skip、失败或取消的 run；`main` push 始终运行完整检查。安全策略检查会结构化解析 workflow，验证 action 固定版本、危险触发器与权限、依赖差异，以及 Rust advisory、license 和来源策略；CodeQL 在独立 workflow 中分析 Rust 与 JavaScript/TypeScript。PR 上 classic suite 使用 1 秒 SSE hold 验证连接与 permit 释放；相关 PR 的 Docker 29 job 继续运行 descriptor deployment/no-op 与两个 compensation 场景。完整资源窗口由每周一及手动触发的 `Extended CI` 运行，后者也周期性复验三个 `containerd_` 场景。
+普通 PR 由 `classify` 区分纯文档变更与代码变更。代码变更会并行运行 Web 检查、Rust lint、Rust tests、release/package smoke 和安全策略检查；只有明确的文档、Web 或 CI 安全工具路径可以跳过 DinD，未识别的非文档路径默认运行 Docker E2E。`ci-gate` 按分类结果逐项核对所有分支，只接受预期的成功或安全跳过，并拒绝意外 skip、失败或取消的 run；`main` push 始终运行完整检查。安全策略检查会结构化解析 workflow，验证 action 固定版本、危险触发器与权限、隔离的 Release attestation/publish job、固定 version tag trigger、依赖差异，以及 Rust advisory、license 和来源策略；tag gate 还会拒绝非 canonical tag 或与 Cargo package version 不一致的 tag。packaging fixture 让 stable 与 main 都穿过共享 apply path，证明 manifest 跟随安装来源与严格 legacy inference，覆盖 package/helper-only 和 same-binary channel transition 不停服务，执行 stable 单调版本 guard，并模拟晚创建 `v0.1.1` 后 GitHub Latest 仍为 `v0.2.0`。installer failure injection 会在 package-only 与停服路径中覆盖每个 staged generation asset 和公开 link commit point，要求普通失败后的四个公开入口、unit、manifest 与 API 可见 identity 仍属于同一个 package，并保留 forward-only 的调用前门禁。rollback-operation injection 还会分别让 binary commit marker、一个 helper 与 unit 的恢复失败；每次都必须返回不完整回滚状态、保留现场并禁止 `start solodock.service`。release-generation ELF stamp 为 legacy binary-only updater 提供一次安全 delta，使其进入 package-aware updater。CodeQL 在独立 workflow 中分析 Rust 与 JavaScript/TypeScript。PR 上 classic suite 使用 1 秒 SSE hold 验证连接与 permit 释放；相关 PR 的 Docker 29 job 继续运行 descriptor deployment/no-op 与两个 compensation 场景。完整资源窗口由每周一及手动触发的 `Extended CI` 运行，后者也周期性复验三个 `containerd_` 场景。
 
 ## Docker 隔离
 
@@ -78,6 +78,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - bind allowlist、symlink/device/inode/data-root revalidation，以及每条 read-write bind 未确认、只读切换和重新确认；
 - HTTP health 五组数值范围与运行稳定窗口由 settings capability 驱动，Web 与 Rust domain 边界一致且 capability 缺失时 fail closed；
 - English 与简体中文 dictionary 在编译期保持 key 同构；locale 测试覆盖首次访问浏览器语言检测、显式已存偏好、刷新持久化、非法或不可用 storage 回退、立即切换、本地化时间和 document `lang` 属性；
+- installation identity parser 只接受固定受管 symlink 和 canonical manifest 字段；API 认证与 Web 展示覆盖 stable、main、development、unknown/失败回退、双语 label 及完整 source/package detail；
 - SQLite bind roots 一次 bootstrap、revision 更新、引用保护与扫描失败关闭；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
 - `/proc/meminfo` 正常、缺失、非法和 overflow，system health 五列状态条与 pull 门禁共用同一 parser；

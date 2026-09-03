@@ -93,4 +93,40 @@ describe('AppShell', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false')
     expect(document.activeElement).toBe(toggle)
   })
+
+  it('shows authenticated installation identity with full verified details', async () => {
+    stubViewport(false)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/system/installation')) {
+        return new Response(JSON.stringify({
+          channel: 'stable',
+          version: '0.2.0',
+          source_sha: 'abcdef0123456789abcdef0123456789abcdef01',
+          package_identity: '1'.repeat(64),
+        }), { status: 200 })
+      }
+      return new Response(JSON.stringify({ code: 'UNAVAILABLE', message: 'unavailable', request_id: 'test' }), { status: 503 })
+    }))
+    const user = userEvent.setup()
+    render(AppShell, { route: '#/', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+    await user.click(screen.getAllByRole('button', { name: 'English' })[0])
+
+    const summary = await screen.findByText('SoloDock v0.2.0 · stable · abcdef0')
+    await user.click(summary)
+    expect(screen.getByText('abcdef0123456789abcdef0123456789abcdef01')).toBeTruthy()
+    expect(screen.getByText('1'.repeat(64))).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Copy installation identity' })).toBeTruthy()
+  })
+
+  it('falls back to a bilingual unknown identity without blocking navigation', async () => {
+    stubViewport(false)
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline') }))
+    const user = userEvent.setup()
+    render(AppShell, { route: '#/', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+
+    const summary = await screen.findByText('SoloDock · unknown')
+    await user.click(summary)
+    expect(screen.getByText('源码提交')).toBeTruthy()
+    expect(screen.getByRole('link', { name: '应用' })).toBeTruthy()
+  })
 })

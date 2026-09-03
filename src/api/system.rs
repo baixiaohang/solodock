@@ -84,6 +84,10 @@ pub struct DriftResponse {
     issues: Vec<DriftIssue>,
 }
 
+pub async fn installation_identity(_authenticated: Authenticated) -> impl IntoResponse {
+    Json(crate::system::installation::read())
+}
+
 pub async fn health(
     State(state): State<AppState>,
     _authenticated: Authenticated,
