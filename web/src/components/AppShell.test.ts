@@ -24,6 +24,17 @@ function stubViewport(mobile: boolean) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('AppShell', () => {
+  it('switches the authenticated shell language immediately', async () => {
+    stubViewport(false)
+    const user = userEvent.setup()
+    render(AppShell, { route: '#/', onRevokeAll: vi.fn(), onLogout: vi.fn() })
+
+    await user.click(screen.getAllByRole('button', { name: 'English' })[0])
+
+    expect(screen.getByRole('link', { name: 'Applications' })).toBeTruthy()
+    expect(document.documentElement.lang).toBe('en')
+  })
+
   it('提供三个主导航入口并按路由映射活动态', async () => {
     stubViewport(false)
     const rendered = render(AppShell, { route: '#/apps/123', onRevokeAll: vi.fn(), onLogout: vi.fn() })

@@ -21,7 +21,7 @@ pub fn descriptor() -> PresetDescriptor {
         id: PRESET_ID,
         schema_version: SCHEMA_VERSION,
         display_name: "PostgreSQL",
-        description: "单实例 PostgreSQL，使用持久卷和平台内部服务发现网络。",
+        description: "Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.",
         default_major: "18",
         supported_majors: &["18", "17"],
         default_username: "postgres",

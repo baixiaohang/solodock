@@ -69,6 +69,8 @@ PostgreSQL quick deployment defaults to major 18 and an owned volume at `/var/li
 
 The global display timezone is selected in **System settings** from the backend IANA tzdb list and stored in the singleton SQLite settings record, defaulting to `UTC`. The mutation uses revision, idempotency key, Origin, session, and CSRF. Saving redraws Web timestamps without restart. It neither injects `TZ` into managed containers nor changes UTC values in the database, API, SSE, cursors, expiry checks, or downloaded logs. If the browser cannot render a saved zone, the UI warns and falls back to UTC.
 
+The Web UI language can be changed between English and Simplified Chinese on the bootstrap/sign-in screen and in the authenticated header. SoloDock stores an explicit choice only in browser `localStorage` under the versioned, non-sensitive key `solodock.ui.locale.v1`; it never sends the locale to the API, session, audit log, URL, SQLite, or server settings. Without a valid stored value, a first preferred browser language of `zh` or `zh-*` selects `zh-CN`; every other value selects English. Unavailable storage and invalid values fail safely without blocking the UI. Language changes immediately update visible text, localized timestamps, accessibility labels, and the document `lang` attribute.
+
 ## Backup
 
 Stop the service before backup:

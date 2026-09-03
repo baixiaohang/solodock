@@ -4,32 +4,33 @@
   import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { applyTimeSettings, loadTimeSettings, timeSettings } from '../lib/time'
   import type { SettingsResponse } from '../lib/types'
+  import { localized, messageText, t, type UserMessage } from '../lib/i18n'
 
   let settings = $state<SettingsResponse | null>(null)
   let selected = $state('UTC')
   let bindRoots = $state<string[]>([])
   let busy = $state(false)
-  let error = $state('')
+  let error = $state<UserMessage | null>(null)
   let saved = $state(false)
   let retry = $state<RetryIdentity | undefined>()
 
   onMount(() => { void load() })
 
   async function load() {
-    error = ''
+    error = null
     try {
       settings = await loadTimeSettings()
       selected = settings.display_timezone
       bindRoots = [...(settings.allowed_bind_roots ?? [])]
       retry = undefined
     } catch {
-      error = '无法加载全局设置。'
+      error = localized('Could not load global settings.')
     }
   }
 
   async function save() {
     if (!settings || !settings.supported_timezones.includes(selected)) return
-    busy = true; error = ''; saved = false
+    busy = true; error = null; saved = false
     const request = {
       expected_revision: settings.revision,
       display_timezone: selected,
@@ -44,32 +45,32 @@
       bindRoots = [...(settings.allowed_bind_roots ?? [])]
       saved = true
     } catch {
-      error = '保存失败；设置可能已被其他页面修改，请刷新后重试。'
+      error = localized('Save failed. Settings may have changed in another page; refresh and try again.')
     } finally {
       busy = false
     }
   }
 
   function region(timezone: string): string {
-    return timezone === 'UTC' ? '常用' : timezone.split('/')[0] ?? '其他'
+    return timezone === 'UTC' ? $t('Common') : timezone.split('/')[0] ?? $t('Other')
   }
 </script>
 
 <main class="page-shell narrow">
-  <div class="page-heading"><div><p class="eyebrow">SYSTEM</p><h1>系统设置</h1><p class="muted">只改变 Web 显示；数据库、API、SSE 和下载日志继续使用 UTC。</p></div></div>
-  {#if error}<p class="notice danger" role="alert">{error}</p>{/if}
-  {#if $timeSettings.warning}<p class="notice warning" role="alert">{$timeSettings.warning}</p>{/if}
+  <div class="page-heading"><div><p class="eyebrow">{$t('SYSTEM')}</p><h1>{$t('System settings')}</h1><p class="muted">{$t('Only Web display changes. The database, API, SSE, and downloaded logs continue to use UTC.')}</p></div></div>
+  {#if error}<p class="notice danger" role="alert">{messageText(error, $t)}</p>{/if}
+  {#if $timeSettings.unsupportedTimezone}<p class="notice warning" role="alert">{$t('This browser does not support {timezone}; times are temporarily displayed in UTC.', { timezone: $timeSettings.unsupportedTimezone })}</p>{/if}
   {#if settings}
     <form class="panel settings-form" onsubmit={(event) => { event.preventDefault(); void save() }}>
-      <label for="display-timezone">显示时区</label>
+      <label for="display-timezone">{$t('Display timezone')}</label>
       <select id="display-timezone" bind:value={selected} disabled={busy}>
         {#each settings.supported_timezones as timezone}
-          <option value={timezone}>{timezone === 'UTC' ? 'UTC（协调世界时）' : `${timezone} · ${region(timezone)}`}</option>
+          <option value={timezone}>{timezone === 'UTC' ? $t('UTC (Coordinated Universal Time)') : `${timezone} · ${region(timezone)}`}</option>
         {/each}
       </select>
-      <p class="muted">选项来自后端内置的 IANA tzdb，不能提交任意字符串。保存后所有已打开页面立即按新时区重绘。</p>
-      <fieldset class="row-editor"><legend>存储访问</legend><p class="muted">每行一个已存在的安全宿主目录。SoloDock 只把它作为 bind allowlist，不会浏览、创建、改权限或删除目录。</p>{#each bindRoots as root, index}<div class="editor-row"><label>允许根目录<input bind:value={bindRoots[index]} placeholder="/home/ubuntu" required /></label><button type="button" class="ghost" onclick={() => { bindRoots = bindRoots.filter((_, current) => current !== index) }}>删除</button></div>{/each}<button type="button" class="ghost" onclick={() => { bindRoots = [...bindRoots, ''] }}>添加根目录</button></fieldset>
-      <div class="actions"><button disabled={busy}>{busy ? '保存中…' : '保存系统设置'}</button>{#if saved}<span class="success-text" role="status">已生效</span>{/if}</div>
+      <p class="muted">{$t('Options come from the backend\'s bundled IANA tzdb; arbitrary strings cannot be submitted. Saving redraws all open pages in the new timezone.')}</p>
+      <fieldset class="row-editor"><legend>{$t('Storage access')}</legend><p class="muted">{$t('One existing, safe host directory per line. SoloDock uses these only as the bind allowlist and never browses, creates, changes permissions on, or deletes them.')}</p>{#each bindRoots as root, index}<div class="editor-row"><label>{$t('Allowed root')}<input bind:value={bindRoots[index]} placeholder="/home/ubuntu" required /></label><button type="button" class="ghost" onclick={() => { bindRoots = bindRoots.filter((_, current) => current !== index) }}>{$t('Delete')}</button></div>{/each}<button type="button" class="ghost" onclick={() => { bindRoots = [...bindRoots, ''] }}>{$t('Add root')}</button></fieldset>
+      <div class="actions"><button disabled={busy}>{busy ? $t('Saving…') : $t('Save system settings')}</button>{#if saved}<span class="success-text" role="status">{$t('Applied')}</span>{/if}</div>
     </form>
   {/if}
 </main>

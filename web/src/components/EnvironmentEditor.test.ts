@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import EnvironmentEditor from './EnvironmentEditor.svelte'
 import { environmentRowsFromDraft } from '../lib/environmentRows'
+import { setLocale } from '../lib/i18n'
 
 afterEach(() => cleanup())
 
@@ -66,7 +67,10 @@ describe('EnvironmentEditor', () => {
     await user.clear(text)
     await user.type(text, 'BROKEN')
     expect(screen.getByText('第 1 行缺少 =')).toBeTruthy()
-    await user.click(screen.getByRole('button', { name: '逐行编辑' }))
+    setLocale('en', false)
+    expect(await screen.findByText('Line 1 is missing =')).toBeTruthy()
+    setLocale('zh-CN', false)
+    await user.click(await screen.findByRole('button', { name: '逐行编辑' }))
     expect(screen.getByLabelText('批量普通环境变量')).toBeTruthy()
     expect(text.value).toBe('BROKEN')
   })

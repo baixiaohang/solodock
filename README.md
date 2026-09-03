@@ -11,8 +11,9 @@ SoloDock turns an image tag into a digest-pinned release, applies a generated on
 
 SoloDock does not build source code, accept arbitrary Compose, manage domains/TLS, provide a reverse proxy, or orchestrate multiple hosts. It is intentionally smaller than a general Docker manager or self-hosting PaaS.
 
-> [!NOTE]
-> The current Web UI is in Simplified Chinese. English/Chinese switching and an English screenshot are planned for the next phase-1 Pull Request. This documentation change does not claim that experience early.
+The Web UI supports English and Simplified Chinese before and after sign-in. On a first visit it selects Simplified Chinese only when the browser's first preferred language is `zh` or `zh-*`; otherwise it uses English. An explicit choice is remembered only in that browser.
+
+![SoloDock English sign-in screen](docs/assets/solodock-login-en.png)
 
 ## Deployment path
 

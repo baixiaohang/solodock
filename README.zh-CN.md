@@ -11,8 +11,9 @@ SoloDock 将镜像 tag 解析为 digest 固定的 release，应用系统生成�
 
 SoloDock 不构建源码、不接受任意 Compose、不管理域名/TLS、不提供反向代理，也不编排多台主机。它刻意比通用 Docker 管理器或自托管 PaaS 更窄。
 
-> [!NOTE]
-> 当前 Web UI 仍为简体中文。English / 简体中文切换与真实英文截图属于第一阶段的下一个 Pull Request；本次文档改造不会提前声称尚未存在的体验。
+Web UI 在登录前后都支持 English 与简体中文。首次访问时，只有浏览器第一偏好语言为 `zh` 或 `zh-*` 才选择简体中文，否则使用 English；显式选择只记忆在当前浏览器中。
+
+![SoloDock 英文登录界面](docs/assets/solodock-login-en.png)
 
 ## 部署链路
 

@@ -1,5 +1,6 @@
 import type { DraftInput, DraftResponse } from './types'
 import { FormValidationError } from './formErrors'
+import { localized } from './i18n'
 
 export interface ManagedFileRow {
   logicalName: string
@@ -46,12 +47,12 @@ export function buildManagedFileProjection(rows: ManagedFileRow[]): ManagedFileP
   for (const [index, row] of active.entries()) {
     row.logicalName = row.logicalName.trim()
     row.targetPath = row.targetPath.trim()
-    if (!row.logicalName) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_NAME_REQUIRED', message: '托管文件逻辑名称不能为空' }])
-    if (!row.targetPath) throw new FormValidationError([{ path: `files[${index}].target_path`, code: 'FILE_TARGET_REQUIRED', message: '托管文件容器路径不能为空' }])
-    if (finalByName.has(row.logicalName)) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_TARGET_CONFLICT', message: '托管文件逻辑名称不能重复' }])
+    if (!row.logicalName) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_NAME_REQUIRED', message: localized('Managed file logical name is required') }])
+    if (!row.targetPath) throw new FormValidationError([{ path: `files[${index}].target_path`, code: 'FILE_TARGET_REQUIRED', message: localized('Managed file container path is required') }])
+    if (finalByName.has(row.logicalName)) throw new FormValidationError([{ path: `files[${index}].logical_name`, code: 'FILE_TARGET_CONFLICT', message: localized('Managed file logical names must be unique') }])
     finalByName.set(row.logicalName, row)
     if (row.originalSensitive && !row.sensitive && !row.value) {
-      throw new FormValidationError([{ path: `files[${index}].content`, code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 文件转为普通文件时必须输入新内容' }])
+      throw new FormValidationError([{ path: `files[${index}].content`, code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter new content when converting a secret file to a regular file') }])
     }
   }
 
@@ -84,14 +85,14 @@ export function buildManagedFileProjection(rows: ManagedFileRow[]): ManagedFileP
       && !finalRow.value
     if (canKeep) result.push({ logical_name: name, target_path: finalRow.targetPath, sensitive: true, readonly: true, operation: 'keep' })
     else {
-      if (!finalRow.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 文件改名或变更类型时必须输入新内容' }])
+      if (!finalRow.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter new content when renaming a secret file or changing its type') }])
       result.push({ logical_name: name, target_path: finalRow.targetPath, sensitive: true, readonly: true, operation: 'replace', value: finalRow.value })
     }
     requestRowIndexes.push(active.indexOf(finalRow))
   }
   for (const row of active) {
     if (!row.sensitive || originalSecretNames.has(row.logicalName)) continue
-    if (!row.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: '新 Secret 文件必须输入内容' }])
+    if (!row.value) throw new FormValidationError([{ path: 'files', code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter content for a new secret file') }])
     result.push({ logical_name: row.logicalName, target_path: row.targetPath, sensitive: true, readonly: true, operation: 'replace', value: row.value })
     requestRowIndexes.push(active.indexOf(row))
   }

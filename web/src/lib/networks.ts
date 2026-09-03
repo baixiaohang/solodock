@@ -1,4 +1,5 @@
 import type { DraftInput, ExternalNetworkAttachment } from './types'
+import { localized, type LocalizedMessage } from './i18n'
 
 export interface NetworkEditorState {
   ownedDefaultNetwork: boolean
@@ -20,11 +21,11 @@ export function networkEditorState(
   }
 }
 
-export function networkEditorError(state: NetworkEditorState): string {
+export function networkEditorError(state: NetworkEditorState): LocalizedMessage | null {
   if (!state.ownedDefaultNetwork && !state.serviceDiscoveryEnabled && state.externalNetworks.length === 0) {
-    return '至少需要应用专属网络、平台内部服务发现或一个 external network。'
+    return localized('At least an application network, platform service discovery, or one external network is required.')
   }
-  return ''
+  return null
 }
 
 export function networkDraft(state: NetworkEditorState): Pick<DraftInput, 'owned_default_network' | 'networks'> {

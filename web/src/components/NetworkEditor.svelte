@@ -2,6 +2,7 @@
   import { networkEditorError } from '../lib/networks'
   import { issuesUnder, type FormIssue } from '../lib/formErrors'
   import type { ExternalNetworkAttachment } from '../lib/types'
+  import { messageText, t } from '../lib/i18n'
 
   let {
     ownedDefaultNetwork = $bindable(true),
@@ -57,34 +58,34 @@
 </script>
 
 <fieldset class="network-editor wide">
-  <legend>网络</legend>
+  <legend>{$t('Networks')}</legend>
   <label class="checkbox">
-    <input data-issue-path="owned_default_network" aria-label="创建应用专属默认网络" type="checkbox" bind:checked={ownedDefaultNetwork} />
-    创建应用专属默认网络
+    <input data-issue-path="owned_default_network" aria-label={$t('Create an application-specific default network')} type="checkbox" bind:checked={ownedDefaultNetwork} />
+    {$t('Create an application-specific default network')}
   </label>
-  <label class="checkbox"><input data-issue-path="service_discovery_enabled" aria-label="启用平台内部服务发现" type="checkbox" bind:checked={serviceDiscoveryEnabled} /> 启用平台内部服务发现</label>
-  <p class="muted">启用后可通过服务 slug 和容器端口互通；所有启用服务属于同一内部信任域，当前没有服务级网络 ACL。</p>
-  <p class="muted">External network 必须预先存在；SoloDock 不会创建、修改或删除它。</p>
+  <label class="checkbox"><input data-issue-path="service_discovery_enabled" aria-label={$t('Enable platform service discovery')} type="checkbox" bind:checked={serviceDiscoveryEnabled} /> {$t('Enable platform service discovery')}</label>
+  <p class="muted">{$t('Enabled services can communicate through service slugs and container ports. All enabled services share one internal trust domain; service-level network ACLs are not available.')}</p>
+  <p class="muted">{$t('External networks must already exist. SoloDock never creates, changes, or deletes them.')}</p>
   {#each externalNetworks as network, networkIndex}
     {@const networkIssues = issuesUnder(issues, `networks[${networkIndex}]`)}
     <section class="network-attachment">
       <div class="network-row">
-        <label>External network 名称<input data-issue-path={`networks[${networkIndex}].name`} aria-label={`External network ${networkIndex + 1}`} value={network.name} oninput={(event) => updateNetworkName(networkIndex, event.currentTarget.value)} aria-invalid={networkIssues.some((issue) => issue.path.endsWith('.name')) ? 'true' : undefined} required /></label>
-        <button type="button" class="ghost" onclick={() => removeNetwork(networkIndex)}>删除网络</button>
+        <label>{$t('External network name')}<input data-issue-path={`networks[${networkIndex}].name`} aria-label={$t('External network {number}', { number: networkIndex + 1 })} value={network.name} oninput={(event) => updateNetworkName(networkIndex, event.currentTarget.value)} aria-invalid={networkIssues.some((issue) => issue.path.endsWith('.name')) ? 'true' : undefined} required /></label>
+        <button type="button" class="ghost" onclick={() => removeNetwork(networkIndex)}>{$t('Delete network')}</button>
       </div>
       <div class="alias-list">
         {#each network.aliases as alias, aliasIndex}
           <div class="alias-row">
-            <label>Alias<input data-issue-path={`networks[${networkIndex}].aliases[${aliasIndex}]`} aria-label={`Network ${networkIndex + 1} alias ${aliasIndex + 1}`} value={alias} oninput={(event) => updateAlias(networkIndex, aliasIndex, event.currentTarget.value)} aria-invalid={networkIssues.some((issue) => issue.path.includes(`aliases[${aliasIndex}]`)) ? 'true' : undefined} required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxlength="63" /></label>
-            <button type="button" class="ghost" onclick={() => removeAlias(networkIndex, aliasIndex)}>删除 alias</button>
+            <label>{$t('Alias')}<input data-issue-path={`networks[${networkIndex}].aliases[${aliasIndex}]`} aria-label={$t('Network {network} alias {alias}', { network: networkIndex + 1, alias: aliasIndex + 1 })} value={alias} oninput={(event) => updateAlias(networkIndex, aliasIndex, event.currentTarget.value)} aria-invalid={networkIssues.some((issue) => issue.path.includes(`aliases[${aliasIndex}]`)) ? 'true' : undefined} required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" maxlength="63" /></label>
+            <button type="button" class="ghost" onclick={() => removeAlias(networkIndex, aliasIndex)}>{$t('Delete alias')}</button>
           </div>
         {/each}
-        <button type="button" class="ghost" onclick={() => addAlias(networkIndex)}>添加 alias</button>
+        <button type="button" class="ghost" onclick={() => addAlias(networkIndex)}>{$t('Add alias')}</button>
       </div>
-      {#each networkIssues as issue}<p class="form-error" role="alert">{issue.message}</p>{/each}
+      {#each networkIssues as issue}<p class="form-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
     </section>
   {/each}
-  <button type="button" class="ghost" onclick={addNetwork}>添加 external network</button>
-  {#if error}<p class="form-error" role="alert">{error}</p>{/if}
-  {#each issues.filter((issue) => !issue.path.includes('[')) as issue}<p class="form-error" role="alert">{issue.message}</p>{/each}
+  <button type="button" class="ghost" onclick={addNetwork}>{$t('Add external network')}</button>
+  {#if error}<p class="form-error" role="alert">{messageText(error, $t)}</p>{/if}
+  {#each issues.filter((issue) => !issue.path.includes('[')) as issue}<p class="form-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
 </fieldset>
