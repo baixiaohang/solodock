@@ -98,6 +98,11 @@ code, pre { color: var(--color-text); font-family: "SFMono-Regular", Consolas, "
 .app-shell { min-height: 100vh; background: var(--color-canvas); }
 .topbar { position: fixed; inset: 0 0 auto; z-index: 40; display: flex; align-items: center; justify-content: space-between; min-width: 320px; height: var(--header-height); padding: 0 var(--space-5); color: var(--color-header-text); background: var(--color-header); }
 .topbar-brand-group, .user-actions { display: flex; align-items: center; min-width: 0; gap: var(--space-2); }
+.language-switcher { display: inline-flex; align-items: center; padding: 2px; gap: 2px; border: 1px solid var(--color-border); border-radius: 8px; background: var(--color-surface); }
+.language-switcher button { min-height: 28px; padding: 4px 8px; border: 0; border-radius: 6px; background: transparent; color: var(--color-muted); font-size: 0.75rem; }
+.language-switcher button[aria-pressed="true"] { background: var(--color-primary-surface); color: var(--color-primary); }
+.auth-language { position: fixed; top: var(--space-4); right: var(--space-4); }
+.sidebar-language { display: none; padding: 0 var(--space-2) var(--space-3); }
 .brand { color: var(--color-header-text); font-size: 1.05rem; font-weight: 850; letter-spacing: -0.02em; white-space: nowrap; }
 .brand:hover { color: var(--color-header-text); }
 .brand span { margin-left: 0.35rem; color: var(--color-header-muted); font-size: 0.82rem; font-weight: 500; }
@@ -262,6 +267,8 @@ pre { max-width: 100%; overflow: auto; padding: 1rem; border: 1px solid var(--co
   button.menu-toggle { display: inline-flex; }
   .brand span, .user { display: none; }
   .user-actions { gap: 0.3rem; }
+  .user-actions .language-switcher { display: none; }
+  .sidebar-language { display: block; }
   button.topbar-action { padding-inline: 0.45rem; font-size: 0.72rem; white-space: nowrap; }
   .sidebar { width: min(17rem, 84vw); visibility: hidden; pointer-events: none; transform: translateX(-105%); box-shadow: var(--shadow-drawer); transition: transform 0.18s ease, visibility 0s linear 0.18s; }
   .sidebar.open { visibility: visible; pointer-events: auto; transform: translateX(0); transition-delay: 0s; }

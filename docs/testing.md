@@ -77,6 +77,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 - Immutable active/pending network expectations, attachment/alias drift, and subset semantics for Docker-added DNS names.
 - Bind allowlist, symlink/device/inode/data-root revalidation, and per-row acknowledgment behavior for read-write, read-only transitions, and renewed confirmation.
 - Five groups of HTTP-health numeric ranges and stability windows driven by settings capability, with Web/Rust domain agreement and fail-closed missing capability.
+- English and Simplified Chinese dictionaries with compile-time key parity; locale tests cover first-visit browser detection, explicit stored preference, refresh persistence, invalid or unavailable storage fallback, immediate switching, localized timestamps, and the document `lang` attribute.
 - One-time SQLite bind-root bootstrap, revision update, reference protection, and fail-closed scan errors.
 - Volume/bind/network canaries survive lifecycle, deploy, rollback, unregister, and remove.
 - Normal, missing, malformed, and overflow `/proc/meminfo`; the five-column system-health strip and pull gate use the same parser.

@@ -1,14 +1,15 @@
 import { ApiError } from './api'
+import { messageText, translate, type Translate, type UserMessage } from './i18n'
 
 export interface FormIssue {
   path: string
   code: string
-  message: string
+  message: UserMessage
 }
 
 export class FormValidationError extends Error {
   constructor(public issues: FormIssue[]) {
-    super(issues[0]?.message ?? 'The form is invalid')
+    super(issues[0] ? messageText(issues[0].message) : 'The form is invalid')
   }
 }
 
@@ -20,19 +21,19 @@ export function issuesUnder(issues: FormIssue[], prefix: string): FormIssue[] {
   return issues.filter((issue) => issue.path === prefix || issue.path.startsWith(`${prefix}.`) || issue.path.startsWith(`${prefix}[`))
 }
 
-function sectionName(path: string): string {
-  if (path.startsWith('environment.')) return '环境变量'
-  if (path.startsWith('files')) return '托管文件'
-  if (path.startsWith('ports')) return '端口'
-  if (path.startsWith('volumes') || path.startsWith('binds')) return '持久存储'
-  if (path.startsWith('networks') || path.includes('network')) return '网络'
-  if (path.startsWith('health') || path === 'stop_grace_period_seconds') return '健康与生命周期'
-  if (path === 'discovery_image_ref' || path === 'credential_ref') return '镜像'
-  return 'Draft 配置'
+function sectionName(path: string, translateMessage: Translate): string {
+  if (path.startsWith('environment.')) return translateMessage('Environment variables')
+  if (path.startsWith('files')) return translateMessage('Managed files')
+  if (path.startsWith('ports')) return translateMessage('Ports')
+  if (path.startsWith('volumes') || path.startsWith('binds')) return translateMessage('Persistent storage')
+  if (path.startsWith('networks') || path.includes('network')) return translateMessage('Networks')
+  if (path.startsWith('health') || path === 'stop_grace_period_seconds') return translateMessage('Health and lifecycle')
+  if (path === 'discovery_image_ref' || path === 'credential_ref') return translateMessage('Image')
+  return translateMessage('Draft configuration')
 }
 
-export function issueSummary(issue: FormIssue): string {
-  return `${sectionName(issue.path)}（${issue.path}）：${issue.message}`
+export function issueSummary(issue: FormIssue, translateMessage: Translate = translate): string {
+  return translateMessage('{section} ({path}): {message}', { section: sectionName(issue.path, translateMessage), path: issue.path, message: messageText(issue.message, translateMessage) })
 }
 
 export function remapIndexedIssues(issues: FormIssue[], prefix: string, requestRowIndexes: number[]): FormIssue[] {
@@ -45,14 +46,34 @@ export function remapIndexedIssues(issues: FormIssue[], prefix: string, requestR
   })
 }
 
-export function errorPresentation(cause: unknown, fallback: string): { message: string; issues: FormIssue[]; requestId?: string } {
+export interface ErrorPresentation {
+  fallback: UserMessage
+  issues: FormIssue[]
+  requestId?: string
+  detail?: string
+}
+
+export function errorPresentation(cause: unknown, fallback: UserMessage): ErrorPresentation {
   if (cause instanceof FormValidationError) {
-    return { message: issueSummary(cause.issues[0]), issues: cause.issues }
+    return { fallback, issues: cause.issues }
   }
   if (cause instanceof ApiError) {
     const issues = cause.body.issues ?? []
-    const detail = issues[0] ? issueSummary(issues[0]) : `${cause.body.code}: ${cause.body.message}`
-    return { message: `${detail}（request ${cause.body.request_id}）`, issues, requestId: cause.body.request_id }
+    return {
+      fallback,
+      issues,
+      detail: issues.length ? undefined : `${cause.body.code}: ${cause.body.message}`,
+      requestId: cause.body.request_id,
+    }
   }
-  return { message: fallback, issues: [] }
+  return { fallback, issues: [] }
+}
+
+export function errorPresentationText(presentation: ErrorPresentation, translateMessage: Translate = translate): string {
+  const detail = presentation.issues[0]
+    ? issueSummary(presentation.issues[0], translateMessage)
+    : presentation.detail ?? messageText(presentation.fallback, translateMessage)
+  return presentation.requestId
+    ? translateMessage('{detail} (request {requestId})', { detail, requestId: presentation.requestId })
+    : detail
 }

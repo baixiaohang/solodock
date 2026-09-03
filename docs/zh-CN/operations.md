@@ -71,6 +71,8 @@ PostgreSQL 快速部署默认使用 major 18 和 `/var/lib/postgresql` owned vol
 
 全局显示时区在 Web“系统设置”中从后端 IANA tzdb 列表选择，保存在 SQLite singleton settings record，默认 `UTC`。修改使用 revision、幂等键、Origin、session 与 CSRF，保存后无需重启即可重绘所有 Web 时间。该设置不向受管容器注入 `TZ`，也不改变数据库、API、SSE、cursor、过期判断或下载日志中的 UTC 原值；浏览器不支持已保存 zone 时会明确告警并按 UTC fallback。
 
+Web UI 可在 bootstrap/login 页面和登录后的 header 中切换 English 与简体中文。SoloDock 只在浏览器 `localStorage` 的版本化非敏感 key `solodock.ui.locale.v1` 中保存显式选择，不把 locale 写入 API、session、audit、URL、SQLite 或 server settings。没有有效已存值时，浏览器第一偏好语言为 `zh` 或 `zh-*` 才选择 `zh-CN`，其他情况使用 English；storage 不可用或值非法时会安全回退，不阻塞 UI。切换会立即更新可见文案、本地化时间、可访问性标签和 document `lang` 属性。
+
 ## 备份
 
 停止服务后执行：

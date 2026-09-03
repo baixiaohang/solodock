@@ -18,4 +18,9 @@ describe('display time formatting', () => {
     expect(browserSupportsTimezone('Mars/Olympus')).toBe(false)
     expect(formatTimestamp('2026-01-15T12:00:00Z', 'Mars/Olympus')).toContain('12:00:00')
   })
+
+  it('formats timestamps with the selected UI locale', () => {
+    const source = '2026-01-15T12:00:00Z'
+    expect(formatTimestamp(source, 'UTC', 'en')).not.toBe(formatTimestamp(source, 'UTC', 'zh-CN'))
+  })
 })

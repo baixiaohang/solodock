@@ -1,6 +1,7 @@
 import type { DraftInput, DraftResponse } from './types'
 import { FormValidationError } from './formErrors'
 import type { PublicEnvironmentEntry } from './environmentText'
+import { localized } from './i18n'
 
 export interface EnvironmentRow {
   id: string
@@ -81,11 +82,11 @@ export function buildEnvironmentProjection(rows: EnvironmentRow[]): EnvironmentP
     row.key = row.key.trim()
     const index = row.sensitive ? secretIndex++ : publicIndex++
     const path = row.sensitive ? `environment.secrets[${index}].key` : `environment.public[${index}].key`
-    if (!row.key) throw new FormValidationError([{ path, code: 'ENV_KEY_REQUIRED', message: '变量名不能为空' }])
-    if (finalByKey.has(row.key)) throw new FormValidationError([{ path, code: 'ENV_DUPLICATE', message: '变量名不能重复' }])
+    if (!row.key) throw new FormValidationError([{ path, code: 'ENV_KEY_REQUIRED', message: localized('Variable name is required') }])
+    if (finalByKey.has(row.key)) throw new FormValidationError([{ path, code: 'ENV_DUPLICATE', message: localized('Variable names must be unique') }])
     finalByKey.set(row.key, row)
     if (row.originalSensitive && !row.sensitive && !row.value) {
-      throw new FormValidationError([{ path: `environment.public[${index}].value`, code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 转为普通变量时必须输入新值' }])
+      throw new FormValidationError([{ path: `environment.public[${index}].value`, code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter a new value when converting a secret to a public variable') }])
     }
   }
 
@@ -112,14 +113,14 @@ export function buildEnvironmentProjection(rows: EnvironmentRow[]): EnvironmentP
       && !finalRow.value
     if (canKeep) secretOperations.push({ key, operation: 'keep' })
     else {
-      if (!finalRow.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: 'Secret 改名或变更类型时必须输入新值' }])
+      if (!finalRow.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter a new value when renaming a secret or changing its type') }])
       secretOperations.push({ key, operation: 'replace', value: finalRow.value })
     }
     secretRequestRowIndexes.push(visibleSecretRows.indexOf(finalRow))
   }
   for (const row of active) {
     if (!row.sensitive || originalSecretKeys.has(row.key)) continue
-    if (!row.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: '新 Secret 必须输入值' }])
+    if (!row.value) throw new FormValidationError([{ path: 'environment.secrets', code: 'SECRET_REPLACEMENT_REQUIRED', message: localized('Enter a value for a new secret') }])
     secretOperations.push({ key: row.key, operation: 'replace', value: row.value })
     secretRequestRowIndexes.push(visibleSecretRows.indexOf(row))
   }

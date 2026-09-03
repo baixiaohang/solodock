@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import { ApiError } from './api'
-import { errorPresentation, FormValidationError, remapIndexedIssues } from './formErrors'
+import { errorPresentation, errorPresentationText, FormValidationError, remapIndexedIssues } from './formErrors'
 
 describe('form errors', () => {
   it('将服务端 issue 转换为可定位摘要并保留 request id', () => {
@@ -11,8 +11,8 @@ describe('form errors', () => {
       request_id: 'request-id',
       issues: [{ path: 'binds[2].source', code: 'BIND_OUTSIDE_ALLOWED_ROOT', message: 'Must be below an allowed root' }],
     }), 'fallback')
-    expect(result.message).toContain('持久存储（binds[2].source）')
-    expect(result.message).toContain('request request-id')
+    expect(errorPresentationText(result)).toContain('持久存储（binds[2].source）')
+    expect(errorPresentationText(result)).toContain('request request-id')
     expect(result.issues).toHaveLength(1)
   })
 
@@ -20,7 +20,7 @@ describe('form errors', () => {
     const result = errorPresentation(new FormValidationError([
       { path: 'environment.public[1].key', code: 'ENV_DUPLICATE', message: '变量名不能重复' },
     ]), 'fallback')
-    expect(result.message).toBe('环境变量（environment.public[1].key）：变量名不能重复')
+    expect(errorPresentationText(result)).toBe('环境变量（environment.public[1].key）：变量名不能重复')
   })
 
   it('按请求投影索引映射托管文件错误到可见行', () => {

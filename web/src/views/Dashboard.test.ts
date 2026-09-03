@@ -66,7 +66,7 @@ describe('Dashboard', () => {
     const table = await screen.findByRole('table')
     expect(within(table).getAllByRole('columnheader').map((cell) => cell.textContent)).toEqual(['应用', '状态', 'CPU', '内存', '活动镜像', 'Drift'])
     expect(screen.getByRole('link', { name: /Demo App/ }).getAttribute('href')).toBe('#/apps/00000000-0000-0000-0000-000000000001')
-    expect(screen.getByText('running')).toBeTruthy()
+    expect(screen.getByText('运行中')).toBeTruthy()
     expect(screen.getByText('sha256:aaaaaaaaaaaa')).toBeTruthy()
     expect(screen.getByText('运行镜像与活动镜像不一致')).toBeTruthy()
     expect(screen.getByText('主机内存可用')).toBeTruthy()

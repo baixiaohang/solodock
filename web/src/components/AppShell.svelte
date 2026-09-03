@@ -2,6 +2,8 @@
   import { onMount } from 'svelte'
   import type { Snippet } from 'svelte'
   import { loadTimeSettings, timeSettings } from '../lib/time'
+  import { t } from '../lib/i18n'
+  import LanguageSwitcher from './LanguageSwitcher.svelte'
 
   let {
     route,
@@ -53,19 +55,20 @@
         bind:this={menuButton}
         class="menu-toggle"
         type="button"
-        aria-label="打开主导航"
+        aria-label={$t('Open primary navigation')}
         aria-expanded={menuOpen}
         aria-controls="primary-navigation"
         onclick={() => { menuOpen = !menuOpen }}
       >
         <span aria-hidden="true">☰</span>
       </button>
-      <a class="brand" href="#/" onclick={() => closeMenu()}>SoloDock <span>Control Panel</span></a>
+      <a class="brand" href="#/" onclick={() => closeMenu()}>SoloDock <span>{$t('Control Panel')}</span></a>
     </div>
-    <nav class="user-actions" aria-label="用户操作">
+    <nav class="user-actions" aria-label={$t('User actions')}>
+      <LanguageSwitcher />
       <span class="user">admin</span>
-      <button class="topbar-action" type="button" onclick={() => void onRevokeAll()}>撤销全部会话</button>
-      <button class="topbar-action" type="button" onclick={() => void onLogout()}>退出</button>
+      <button class="topbar-action" type="button" onclick={() => void onRevokeAll()}>{$t('Revoke all sessions')}</button>
+      <button class="topbar-action" type="button" onclick={() => void onLogout()}>{$t('Log out')}</button>
     </nav>
   </header>
 
@@ -74,34 +77,35 @@
       id="primary-navigation"
       class:open={menuOpen}
       class="sidebar"
-      aria-label="主导航"
+      aria-label={$t('Primary navigation')}
       aria-hidden={mobile && !menuOpen ? 'true' : undefined}
       inert={mobile && !menuOpen}
     >
       <div class="sidebar-heading">
-        <span>控制台</span>
-        <button class="drawer-close" type="button" aria-label="关闭主导航" onclick={() => closeMenu(true)}>×</button>
+        <span>{$t('Console')}</span>
+        <button class="drawer-close" type="button" aria-label={$t('Close primary navigation')} onclick={() => closeMenu(true)}>×</button>
       </div>
+      <div class="sidebar-language"><LanguageSwitcher /></div>
       <nav>
         <a class:active={applicationsActive} aria-current={applicationsActive ? 'page' : undefined} href="#/" onclick={() => closeMenu()}>
           <span class="nav-icon" aria-hidden="true">▦</span>
-          应用
+          {$t('Applications')}
         </a>
         <a class:active={credentialsActive} aria-current={credentialsActive ? 'page' : undefined} href="#/credentials" onclick={() => closeMenu()}>
           <span class="nav-icon" aria-hidden="true">⌾</span>
-          Registry 凭据
+          {$t('Registry credentials')}
         </a>
         <a class:active={settingsActive} aria-current={settingsActive ? 'page' : undefined} href="#/settings" onclick={() => closeMenu()}>
           <span class="nav-icon" aria-hidden="true">◷</span>
-          系统设置
+          {$t('System settings')}
         </a>
       </nav>
     </aside>
     {#if menuOpen}
-      <button class="drawer-backdrop" type="button" aria-label="关闭主导航" onclick={() => closeMenu(true)}></button>
+      <button class="drawer-backdrop" type="button" aria-label={$t('Close primary navigation')} onclick={() => closeMenu(true)}></button>
     {/if}
     <div class="content-canvas">
-      {#if $timeSettings.warning}<p class="notice warning global-warning" role="alert">{$timeSettings.warning}</p>{/if}
+      {#if $timeSettings.unsupportedTimezone}<p class="notice warning global-warning" role="alert">{$t('This browser does not support {timezone}; times are temporarily displayed in UTC.', { timezone: $timeSettings.unsupportedTimezone })}</p>{/if}
       {#if children}{@render children()}{/if}
     </div>
   </div>

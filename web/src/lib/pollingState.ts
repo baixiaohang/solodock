@@ -1,22 +1,23 @@
 import type { PollState } from './types'
+import { translate, type Translate } from './i18n'
 
-const labels: Record<PollState['last_outcome'], string> = {
-  disabled: '已禁用',
-  scheduled: '已调度新 digest',
-  unchanged: 'digest 未变化',
-  config_pending_manual: '仅配置变化，等待手动部署',
-  busy_skipped: '应用忙，本轮已合并',
-  blocked_drift: '运行态漂移，已阻止',
-  blocked_attention: '需要管理员处理',
-  suppressed_failed_target: '失败 digest 已抑制',
-  registry_error: 'Registry 检查失败',
-  credential_error: 'Registry credential 失败',
-  invalid_source: '镜像引用无效',
-  cancelled: '检查已取消',
+const labels: Record<PollState['last_outcome'], Parameters<Translate>[0]> = {
+  disabled: 'Disabled',
+  scheduled: 'New digest scheduled',
+  unchanged: 'Digest unchanged',
+  config_pending_manual: 'Configuration changed; waiting for manual deployment',
+  busy_skipped: 'Application busy; this poll was coalesced',
+  blocked_drift: 'Runtime drift blocked deployment',
+  blocked_attention: 'Administrator attention required',
+  suppressed_failed_target: 'Failed digest suppressed',
+  registry_error: 'Registry check failed',
+  credential_error: 'Registry credential failed',
+  invalid_source: 'Invalid image reference',
+  cancelled: 'Check cancelled',
 }
 
-export function pollOutcomeText(state: PollState | null): string {
-  return state ? labels[state.last_outcome] : '尚未检查'
+export function pollOutcomeText(state: PollState | null, translateMessage: Translate = translate): string {
+  return state ? translateMessage(labels[state.last_outcome]) : translateMessage('Not checked yet')
 }
 
 export function pollNeedsAttention(state: PollState | null): boolean {

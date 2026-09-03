@@ -26,7 +26,7 @@ describe('registry credential form', () => {
     const user = userEvent.setup()
     render(Credentials)
     await user.type(screen.getByLabelText('Registry'), 'ghcr.io')
-    await user.type(screen.getByLabelText('Username'), 'robot')
+    await user.type(screen.getByLabelText('用户名'), 'robot')
     const secret = screen.getByLabelText('Token / password') as HTMLInputElement
     expect(secret.type).toBe('password')
     await user.type(secret, 'component-secret-canary')

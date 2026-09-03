@@ -1,13 +1,14 @@
 <script lang="ts">
   import type { SystemHealth } from '../lib/types'
-  import { formatBytes } from '../lib/presentation'
+  import { formatBytes, stateText } from '../lib/presentation'
+  import { t } from '../lib/i18n'
   let { health }: { health: SystemHealth } = $props()
 </script>
 
-<section class:degraded={health.status === 'degraded'} class="system-bar" aria-label="系统健康">
-  <div class="system-fact"><span class="label">Docker</span><strong>{health.docker.status}</strong><small>{health.docker.server_version ?? health.docker.error_code ?? '正在探测'}</small></div>
-  <div class="system-fact"><span class="label">恢复扫描</span><strong>{health.recovery.status}</strong><small>{health.recovery.issue_count} 个问题</small></div>
-  <div class="system-fact"><span class="label">主机内存可用</span><strong>{formatBytes(health.memory.available_bytes)}</strong><small>{health.memory.used_percent?.toFixed(1) ?? '—'}% 已用</small></div>
-  <div class="system-fact"><span class="label">状态盘可用</span><strong>{formatBytes(health.disk.state.available_bytes)}</strong><small>{health.disk.state.used_percent?.toFixed(1) ?? '—'}% 已用</small></div>
-  <div class="system-fact"><span class="label">实时连接</span><strong>{health.streams.active} / {health.streams.limit}</strong><small>有界 SSE</small></div>
+<section class:degraded={health.status === 'degraded'} class="system-bar" aria-label={$t('System health')}>
+  <div class="system-fact"><span class="label">Docker</span><strong>{stateText(health.docker.status, $t)}</strong><small>{health.docker.server_version ?? health.docker.error_code ?? $t('Detecting')}</small></div>
+  <div class="system-fact"><span class="label">{$t('Recovery scan')}</span><strong>{stateText(health.recovery.status, $t)}</strong><small>{$t('{count} issues', { count: health.recovery.issue_count })}</small></div>
+  <div class="system-fact"><span class="label">{$t('Host memory available')}</span><strong>{formatBytes(health.memory.available_bytes)}</strong><small>{$t('{percent}% used', { percent: health.memory.used_percent?.toFixed(1) ?? '—' })}</small></div>
+  <div class="system-fact"><span class="label">{$t('State disk available')}</span><strong>{formatBytes(health.disk.state.available_bytes)}</strong><small>{$t('{percent}% used', { percent: health.disk.state.used_percent?.toFixed(1) ?? '—' })}</small></div>
+  <div class="system-fact"><span class="label">{$t('Live connections')}</span><strong>{health.streams.active} / {health.streams.limit}</strong><small>{$t('Bounded SSE')}</small></div>
 </section>

@@ -10,6 +10,7 @@
   import Credentials from './views/Credentials.svelte'
   import DeploymentDetail from './views/DeploymentDetail.svelte'
   import Settings from './views/Settings.svelte'
+  import { t } from './lib/i18n'
 
   let route = window.location.hash
   const updateRoute = () => { route = window.location.hash }
@@ -31,7 +32,7 @@
 <svelte:head><title>SoloDock</title></svelte:head>
 
 {#if $auth.kind === 'loading'}
-  <main class="center-shell"><div class="spinner" aria-label="正在加载"></div></main>
+  <main class="center-shell"><div class="spinner" aria-label={$t('Loading')}></div></main>
 {:else if $auth.kind === 'setup' || $auth.kind === 'login'}
   <AuthView mode={$auth.kind} />
 {:else}

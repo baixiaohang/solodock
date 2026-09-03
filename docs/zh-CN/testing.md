@@ -77,6 +77,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - active/pending immutable network expectation、attachment/alias drift 和 Docker 自动 DNS names 子集语义；
 - bind allowlist、symlink/device/inode/data-root revalidation，以及每条 read-write bind 未确认、只读切换和重新确认；
 - HTTP health 五组数值范围与运行稳定窗口由 settings capability 驱动，Web 与 Rust domain 边界一致且 capability 缺失时 fail closed；
+- English 与简体中文 dictionary 在编译期保持 key 同构；locale 测试覆盖首次访问浏览器语言检测、显式已存偏好、刷新持久化、非法或不可用 storage 回退、立即切换、本地化时间和 document `lang` 属性；
 - SQLite bind roots 一次 bootstrap、revision 更新、引用保护与扫描失败关闭；
 - lifecycle、deploy、rollback、unregister和remove后的volume/bind/network canary保留。
 - `/proc/meminfo` 正常、缺失、非法和 overflow，system health 五列状态条与 pull 门禁共用同一 parser；

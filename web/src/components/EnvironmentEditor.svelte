@@ -8,6 +8,7 @@
   } from '../lib/environmentRows'
   import { EnvironmentTextError, parseEnvironmentText, serializeEnvironmentText } from '../lib/environmentText'
   import { issuesUnder, type FormIssue } from '../lib/formErrors'
+  import { localized, messageText, t } from '../lib/i18n'
 
   let {
     rows = $bindable(),
@@ -43,7 +44,7 @@
       && row.originalSensitive
       && row.sensitive
       && row.originalKey === row.key
-    return canKeep ? '已保存（留空保持）' : row.originalSensitive ? '请输入新值' : 'VALUE'
+    return canKeep ? $t('Saved (leave empty to keep)') : row.originalSensitive ? $t('Enter a new value') : 'VALUE'
   }
 
   function openTextMode() {
@@ -63,7 +64,7 @@
     } catch (cause) {
       clientIssue = cause instanceof EnvironmentTextError
         ? cause.issue
-        : { path: 'environment.public', code: 'ENV_TEXT_INVALID', message: '批量环境变量格式无效' }
+        : { path: 'environment.public', code: 'ENV_TEXT_INVALID', message: localized('Invalid bulk environment-variable format') }
     }
   }
 
@@ -100,51 +101,51 @@
 </script>
 
 <fieldset class="environment-editor">
-  <legend>环境变量</legend>
-  <div class="mode-switch" aria-label="普通环境变量编辑模式">
-    <button type="button" class:active={mode === 'rows'} onclick={openRowsMode}>逐行编辑</button>
-    <button type="button" class:active={mode === 'text'} onclick={openTextMode}>批量文本</button>
+  <legend>{$t('Environment variables')}</legend>
+  <div class="mode-switch" aria-label={$t('Public environment variable editing mode')}>
+    <button type="button" class:active={mode === 'rows'} onclick={openRowsMode}>{$t('Edit rows')}</button>
+    <button type="button" class:active={mode === 'text'} onclick={openTextMode}>{$t('Bulk text')}</button>
   </div>
   {#if mode === 'rows'}
-    <p class="muted">每行一条配置。普通值可直接编辑；已保存的 Secret 保持不可见，留空表示 keep，输入新值表示 replace。</p>
-    <div class="environment-header" aria-hidden="true"><span>名称</span><span>值</span><span>敏感</span><span>操作</span></div>
+    <p class="muted">{$t('Configure one variable per row. Public values can be edited directly. Stored secrets remain hidden; empty means keep and a new value means replace.')}</p>
+    <div class="environment-header" aria-hidden="true"><span>{$t('Name')}</span><span>{$t('Value')}</span><span>{$t('Sensitive')}</span><span>{$t('Actions')}</span></div>
     {#each activeRows as row (row.id)}
       {@const rowIssues = issuesForRow(row)}
       {@const rowPath = pathForRow(row)}
       <div class="environment-row" class:has-error={rowIssues.length > 0}>
-        <label><span class="sr-only">变量名</span><input data-issue-path={`${rowPath}.key`} value={row.key} oninput={(event) => update(row, 'key', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => issue.path.endsWith('.key')) ? 'true' : undefined} required placeholder="KEY" autocomplete="off" /></label>
-        <label><span class="sr-only">变量值</span><input data-issue-path={`${rowPath}.value`} type={row.sensitive ? 'password' : 'text'} value={row.value} oninput={(event) => update(row, 'value', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => !issue.path.endsWith('.key')) ? 'true' : undefined} placeholder={valuePlaceholder(row)} autocomplete={row.sensitive ? 'new-password' : 'off'} /></label>
-        <label class="sensitive-toggle"><input data-issue-path={rowPath} type="checkbox" checked={row.sensitive} onchange={(event) => updateSensitive(row, event.currentTarget.checked)} /> <span>敏感</span></label>
-        <button data-issue-path={row.sensitive ? 'environment.secrets' : 'environment.public'} type="button" class="ghost compact" onclick={() => remove(row)}>删除</button>
-        {#each rowIssues as issue}<p class="form-error editor-inline-error" role="alert">{issue.message}</p>{/each}
+        <label><span class="sr-only">{$t('Variable name')}</span><input data-issue-path={`${rowPath}.key`} value={row.key} oninput={(event) => update(row, 'key', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => issue.path.endsWith('.key')) ? 'true' : undefined} required placeholder="KEY" autocomplete="off" /></label>
+        <label><span class="sr-only">{$t('Variable value')}</span><input data-issue-path={`${rowPath}.value`} type={row.sensitive ? 'password' : 'text'} value={row.value} oninput={(event) => update(row, 'value', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => !issue.path.endsWith('.key')) ? 'true' : undefined} placeholder={valuePlaceholder(row)} autocomplete={row.sensitive ? 'new-password' : 'off'} /></label>
+        <label class="sensitive-toggle"><input data-issue-path={rowPath} type="checkbox" checked={row.sensitive} onchange={(event) => updateSensitive(row, event.currentTarget.checked)} /> <span>{$t('Sensitive')}</span></label>
+        <button data-issue-path={row.sensitive ? 'environment.secrets' : 'environment.public'} type="button" class="ghost compact" onclick={() => remove(row)}>{$t('Delete')}</button>
+        {#each rowIssues as issue}<p class="form-error editor-inline-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
       </div>
     {:else}
-      <p class="muted">尚无环境变量。</p>
+      <p class="muted">{$t('No environment variables.')}</p>
     {/each}
-    <button type="button" class="ghost" onclick={addPublic}>＋ 添加一行</button>
+    <button type="button" class="ghost" onclick={addPublic}>＋ {$t('Add row')}</button>
   {:else}
-    <label>普通环境变量（一行一个 KEY=VALUE）
-      <textarea data-issue-path="environment.public" aria-label="批量普通环境变量" rows="10" value={batchText} oninput={(event) => updateBatch(event.currentTarget.value)} aria-invalid={clientIssue || publicIssues.length ? 'true' : undefined} spellcheck="false" autocomplete="off"></textarea>
+    <label>{$t('Public environment variables (one KEY=VALUE per line)')}
+      <textarea data-issue-path="environment.public" aria-label={$t('Bulk public environment variables')} rows="10" value={batchText} oninput={(event) => updateBatch(event.currentTarget.value)} aria-invalid={clientIssue || publicIssues.length ? 'true' : undefined} spellcheck="false" autocomplete="off"></textarea>
     </label>
-    <p class="muted">按第一个 <code>=</code> 分隔；value 可为空或继续包含 <code>=</code>。不解析引号、注释、变量替换或 <code>export</code>。</p>
-    {#if clientIssue}<p class="form-error" role="alert">{clientIssue.message}</p>{/if}
-    {#each publicIssues as issue}<p class="form-error" role="alert">{issue.message}</p>{/each}
+    <p class="muted">{$t('Split at the first =. Values may be empty or contain additional = characters. Quotes, comments, variable expansion, and export are not parsed.')}</p>
+    {#if clientIssue}<p class="form-error" role="alert">{messageText(clientIssue.message, $t)}</p>{/if}
+    {#each publicIssues as issue}<p class="form-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
     <section class="secret-environment">
-      <h3>Secret（write-only）</h3>
-      <p class="muted">Secret 不进入批量文本；已保存的值不会回显，保存成功后输入会立即清空。</p>
+      <h3>{$t('Secret (write-only)')}</h3>
+      <p class="muted">{$t('Secrets are excluded from bulk text. Saved values are never returned, and inputs are cleared immediately after a successful save.')}</p>
       {#each secretRows as row (row.id)}
         {@const rowIssues = issuesForRow(row)}
         {@const rowPath = pathForRow(row)}
         <div class="environment-row secret-row">
-          <label>变量名<input data-issue-path={`${rowPath}.key`} value={row.key} oninput={(event) => update(row, 'key', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => issue.path.endsWith('.key')) ? 'true' : undefined} required placeholder="KEY" autocomplete="off" /></label>
-          <label>Secret 值<input data-issue-path={`${rowPath}.value`} type="password" value={row.value} oninput={(event) => update(row, 'value', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => !issue.path.endsWith('.key')) ? 'true' : undefined} placeholder={valuePlaceholder(row)} autocomplete="new-password" /></label>
+          <label>{$t('Variable name')}<input data-issue-path={`${rowPath}.key`} value={row.key} oninput={(event) => update(row, 'key', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => issue.path.endsWith('.key')) ? 'true' : undefined} required placeholder="KEY" autocomplete="off" /></label>
+          <label>{$t('Secret value')}<input data-issue-path={`${rowPath}.value`} type="password" value={row.value} oninput={(event) => update(row, 'value', event.currentTarget.value)} aria-invalid={rowIssues.some((issue) => !issue.path.endsWith('.key')) ? 'true' : undefined} placeholder={valuePlaceholder(row)} autocomplete="new-password" /></label>
           <span></span>
-          <button data-issue-path="environment.secrets" type="button" class="ghost compact" onclick={() => remove(row)}>删除</button>
-          {#each rowIssues as issue}<p class="form-error editor-inline-error" role="alert">{issue.message}</p>{/each}
+          <button data-issue-path="environment.secrets" type="button" class="ghost compact" onclick={() => remove(row)}>{$t('Delete')}</button>
+          {#each rowIssues as issue}<p class="form-error editor-inline-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
         </div>
-      {:else}<p class="muted">尚无 Secret。</p>{/each}
-      <button type="button" class="ghost" onclick={addSecret}>＋ 添加 Secret</button>
+      {:else}<p class="muted">{$t('No secrets.')}</p>{/each}
+      <button type="button" class="ghost" onclick={addSecret}>＋ {$t('Add secret')}</button>
     </section>
   {/if}
-  {#each sectionIssues as issue}<p class="form-error" role="alert">{issue.message}</p>{/each}
+  {#each sectionIssues as issue}<p class="form-error" role="alert">{messageText(issue.message, $t)}</p>{/each}
 </fieldset>

@@ -1,17 +1,18 @@
 import { writable } from 'svelte/store'
 import { api } from './api'
 import type { SettingsResponse } from './types'
+import { currentLocale, type Locale } from './i18n'
 
 export interface TimeDisplayState {
   configuredTimezone: string
   timezone: string
-  warning: string | null
+  unsupportedTimezone: string | null
 }
 
 export const timeSettings = writable<TimeDisplayState>({
   configuredTimezone: 'UTC',
   timezone: 'UTC',
-  warning: null,
+  unsupportedTimezone: null,
 })
 
 export async function loadTimeSettings(): Promise<SettingsResponse> {
@@ -25,27 +26,25 @@ export function applyTimeSettings(settings: Pick<SettingsResponse, 'display_time
   timeSettings.set({
     configuredTimezone: settings.display_timezone,
     timezone: supported ? settings.display_timezone : 'UTC',
-    warning: supported
-      ? null
-      : `当前浏览器不支持 ${settings.display_timezone}，界面暂时按 UTC 显示。`,
+    unsupportedTimezone: supported ? null : settings.display_timezone,
   })
 }
 
 export function browserSupportsTimezone(timezone: string): boolean {
   try {
-    new Intl.DateTimeFormat('zh-CN', { timeZone: timezone }).format(new Date(0))
+    new Intl.DateTimeFormat('en', { timeZone: timezone }).format(new Date(0))
     return true
   } catch {
     return false
   }
 }
 
-export function formatTimestamp(value: string | null | undefined, timezone: string): string {
+export function formatTimestamp(value: string | null | undefined, timezone: string, locale: Locale = currentLocale()): string {
   if (!value) return '—'
   const parsed = new Date(value)
   if (Number.isNaN(parsed.valueOf())) return '—'
   try {
-    return new Intl.DateTimeFormat('zh-CN', {
+    return new Intl.DateTimeFormat(locale, {
       timeZone: timezone,
       year: 'numeric',
       month: '2-digit',
@@ -56,7 +55,7 @@ export function formatTimestamp(value: string | null | undefined, timezone: stri
       hourCycle: 'h23',
     }).format(parsed)
   } catch {
-    return new Intl.DateTimeFormat('zh-CN', {
+    return new Intl.DateTimeFormat(locale, {
       timeZone: 'UTC',
       year: 'numeric',
       month: '2-digit',
