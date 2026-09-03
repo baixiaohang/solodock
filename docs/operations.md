@@ -6,7 +6,13 @@ Start with the [product scope](product-scope.md). See the [application model](ap
 
 ## Installation and upgrade
 
-The production target is Ubuntu 24.04 x86_64 with Docker Engine, the `docker` group/socket, systemd, and Docker Compose v2.24+. Stable GitHub Releases provide a long-lived package and require GitHub CLI authentication plus `gh attestation verify`; they do not require Rust, Node.js, npm, or Git on the host.
+The production target is Ubuntu 24.04 x86_64 with Docker Engine, the `docker` group/socket, systemd, and Docker Compose v2.24+. Stable GitHub Releases provide a long-lived package and require GitHub CLI authentication plus the `gh attestation verify` capability; they do not require Rust, Node.js, npm, or Git on the host. Distribution packages can lag behind GitHub CLI capabilities. Install or upgrade `gh` with GitHub's [official Linux instructions](https://github.com/cli/cli/blob/trunk/docs/install_linux.md), and treat this capability check—not a permanently documented version number—as authoritative:
+
+```bash
+gh attestation verify --help
+gh auth login --hostname github.com
+gh auth status
+```
 
 The following Bash session selects GitHub's actual Latest Release, verifies that it is published and stable, requires its canonical `vMAJOR.MINOR.PATCH` tag, resolves the tag to an immutable commit, downloads the three exact assets, verifies the `SHA256SUMS` provenance and source identity, checks both checksum layers, and installs the packaged binary:
 
@@ -49,7 +55,9 @@ The package's checksummed `INSTALL_MANIFEST` binds its `stable` channel, version
 The installer also installs `/usr/local/bin/solodock-update`. Log in once with the day-to-day administrator account; its token needs only the read access required for the repository, Release or Actions artifact, and artifact attestation. Never place the token in scripts, configuration, or command arguments:
 
 ```bash
+gh attestation verify --help
 gh auth login --hostname github.com
+gh auth status
 solodock-update
 ```
 
