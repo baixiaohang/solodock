@@ -1,31 +1,47 @@
-# 贡献指南
+# Contributing to SoloDock
 
-感谢你改进 SoloDock。提交改动前，请先阅读 [产品范围](docs/product-scope.md)、[架构](docs/architecture.md) 和 [威胁模型](docs/threat-model.md)，保持单主机、单管理员、单 service 应用模型及现有安全边界。
+Thank you for improving SoloDock. Before proposing a change, read the [product scope](docs/product-scope.md), [architecture](docs/architecture.md), and [threat model](docs/threat-model.md). Preserve the single-host, single-administrator, single-service application model and its existing security boundaries.
 
-## 开发流程
+Repository documentation and GitHub-visible collaboration use English. Simplified Chinese files under `docs/zh-CN/` and `README.zh-CN.md` are translations; the English versions are authoritative.
 
-1. 从最新 `main` 创建短生命周期分支。
-2. 保持改动小而可审查；行为变化应更新最低层级的确定性测试和相关文档。
-3. 只运行与改动直接相关的本地验证；Docker E2E 必须使用隔离 daemon 或明确的测试 context。
-4. 创建 Pull Request，说明行为、风险和已运行的验证。
-5. 等待 `ci-gate` 和其他必需检查通过并解决 review 意见。外部 fork 的 workflow 需要维护者人工批准后才会运行。
+## Development workflow
 
-常用验证命令见 [README](README.md)。测试并发度不得大于 2。
+1. Create a short-lived branch from the latest `main`.
+2. Keep the change small and reviewable. Behavior changes should add deterministic tests at the lowest useful layer and update both language versions of affected documentation.
+3. Run only the local validation directly related to the change. Docker E2E must use an isolated daemon or an explicit test context.
+4. Open a Pull Request in English and describe the behavior, risks, security or data impact, documentation synchronization, and validation performed.
+5. Wait for `ci-gate` and all other required checks, then resolve review feedback. Workflows from external forks require maintainer approval before they run.
 
-## 安全要求
+Test concurrency must not exceed 2. Select only the commands relevant to the change:
 
-- 不要提交密码、token、私钥、真实生产域名/IP、宿主实例路径或客户数据。
-- 不要让 Secret 原值进入 Compose、日志、错误、审计、普通 API 响应或命令行参数。
-- 不要扩大 Docker socket、非 loopback 监听、任意 host bind、volume 删除或 shell/exec 能力。
-- GitHub Actions 必须使用最小权限；第三方 action 必须固定到完整 commit SHA。
-- 安全漏洞请按 [安全策略](SECURITY.md) 私下报告，不要创建公开 Issue。
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features -- --test-threads=2
 
-## 提交约定
-
-Commit Message 遵循 Conventional Commits。类型与可选 scope 使用英文，subject 和 body 默认使用简体中文，例如：
-
-```text
-fix(auth): 拒绝过期会话
+cd web
+npm ci
+npm run check
+npm run test
+npm run build
 ```
 
-仓库采用 [Apache License 2.0](LICENSE)。提交贡献即表示你有权提供该内容，并同意其按仓库许可证发布。
+See [testing and safety guardrails](docs/testing.md) for Docker isolation, CI classification, and documentation-only checks.
+
+## Security requirements
+
+- Do not commit passwords, tokens, private keys, production hostnames/IPs, instance-specific host paths, or customer data.
+- Never allow secret plaintext to enter Compose, logs, errors, audit records, ordinary API responses, or command-line arguments.
+- Do not expand Docker socket access, non-loopback listening, arbitrary host binds, volume deletion, or shell/exec capabilities.
+- GitHub Actions must use least privilege, and every third-party action must be pinned to a full commit SHA.
+- Report vulnerabilities privately under the [security policy](SECURITY.md), not through a public Issue.
+
+## Commit messages
+
+Use Conventional Commits and write the type, optional scope, subject, and body in English. For example:
+
+```text
+fix(auth): reject expired sessions
+```
+
+SoloDock uses the [Apache License 2.0](LICENSE). By contributing, you confirm that you have the right to provide the contribution and agree that it will be licensed under the repository license.

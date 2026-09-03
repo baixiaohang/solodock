@@ -1,108 +1,110 @@
-# SoloDock 应用模型
+# SoloDock application model
 
-SoloDock 只管理结构化的单 service 应用。管理员填写受支持字段，系统生成并验证 canonical Compose；不存在通用 Compose 导入或原始 YAML 编辑入口。
+> English (authoritative) · [简体中文](zh-CN/application-model.md)
 
-## 应用、draft 与 project
+SoloDock manages only structured, single-service applications. The administrator fills supported fields, and SoloDock generates and validates canonical Compose. There is no general Compose import or raw YAML editor.
 
-应用拥有不可变 UUID 与不可变 slug。UUID 是 API path、filesystem directory 和 ownership label 的权威身份；新应用的 slug 必须全局唯一，由 1–20 个小写 ASCII 字母、数字或连字符组成且首尾为字母或数字。slug 创建后不能更新，`display_name` 仍可修改。
+## Applications, drafts, and projects
 
-资源命名只有一个版本化 helper。Compose project 为 `solodock-<slug>`，默认容器名通常为 `solodock-<slug>-app-1`，owned network 为 `solodock-<slug>-default`，owned volume 为 `solodock-<slug>.<logical-name>`。旧 naming v1 应用继续使用 `sd-<slug>` bridge；新 naming v2 应用使用 UUID 派生的 `sd-<12-char-token>`，从而允许 20 字符 slug 且不改变历史 UFW/nftables identity。不允许用户设置 `container_name` 或任意 Docker resource name。
+An application has an immutable UUID and immutable slug. The UUID is the authoritative identity in API paths, filesystem directories, and ownership labels. A new slug must be globally unique, contain 1–20 lowercase ASCII letters, digits, or hyphens, and begin and end with a letter or digit. A slug cannot change after creation; `display_name` remains editable.
 
-空白创建只写 app metadata，不伪造空 config revision，也不创建 Docker 资源。此时详情状态为 `UNCONFIGURED`，draft/image/credential/active/pending 均为空且 desired state 为 stopped。第一次保存配置与普通更新复用同一 revision mutation，只有当前没有 draft 时才接受 `expected_revision = null`；deploy/start/poll/webhook 对未配置应用确定性返回 `APP_UNCONFIGURED`。
+A single versioned helper controls resource naming. The Compose project is `solodock-<slug>`, the default container is normally `solodock-<slug>-app-1`, an owned network is `solodock-<slug>-default`, and an owned volume is `solodock-<slug>.<logical-name>`. Legacy naming-v1 applications retain their `sd-<slug>` bridge. New naming-v2 applications use a stable UUID-derived `sd-<12-char-token>` bridge, allowing 20-character slugs without changing historical UFW/nftables identities. Users cannot set `container_name` or arbitrary Docker resource names.
 
-`app.toml` 指向当前 draft config revision，并记录 desired state、Registry polling 配置和最后一次文件系统 mutation。每次编辑先完整发布新的 `config-revisions/<revision-id>/`，最后原子替换 metadata 作为 commit point。已经发布的 release 固定引用自己的 config revision，因此后续 draft 编辑不会改变 active 或 pending 容器挂载的内容。
+Blank creation writes only application metadata; it does not fabricate an empty config revision or create Docker resources. The detail state is then `UNCONFIGURED`; draft, image, credential, active, and pending are empty, and desired state is stopped. The first configuration save reuses the normal revision mutation and accepts `expected_revision = null` only when no draft exists. Deploy, start, poll, and webhook operations deterministically return `APP_UNCONFIGURED` for an unconfigured application.
 
-draft 还包含应用级 `stop_grace_period_seconds`，范围为 `1–600`，默认 `10`。发布时该值与 config revision 一起固定进 immutable release，并生成 Compose `services.app.stop_grace_period`。它表示 SIGTERM 后允许服务收尾的最长时间，而非固定等待；服务提前退出时 lifecycle 或部署立即继续。缺少该字段的旧 config revision 和 release 按 `10` 秒解释，并继续使用原 canonical hash/HMAC。
+`app.toml` points to the current draft config revision and records desired state, Registry polling configuration, and the last filesystem mutation. Every edit fully publishes a new `config-revisions/<revision-id>/` before atomically replacing metadata as the commit point. A published release pins its own config revision, so later draft edits cannot alter the files mounted by an active or pending container.
 
-## 镜像与 credential
+The draft also contains `stop_grace_period_seconds`, with a range of `1–600` and a default of `10`. A release pins this value with its config revision and emits Compose `services.app.stop_grace_period`. It is the maximum time allowed for graceful shutdown after SIGTERM, not a fixed delay; lifecycle or deployment proceeds as soon as the service exits. Legacy config revisions and releases without this field are interpreted as `10` seconds and retain their original canonical hash/HMAC.
 
-draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry 发现；实际 release 和 Compose 使用：
+## Images and credentials
+
+A draft stores a tagged discovery image reference. The tag is used only for Registry discovery. Releases and Compose use:
 
 ```text
 <canonical-registry>/<repository>@sha256:<manifest-digest>
 ```
 
-多平台镜像同时记录 source descriptor、可选 index digest、选中的 OS/architecture/variant、manifest digest 和 image config digest。历史 v2 release 仍以 `local_image_id` 键序列化 config digest，以保持 HMAC 和存量文件兼容。Docker Engine 的 image/container observation 可能以 config digest 或选中的 manifest digest 表示 image ID；SoloDock 用同一身份对象匹配两者。旧/classic daemon 未返回 manifest descriptor 时回退到该 digest 集合。Docker 29 containerd image store 的原始 `ImageInspect.Descriptor` 可能带 digest 但缺 platform；Docker adapter 只用同一次 `ImageInspect` 响应的顶层 OS/architecture/variant 补齐缺项，形成 effective observation，不覆盖 descriptor 已有值。effective descriptor 一旦存在，其 digest 和 canonical platform 仍必须完整匹配，缺字段、格式错误或值不符都 fail closed；`ContainerInspect.ImageManifestDescriptor` 没有该 fallback，始终按自身字段严格校验。应用可引用一个 logical registry 精确匹配的 write-only Registry credential；credential 生命周期见 [部署与回滚](deployments.md)。
+For a multi-platform image, SoloDock records the source descriptor, optional index digest, selected OS/architecture/variant, manifest digest, and image config digest. Historical v2 releases still serialize the config digest under `local_image_id` to preserve HMAC and stored-file compatibility. Docker Engine may represent an image/container ID as either the config digest or selected manifest digest; SoloDock matches both through one identity object. Legacy/classic daemons that do not return a manifest descriptor fall back to that digest set. With Docker 29's containerd image store, raw `ImageInspect.Descriptor` may include a digest but omit its platform. The Docker adapter fills only missing OS/architecture/variant fields from the top-level fields in the same `ImageInspect` response, creating an effective observation without overwriting descriptor values. Once an effective descriptor exists, its digest and canonical platform must match completely; missing, malformed, or conflicting values fail closed. `ContainerInspect.ImageManifestDescriptor` has no such fallback and is always validated from its own fields. An application may reference one write-only Registry credential whose logical registry matches exactly. See [deployments and rollback](deployments.md) for credential lifecycle.
 
-## 环境变量
+## Environment variables
 
-环境变量只有一份规范数据。配置页的 public 环境变量可以在逐行编辑器与批量 `KEY=VALUE` 文本之间无损切换；批量模式按第一个 `=` 分隔，忽略空行，并对缺少分隔符、非法或重复 key 给出行号。Secret 始终留在独立的 write-only 逐行区域，不进入批量文本，也不使用可被误提交的占位值。
+Environment variables have one canonical data model. Public variables can switch losslessly between a row editor and bulk `KEY=VALUE` text. Bulk mode splits on the first `=`, ignores blank lines, and reports line numbers for missing separators, invalid keys, and duplicate keys. Secrets remain in a separate write-only row editor; they never enter bulk text or use placeholders that could be submitted accidentally.
 
-- public 值可以读取和编辑；
-- 已保存的 secret 只显示“已保存”占位且 value 保持空白；留空、输入新值和删除行分别投影为 `keep`、`replace`、`delete`；
-- API、UI、SQLite、release、Compose、audit、错误和 tracing 不回显 secret；
-- public/secret 分类转换必须显式删除旧分类并提交新分类；
-- 重复 key、非法名称、插值或命令替换语法会被拒绝。
+- Public values can be read and edited.
+- A saved secret displays only a "saved" marker with a blank value. Leaving blank, entering a new value, or deleting the row maps to `keep`, `replace`, or `delete`.
+- The API, UI, SQLite, releases, Compose, audit, errors, and tracing never echo secrets.
+- Moving a key between public and secret classifications requires explicit deletion from the old class and submission to the new class.
+- Duplicate keys, invalid names, interpolation, and command substitution syntax are rejected.
 
-生成的 Compose 不含 secret 原值，只引用权限受限的受管文件。
+Generated Compose contains no secret plaintext; it references permission-constrained managed files.
 
-## 受管文件
+## Managed files
 
-受管文本文件包含 logical name、容器 target path、sensitive 标记和只读属性。public 内容可读取；secret 内容使用与环境变量相同的 write-only operation。配置 revision 对单文件和总量设置配额，并将 public/secret 内容存入不同权限边界。
+A managed text file has a logical name, container target path, sensitive flag, and read-only property. Public contents can be read. Secret contents use the same write-only operation model as secret environment variables. Config revisions enforce per-file and aggregate quotas and store public and secret contents in separate permission boundaries.
 
-宿主上的 state root、应用目录、config revision 及 `files/{public,secret}` 目录保持 `0700 solodock:solodock`；只有实际 bind mount 的 `files/public/<logical-name>` 与 `files/secret/<logical-name>` direct leaf 是精确 `0444 solodock:solodock`。因此任意常见非 root 容器 UID/GID 可以读取显式挂入自己的文件，而普通宿主用户仍无法穿过私有 ancestor 枚举或读取 state tree。环境 secret、Registry/webhook credential、SQLite、release metadata 和其他控制面文件不使用该例外，继续保持私有文件权限。
+On the host, the state root, application directory, config revision, and `files/{public,secret}` directories remain `0700 solodock:solodock`. Only a direct leaf mounted into a container at `files/public/<logical-name>` or `files/secret/<logical-name>` is exactly `0444 solodock:solodock`. This lets common non-root container UIDs/GIDs read a file explicitly mounted into their container while ordinary host users cannot traverse or enumerate the private state tree. Environment secrets, Registry/webhook credentials, SQLite, release metadata, and other control-plane files do not use this exception and remain private.
 
-所有受管文件仍以 Compose `read_only: true` 挂载，容器不能写回宿主 inode。需要容器写入的持久内容必须使用 volume 或显式确认的 read-write bind，不能借受管文件绕过 secret、配额或不可变 release 语义。每次发布在私有 temp revision 内写完、显式设置最终 mode 并 fsync 后才原子可见；部署前 strict loader 会拒绝 mode、owner、类型或 symlink 漂移，并沿用相应部署阶段的配置或 release 无效错误。
+Compose still mounts every managed file with `read_only: true`, so the container cannot write to the host inode. Persistent writable content must use a volume or an explicitly confirmed read-write bind, not managed files that bypass secret, quota, or immutable-release semantics. Publication writes into a private temporary revision, applies the final mode, and fsyncs before the revision becomes atomically visible. Before deployment, the strict loader rejects mode, owner, file-type, or symlink drift and returns the configuration- or release-invalid error appropriate to that deployment phase.
 
-## Port、volume、bind 与 network
+## Ports, volumes, binds, and networks
 
-### Port
+### Ports
 
-发布 port 必须显式使用 loopback host IP，并区分 TCP/UDP。SoloDock 不接受非 loopback 应用发布地址。
+Published ports must explicitly use a loopback host IP and specify TCP or UDP. SoloDock rejects non-loopback application publishing.
 
-### Named volume
+### Named volumes
 
-- owned volume 由应用 logical name 映射到内部 Compose resource key；
-- external volume 必须预先存在，SoloDock 不改变其 ownership；
-- lifecycle、deploy、rollback、unregister、remove 和 deletion 均不传入 volume 删除参数。
+- An owned volume maps an application logical name to an internal Compose resource key.
+- An external volume must already exist; SoloDock does not change its ownership.
+- Lifecycle, deploy, rollback, unregister, remove, and deletion never pass volume-deletion flags.
 
-### Bind mount
+### Bind mounts
 
-允许 bind 的根目录由 SQLite 全局设置维护，默认空，即默认禁用 bind。升级时 TOML `allowed_bind_roots` 只做一次 bootstrap import；此后 UI/SQLite 是唯一事实源。删除仍被 draft、active 或 pending revision 引用的 root 会返回冲突。启用后：
+SQLite global settings maintain the allowed bind roots. The default list is empty, so binds are disabled by default. During upgrade, TOML `allowed_bind_roots` is imported only once; the UI and SQLite are authoritative afterward. Removing a root still referenced by a draft, active, or pending revision returns a conflict. When binds are enabled:
 
-- root 必须是既有、绝对、无 symlink 的私有安全路径；
-- source 必须是 root 的严格子目录，不能直接挂载整个 root；
-- root/source 不能与 state、runtime、Docker socket、敏感系统目录或 daemon 实际 data-root 重叠；
-- validate、preview 和每次 Docker effect 前都会重新检查 canonical path、symlink、device/inode 和 data-root；
-- 默认只读；每一条 read-write bind 都必须在对应行显式确认“不能随 release 回滚”，改回只读或重新切为读写会重置该确认；
-- SoloDock 不创建、`chown`、`chmod`、备份或删除 source。
+- a root must be an existing, absolute, symlink-free private path;
+- a source must be a strict descendant, never the root itself;
+- neither root nor source may overlap state, runtime, the Docker socket, sensitive system directories, or the daemon's actual data root;
+- validate, preview, and every Docker effect recheck the canonical path, symlinks, device/inode, and data root;
+- binds are read-only by default; each read-write bind must explicitly acknowledge in its own row that release rollback cannot revert it, and changing to read-only and back resets that acknowledgment;
+- SoloDock never creates, `chown`s, `chmod`s, backs up, or deletes a source.
 
-### Network
+### Networks
 
-新应用默认同时挂载应用 owned default network 和平台内部服务发现网络。owned network 的 bridge identity 由应用 naming schema 决定；平台网络固定为 internal `solodock-services`、host bridge `sd-services`，并带精确 platform ownership labels。首次需要时由唯一 manager inspect-or-create；同名资源的 driver、internal、bridge 或 labels 不匹配时 fail closed，绝不接管。应用在平台网络上的 DNS alias 为 slug，因此可通过 `<slug>:<container-port>` 互通。平台网络不随单个应用删除。
+New applications attach by default to both the application's owned default network and the platform's internal service-discovery network. The owned network bridge identity follows the application's naming schema. The platform network is the internal `solodock-services` network with host bridge `sd-services` and exact platform ownership labels. A single manager inspects or creates it on first use. A same-named resource with mismatched driver, internal flag, bridge, or labels fails closed and is never adopted. The application's DNS alias on the platform network is its slug, enabling `<slug>:<container-port>` communication. The platform network is not deleted with any single application.
 
-config schema 1/2 与 release schema 3/4 的 `service_discovery_enabled` 有效值固定为 `false`，即使向旧签名域注入该字段也不能扩大网络权限。旧应用只有显式保存新 revision/release 后才加入。配置还可加入最多 8 个显式存在的 external network，或按高级设置关闭 owned/platform network；若三类网络均关闭则拒绝配置。
+In config schemas 1/2 and release schemas 3/4, the only valid `service_discovery_enabled` value is `false`; injecting the field into an old signed domain cannot expand network access. Existing applications join the platform network only after explicitly saving a new revision/release. Configuration may also attach up to 8 existing external networks or disable owned/platform networking in advanced settings. A configuration with all three categories disabled is rejected.
 
-每个 external attachment 可为当前唯一 `app` service 配置最多 8 个稳定 alias。Alias 是小写 DNS label，在同一 attachment 内唯一；网络与 alias 都按 canonical 顺序进入 config SHA、release 完整性和 Compose。无 alias 的旧 release 继续使用 Compose networks 短语法，默认布尔值与空 alias 不参与旧 canonical serialization。
+Each external attachment can assign up to 8 stable aliases to the sole `app` service. An alias is a lowercase DNS label unique within the attachment. Networks and aliases enter config SHA, release integrity, and Compose in canonical order. Legacy releases without aliases keep Compose network short syntax; default booleans and empty aliases do not enter legacy canonical serialization.
 
-External network 必须由管理员预先创建。effect 前的 fresh Docker snapshot 会验证网络存在性、成员 full ID 与有效 DNS names；alias 被无关容器占用、成员观察不完整或发生变化时 fail closed，只有 caller 已精确验证的待替换旧容器 full ID 可被忽略。SoloDock 永不创建、修改或删除 external network；取消注册或移除容器时也保留 owned network。
+Administrators must create external networks in advance. Before an effect, a fresh Docker snapshot validates network existence, member full IDs, and effective DNS names. An alias held by an unrelated container, incomplete member observation, or intervening change fails closed. Only the exact full ID of a verified predecessor container may be ignored. SoloDock never creates, modifies, or removes an external network. Unregister and container removal also preserve owned networks.
 
-volume、bind 和受管文件的容器 target path 必须互不冲突。preview 会展示规范化后的 source/target、只读状态以及资源是 owned 还是 external。
+Container target paths for volumes, binds, and managed files must not conflict. Preview shows canonical source and target, read-only state, and owned/external status.
 
-## 健康策略
+## Health policies
 
-应用选择一种 health policy：
+An application selects one health policy:
 
-- `healthy`：要求 Docker health 达到 `healthy`，可使用镜像内置或结构化 HTTP healthcheck；
-- `running`：同一容器在稳定窗口内持续处于 running，默认 15 秒；
-- `completed`：一次性工作负载以退出码 0 完成；
-- `disabled`：显式确认降低安全性，只证明容器达到有限运行条件。
+- `healthy`: require Docker health to become `healthy`, using either the image healthcheck or a structured HTTP healthcheck;
+- `running`: require the same container to remain running for a stability window, default 15 seconds;
+- `completed`: require a one-shot workload to exit with code 0;
+- `disabled`: explicitly acknowledge reduced safety and prove only a bounded running condition.
 
-健康策略用于 deployment commit 和 rollback verification。更改 draft policy 不会追溯改变既有 release。
+The health policy governs deployment commit and rollback verification. Changing a draft policy does not retroactively alter existing releases.
 
-健康检查的数值范围与默认值由 Rust domain 常量定义，并通过 `GET /api/v1/settings` 的 `configuration_limits.health` 投影给 Web；前端不复制另一套边界。capability 不可用时配置编辑 fail closed，避免浏览器接受后端必然拒绝的值。
+Rust domain constants define healthcheck numeric limits and defaults. `GET /api/v1/settings` exposes them to the Web UI under `configuration_limits.health`; the frontend does not maintain a second set of limits. Configuration editing fails closed if the capability is unavailable, preventing the browser from accepting values the backend must reject.
 
-## 生命周期与删除
+## Lifecycle and deletion
 
-start、stop、restart 和 remove 只作用于通过 project/service/app/release/schema/full container ID 完整 ownership 校验的对象。stop/restart 使用被操作 release 固定的停机宽限；remove 先以同一宽限显式 stop，再移除已停止容器。unmanaged、stale、multiple 或 malformed candidate 一律 fail closed。
+Start, stop, restart, and remove act only on objects that pass complete project/service/application/release/schema/full-container-ID ownership validation. Stop and restart use the operated release's pinned grace period. Remove explicitly stops with that same grace period before deleting the stopped container. Unmanaged, stale, multiple, or malformed candidates always fail closed.
 
-删除是两阶段协议：
+Deletion is a two-phase protocol:
 
-1. preview 从 fresh filesystem、active/pending/draft config 和精确 Docker observation 生成 canonical facts；
-2. DELETE 提交 confirmation token、slug 和 disposition，并在 token consume 与 tombstone 前重算 facts hash。
+1. Preview builds canonical facts from fresh filesystem data, active/pending/draft configurations, and exact Docker observations.
+2. DELETE submits the confirmation token, slug, and disposition and recomputes the facts hash before token consumption and before the filesystem tombstone.
 
-preview 合并 active、pending 与 draft 中的文件、volume、bind、network，并区分实际存在与仅配置。Network fact 带 owned/external kind、owned bridge name、排序后的 aliases 和配置 scope；external-only revision 不虚构 owned default network。已配置或 degraded webhook 会保守提示其 write-only secret 随 app tombstone 永久删除。
+Preview merges files, volumes, binds, and networks from active, pending, and draft, distinguishing present resources from configured-only resources. Network facts include owned/external kind, owned bridge name, sorted aliases, and configuration scope; an external-only revision does not invent an owned default network. A configured or degraded webhook conservatively warns that its write-only secret is permanently deleted with the application tombstone.
 
-默认 deletion 只 unregister。显式 remove 也只移除 token 绑定的精确 owned container；所有 volume、bind 内容和 network 继续保留。删除与 stream producer 之间使用可回滚 barrier，只有 filesystem tombstone commit 后才永久阻止该 app 的新流。
+Deletion unregisters by default. Explicit removal still removes only the exact owned container bound to the token; all volumes, bind contents, and networks remain. A rollback-capable barrier coordinates deletion with stream producers, and new streams become permanently unavailable only after the filesystem tombstone commits.
 
-部署、active/pending 和 rollback 语义见 [部署与回滚](deployments.md)，恢复时的文件权限与链接约束见 [恢复](recovery.md)。
+See [deployments and rollback](deployments.md) for active/pending and rollback semantics, and [recovery](recovery.md) for file-permission and link requirements.

@@ -1,30 +1,35 @@
-# 文档编写与维护规范
+# Documentation authoring and maintenance
 
-本文件适用于 `docs/` 目录，并可独立约束文档变更。仓库根目录存在项目级协作说明时，开发、安全和 Git 约束同时以其为准。
+This file applies to the entire `docs/` tree and independently governs documentation changes. When the repository root contains project-wide instructions, its development, security, Git, and language rules also apply.
 
-## 语言与格式
+## Language, pairing, and format
 
-- 文档默认使用简体中文；代码标识符、命令、环境变量、API 路径、错误码和产品专有名词保持英文。
-- 普通文档文件名使用 `kebab-case.md`；约定入口 `AGENTS.md` 和 `CLAUDE.md` 除外。文档间优先使用相对链接。
-- 只在图表、目录图或数据示例能显著帮助理解时使用它们，避免复制容易随代码漂移的大段实现细节。
-- 本仓库采用 Apache-2.0；文档不得引入实例专属的主机路径、网络标识、部署凭据或其他私有运维信息。
+- English is the authoritative documentation language. Keep authoritative topic documents at `docs/<name>.md` and their Simplified Chinese translations at `docs/zh-CN/<name>.md` with identical relative paths and filenames.
+- Every English topic document under `docs/` must have a Simplified Chinese counterpart, and every Simplified Chinese topic document must map to an English authoritative document. `AGENTS.md` and the `CLAUDE.md` symlink are instruction files, not topic documents; do not create localized copies of them.
+- Put a language switch at the top of every paired document. State that the English version is authoritative. English pages link to `zh-CN/<name>.md`; Chinese pages link to `../<name>.md`.
+- Changes to behavior, APIs, configuration, operations, security, or test guardrails must update both language versions in the same Pull Request. A translation-only wording correction may change only the Chinese file when it does not alter meaning.
+- If the two versions disagree, fix the translation; the English version remains authoritative.
+- Use `kebab-case.md` for ordinary document filenames. `AGENTS.md` and `CLAUDE.md` are conventional exceptions. Prefer relative links between documents.
+- Preserve canonical code identifiers, commands, environment variables, API paths, error codes, and product names in both languages.
+- Use diagrams, directory trees, or data examples only when they materially aid understanding. Avoid copying large implementation details that will drift from the code.
+- SoloDock uses Apache-2.0. Documentation must not include instance-specific host paths, network identifiers, deployment credentials, or other private operational data.
 
-## 目录职责与生命周期
+## Directory responsibilities and lifecycle
 
-- `proposals/` 保存尚未完整实现并经确认的设计。实现期间，已确认 proposal 是产品边界和验收标准的设计合约。
-- 功能实现后，把仍然有效的架构、不变量和运维要求整理到对应专题文档；不要让已完成 proposal 永久充当当前实现说明。
-- 不为同一事实新增“补丁文档”。发现冲突时，应修正权威文档或实现，并删除过期表述。
+- `proposals/` holds designs that have not yet been fully implemented and confirmed. During implementation, an approved proposal is the design contract for product boundaries and acceptance criteria.
+- After a feature is implemented, move still-valid architecture, invariants, and operational requirements into the paired topic documents. Do not leave a completed proposal as the permanent description of current behavior.
+- Do not add "patch documents" for the same fact. Correct the authoritative documentation or implementation and remove stale statements.
 
-## 事实来源
+## Sources of truth
 
-- 当前实际行为以代码、测试、配置 schema 和 migration 为准。
-- 目标产品边界以维护者已确认的需求和当前已确认 proposal 为准，直到维护者明确批准替代方案。
-- 实际行为与目标设计冲突时，不得自行选择一方或用文档掩盖偏差；应修复实现，或先取得维护者确认，再在同一 PR 更新设计与实现。
-- 专题文档描述当前有效行为；历史 proposal、外部项目和历史材料只作为背景，不是 SoloDock 当前行为或目标边界的事实来源。
+- Code, tests, configuration schema, and migrations define current implemented behavior.
+- Maintainer-approved requirements and the current approved proposal define the intended product boundary until the maintainer approves a replacement.
+- If implementation and intended design conflict, do not choose one silently or hide the mismatch in documentation. Fix the implementation, or obtain maintainer approval before updating design and implementation in the same Pull Request.
+- Topic documents describe current behavior. Historical proposals, external projects, and historical material provide context only; they do not define SoloDock behavior or product scope.
 
-## 内容与同步
+## Content and synchronization
 
-- 文档应记录产品定位、非目标、设计取舍、状态机、安全边界、失败语义、恢复要求和测试护栏。
-- 架构、API、配置字段、存储布局、部署/回滚语义或安全边界变化时，必须在同一 PR 同步更新对应文档。
-- 命令或配置可以由源码、schema 或 `--help` 精确得到时，文档只保留必要入口和使用语义，不机械复制完整输出。
-- 新增外部链接时检查可访问性；引用外部资料时说明它是调研依据还是规范来源。
+- Document product positioning, non-goals, design tradeoffs, state machines, security boundaries, failure semantics, recovery requirements, and test guardrails.
+- When architecture, API fields, configuration, storage layout, deployment/rollback semantics, or security boundaries change, update the relevant English and Simplified Chinese topic documents in the same Pull Request.
+- When commands or configuration can be derived exactly from source, schema, or `--help`, document only the necessary entry points and semantics instead of duplicating full generated output.
+- Verify new external links. Identify whether an external reference is background research or a normative source.

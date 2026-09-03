@@ -1,27 +1,29 @@
-# SoloDock 恢复
+# SoloDock recovery
 
-本文只描述控制面与受管状态的恢复。事实来源和 publication 边界见 [架构](architecture.md)，active/pending/actual 与 deployment 终态见 [部署与回滚](deployments.md)。
+> English (authoritative) · [简体中文](zh-CN/recovery.md)
 
-## 离线恢复
+This document covers recovery of the control plane and managed state only. See [architecture](architecture.md) for sources of truth and publication boundaries, and [deployments and rollback](deployments.md) for active/pending/actual facts and terminal deployment states.
 
-只支持服务停止后的离线恢复。先校验 archive 旁的 SHA-256 文件，在私有临时目录解包并拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；restore helper 会在私有 staging 中把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，再调用同 package binary 严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。`0644`、owner drift、symlink 或特殊文件不会被自动修复。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
+## Offline recovery
 
-binary、config 和 state 必须来自兼容的一组备份。SQLite migration 是 forward-only；迁移后仅回滚 binary 不安全。
+Recovery is supported only while the service is stopped. Verify the SHA-256 file beside the archive, extract into a private temporary directory, and reject absolute paths, `..`, hard links, special files, and unexpected top-level entries. The only allowed symlinks are SoloDock-owned canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>` links. In private staging, the restore helper normalizes legacy `0400`/`0600` modes on canonical managed leaves to `0444`, then invokes the same package binary to validate owner/mode, link boundaries, HMACs, config revisions, and canonical Compose. It does not repair `0644`, owner drift, symlinks, or special files. Never overwrite live state. Atomically rename the current `/var/lib/solodock` to a recoverable backup before switching in the complete validated state/config. Keep directories at `0700`, ordinary control-plane files at `0600`, and direct `files/{public,secret}` leaves at `0444`, then start the service and inspect the journal, `/healthz`, and authenticated system health.
 
-## 故障分类
+Binary, configuration, and state must come from one compatible backup set. SQLite migrations are forward-only; reverting only the binary after migration is unsafe.
 
-- SQLite 丢失：filesystem 可重建 app/release 查询事实，但管理员、session、audit、deployment history 不会被伪造，需要重新 bootstrap。
-- filesystem degraded：停止 mutation，保留旧 redactor patterns；核对 owner/mode、缺失 revision 或 symlink boundary 后重启。启动恢复只会把 canonical managed leaf 的已知 legacy `0400`/`0600` 改为 `0444`；运行期 projection scan 严格只读，其他漂移需要管理员在离线备份后修复。不要递归把所有 state file 改成 `0600`，也不要手工编辑 HMAC release。
-- Docker drift：用 exact project/service/full container ID 检查 unmanaged、stale 或 multiple candidate。网络 expectation 必须从实际 container release ID 对应的 active/pending immutable config revision 读取，不能拿当前 draft 覆盖；`NETWORK_ATTACHMENT_MISMATCH` 检查 network name 集，`NETWORK_ALIAS_MISMATCH` 检查期望 alias 是否为实际有效 DNS names 的子集。先备份业务数据，再明确选择人工修复；禁止通配 cleanup、`docker compose down -v`、`docker volume rm`。
-- bridge drift：以应用详情投影的版本化 bridge 为期望，不能按 slug 猜测新应用的 token。核对 network ownership、driver 和 `Options.com.docker.network.bridge.name`；SoloDock 对不一致资源 fail closed 且不会自动删除。
-- platform network drift：`solodock-services` 必须是 internal `bridge`、host bridge `sd-services` 并带精确 platform labels。同名 unmanaged 或漂移资源不会被接管；停止受影响发布并由管理员确认资源来源后再恢复。
-- deployment `interrupted`/`needs_attention`：依据 pending/active/actual exact facts从 detail 重试或人工回滚；未知 effect 不猜测性删除。
-- credential tombstone：startup/background finalizer 只在 ledger 已证明精确成功时清理；未知 marker fail closed。
-- poll suppression：修复应用/health 后用人工 Deploy 或发布新 digest/config；不要直接改 SQLite。
-- webhook degraded：保持 endpoint fail closed，修复 `webhook.toml`、immutable secret revision 的 owner/mode/HMAC 后重启；不要手工编辑 secret metadata。SQLite 丢失会丢失 nonce history/wake operational state，但不会伪造 webhook audit。
+## Failure categories
 
-恢复后先重建所有 immutable active/pending revision 引用但 daemon 中缺失的 external network；平台网络由首次 deployment 在精确 identity 预检下重建。再逐项验证 active digest、容器 full ID、health、端口、volume/bind/network canary、platform slug DNS 与 external alias。SoloDock 的 release 回滚不回滚数据库或持久化数据。
+- **Lost SQLite:** filesystem facts rebuild application/release query projections, but administrator credentials, sessions, audit, and deployment history cannot be recreated; bootstrap is required.
+- **Degraded filesystem:** stop mutations and retain old redactor patterns. Verify owner/mode, missing revisions, and symlink boundaries, then restart. Startup recovery normalizes only known legacy `0400`/`0600` canonical managed leaves to `0444`; runtime projection scans are strictly read-only. Repair other drift only offline after backup. Do not recursively set every state file to `0600` or manually edit HMAC-protected releases.
+- **Docker drift:** inspect exact project/service/full container IDs for unmanaged, stale, or multiple candidates. Read expected networks from the immutable active/pending config revision corresponding to the actual container's release ID, never the current draft. For `NETWORK_ATTACHMENT_MISMATCH`, compare network-name sets; for `NETWORK_ALIAS_MISMATCH`, ensure expected aliases are a subset of effective DNS names. Back up business data and choose an explicit repair. Never use wildcard cleanup, `docker compose down -v`, or `docker volume rm`.
+- **Bridge drift:** use the versioned bridge projected on application details instead of guessing a new application's token from its slug. Inspect network ownership, driver, and `Options.com.docker.network.bridge.name`. SoloDock fails closed on mismatches and never deletes them automatically.
+- **Platform-network drift:** `solodock-services` must be an internal `bridge` using host bridge `sd-services` and exact platform labels. SoloDock does not adopt a same-named unmanaged or drifted resource. Stop affected releases and have an administrator confirm the resource source before recovery.
+- **Deployment `interrupted`/`needs_attention`:** use exact pending/active/actual facts in details to retry or manually roll back. Never speculatively delete an unknown effect.
+- **Credential tombstone:** startup/background finalizers clean only when the ledger proves exact success; unknown markers fail closed.
+- **Poll suppression:** after repairing the application/health, use manual Deploy or publish a new digest/config. Do not edit SQLite directly.
+- **Degraded webhook:** keep the endpoint fail closed. Repair owner/mode/HMAC of `webhook.toml` and its immutable secret revision, then restart. Do not edit secret metadata manually. Losing SQLite loses nonce history and wake operational state but does not fabricate webhook audit.
 
-旧 naming/config/release schema 保持可读和可回滚：旧应用继续使用原 bridge 且不会自动加入平台网络。旧 Compose schema 仍先验证 release HMAC 和它签名覆盖的精确文件 hash，再按对应 schema 校验 canonical 文档；serializer 引号表示变化不会把合法旧 release 误判为损坏，也不会放宽内容或结构校验。不要手工向历史 artifact 注入新字段；reader 会忽略旧签名域之外的控制值。SQLite global settings 备份必须与 filesystem state 同一恢复点，否则 bind roots revision 可能与应用引用不一致并使恢复 fail closed。
+After recovery, recreate every external network referenced by immutable active/pending revisions but missing from the daemon. The first deployment recreates the platform network only after exact identity preflight. Then verify each active digest, container full ID, health, port, volume/bind/network canary, platform slug DNS, and external alias. SoloDock release rollback does not roll back a database or persistent data.
 
-日常安装、备份和 health 检查入口见 [运维](operations.md)；资源保留与删除语义见 [应用模型](application-model.md)。
+Legacy naming/config/release schemas remain readable and rollback-capable. Old applications retain their bridge and do not automatically join the platform network. Old Compose schemas first verify the release HMAC and exact file hashes covered by its signature, then validate the canonical document for that schema. Serializer quoting changes do not mark a valid old release as corrupt or relax content/structure validation. Do not inject new fields into historical artifacts manually; readers ignore control values outside the old signed domain. Restore SQLite global settings from the same point as filesystem state, or bind-root revisions may disagree with application references and make recovery fail closed.
+
+See [operations](operations.md) for routine installation, backup, and health checks, and [application model](application-model.md) for resource-retention and deletion semantics.
