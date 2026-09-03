@@ -1,37 +1,39 @@
-# SoloDock 签名 Registry Recheck Webhook
+# SoloDock signed Registry recheck webhook
 
-Webhook 只表达“配置的 Registry tag 可能已变化”。它不会接收或信任 repository、tag、digest、Compose 或 Docker action；有效通知只写入 durable poll wake，随后由现有 PollCoordinator 重新读取 filesystem 配置、解析 Registry tag，并复用唯一的 digest deployment/health/rollback 状态机。
+> English (authoritative) · [简体中文](zh-CN/webhooks.md)
 
-## 能力边界
+A webhook states only that a configured Registry tag may have changed. It neither receives nor trusts a repository, tag, digest, Compose document, or Docker action. A valid notification writes only a durable poll wake. The existing `PollCoordinator` then reloads filesystem configuration, resolves the Registry tag, and uses the sole digest-deployment, health, and rollback state machine.
 
-Webhook 是可选增强，不是部署 API。当前不支持 provider-specific payload、unsigned compatibility、直接 deploy action、绕过 auto-deploy policy 的事件、Cosign/Sigstore、外部入口自动配置、通用 import 或多主机编排。完整 deployment 状态与 backoff/suppression 语义见 [部署与回滚](deployments.md)。
+## Capability boundary
 
-## 入口隔离
+The webhook is an optional enhancement, not a deployment API. It does not support provider-specific payloads, unsigned compatibility, direct deploy actions, events that bypass auto-deploy policy, Cosign/Sigstore, automatic external-entry configuration, general import, or multiple hosts. See [deployments and rollback](deployments.md) for complete deployment-state and backoff/suppression semantics.
 
-在宿主配置中为 webhook 使用独立 HTTPS origin：
+## Entry-point isolation
+
+Configure a separate HTTPS origin for webhooks:
 
 ```toml
 webhook_public_origin = "https://solodock-hooks.example.com"
 ```
 
-它必须与 `public_origin` 使用不同 authority。SoloDock 仍只监听 loopback；外部 tunnel 或 reverse proxy、DNS、TLS 和 WAF 由管理员配置。Webhook hostname 只应允许精确的 `POST /hooks/v1/apps/*/registry`，其它 path/method 均拒绝；管理 hostname 不应路由 `/hooks/**`。SoloDock 忽略 `Forwarded` 和 `X-Forwarded-*` 进行安全判断。
+It must use a different authority from `public_origin`. SoloDock still listens only on loopback; the administrator configures the external tunnel or reverse proxy, DNS, TLS, and WAF. The webhook hostname should allow only exact `POST /hooks/v1/apps/*/registry`; reject every other path and method. The management hostname should not route `/hooks/**`. SoloDock ignores `Forwarded` and `X-Forwarded-*` for security decisions.
 
-## v1 签名协议
+## v1 signature protocol
 
-请求 body 固定为 `{"event":"registry.push"}`，最大 1 KiB，`Content-Type` 必须为 `application/json`。必需 header：
+The request body is exactly `{"event":"registry.push"}`, at most 1 KiB, with `Content-Type: application/json`. Required headers are:
 
-- `X-SoloDock-Timestamp`: canonical Unix seconds，服务器时间前后最多 300 秒；
-- `X-SoloDock-Nonce`: 16 个随机 bytes 的 base64url-no-pad；每次重试必须使用新的 nonce/timestamp；
-- `X-SoloDock-Signature`: `v1=` 加 64 个 lowercase hex 字符。
+- `X-SoloDock-Timestamp`: canonical Unix seconds, within 300 seconds before or after server time;
+- `X-SoloDock-Nonce`: 16 random bytes encoded as base64url-no-pad; each retry needs a new nonce and timestamp;
+- `X-SoloDock-Signature`: `v1=` followed by 64 lowercase hexadecimal characters.
 
-签名输入为：
+The signature input is:
 
 ```text
 solodock-webhook-v1\n<TIMESTAMP>\n<NONCE>\nPOST\n/hooks/v1/apps/<APP_UUID>/registry\n<SHA256_RAW_BODY_LOWER_HEX>
 ```
 
-使用应用设置页生成的 32-byte base64url secret 计算 HMAC-SHA256。Secret 只显示一次，应保存到 CI secret store；不要放入 URL、命令参数或 shell history。轮换 commit 后旧 secret 立即失效，撤销只关闭 webhook，不改变周期轮询或已 durable claim 的部署。
+Compute HMAC-SHA256 with the 32-byte base64url secret generated on the application settings page. The secret is shown once. Save it in a CI secret store; never place it in a URL, command argument, or shell history. A committed rotation invalidates the previous secret immediately. Revocation disables only the webhook and does not change periodic polling or an already durable deployment claim.
 
-`202 Accepted` 仅表示 recheck 已持久接受，不表示存在新 digest 或部署成功。结果应在应用 polling/deployment 页面查看。Webhook 不绕过 auto-deploy disabled、Registry backoff、busy、failed-target suppression、drift、needs-attention 或健康门禁。
+`202 Accepted` means only that the recheck was durably accepted, not that a new digest exists or a deployment succeeded. Inspect results in the application's polling/deployment page. Webhooks never bypass auto-deploy-disabled, Registry backoff, busy, failed-target suppression, drift, needs-attention, or health-gate policy.
 
-管理端 webhook secret 是 write-only immutable revision，并纳入 recovery、redactor、backup 和 app deletion preview。API/幂等/删除共同边界见 [API 与实时流](api-and-streams.md)，secret 与公开入口的信任假设见 [威胁模型](threat-model.md)。
+The management-side webhook secret is a write-only immutable revision included in recovery, redaction, backup, and application deletion preview. See [API and streams](api-and-streams.md) for shared API/idempotency/deletion boundaries and the [threat model](threat-model.md) for trust assumptions about secrets and public entry points.

@@ -1,27 +1,29 @@
-# SoloDock 威胁模型
+# SoloDock threat model
 
-本模型以 [产品范围](product-scope.md) 的单主机、单管理员边界为前提。接口配额与日志脱敏行为见 [API 与实时流](api-and-streams.md)，容器资源限制见 [应用模型](application-model.md)。
+> English (authoritative) · [简体中文](zh-CN/threat-model.md)
 
-## 信任边界
+This model assumes the single-host, single-administrator boundary in [product scope](product-scope.md). See [API and streams](api-and-streams.md) for interface quotas and log redaction, and [application model](application-model.md) for container resource constraints.
 
-SoloDock 假定唯一管理员和宿主 OS 可信；Registry、镜像、容器输出、Docker/Compose 输出、浏览器输入和反向代理输入均不可信。Docker socket 和 `docker` group 在效果上等同宿主 root，因此 Web 身份认证、loopback 监听、固定动作与 systemd hardening 是纵深防御，不是对恶意宿主管理员的隔离。
+## Trust boundaries
 
-secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入 API response、SQLite、release、audit、argv、tracing 或错误；日志使用完整、fail-closed 的动态已知 secret 集脱敏。内核、allocator、Docker daemon、Registry 服务端和管理员业务备份不在“内存中从未出现明文”的保证范围。备份含 secret，必须高敏保护。
+SoloDock trusts the sole administrator and host OS. Registries, images, container output, Docker/Compose output, browser input, and reverse-proxy input are untrusted. Docker socket access and `docker` group membership are effectively host root access, so Web authentication, loopback listeners, fixed actions, and systemd hardening are defense in depth, not isolation from a malicious host administrator.
 
-受管 public/secret file 的宿主 leaf 为 `0444`，用于让显式 bind mount 的非 root 容器读取；其全部宿主 ancestor 仍为 `0700 solodock:solodock`，容器只看到 Compose 明确挂入的单个 leaf。该边界不隔离宿主 root、Docker daemon 控制者或拥有 Docker socket 的主体，也不允许受管容器浏览完整 state tree。只读性由 Compose `read_only: true` 和 immutable revision 共同执行；其他控制面 secret 不因该例外放宽。
+Secrets are write-only. Buffers owned by this project are zeroized, and secrets do not enter API responses, SQLite, releases, audit records, argv, tracing, or errors. Logs redact against a complete, fail-closed dynamic set of secrets known to SoloDock. The kernel, allocator, Docker daemon, Registry server, and administrator business backups are outside any guarantee that plaintext never appears in memory. Backups contain secrets and require high-sensitivity protection.
 
-受管 state reader 在拼接或读取 leaf 前先验证来自 metadata 的文件名；root-relative 路径只接受普通组件，拒绝 `.`、`..`、absolute/prefix 和 symlink boundary。HMAC 负责内容完整性，不被当作延迟执行的路径消毒器；路径不合法时必须在读取目标内容前 fail closed。
+A managed public/secret file leaf is `0444` on the host so an explicitly bind-mounted file can be read by a non-root container. Every host ancestor remains `0700 solodock:solodock`, and a container sees only the individual leaf named in Compose. This boundary does not isolate host root, the Docker daemon controller, or a Docker-socket holder, and does not let a managed container browse the complete state tree. Compose `read_only: true` plus immutable revisions enforce read-only behavior. Other control-plane secrets are not relaxed by this exception.
 
-部署只信任严格解析并校验 digest/header/body/platform 的 Registry 结果，不验证 Cosign/Sigstore 签名。tag race 不能改变已调度 candidate，但 Registry/镜像供应链仍可能提供恶意内容。容器 capabilities、mount 和 Compose 由 typed generator 限制；bind allowlist 和 Docker data-root overlap 每次 effect 前 fail closed。
+Before joining or reading a leaf, the managed-state reader validates every filename obtained from metadata. Root-relative paths accept only ordinary components and reject `.`, `..`, absolute/prefix paths, and symlink boundaries. HMAC provides content integrity; it is not deferred path sanitization. Invalid paths fail closed before target content is read.
 
-资源防护包括请求/body/stream/log buffer 上限、单一 Compose mutation、最多两个 Registry resolve、poll jitter/backoff、busy coalescing 和失败 target suppression。它不承诺抵御拥有宿主 root、Docker daemon控制权或合法管理员 session 的攻击者，也不提供多租户隔离。
+Deployment trusts only Registry results whose digest, headers, body, and platform pass strict parsing and validation. SoloDock does not verify Cosign/Sigstore signatures. A tag race cannot alter a scheduled candidate, but a compromised Registry or image supply chain can still provide malicious content. Typed generation constrains container capabilities, mounts, and Compose. Bind allowlist and Docker data-root overlap are rechecked before every effect.
 
-Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
+Resource protections include request/body/stream/log-buffer limits, one Compose mutation, at most two Registry resolutions, poll jitter/backoff, busy coalescing, and failed-target suppression. They do not claim resistance to an actor with host root, Docker-daemon control, or a valid administrator session, and they do not provide multi-tenant isolation.
 
-volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。External network 与其成员属于 daemon 共享状态：SoloDock 对成员数量设置上限，在共享 deadline 内完整 inspect 成员 full ID 和有效 DNS names，任何截断或部分成功都 fail closed。Alias 冲突只对已经通过 filesystem/ownership policy 精确确认的旧 container full ID 放行；app label、名称和短 ID 不构成替换权限。
+The webhook hostname is a separate public attack surface. It trusts only an HMAC from the current filesystem secret over a fixed body/path/timestamp/nonce; it does not trust proxy source IP, image facts in a payload, or forwarding headers. Nonce, wake, and audit commit atomically. Body, concurrency, and rate maps have fixed bounds. Invalid requests do not create persistent audit/replay records, preventing external storage amplification. This boundary does not replace external tunnel/WAF rate limiting.
 
-Slug 是受限、全局唯一且不可变的人类可读命名空间，但不是 ownership 凭据；UUID app label 仍决定资源归属。Owned network 复用前必须同时匹配 exact name、UUID/project labels、bridge driver 与固定 option，防止同名 unmanaged network 或错误 host interface 被接管。用户不能输入任意 project、container、network 或 bridge name。
+Volumes, binds, and external networks are never deleted automatically, but their data is not rolled back with a release. External networks and members are shared daemon state. SoloDock caps member counts and inspects all member full IDs and effective DNS names within a shared deadline; truncation or partial success fails closed. An alias conflict may ignore only the exact full ID of an old container already proven by filesystem and ownership policy. Application labels, names, and short IDs do not confer replacement authority.
 
-Docker observation 与后续 Compose effect 无法组成跨 API 原子事务，外部 root actor 仍可在两者之间改变网络。系统以 durable marker 后的最后一次 fresh preflight 缩小窗口，并在 effect 后用 `NETWORK_ATTACHMENT_MISMATCH` 与 `NETWORK_ALIAS_MISMATCH` 持续揭示漂移，不宣称消除有宿主 root 权限的并发。Compose 返回后的首次 container observation 以唯一非 predecessor full ID 和全套 canonical candidate-release labels 建立 ownership claim；具备 Docker daemon/root 权限的主体若在该 marker 前复制全部 canonical labels 替换容器，属于本 threat model 明确排除的主体，系统不提供因果 attestation。`post_container_id` 持久化后 exact full ID 才成为 SSOT，任何不同 ID 的 replacement 均保留现场并 fail closed。应用级备份/restore、安全更新和 schema兼容由管理员负责。
+A slug is a constrained, globally unique, immutable human-readable namespace, not an ownership credential. The UUID application label still determines ownership. Before reuse, an owned network must match its exact name, UUID/project labels, bridge driver, and fixed option to prevent adoption of a same-named unmanaged network or wrong host interface. Users cannot provide arbitrary project, container, network, or bridge names.
 
-测试如何证明这些边界见 [测试与安全护栏](testing.md)；故障后的人工处置见 [恢复](recovery.md)。
+Docker observation and a later Compose effect cannot form a transaction across APIs; an external root actor can change a network between them. A final fresh preflight after the durable marker narrows this window, and `NETWORK_ATTACHMENT_MISMATCH` and `NETWORK_ALIAS_MISMATCH` reveal post-effect drift. SoloDock does not claim to eliminate a concurrent actor with host root. The first container observation after Compose claims ownership using one non-predecessor full ID and all canonical candidate-release labels. A Docker-daemon/root actor that copies every canonical label and replaces the container before this marker is explicitly outside this model; SoloDock provides no causal attestation. Once `post_container_id` is persisted, its exact full ID becomes the source of truth, and any different replacement ID preserves the scene and fails closed. Administrators own application backup/restore, security updates, and schema compatibility.
+
+See [testing and safety guardrails](testing.md) for evidence of these boundaries and [recovery](recovery.md) for manual incident handling.

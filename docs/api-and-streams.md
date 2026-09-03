@@ -1,21 +1,23 @@
-# SoloDock API 与实时流
+# SoloDock API and real-time streams
 
-SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程只监听 loopback，由外部 Tunnel/WAF/TLS 提供公网入口；应用自身仍执行认证、Origin、CSRF、请求大小和权限检查。
+> English (authoritative) · [简体中文](zh-CN/api-and-streams.md)
 
-## 认证边界
+SoloDock's management API and embedded UI share one HTTPS origin. In production, the process listens only on loopback and relies on an external tunnel/WAF/TLS endpoint for public access. The application still enforces authentication, Origin, CSRF, request-size, and authorization checks.
 
-- 首次启动生成一次性 `bootstrap.token`，管理员凭据只能通过 bootstrap endpoint 初始化；
-- 密码使用 Argon2id，只有一个管理员账户；
-- 登录建立 Secure、HttpOnly、SameSite=Strict session cookie；
-- authenticated mutation 同时要求与 `public_origin` 精确匹配的 `Origin` 和 double-submit `X-CSRF-Token`；
-- session 有期限，可 logout 或 revoke-all；SSE heartbeat 也会重新验证；
-- 登录限速、成功/失败及敏感管理动作写入审计，但不记录密码、cookie 或 secret。
+## Authentication boundary
 
-认证协议 endpoint 不使用业务 `Idempotency-Key`。它们依靠 singleton credential、一次性 token 或随机 session 建立自己的重放边界。
+- First startup creates a one-time `bootstrap.token`; administrator credentials can be initialized only through the bootstrap endpoint.
+- Passwords use Argon2id, and there is only one administrator account.
+- Login establishes a Secure, HttpOnly, SameSite=Strict session cookie.
+- An authenticated mutation also requires an `Origin` exactly matching `public_origin` and a double-submit `X-CSRF-Token`.
+- Sessions expire and can be logged out or revoked globally; SSE heartbeat revalidates them.
+- Login throttling, successes/failures, and sensitive administrative actions are audited without recording passwords, cookies, or secrets.
 
-## 管理 API 契约
+Authentication protocol endpoints do not use the business `Idempotency-Key`. Singleton credentials, one-time tokens, or random sessions provide their replay boundaries.
 
-所有 `/api/v1/**` 响应使用 `Cache-Control: no-store`，并返回 allowlist DTO，不直接序列化 Docker、Registry 或内部存储 model。错误保持稳定的 code、脱敏 message 和 `request_id`。配置校验错误还可带向后兼容的 `issues`；每项只含字段路径、稳定 code 和安全说明，不回显输入值、Secret、credential 或宿主路径：
+## Management API contract
+
+Every `/api/v1/**` response uses `Cache-Control: no-store` and an allowlisted DTO rather than serializing Docker, Registry, or internal storage models directly. Errors keep a stable code, sanitized message, and `request_id`. Configuration validation may also include backward-compatible `issues`, each containing only a field path, stable code, and safe explanation without echoing input values, secrets, credentials, or host paths:
 
 ```json
 {
@@ -26,82 +28,82 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
     {
       "path": "health.http.retries",
       "code": "HEALTH_RETRIES_OUT_OF_RANGE",
-      "message": "重试次数超出允许范围"
+      "message": "The retry count is outside the allowed range"
     }
   ]
 }
 ```
 
-持久业务 mutation 必须携带 16–128 字节安全 ASCII `Idempotency-Key`。SQLite 保存 request fingerprint/HMAC、operation 状态和脱敏响应；相同 key 与相同 request 可 replay，换 body/route/method 会冲突。Registry credential 与 webhook secret 在前端 retry identity 中只保留 hash，并在后端 API 的受管 parsed buffer 中使用 zeroizing wrapper。
+Persistent business mutations require a safe 16–128-byte ASCII `Idempotency-Key`. SQLite stores the request fingerprint/HMAC, operation state, and sanitized response. The same key and identical request may replay; changing the body, route, or method conflicts. Frontend retry identities keep only hashes of Registry credentials and webhook secrets, while the backend API uses zeroizing wrappers for managed parsed buffers.
 
-接口按稳定资源分组：
+Endpoints are grouped around stable resources:
 
-- app catalog、detail、draft、validate、lifecycle 和 deletion；
-- 内置 app preset 与只读 OCI image config 建议；
-- Registry credential；
-- deployment schedule、history、detail 和 rollback；
-- per-app webhook status/configure/revoke；
-- 全局显示设置 `GET/PUT /api/v1/settings`；
-- system health 和 drift；
-- events、logs 和 stats SSE。
+- application catalog, detail, draft, validation, lifecycle, and deletion;
+- built-in application presets and read-only OCI image-config suggestions;
+- Registry credentials;
+- deployment scheduling, history, detail, and rollback;
+- per-application webhook status, configure, and revoke;
+- global display settings at `GET/PUT /api/v1/settings`;
+- system health and drift;
+- events, logs, and stats SSE.
 
-具体 route、body limit 和字段以 `src/api/mod.rs`、DTO 与生成的前端类型为准。文档不复制容易漂移的完整 route 表。
+For exact routes, body limits, and fields, use `src/api/mod.rs`, DTOs, and generated frontend types. This document intentionally does not duplicate a route table that would drift.
 
-`POST /api/v1/apps` 只接受 1–20 字符的不可变 `slug` 并返回 `UNCONFIGURED` 应用。首次 draft mutation 接受 `expected_revision: null`，以后必须提交精确 UUID；两种路径共享 revision/idempotency guard。Draft 输入包含 `1..=600` 的 `stop_grace_period_seconds`（缺失默认 `10`）、新 revision 默认启用的 `owned_default_network`/`service_discovery_enabled` 和结构化 external attachment。Compose 预检返回最终停机宽限、network mode、attachment、platform DNS alias、warning 与版本化资源 identity。
+`POST /api/v1/apps` accepts only an immutable 1–20-character `slug` and returns an `UNCONFIGURED` application. The first draft mutation accepts `expected_revision: null`; subsequent mutations require the exact UUID. Both paths share revision and idempotency guards. Draft input includes `stop_grace_period_seconds` in `1..=600` (default `10`), `owned_default_network` and `service_discovery_enabled` enabled by default for new revisions, and structured external attachments. Compose preflight returns the final grace period, network mode, attachments, platform DNS alias, warnings, and versioned resource identity.
 
-`GET /api/v1/app-presets` 只返回版本化公开 descriptor；`POST /api/v1/apps/from-preset` 以 write-only 变量生成正常 revision。PostgreSQL v1 支持 major 18/17，分别挂载 `/var/lib/postgresql` 与 `/var/lib/postgresql/data`，不使用 `latest`，且 response 不回显密码。Web 随后以独立稳定幂等键调用现有 deployment mutation；创建成功而部署失败时保留可恢复应用。
+`GET /api/v1/app-presets` returns only versioned public descriptors. `POST /api/v1/apps/from-preset` uses write-only variables to create a normal revision. PostgreSQL v1 supports majors 18 and 17, mounting `/var/lib/postgresql` and `/var/lib/postgresql/data` respectively, never uses `latest`, and never echoes the password. The Web UI then calls the existing deployment mutation with a separate stable idempotency key. If creation succeeds and deployment fails, the recoverable application remains.
 
-`POST /api/v1/images/inspect-config` 复用 Registry credential 与 manifest resolver，验证 config blob digest/大小/media type，只投影 exposed ports、volume targets、healthcheck presence、user 和 stop signal。Web 通过统一的 JSON/CSRF mutation helper 发起这个只读 POST，并原样提交当前选择的 credential reference；它不需要 durable idempotency ledger。API 不返回 image Env、labels、entrypoint/command，不写 revision；用户明确采用建议后仍走正常 draft mutation。
+`POST /api/v1/images/inspect-config` reuses Registry credentials and the manifest resolver, validates config-blob digest/size/media type, and projects only exposed ports, volume targets, healthcheck presence, user, and stop signal. The Web UI calls this read-only POST through the common JSON/CSRF mutation helper and submits the selected credential reference unchanged. It needs no durable idempotency ledger. The API does not return image Env, labels, entrypoint/command, or write a revision. Explicitly accepting suggestions still uses the normal draft mutation.
 
-应用详情返回 slug 派生的 project/network/bridge 名称，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。
+Application details return resource names generated by the versioned naming helper from the immutable slug and UUID. They separately show the immutable expected network plan selected from actual release identity, expected owned identity, Docker's actual driver/bridge, and container attachments. A different attachment-name set reports `NETWORK_ATTACHMENT_MISMATCH`; a mismatched driver or explicit bridge option reports `NETWORK_BRIDGE_IDENTITY_MISMATCH`; and a missing expected alias on an external attachment reports `NETWORK_ALIAS_MISMATCH`. Incomplete inspection leaves observation incomplete instead of fabricating a mismatch.
 
-`GET /healthz` 只返回最小进程存活信息。认证后的 system health 才展示 Docker capability、filesystem recovery、projection、deployment、poll、webhook、主机 `MemAvailable`、disk、credential 和 stream 状态。Docker 不可用时认证控制面仍可启动；catalog 保留 filesystem 事实，无法完整观察的 drift 明确标记为 incomplete。
+`GET /healthz` returns only minimal process liveness. Authenticated system health exposes Docker capability, filesystem recovery, projection, deployment, polling, webhook, host `MemAvailable`, disk, credential, and stream state. The authenticated control plane can start without Docker; the catalog retains filesystem facts, and drift that cannot be observed completely is explicitly incomplete.
 
-`GET /api/v1/settings` 返回 revision、显示时区、IANA 列表、动态 `allowed_bind_roots`、`slug_max_length`、支持的 mount 类型，以及由 Rust domain 定义的 `configuration_limits.health`。Web 只使用这份 capability 设置健康字段的 min/max/default；缺少 capability 时禁止保存配置。`PUT` 原子更新时区与 bind roots；被 revision 引用的 root 不得删除，扫描或 artifact 读取失败时 fail closed。设置 mutation要求 `expected_revision`、`Idempotency-Key`、精确 Origin、session 与 CSRF。显示设置只影响 Web formatter，所有 API/SSE timestamp 继续返回 RFC3339 UTC。
+`GET /api/v1/settings` returns revision, display timezone, the IANA list, dynamic `allowed_bind_roots`, `slug_max_length`, supported mount types, and Rust-domain `configuration_limits.health`. The Web UI uses only these capabilities for health-field min/max/default values and prevents configuration save if they are missing. `PUT` atomically updates timezone and bind roots. A root referenced by a revision cannot be removed, and scan or artifact-read failure fails closed. The settings mutation requires `expected_revision`, `Idempotency-Key`, exact Origin, session, and CSRF. Display settings affect only Web formatting; API and SSE timestamps remain RFC3339 UTC.
 
-## 两阶段删除
+## Two-phase deletion
 
-删除不能只依赖 UI 当前显示。preview 在协调锁内从 fresh filesystem、verified active/pending config、webhook artifact 和 Docker observation生成 canonical facts，并签发短期 confirmation token。
+Deletion cannot trust only the UI's current view. Under coordination lock, preview builds canonical facts from fresh filesystem data, verified active/pending configs, webhook artifacts, and Docker observation and issues a short-lived confirmation token.
 
-DELETE 提交 token、slug 和是否移除 container；系统在 token consume 前及 filesystem tombstone前重算完整 facts hash。Network facts 包含 mode 所决定的 owned/external kind、aliases、active/pending/draft scope 和存在性，因此 attachment mode 或 alias 变化会使 token 失效。事实变化返回 stale/conflict，不执行删除。默认只 unregister，显式 remove 也只作用于 token 绑定的 exact owned container，并保留所有 volume、bind 内容和 network。
+DELETE submits the token, slug, and container-removal choice. The service recomputes the complete facts hash before token consumption and before the filesystem tombstone. Network facts include mode-derived owned/external kind, aliases, active/pending/draft scope, and existence, so changes to attachment mode or aliases invalidate the token. Changed facts return stale/conflict without deletion. The default only unregisters; explicit removal acts only on the exact owned container bound to the token and preserves all volumes, bind contents, and networks.
 
-成功 tombstone 必须先从 catalog 发布移除，再精确 finalize；projection 或 fsync 不确定时保留 tombstone并由 reconciler/startup继续收敛。删除 app 会永久删除其受管 config/secret 与 webhook secret，因此 locked preview 必须明确提示。
+A successful tombstone must first publish catalog removal, then finalize exactly. If projection or fsync is uncertain, the tombstone remains for reconciler/startup convergence. Application deletion permanently removes its managed config/secrets and webhook secret, so the locked preview must state that clearly.
 
-## SSE 共同边界
+## Common SSE boundary
 
-events、logs 和 stats 都是 server-to-client 的 SSE，不提供 WebSocket、terminal、shell 或 exec。
+Events, logs, and stats are server-to-client SSE only. There is no WebSocket, terminal, shell, or exec capability.
 
-StreamGate 当前限制：
+Current `StreamGate` limits are:
 
-| 范围 | 上限 |
+| Scope | Limit |
 | --- | ---: |
-| 全局连接 | 24 |
-| 单 session | 8 |
-| events 全局 / 单 app | 16 / 4 |
-| logs 全局 / 单 app | 8 / 2 |
-| stats 全局 / 单 app | 8 / 2 |
+| Global connections | 24 |
+| Per session | 8 |
+| Events global / per application | 16 / 4 |
+| Logs global / per application | 8 / 2 |
+| Stats global / per application | 8 / 2 |
 
-建立流之前会重新验证 session、app catalog 和精确 full container ID ownership；响应 headers 发出前发现 Docker unavailable 或 ownership异常时返回稳定错误。15 秒 heartbeat重新验证 session，过期或 revoke-all 会关闭连接。
+Before establishing a stream, SoloDock revalidates the session, application catalog, and ownership of the exact full container ID. Docker unavailability or ownership errors discovered before response headers produce a stable error. A 15-second heartbeat revalidates the session; expiration or revoke-all closes the connection.
 
-app deletion 先阻断新流并等待 subscriber、logs/stats producer 退出。tombstone前失败会回滚 stream generation，使仍注册的 app 可以再次订阅；commit后才永久封闭。
+Application deletion blocks new streams and waits for subscribers and logs/stats producers to exit. Failure before the tombstone rolls back the stream generation so the still-registered application can be subscribed again. Commit permanently closes it.
 
 ## Events
 
-Docker events 只投影匹配 SoloDock ownership 的 allowlist字段。每进程 boot UUID 与单调 sequence构成 cursor，有限 ring支持同一进程内 replay；无法 replay 时发送 reset，而不是伪造连续历史。慢消费者超过有界 queue 会收到 `SLOW_CONSUMER` 并断开。
+Docker events project only allowlisted fields for matching SoloDock ownership. A per-process boot UUID and monotonic sequence form the cursor. A bounded ring can replay within the same process; otherwise it sends reset rather than fabricating continuity. A slow consumer that exceeds its bounded queue receives `SLOW_CONSUMER` and is disconnected.
 
 ## Logs
 
-logs 支持有限 tail/since cursor，不接受任意 Docker 参数。framer 先重组 logical line，再按 byte对 SoloDock 已知 secret做单遍有界脱敏，跨 Docker chunk 的 pattern仍能覆盖。
+Logs support bounded tail/since cursors and accept no arbitrary Docker arguments. The framer reconstructs logical lines, then performs a one-pass bounded byte-level redaction against all secrets known to SoloDock, including patterns split across Docker chunks.
 
-- 原始行超过 64 KiB 时整行省略；
--正常 message 上限 16 KiB；
--移除 NUL 和终端控制序列；
--输出只包含 stream、timestamp、message 等 allowlist字段。
+- A raw line over 64 KiB is omitted entirely.
+- A normal message is limited to 16 KiB.
+- NUL and terminal-control sequences are removed.
+- Output includes only allowlisted fields such as stream, timestamp, and message.
 
-控制面从未持有的应用自生成 secret 无法可靠识别，不在脱敏保证内。
+Application-generated secrets the control plane has never held cannot be identified reliably and are outside the redaction guarantee.
 
 ## Stats
 
-stats 只在有 subscriber 时创建 Docker producer，并只保留最新 sample，不累计无界历史。最后一个 subscriber 离开后取消 producer；独立 producer registry保证 deletion/shutdown 能 cancel并 join 所有 generation。
+Stats creates a Docker producer only while subscribers exist and retains only the latest sample, never an unbounded history. The final subscriber cancels the producer. A separate producer registry ensures deletion and shutdown can cancel and join every generation.
 
-静态资源、SPA fallback 和安全 header 由 embedded asset handler提供；`/api/**` 和 `/hooks/**` 不进入 SPA fallback。公开 webhook 的独立 Host 与签名协议见 [Webhook](webhooks.md)。
+The embedded asset handler serves static files, SPA fallback, and security headers. `/api/**` and `/hooks/**` never enter SPA fallback. See [webhooks](webhooks.md) for the public webhook's separate Host and signature protocol.

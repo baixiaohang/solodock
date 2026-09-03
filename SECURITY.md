@@ -1,24 +1,24 @@
-# 安全策略
+# Security policy
 
-## 支持范围
+## Supported versions
 
-SoloDock 当前处于 `0.x` 阶段，只为默认分支的最新版本提供安全修复。历史提交、旧构建产物和自行修改的版本不单独维护。
+SoloDock is currently in the `0.x` stage. Security fixes are provided only for the latest version on the default branch. Historical commits, old build artifacts, and locally modified versions are not maintained separately.
 
-SoloDock 通过 Docker socket 管理宿主容器；获得 SoloDock 进程权限等同获得宿主 root 级能力。部署时必须保持 loopback 监听，并在外部入口实施 TLS、认证前访问控制和速率限制。
+SoloDock manages host containers through the Docker socket. Control of the SoloDock process is effectively host root access. Production deployments must keep SoloDock bound to loopback and must provide TLS, pre-authentication access control, and rate limiting at the external entry point.
 
-## 报告漏洞
+## Reporting a vulnerability
 
-请使用 GitHub 仓库 Security 页面中的 **Report a vulnerability** 私下提交安全问题：
+Use **Report a vulnerability** on the repository Security page to submit a private report:
 
 <https://github.com/baixiaohang/solodock/security/advisories/new>
 
-不要在公开 Issue、Pull Request 或 Discussion 中披露尚未修复的漏洞、利用步骤、真实凭据或生产环境标识。报告应尽量包含受影响版本、前置条件、最小复现、影响范围和建议缓解方式。
+Do not disclose an unpatched vulnerability, exploitation steps, real credentials, or production identifiers in a public Issue, Pull Request, or Discussion. Include the affected version, prerequisites, a minimal reproduction, impact, and suggested mitigations when possible.
 
-维护者会尽力确认报告、评估影响并协调修复与披露时间；当前项目不承诺固定响应时限。若 GitHub 私密漏洞报告尚未启用，请先通过维护者已有的私密联系渠道报告，不要创建公开 Issue。
+The maintainer will make a best effort to acknowledge the report, assess its impact, and coordinate remediation and disclosure. The project does not currently promise a fixed response time. If GitHub private vulnerability reporting is unavailable, use an existing private contact channel for the maintainer and do not open a public Issue.
 
-## 不属于漏洞的情况
+## Out of scope
 
-- 在管理员主动授予 Docker socket、宿主 bind root 或 Registry credential 后获得相应能力；
-- 已在文档中明确说明的单管理员、单主机、非多租户边界；
-- 仅造成版本信息、公开配置字段或通用部署架构可见，且不包含秘密或访问能力；
-- 没有可复现安全影响的自动化扫描结果。
+- Capabilities that follow from an administrator deliberately granting Docker socket access, a host bind root, or a Registry credential.
+- The documented single-administrator, single-host, non-multi-tenant boundaries.
+- Exposure limited to version information, public configuration fields, or general deployment architecture without secrets or access capability.
+- Automated scanner output without a reproducible security impact.

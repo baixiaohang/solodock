@@ -1,10 +1,12 @@
-# SoloDock 当前架构
+# SoloDock architecture
 
-SoloDock 是单主机、单管理员、单 service 的容器部署控制面。它保持单 Rust 进程、单 crate 和单一 Docker mutation路径，不引入内部微服务、通用 workflow engine 或第二套 Compose 规范。
+> English (authoritative) · [简体中文](zh-CN/architecture.md)
+
+SoloDock is a single-host, single-administrator, single-service container deployment control plane. It keeps one Rust process, one crate, and one Docker mutation path; it does not introduce internal microservices, a general workflow engine, or a second Compose specification.
 
 ```text
 Browser
-  -> external Tunnel / WAF / TLS
+  -> external tunnel / WAF / TLS
   -> loopback SoloDock process
        |-- REST + bounded SSE + embedded UI
        |-- private filesystem app/release/credential/secret store
@@ -14,43 +16,43 @@ Browser
        `-- OCI Registry client for tag-to-digest resolution
 ```
 
-产品能力和非目标见 [产品范围](product-scope.md)，具体配置资源见 [应用模型](application-model.md)。
+See [product scope](product-scope.md) for capabilities and non-goals, and [application model](application-model.md) for supported configuration and resources.
 
-## 组件职责
+## Component responsibilities
 
-- Axum API：认证、typed DTO、mutation 协调、SSE 与嵌入式前端；
-- app store：应用 metadata、immutable config revision、release、active/pending link、webhook secret；
-- SQLite：认证、session、audit、幂等、deployment transition、poll/replay operational state；
-- Docker observer：固定 socket上的 capability、list/inspect/events/logs/stats 和 ownership；
-- Compose adapter：从 typed config生成canonical单 service YAML，并以固定参数向量执行封闭动作；
-- Registry adapter：canonical reference、Bearer auth、manifest/digest/platform resolve；
-- deployment engine：manual、poll和rollback的唯一调度/执行状态机；
-- PollCoordinator：有界due heap、backoff、coalescing和durable webhook wake；
-- projection/reconciliation：从filesystem全量事实刷新catalog、redactor和SQLite查询投影。
+- Axum API: authentication, typed DTOs, mutation coordination, SSE, and the embedded frontend.
+- Application store: application metadata, immutable config revisions, releases, active/pending links, and webhook secrets.
+- SQLite: authentication, sessions, audit, idempotency, deployment transitions, and poll/replay operational state.
+- Docker observer: capability, list/inspect/events/logs/stats, and ownership over a fixed socket.
+- Compose adapter: generates canonical single-service YAML from typed configuration and executes a closed set of fixed argument vectors.
+- Registry adapter: canonical references, Bearer authentication, and manifest/digest/platform resolution.
+- Deployment engine: the only scheduler and execution state machine for manual deployment, polling, and rollback.
+- `PollCoordinator`: bounded due heap, backoff, coalescing, and durable webhook wake.
+- Projection/reconciliation: refreshes catalog, redactor, and SQLite query projections from complete filesystem facts.
 
-生产 binary 使用 `embed-ui` 编译期嵌入 Vite产物，不运行 Node服务。hashed asset可长缓存，HTML不缓存；`/api/**`和`/hooks/**`不会进入SPA fallback。接口边界见 [API 与实时流](api-and-streams.md)。
+The production binary embeds Vite output at compile time with `embed-ui`; no Node service runs. Hashed assets may use long-lived caching, while HTML is uncached. `/api/**` and `/hooks/**` never enter SPA fallback. See [API and streams](api-and-streams.md).
 
-## 唯一事实来源
+## Sources of truth
 
-| 事实 | 权威来源 |
+| Fact | Authoritative source |
 | --- | --- |
-| app metadata、draft config、managed files、credential引用 | 私有文件系统 |
-| Registry/webhook/app secret原值 | 专用权限受限文件 |
-| immutable release、digest、platform、canonical Compose | 私有文件系统 |
-| active/pending release | app目录中的canonical symlink |
-| container实际状态、full ID、image和resource存在性 | Docker daemon |
-| tag当前指向 | Registry；调度后以release manifest digest为准 |
-| 管理员、session、audit、幂等、deployment执行和poll/replay状态 | SQLite |
-| 全局显示时区与 bind allow roots | SQLite global settings |
-| catalog/redactor/查询索引 | 从上述事实派生的可重建投影 |
+| Application metadata, draft config, managed files, credential references | Private filesystem |
+| Registry/webhook/application secret plaintext | Dedicated permission-constrained files |
+| Immutable releases, digest, platform, canonical Compose | Private filesystem |
+| Active/pending release | Canonical symlink in the application directory |
+| Actual container state, full ID, image, and resource existence | Docker daemon |
+| Current tag target | Registry; after scheduling, the release manifest digest |
+| Administrator, sessions, audit, idempotency, deployment execution, and poll/replay state | SQLite |
+| Global display timezone and allowed bind roots | SQLite global settings |
+| Catalog, redactor, and query indexes | Rebuildable projections from the facts above |
 
-任何SQLite投影都不能反向覆盖filesystem事实。SQLite丢失后可以从文件恢复app/release查询事实，但不能伪造管理员、session、audit或deployment历史；必须重新bootstrap。
+No SQLite projection may overwrite filesystem facts. If SQLite is lost, application and release query facts can be reconstructed from files, but administrator credentials, sessions, audit, and deployment history cannot be fabricated; bootstrap must run again.
 
-App header 持久化 UUID、不可变 slug 与 `resource_name_schema_version`，不持久化可派生 project name。domain naming helper 是 project、owned network、owned volume 和 bridge 名称的唯一来源；旧 schema 保留 slug bridge，新 schema 使用 UUID token bridge。只持有 UUID 的异步路径必须重新读取已验证 metadata/catalog，不能猜测资源名。
+The application header persists UUID, immutable slug, and `resource_name_schema_version`, but not the derived project name. The domain naming helper is the sole source of project, owned network, owned volume, and bridge names. Old schemas retain slug-based bridges; new schemas use UUID-token bridges. An asynchronous path holding only a UUID must reload validated metadata/catalog rather than guessing a resource name.
 
-## 持久化布局
+## Persistent layout
 
-默认根目录如下；权限、HMAC和canonical entry由startup/recovery验证：
+The default roots are below. Startup and recovery validate permissions, HMACs, and canonical entries:
 
 ```text
 /etc/solodock/config.toml
@@ -83,34 +85,34 @@ App header 持久化 UUID、不可变 slug 与 `resource_name_schema_version`，
   docker-config/<deployment-id>/config.json
 ```
 
-具体文件名可能随兼容 migration演进；调用者不得绕过store或recovery直接编辑这些artifact。
+Exact filenames may evolve through compatible migrations. Callers must not bypass the store or recovery logic to edit these artifacts directly.
 
 ## Filesystem-first publication
 
-config revision和release先在同一父目录内写入operation-owned temp，完成file `fsync`、atomic rename和parent `fsync`后才可引用。app metadata或`active`/`pending`link是相应可见事实的commit point。
+Config revisions and releases are written to operation-owned temporary locations under the same parent. They become referenceable only after file `fsync`, atomic rename, and parent `fsync`. Application metadata or the `active`/`pending` link is the corresponding visibility commit point.
 
-filesystem commit之后才发布内存catalog/redactor和SQLite投影。投影失败不能把已经提交的事实误报为回滚；系统标记degraded并由shutdown-aware reconciler重试。redactor只有在完整读取所有app、active/pending/draft、Registry credential和webhook secret后才允许destructive replace，不完整时保留旧pattern或拒绝冷启动。
+In-memory catalog/redactor and SQLite projections are published only after the filesystem commit. Projection failure cannot report already committed facts as rolled back; the system becomes degraded and a shutdown-aware reconciler retries. The redactor may destructively replace its patterns only after a complete inventory of every application, active/pending/draft, Registry credential, and webhook secret. An incomplete inventory preserves old patterns or prevents cold startup.
 
-破坏性recovery cleanup只在HTTP listen前运行。运行期verified loader、catalog refresh和reconciler使用read-only scan，不能删除另一个writer正在发布的temp或尚未被旧metadata引用的新revision。
+Destructive recovery cleanup runs only before the HTTP listener starts. Runtime verified loaders, catalog refresh, and reconciliation use read-only scans; they cannot delete a concurrent writer's temporary artifact or a new revision not yet referenced by old metadata.
 
-## Docker 与 Compose 边界
+## Docker and Compose boundary
 
-生产观察固定连接 `/var/run/docker.sock`，不读取 `DOCKER_HOST`。Docker unavailable时认证控制面仍可启动，catalog和health显示degraded；需要Docker的stream或mutation在effect前失败。
+Production observation uses only `/var/run/docker.sock` and ignores `DOCKER_HOST`. If Docker is unavailable, the authenticated control plane remains available and catalog/health show degraded state; streams and mutations that need Docker fail before an effect.
 
-Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，禁用隐式 `.env`，不使用shell。它只能生成version/validate/start/recreate/deploy-candidate/stop/restart/remove的封闭argv；不存在build、pull、exec、down、volume remove或用户参数透传。
+The production Compose runner always executes `/usr/bin/docker`, clears inherited environment, disables implicit `.env`, and never invokes a shell. It can emit only closed argument vectors for version, validate, start, recreate, deploy-candidate, stop, restart, and remove. It has no build, pull, exec, down, volume-removal, or user-argument passthrough path.
 
-每次effect前都从filesystem重新验证active/pending release、config/HMAC/canonical YAML，并枚举project/service下全部container candidate。任一unmanaged、stale、invalid、replacement或multiple collision都fail closed。统一的 canonical network plan 同时驱动 Compose、resource preflight、runtime drift、删除 facts 和 API projection；active/pending expectation 分别来自各自 immutable config revision，不能由 mutable draft 替代。未配置应用没有 revision/release，所有 Docker effect 都在资源创建前以 `APP_UNCONFIGURED` 结束。
+Before every effect, SoloDock reloads and verifies active/pending releases, config/HMAC/canonical YAML from the filesystem and enumerates all container candidates under the project/service. Any unmanaged, stale, invalid, replacement, or multiple collision fails closed. One canonical network plan drives Compose, resource preflight, runtime drift, deletion facts, and API projection. Active and pending expectations come from their own immutable config revisions, never the mutable draft. An unconfigured application has no revision/release, so every Docker effect ends with `APP_UNCONFIGURED` before resource creation.
 
-Owned network 仅在对应 revision 启用时检查版本化 exact name/ownership、`bridge` driver 和 bridge option；ownership 冲突与 `NETWORK_BRIDGE_IDENTITY_CONFLICT` 都在 runner 前 fail closed。平台内部网络由全局 manager 在首次 deployment effect 前创建或校验，固定 internal/bridge/labels，既不伪装为 external network，也不由应用 deletion 删除。External network 使用 fresh network inspect 加有界并发的成员 container inspect，读取 full ID 与有效 DNS names；缺失、alias 冲突或不完整 observation 均在 runner 前 fail closed。resource、network、bind和daemon data-root在durable marker后再次检查；最后一个外部事实检查完成后才调用runner。
+An enabled owned network must match its versioned exact name and ownership, the `bridge` driver, and the bridge option. Ownership conflicts and `NETWORK_BRIDGE_IDENTITY_CONFLICT` fail before the runner. A global manager creates or validates the internal platform network before first deployment effect using fixed internal/bridge/label identity. It is neither represented as an external network nor deleted with an application. External networks use fresh network inspection plus bounded-concurrency member-container inspection to obtain full IDs and effective DNS names. Missing networks, alias conflicts, or incomplete observation fail before the runner. Resources, networks, binds, and daemon data root are rechecked after the durable marker; the runner is called only after the final external fact check.
 
-内置 preset 只负责把少量输入渲染成普通 `DraftInput`，不生成 Compose、不直接操作 Docker。OCI metadata inspection 同样是无副作用 reader，复用 Registry auth/redirect/timeout/digest 校验并只返回 UI 消费的 allowlist。两者最终都回到唯一 config revision、release resolver 与 deployment engine。
+A built-in preset only renders a small input set to ordinary `DraftInput`; it does not generate Compose or manipulate Docker. OCI metadata inspection is likewise a side-effect-free reader that reuses Registry authentication, redirect, timeout, and digest checks and returns only an allowlist for the UI. Both paths return to the sole config revision, release resolver, and deployment engine.
 
-## 发布与自动化
+## Releases and automation
 
-manual、poll和rollback进入同一个deployment engine。candidate在Docker effect前落盘并设置`pending`；Compose 后的首次 observation 是 ownership claim boundary：唯一非 predecessor full ID 与全套 canonical project/service/app/schema/candidate-release labels 足以证明 exact owned effect，worker 立即把该 ID 持久化为 `post_container_id`，再校验 configured digest reference、config/manifest identity、可用的 manifest descriptor、status 与 health。marker 持久化后该 exact ID 是补偿、health、commit/rollback 的 SSOT；此后不同 full ID 才属于 uncertain replacement，必须保留 pending/现场并进入`interrupted`或`needs_attention`，禁止 stop/remove。exact owned candidate 的确定性拒绝统一进入移除或旧 active 恢复补偿，只有补偿结果被重新观察证明后才写`failed`或`rolled_back`。
+Manual, poll, and rollback work enter one deployment engine. The candidate is persisted and `pending` is set before a Docker effect. The first observation after Compose is the ownership-claim boundary: one non-predecessor full ID with the complete canonical project/service/application/schema/candidate-release labels proves an exact owned effect. The worker immediately persists that ID as `post_container_id`, then validates configured digest reference, config/manifest identity, available manifest descriptor, status, and health. Once persisted, that exact ID is the source of truth for compensation, health, and commit/rollback. Any later different full ID is an uncertain replacement, so pending and the scene remain and the deployment becomes `interrupted` or `needs_attention`; SoloDock must not stop or remove it. Deterministic rejection of an exact owned candidate enters the same remove-or-restore compensation path, and only newly observed proof of compensation permits `failed` or `rolled_back`.
 
-webhook HMAC验证后，把nonce claim、audit和per-app wake sequence在一个SQLite transaction提交。sequence只是bounded coalescing signal；PollCoordinator仍会重新读取filesystem、Registry和Docker事实。完整状态语义见 [部署与回滚](deployments.md) 和 [Webhook](webhooks.md)。
+After webhook HMAC verification, nonce claim, audit, and per-application wake sequence commit in one SQLite transaction. The sequence is only a bounded coalescing signal; `PollCoordinator` still reloads filesystem, Registry, and Docker facts. See [deployments and rollback](deployments.md) and [webhooks](webhooks.md).
 
-## 数据与恢复边界
+## Data and recovery boundary
 
-unregister/remove/delete保留named/external volume、bind内容和network。业务数据不属于control-plane backup，release rollback也不回滚数据migration。安装、备份和故障处置分别见 [运维](operations.md)、[恢复](recovery.md) 和 [威胁模型](threat-model.md)。
+Unregister, remove, and delete preserve named/external volumes, bind contents, and networks. Business data is outside the control-plane backup, and release rollback does not reverse data migrations. See [operations](operations.md), [recovery](recovery.md), and the [threat model](threat-model.md).

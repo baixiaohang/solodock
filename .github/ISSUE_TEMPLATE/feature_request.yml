@@ -1,0 +1,49 @@
+name: Feature request
+description: Propose an improvement within SoloDock's focused product scope.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        SoloDock intentionally targets one host, one administrator, one service per application, and prebuilt OCI images. Please explain how the proposal fits that model.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem are you trying to solve? Describe the workflow, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: scope_fit
+    attributes:
+      label: Product-scope fit
+      description: Explain how this remains within the single-host, single-administrator, single-service, prebuilt-image boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful behavior and any alternatives you considered.
+    validations:
+      required: true
+  - type: textarea
+    id: security_data
+    attributes:
+      label: Security and data impact
+      description: Note any impact on Docker access, secrets, networking, storage, deletion, backup, or rollback.
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundaries
+    attributes:
+      label: Scope checklist
+      options:
+        - label: The request does not require arbitrary Compose import or raw YAML editing.
+          required: true
+        - label: The request does not require multiple hosts, multi-tenancy, or RBAC.
+          required: true
+        - label: The request does not require SoloDock to build source code or manage reverse proxy/TLS.
+          required: true

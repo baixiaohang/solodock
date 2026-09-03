@@ -1,23 +1,26 @@
 # AGENTS.md
 
-SoloDock 是面向个人单机环境的轻量 Docker 应用部署控制台。一个 SoloDock 应用只对应一个容器和一个预构建镜像；系统生成最小 Compose 配置，不提供源码构建、通用 Compose 导入、反向代理或多节点编排。
+SoloDock is a lightweight Docker application deployment console for personal, single-host environments. One SoloDock application maps to one container and one prebuilt image. SoloDock generates a minimal Compose configuration; it does not build source code, import arbitrary Compose files, provide a reverse proxy, or orchestrate multiple hosts.
 
-## 语言与文档
+## Language and documentation
 
-- 仓库文档、Issue、PR、Review、Release Note 及其他面向人的协作内容默认使用简体中文。
-- Commit Message 遵循 Conventional Commits：类型与可选 scope 使用英文，subject 和 body 默认使用中文，例如 `feat: 增加应用状态查询`。
-- 代码标识符、命令、环境变量、API 路径、错误信息和第三方产品名保持英文；代码注释优先使用中文。
-- 架构、API、配置、运维方式或安全边界发生变化时，同步更新对应文档。
+- Use English for repository documentation and all GitHub-visible collaboration, including Issues, Pull Requests, Reviews, Discussions, Release Notes, and changelog entries.
+- Follow Conventional Commits. Write the type, optional scope, subject, and body in English, for example `feat: add application status query`.
+- Keep code identifiers, commands, environment variables, API paths, error codes, and third-party product names in their canonical form. Write new or substantially modified code comments and user-facing text in English.
+- Simplified Chinese translations are allowed only in explicitly localized files such as `README.zh-CN.md` and `docs/zh-CN/*.md`. English documentation is authoritative if translations disagree.
+- Direct maintainer conversations, private design confirmation, and internal coordination may use the participants' preferred language; this does not change the repository language policy.
+- When architecture, APIs, configuration, operations, security boundaries, or test guardrails change, update the corresponding English and Simplified Chinese documentation in the same Pull Request. See `docs/AGENTS.md` for the documentation pairing rules.
+- Do not rewrite Git history or translate unrelated legacy comments solely for language consistency. Apply this policy to new content and files otherwise changed by the task.
 
-## 技术栈与常用命令
+## Stack and common commands
 
-- 后端：Rust stable、edition 2024、Axum、Tokio。
-- 前端：Svelte、TypeScript、Vite；生产版本最终嵌入 Rust 单一二进制，不运行 Node 服务。
+- Backend: Rust stable, edition 2024, Axum, and Tokio.
+- Frontend: Svelte, TypeScript, and Vite. Production builds embed the frontend in a single Rust binary; no Node service runs in production.
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo test --all-targets --all-features -- --test-threads=2
 
 cd web
 npm ci
@@ -25,20 +28,20 @@ npm run check
 npm run build
 ```
 
-只运行与本次改动直接相关的最小验证；除非维护者明确要求，不主动运行全量或宿主 Docker E2E。
+Run the smallest validation directly related to the change. Do not run the complete suite or host Docker E2E unless the maintainer explicitly requests it.
 
-## 开发与安全边界
+## Development and security boundaries
 
-- 保持单进程、单 Rust crate 和单 service 应用模型，不为未来能力提前增加平台化抽象。
-- Docker socket / `docker` group 权限等同宿主 root 权限；不得将其描述为低权限安全边界，也不得暴露给受管容器或 Web API。
-- 管理端和应用发布端口都只允许绑定 loopback；MVP 不接受非 loopback 监听或端口映射。
-- Secret 原值不得进入 Git、Compose 文件、日志、错误、审计、普通 API 响应或命令行参数；Compose 只允许引用受管 secret。
-- 删除应用默认保留 volume；禁止使用 `docker system prune`、通配删除或未经精确确认的破坏性命令。
-- Docker/Compose 集成测试必须使用隔离 daemon 或明确的测试 context，并按随机 project、专属 label 和精确 ID 清理。
+- Preserve the single-process, single-Rust-crate, single-service application model. Do not introduce platform abstractions for hypothetical future features.
+- Access to the Docker socket or membership in the `docker` group is effectively host root access. Never describe it as a low-privilege security boundary or expose it to managed containers or the Web API.
+- Bind the management endpoint and published application ports only to loopback addresses. The MVP does not accept non-loopback listeners or port mappings.
+- Secret plaintext must never enter Git, Compose files, logs, errors, audit records, ordinary API responses, or command-line arguments. Compose may only reference managed secrets.
+- Application deletion preserves volumes by default. Never use `docker system prune`, wildcard deletion, or destructive commands without exact verification.
+- Docker/Compose integration tests must use an isolated daemon or an explicit test context, random projects, dedicated labels, and exact-ID cleanup.
 
-## 变更约定
+## Change conventions
 
-- 保持变更范围小且可审查，不提交 `target/`、`web/node_modules/`、`web/dist/` 等生成产物。
-- Rust 与 npm lockfile 必须随依赖变更一起提交。
-- 新行为应配套最低层级的确定性测试；失败路径、安全边界和破坏性操作优先测试。
-- 未经维护者对具体方案的确认，不擅自扩大产品边界或实施 volume/数据迁移。
+- Keep changes small and reviewable. Do not commit generated output such as `target/`, `web/node_modules/`, or `web/dist/`.
+- Commit Rust and npm lockfiles together with dependency changes.
+- Add deterministic tests at the lowest useful layer for new behavior. Prioritize failure paths, security boundaries, and destructive operations.
+- Do not expand the product boundary or perform volume/data migrations without maintainer approval for the specific design.
