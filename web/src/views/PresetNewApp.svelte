@@ -4,12 +4,20 @@
   import type { AppDetailResponse, AppMutationResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   import { presetDescription } from '../lib/presets'
+
   let slug = $state('postgres')
   let major = $state('18')
   let username = $state('postgres')
   let database = $state('postgres')
   let password = $state(generatePassword())
-  let busy = $state(false); let error = $state<UserMessage | null>(null); let copied = $state(false)
+  let acknowledgeNonRollbackableData = $state(false)
+  let passwordSaved = $state(false)
+  let busy = $state(false)
+  let error = $state<UserMessage | null>(null)
+  let confirmationError = $state<UserMessage | null>(null)
+  let copied = $state(false)
+  let passwordGeneration = 0
+  let copyGeneration = 0
   let createdAppId = $state<string | null>(null)
   let createRetry = $state<RetryIdentity | undefined>()
   let deployRetry = $state<RetryIdentity | undefined>()
@@ -21,27 +29,160 @@
     expected_actual_container_id: string | null
     acknowledge_non_rollbackable_data: boolean
   } | null>(null)
-  function generatePassword() { const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'; const bytes = crypto.getRandomValues(new Uint8Array(24)); return Array.from(bytes, (value) => alphabet[value % alphabet.length]).join('') }
-  async function copyPassword() { await navigator.clipboard.writeText(password); copied = true }
+
+  function generatePassword() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789'
+    const bytes = crypto.getRandomValues(new Uint8Array(24))
+    return Array.from(bytes, (value) => alphabet[value % alphabet.length]).join('')
+  }
+
+  function changePassword(value: string) {
+    password = value
+    passwordGeneration += 1
+    passwordSaved = false
+    copied = false
+    confirmationError = null
+  }
+
+  function regeneratePassword() {
+    changePassword(generatePassword())
+  }
+
+  async function copyPassword() {
+    const value = password
+    const passwordVersion = passwordGeneration
+    const copyVersion = ++copyGeneration
+    copied = false
+    try {
+      await navigator.clipboard.writeText(value)
+      if (passwordVersion === passwordGeneration && copyVersion === copyGeneration) copied = true
+    } catch {
+      // A failed clipboard write must not imply that the password was copied.
+    }
+  }
+
   async function create() {
-    busy = true; error = null; copied = false
+    if (!createdAppId && (!acknowledgeNonRollbackableData || !passwordSaved)) {
+      confirmationError = localized('Confirm both PostgreSQL safety acknowledgements before creating the service.')
+      return
+    }
+
+    const confirmedNonRollbackableData = acknowledgeNonRollbackableData
+    busy = true
+    error = null
+    confirmationError = null
+    copied = false
     try {
       if (!createdAppId) {
-        const request = { slug, preset_id: 'postgresql', preset_schema_version: 1, variables: { major, username, database, password, initdb_args: '' } }
+        const request = {
+          slug,
+          preset_id: 'postgresql',
+          preset_schema_version: 1,
+          variables: { major, username, database, password, initdb_args: '' },
+        }
         createRetry = retryIdentity(createRetry, request)
-        const created = await mutation<AppMutationResponse>('/api/v1/apps/from-preset', request, { idempotencyKey: createRetry.key })
-        createdAppId = created.app.id; createRetry = undefined; password = ''
+        const created = await mutation<AppMutationResponse>('/api/v1/apps/from-preset', request, {
+          idempotencyKey: createRetry.key,
+        })
+        createdAppId = created.app.id
+        createRetry = undefined
+        password = ''
       }
       if (!deployRequest) {
         const app = await api<AppDetailResponse>(`/api/v1/apps/${createdAppId}`)
-        deployRequest = { expected_draft_revision: app.draft_revision, expected_active_release_id: app.active_release?.id ?? null, expected_pending_release_id: app.pending_release_id, expected_actual_release_id: app.actual_release_id, expected_actual_container_id: app.actual?.id ?? null, acknowledge_non_rollbackable_data: true }
+        deployRequest = {
+          expected_draft_revision: app.draft_revision,
+          expected_active_release_id: app.active_release?.id ?? null,
+          expected_pending_release_id: app.pending_release_id,
+          expected_actual_release_id: app.actual_release_id,
+          expected_actual_container_id: app.actual?.id ?? null,
+          acknowledge_non_rollbackable_data: confirmedNonRollbackableData,
+        }
         deployRetry = retryIdentity(undefined, deployRequest)
       }
       if (!deployRetry) deployRetry = retryIdentity(undefined, deployRequest)
-      const deployment = await mutation<{ deployment_id: string }>(`/api/v1/apps/${createdAppId}/deployments`, deployRequest, { idempotencyKey: deployRetry.key })
-      deployRetry = undefined; deployRequest = null; window.location.hash = `/deployments/${deployment.deployment_id}`
-    } catch { error = createdAppId ? localized('The service and configuration were created but not deployed. Retry here or continue from the service detail page.') : localized('Creation failed. If the network result is uncertain, the same password and idempotency key will be reused.') }
-    finally { busy = false }
+      const deployment = await mutation<{ deployment_id: string }>(
+        `/api/v1/apps/${createdAppId}/deployments`,
+        deployRequest,
+        { idempotencyKey: deployRetry.key },
+      )
+      deployRetry = undefined
+      deployRequest = null
+      window.location.hash = `/deployments/${deployment.deployment_id}`
+    } catch {
+      error = createdAppId
+        ? localized('The service and configuration were created, but deployment was not confirmed. The generated password cannot be shown again. Retry here or continue from the service detail page.')
+        : localized('Creation failed. If the network result is uncertain, the same password and idempotency key will be reused.')
+    } finally {
+      busy = false
+    }
   }
 </script>
-<main class="page-shell narrow"><a class="back" href="#/apps/new">← {$t('Back to new service')}</a><div class="page-heading"><div><p class="eyebrow">{$t('QUICK DEPLOY')}</p><h1>PostgreSQL</h1><p class="muted">{presetDescription('postgresql', 'Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.', $t)}</p><p class="muted">{$t('Only a service name is required by default. No host port is published; other services connect at {host}:5432.', { host: slug || 'postgres' })}</p></div></div>{#if error}<p class="notice danger" role="alert">{messageText(error, $t)}{#if createdAppId} <a href={`#/apps/${createdAppId}`}>{$t('Open service details')}</a>{/if}</p>{/if}<form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void create() }}><label>{$t('Service name')}<input bind:value={slug} maxlength="20" required disabled={createdAppId !== null} /></label><label>{$t('Major')}<select bind:value={major} disabled={createdAppId !== null}><option value="18">18 ({$t('Recommended')})</option><option value="17">17</option></select></label><label>{$t('Username')}<input bind:value={username} required disabled={createdAppId !== null} /></label><label>{$t('Database')}<input bind:value={database} required disabled={createdAppId !== null} /></label>{#if !createdAppId}<label>{$t('Generated password')}<input type="password" bind:value={password} required minlength="16" /><span class="muted">{$t('Copy and save it before creating the service. SoloDock never returns it after saving.')}</span></label>{/if}<div class="actions">{#if !createdAppId}<button type="button" class="ghost" onclick={() => { password = generatePassword(); copied = false }}>{$t('Regenerate')}</button><button type="button" class="ghost" onclick={() => void copyPassword()}>{copied ? $t('Copied') : $t('Copy password')}</button>{/if}<button disabled={busy}>{busy ? $t('Processing…') : createdAppId ? $t('Continue deployment') : $t('Create and deploy')}</button></div></form></main>
+
+<main class="page-shell narrow">
+  <a class="back" href="#/apps/new">← {$t('Back to new service')}</a>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">{$t('QUICK DEPLOY')}</p>
+      <h1>PostgreSQL</h1>
+      <p class="muted">{presetDescription('postgresql', 'Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.', $t)}</p>
+      <p class="muted">{$t('Only a service name is required by default. No host port is published; other services connect at {host}:5432.', { host: slug || 'postgres' })}</p>
+    </div>
+  </div>
+  {#if error}
+    <p class="notice danger" role="alert">
+      {messageText(error, $t)}
+      {#if createdAppId} <a href={`#/apps/${createdAppId}`}>{$t('Open service details')}</a>{/if}
+    </p>
+  {/if}
+  <form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void create() }}>
+    <label>{$t('Service name')}<input bind:value={slug} maxlength="20" required disabled={busy || createdAppId !== null} /></label>
+    <label>{$t('Major')}<select bind:value={major} disabled={busy || createdAppId !== null}><option value="18">18 ({$t('Recommended')})</option><option value="17">17</option></select></label>
+    <label>{$t('Username')}<input bind:value={username} required disabled={busy || createdAppId !== null} /></label>
+    <label>{$t('Database')}<input bind:value={database} required disabled={busy || createdAppId !== null} /></label>
+    {#if !createdAppId}
+      <label>
+        {$t('Generated password')}
+        <input
+          type="password"
+          value={password}
+          oninput={(event) => changePassword(event.currentTarget.value)}
+          required
+          minlength="16"
+          disabled={busy}
+        />
+        <span class="muted">{$t('Copy and save it before creating the service. SoloDock never returns it after saving.')}</span>
+      </label>
+      <label class="checkbox">
+        <input
+          type="checkbox"
+          bind:checked={acknowledgeNonRollbackableData}
+          onchange={() => { confirmationError = null }}
+          required
+          disabled={busy}
+        />
+        {$t('I understand that PostgreSQL data in the named volume does not roll back with a deployment or rollback')}
+      </label>
+      <label class="checkbox">
+        <input
+          type="checkbox"
+          bind:checked={passwordSaved}
+          onchange={() => { confirmationError = null }}
+          required
+          disabled={busy}
+        />
+        {$t('I saved the generated PostgreSQL password outside SoloDock')}
+      </label>
+      {#if confirmationError}<p class="form-error" role="alert">{messageText(confirmationError, $t)}</p>{/if}
+    {/if}
+    <div class="actions">
+      {#if !createdAppId}
+        <button type="button" class="ghost" disabled={busy} onclick={regeneratePassword}>{$t('Regenerate')}</button>
+        <button type="button" class="ghost" disabled={busy} onclick={() => void copyPassword()}>{copied ? $t('Copied') : $t('Copy password')}</button>
+      {/if}
+      <button disabled={busy || (!createdAppId && (!acknowledgeNonRollbackableData || !passwordSaved))}>
+        {busy ? $t('Processing…') : createdAppId ? $t('Continue deployment') : $t('Create and deploy')}
+      </button>
+    </div>
+  </form>
+</main>
