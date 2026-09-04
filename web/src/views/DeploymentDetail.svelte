@@ -12,17 +12,31 @@
   let timer: ReturnType<typeof setTimeout> | undefined
   let error = $state<UserMessage | null>(null)
   let rollbackRetry = $state<RetryIdentity | undefined>()
-  onMount(() => { void load(); return () => { if (timer) clearTimeout(timer) } })
+  let disposed = false
+  onMount(() => {
+    disposed = false
+    void load()
+    return () => {
+      disposed = true
+      if (timer) clearTimeout(timer)
+      timer = undefined
+      rollbackRetry = undefined
+    }
+  })
   async function load() {
+    if (disposed) return
     try {
-      deployment = await api(`/api/v1/deployments/${deploymentId}`)
+      const loaded = await api<Deployment>(`/api/v1/deployments/${deploymentId}`)
+      if (disposed) return
+      deployment = loaded
       if (deployment && !isTerminalDeployment(deployment.status)) timer = setTimeout(() => void load(), 1000)
-    } catch { error = localized('Could not load deployment.') }
+    } catch { if (!disposed) error = localized('Could not load deployment.') }
   }
   async function rollback() {
-    if (!deployment || !window.confirm($t('Rollback changes only the image and configuration; database, named volume, and bind contents are not reverted. Continue?'))) return
+    if (disposed || !deployment || !window.confirm($t('Rollback changes only the image and configuration; database, named volume, and bind contents are not reverted. Continue?'))) return
     try {
       const app = await api<AppDetailResponse>(`/api/v1/apps/${deployment.app_id}`)
+      if (disposed) return
       const request = {
         expected_active_release_id: app.active_release?.id ?? null,
         expected_pending_release_id: app.pending_release_id,
@@ -32,9 +46,10 @@
       }
       rollbackRetry = retryIdentity(rollbackRetry, request)
       const result = await mutation<{ deployment_id: string }>(`/api/v1/deployments/${deployment.id}/rollback`, request, { idempotencyKey: rollbackRetry.key })
+      if (disposed) return
       rollbackRetry = undefined
       window.location.hash = `/deployments/${result.deployment_id}`
-    } catch { error = localized('Rollback facts changed. Return to the application page and refresh.') }
+    } catch { if (!disposed) error = localized('Rollback facts changed. Return to the application page and refresh.') }
   }
 </script>
 <main class="page-shell narrow">

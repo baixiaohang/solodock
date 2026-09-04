@@ -42,13 +42,17 @@
     {:else if credentials}
       <Credentials />
     {:else if deploymentId}
-      <DeploymentDetail {deploymentId} />
+      {#key deploymentId}
+        <DeploymentDetail {deploymentId} />
+      {/key}
     {:else if creatingPostgresql}
       <PresetNewApp />
     {:else if creating}
       <NewApp />
     {:else if appId}
-      <AppDetail {appId} />
+      {#key appId}
+        <AppDetail {appId} />
+      {/key}
     {:else}
       <Dashboard />
     {/if}
