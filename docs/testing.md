@@ -49,6 +49,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 - Dashboard generations abort superseded loads, prevent late responses from publishing state or opening SSE, close old and partially constructed source sets, and cap the live stats set at eight. Deployment detail polling permits one request and one timer, retries transient failures with bounded exponential backoff, resets to the one-second cadence after success, and stops on terminal state, route change, or teardown.
 - Frontend mutation retry tests cover normal request bodies, write-only secret digests, and manually managed lifecycle/deletion keys. Network, unvalidated HTML/proxy failures, and HTTP 5xx retain the exact key; validated backend JSON 4xx and confirmed success clear it. Secret canaries remain absent from errors, UI, and browser storage.
 - Authority-routing tests exercise the production middleware with management, webhook, and distinct local-probe authorities. They cover DNS/default-port and IPv4/IPv6 normalization; URI/`Host` agreement; missing, duplicate, invalid, unknown, and forwarding-only input; exact webhook method/path/UUID; cross-surface requests with a valid session; body-minimal no-store rejections; and the minimal health/favicon probe contract.
+- Packaged-layout tests drive the production Rust inspector and runtime marker for fixed config/state/runtime identity, custom IPv4 and bracketed IPv6 loopback probes, invalid markers, and pre-side-effect rejection. Package fixtures prove installer/updater/backup/restore zero mutation on custom layout or malformed inspector output, updater URL derivation without an override, absent-versus-invalid Docker socket handling, and a unit with only `After`/`Wants` Docker ordering.
 - Public/secret classification and `keep`/`replace`/`delete`.
 - Lossless row/bulk `KEY=VALUE` editing for public environment variables, including CRLF, blank lines, first `=`, duplicate/invalid keys, and line-number errors. Secrets never enter the textarea; masking, class conversion, rename, keep/replace/delete, and post-success clearing remain covered.
 - Image-suggestion POST JSON `Content-Type`, CSRF, credential reference, allowlisted success projection, and sanitized error display.
@@ -66,7 +67,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 - Canonical active/pending symlinks, modes/owners, HMACs, and config/release/Compose validation.
 - Exact `0444` public/secret managed leaves with `0700` ancestors and publication modes that do not narrow under restrictive umask. Startup migrates only canonical legacy `0400`/`0600`; runtime scans do not change permissions and unsafe drift fails closed.
 - Rebuildable facts and non-fabricated authentication/audit history after SQLite loss.
-- Backup/restore rejects escaping links, hard links, special files, and incompatible state.
+- Backup/restore rejects escaping links, hard links, special files, and incompatible or non-packaged state. The root-capable chain builds canonical Compose for `/var/lib/solodock` while storing the fixture below a private staging root, then validates the relocated tree as the service identity.
 
 ### Docker and Compose
 

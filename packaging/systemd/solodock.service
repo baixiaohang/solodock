@@ -2,8 +2,7 @@
 Description=SoloDock container deployment console
 Documentation=https://github.com/baixiaohang/solodock
 After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+Wants=network-online.target docker.service
 
 [Service]
 Type=simple
@@ -11,6 +10,7 @@ User=solodock
 Group=solodock
 SupplementaryGroups=docker
 Environment=SOLODOCK_CONFIG_PATH=/etc/solodock/config.toml
+Environment=SOLODOCK_PACKAGED_LAYOUT=1
 Environment=RUST_LOG=solodock=info
 ExecStart=/usr/local/bin/solodock
 Restart=on-failure

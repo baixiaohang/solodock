@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
@@ -9,6 +11,9 @@ use thiserror::Error;
 use url::{Host, Url};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/solodock/config.toml";
+pub const PACKAGED_STATE_DIRECTORY: &str = "/var/lib/solodock";
+pub const PACKAGED_RUNTIME_DIRECTORY: &str = "/run/solodock";
+pub const PACKAGED_LAYOUT_ENV: &str = "SOLODOCK_PACKAGED_LAYOUT";
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,13 +43,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn load() -> Result<Self, ConfigError> {
-        let path = env::var_os("SOLODOCK_CONFIG_PATH")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-        Self::load_from(&path)
-    }
-
     pub fn load_from(path: &Path) -> Result<Self, ConfigError> {
         check_config_file(path)?;
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -53,6 +51,47 @@ impl Config {
         })?;
         let raw: ConfigFile = toml::from_str(&contents).map_err(ConfigError::Parse)?;
         Self::try_from(raw)
+    }
+
+    pub fn load_runtime() -> Result<Self, ConfigError> {
+        let marker = env::var_os(PACKAGED_LAYOUT_ENV);
+        let packaged = packaged_layout_enabled(marker.as_deref())?;
+        let path = env::var_os("SOLODOCK_CONFIG_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+        if packaged {
+            validate_packaged_config_path(&path)?;
+        }
+        #[cfg(feature = "docker-e2e")]
+        let read_path = env::var_os("SOLODOCK_PACKAGED_CONFIG_TEST_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| path.clone());
+        #[cfg(not(feature = "docker-e2e"))]
+        let read_path = path;
+        let config = Self::load_from(&read_path)?;
+        if packaged {
+            config.validate_packaged_layout()?;
+        }
+        Ok(config)
+    }
+
+    pub fn validate_packaged_layout(&self) -> Result<(), ConfigError> {
+        if self.state_directory != Path::new(PACKAGED_STATE_DIRECTORY) {
+            return Err(ConfigError::PackagedStateDirectory);
+        }
+        if self.runtime_directory != Path::new(PACKAGED_RUNTIME_DIRECTORY) {
+            return Err(ConfigError::PackagedRuntimeDirectory);
+        }
+        Ok(())
+    }
+
+    pub fn packaged_inspection(&self) -> Result<PackagedConfigInspection, ConfigError> {
+        self.validate_packaged_layout()?;
+        Ok(PackagedConfigInspection {
+            health_url: format!("http://{}/healthz", self.listen_address),
+            local_authority: self.local_probe_authority.explicit(),
+            management_authority: self.management_authority.explicit(),
+        })
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -101,6 +140,37 @@ impl Config {
             docker_root,
         )
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PackagedConfigInspection {
+    pub health_url: String,
+    pub local_authority: String,
+    pub management_authority: String,
+}
+
+impl PackagedConfigInspection {
+    pub fn render(&self) -> String {
+        format!(
+            "FORMAT=solodock-packaged-config-v1\nHEALTH_URL={}\nLOCAL_AUTHORITY={}\nMANAGEMENT_AUTHORITY={}\n",
+            self.health_url, self.local_authority, self.management_authority
+        )
+    }
+}
+
+fn packaged_layout_enabled(marker: Option<&OsStr>) -> Result<bool, ConfigError> {
+    match marker {
+        None => Ok(false),
+        Some(value) if value == OsStr::new("1") => Ok(true),
+        Some(_) => Err(ConfigError::PackagedLayoutMarker),
+    }
+}
+
+fn validate_packaged_config_path(path: &Path) -> Result<(), ConfigError> {
+    if path != Path::new(DEFAULT_CONFIG_PATH) {
+        return Err(ConfigError::PackagedConfigPath);
+    }
+    Ok(())
 }
 
 impl TryFrom<ConfigFile> for Config {
@@ -501,6 +571,14 @@ pub enum ConfigError {
     ConfigOwner,
     #[error("configuration file must not be group or other writable")]
     ConfigMode,
+    #[error("SOLODOCK_PACKAGED_LAYOUT must be exactly 1 when it is set")]
+    PackagedLayoutMarker,
+    #[error("packaged SoloDock must use /etc/solodock/config.toml")]
+    PackagedConfigPath,
+    #[error("packaged SoloDock state_directory must be /var/lib/solodock")]
+    PackagedStateDirectory,
+    #[error("packaged SoloDock runtime_directory must be /run/solodock")]
+    PackagedRuntimeDirectory,
 }
 
 #[cfg(test)]
@@ -621,6 +699,59 @@ mod tests {
         value.public_origin = "https://127.0.0.1:8443".into();
         let config = Config::try_from(value).unwrap();
         assert_eq!(config.management_authority, config.local_probe_authority);
+    }
+
+    #[test]
+    fn packaged_layout_accepts_fixed_paths_and_custom_loopback_listeners() {
+        for listen in ["127.8.9.10:9123", "[::1]:9124"] {
+            let mut value = raw();
+            value.listen_address = listen.into();
+            let config = Config::try_from(value).unwrap();
+            config.validate_packaged_layout().unwrap();
+            let inspection = config.packaged_inspection().unwrap();
+            assert!(inspection.health_url.ends_with("/healthz"));
+            assert_eq!(
+                inspection.local_authority,
+                config.local_probe_authority.explicit()
+            );
+        }
+    }
+
+    #[test]
+    fn packaged_layout_rejects_marker_config_and_managed_path_drift() {
+        assert!(!packaged_layout_enabled(None).unwrap());
+        assert!(packaged_layout_enabled(Some(OsStr::new("1"))).unwrap());
+        assert!(matches!(
+            packaged_layout_enabled(Some(OsStr::new("true"))),
+            Err(ConfigError::PackagedLayoutMarker)
+        ));
+        assert!(matches!(
+            validate_packaged_config_path(Path::new("/tmp/config.toml")),
+            Err(ConfigError::PackagedConfigPath)
+        ));
+
+        let mut value = raw();
+        value.state_directory = "/srv/solodock".into();
+        assert!(matches!(
+            Config::try_from(value).unwrap().validate_packaged_layout(),
+            Err(ConfigError::PackagedStateDirectory)
+        ));
+        let mut value = raw();
+        value.runtime_directory = "/tmp/solodock".into();
+        assert!(matches!(
+            Config::try_from(value).unwrap().validate_packaged_layout(),
+            Err(ConfigError::PackagedRuntimeDirectory)
+        ));
+    }
+
+    #[test]
+    fn development_configuration_keeps_safe_custom_managed_paths() {
+        let mut value = raw();
+        value.state_directory = "/srv/solodock-state".into();
+        value.runtime_directory = "/tmp/solodock-runtime".into();
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(config.state_directory, Path::new("/srv/solodock-state"));
+        assert_eq!(config.runtime_directory, Path::new("/tmp/solodock-runtime"));
     }
 
     #[test]

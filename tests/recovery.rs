@@ -318,9 +318,13 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    let store =
-        AppStore::initialize_managed(state.join("apps"), key.clone(), vec![bind_root.clone()])
-            .unwrap();
+    let store = AppStore::initialize_managed_relocated(
+        state.join("apps"),
+        std::path::PathBuf::from("/var/lib/solodock/apps"),
+        key.clone(),
+        vec![bind_root.clone()],
+    )
+    .unwrap();
     let draft = normalize_draft(
         DraftInput {
             display_name: "Backup fixture".into(),
@@ -442,7 +446,7 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         &config,
         format!(
             "schema_version=1\nlisten_address='127.0.0.1:8080'\npublic_origin='https://solodock.example.invalid'\nwebhook_public_origin='https://hooks.example.invalid'\nstate_directory='{}'\nruntime_directory='/run/solodock'\nallowed_bind_roots=['{}']\n",
-            state.display(),
+            "/var/lib/solodock",
             bind_root.display()
         ),
     )
@@ -452,7 +456,13 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     let archive = fixture.path().join("backup.tar");
     let backup = Command::new(manifest.join("packaging/solodock-backup"))
         .current_dir(manifest)
-        .args(["--root", package_root.to_str().unwrap(), "--output"])
+        .args([
+            "--root",
+            package_root.to_str().unwrap(),
+            "--validator",
+            env!("CARGO_BIN_EXE_solodock"),
+            "--output",
+        ])
         .arg(&archive)
         .output()
         .unwrap();

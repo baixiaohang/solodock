@@ -5,6 +5,32 @@ usage() {
   printf '%s\n' 'usage: install.sh --version VERSION [--binary PATH] [--destdir PATH] [--enable-now]'
 }
 
+inspect_packaged_config() {
+  local inspector=$1 config=$2 output health authority management
+  local -a fields
+  output=$("$inspector" inspect-packaged-config "$config") || return 1
+  mapfile -t fields <<<"$output"
+  [[ ${#fields[@]} == 4 ]] || return 1
+  [[ ${fields[0]} == 'FORMAT=solodock-packaged-config-v1' ]] || return 1
+  [[ ${fields[1]} == HEALTH_URL=* ]] || return 1
+  health=${fields[1]#HEALTH_URL=}
+  [[ -n $health && ${#health} -le 320 && $health != *[$' \t\r\n']* ]] || return 1
+  authority=${health#http://}
+  authority=${authority%/healthz}
+  [[ -n $authority && $health == "http://$authority/healthz" && $authority != *['/?#@\']* ]] || return 1
+  [[ ${fields[2]} == "LOCAL_AUTHORITY=$authority" ]] || return 1
+  [[ ${fields[3]} == MANAGEMENT_AUTHORITY=* ]] || return 1
+  management=${fields[3]#MANAGEMENT_AUTHORITY=}
+  [[ -n $management && ${#management} -le 320 && $management != *[$' \t\r\n']* && $management != *['/?#@\']* ]] || return 1
+}
+
+validate_docker_socket() {
+  local socket=$1
+  if [[ -e $socket || -L $socket ]]; then
+    [[ -S $socket && ! -L $socket && $(stat -c '%G' "$socket") == docker ]] || return 1
+  fi
+}
+
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 version=''
 binary=''
@@ -50,7 +76,6 @@ fi
 if [[ -n $destdir ]]; then
   [[ $destdir = /* && $destdir != / && ! -L $destdir ]] || { printf '%s\n' 'unsafe DESTDIR' >&2; exit 2; }
   ((enable_now == 0)) || { printf '%s\n' '--enable-now is unavailable with --destdir' >&2; exit 2; }
-  mkdir -p -- "$destdir"
 else
   [[ ${EUID:-$(id -u)} -eq 0 ]] || { printf '%s\n' 'production installation requires root' >&2; exit 1; }
   grep -qx 'ID=ubuntu' /etc/os-release
@@ -59,10 +84,20 @@ else
   command -v docker >/dev/null
   /usr/bin/docker compose version --short >/dev/null
   getent group docker >/dev/null
-  [[ -S /var/run/docker.sock && $(stat -c '%G' /var/run/docker.sock) == docker ]] || { printf '%s\n' 'Docker socket/group is unavailable' >&2; exit 1; }
 fi
 
 root=${destdir%/}
+config_target="$root/etc/solodock/config.toml"
+config_to_inspect=$config_source
+if [[ -e $config_target || -L $config_target ]]; then
+  [[ -f $config_target && ! -L $config_target ]] || { printf '%s\n' 'refusing unsafe existing config target' >&2; exit 1; }
+  config_to_inspect=$config_target
+fi
+inspect_packaged_config "$binary" "$config_to_inspect" || { printf '%s\n' 'packaged configuration preflight failed' >&2; exit 1; }
+docker_socket=/var/run/docker.sock
+[[ -z $destdir ]] || docker_socket="$root/var/run/docker.sock"
+validate_docker_socket "$docker_socket" || { printf '%s\n' 'Docker socket has an unsafe type or group' >&2; exit 1; }
+[[ -z $destdir || -d $destdir ]] || mkdir -p -- "$destdir"
 managed_root="$root/usr/local/lib/solodock"
 generations="$managed_root/generations"
 bin_dir="$root/usr/local/bin"

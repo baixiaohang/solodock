@@ -34,6 +34,8 @@ Browser
 
 `Config` 会把 HTTPS `public_origin`、可选 `webhook_public_origin` 与 loopback `listen_address` 规范化为三个 HTTP authority。Middleware 先从 URI authority 和/或单个 `Host` header 得到唯一有效 authority 并完成分类，之后 request 才能进入 router。Management authority 可访问 UI、management API、SSE、health 与 favicon，但不能访问 webhook path；webhook authority 只允许 canonical Registry webhook POST；若 local listen authority 与 management 不同，则仅允许精确的 `GET /healthz` 与 `GET /favicon.svg` probe。缺失、畸形、冲突或未知 authority 会在路由前 fail closed，forwarding host header 不构成 authority 输入。
 
+官方 package 的 systemd profile 设置 `SOLODOCK_PACKAGED_LAYOUT=1`。同一个 Rust `Config` validator 会在创建受管目录或打开 SQLite 前，把 config、state 与 runtime 身份固定为 `/etc/solodock/config.toml`、`/var/lib/solodock` 与 `/run/solodock`；未设置 marker 的源码和测试运行仍可使用安全的自定义路径。无副作用的 `inspect-packaged-config` 命令复用该 validator，只为 generation-bound shell helper 输出带版本的 loopback health URL/authority 与 management authority；Bash 不解析 TOML。
+
 ## 唯一事实来源
 
 | 事实 | 权威来源 |
@@ -103,7 +105,7 @@ replay retention 与 recovery proof retention 是两个不同生命周期。term
 
 ## Docker 与 Compose 边界
 
-生产观察固定连接 `/var/run/docker.sock`，不读取 `DOCKER_HOST`。Docker unavailable时认证控制面仍可启动，catalog和health显示degraded；需要Docker的stream或mutation在effect前失败。
+生产观察固定连接 `/var/run/docker.sock`，不读取 `DOCKER_HOST`。官方 unit 只在顺序上位于 Docker 之后并 soft-want Docker，不要求 Docker，也不把自身 lifecycle 绑定到 Docker。socket 缺失或 Docker unavailable 时认证控制面仍可启动，catalog 和 health 显示 degraded；需要 Docker 的 stream 或 mutation 在 effect 前失败。若 socket 路径存在但类型或 group 错误，安装仍会确定性拒绝。
 
 Compose production runner固定执行 `/usr/bin/docker`，清空继承环境，禁用隐式 `.env`，不使用shell。它只能生成version/validate/start/recreate/deploy-candidate/stop/restart/remove的封闭argv；不存在build、pull、exec、down、volume remove或用户参数透传。
 

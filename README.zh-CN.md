@@ -77,7 +77,7 @@ SoloDock 可能适合以下情况：
 
 带版本号的 archive 包含嵌入式 SoloDock binary、installer、updater、backup/restore helper、package verifier 与 install manifest、systemd unit、配置示例、checksum、source identity 与运维文档。运行 package 内的 installer 前，必须先验证 Release `SHA256SUMS` 的 attestation 和 checksum。
 
-installer 会创建专用 `solodock` system account，把 binary、updater、backup/restore helper、manifest 与 systemd unit 作为一个身份限定 generation 安装，并保留已有配置与 state。默认不会启动服务。
+installer 会创建专用 `solodock` system account，把 binary、updater、backup/restore helper、manifest 与 systemd unit 作为一个身份限定 generation 安装，并保留已有配置与 state。官方 package 固定使用 `/etc/solodock/config.toml`、`/var/lib/solodock` 和 `/run/solodock`；自定义 loopback 监听端口仍受支持，updater 会从已验证配置读取。默认不会启动服务。
 
 首次启动前：
 

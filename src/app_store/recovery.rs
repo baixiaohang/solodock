@@ -113,6 +113,21 @@ pub fn scan_with_options(
     )
 }
 
+pub(crate) fn scan_relocated_with_options(
+    apps_directory: &Path,
+    canonical_apps_directory: &Path,
+    integrity_key: Option<&[u8]>,
+    allowed_bind_roots: &[PathBuf],
+) -> Result<RecoveryReport, StoreError> {
+    scan_with_mode(
+        apps_directory,
+        integrity_key,
+        allowed_bind_roots,
+        ScanMode::StartupCleanup,
+        Some(canonical_apps_directory),
+    )
+}
+
 pub fn scan_read_only_with_options(
     apps_directory: &Path,
     integrity_key: Option<&[u8]>,

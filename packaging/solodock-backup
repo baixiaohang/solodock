@@ -1,6 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_path=$(realpath -e -- "${BASH_SOURCE[0]}")
+script_dir=$(dirname -- "$script_path")
+
+inspect_packaged_config() {
+  local inspector=$1 config=$2 output health authority management
+  local -a fields
+  output=$("$inspector" inspect-packaged-config "$config") || return 1
+  mapfile -t fields <<<"$output"
+  [[ ${#fields[@]} == 4 ]] || return 1
+  [[ ${fields[0]} == 'FORMAT=solodock-packaged-config-v1' ]] || return 1
+  [[ ${fields[1]} == HEALTH_URL=* ]] || return 1
+  health=${fields[1]#HEALTH_URL=}
+  [[ -n $health && ${#health} -le 320 && $health != *[$' \t\r\n']* ]] || return 1
+  authority=${health#http://}
+  authority=${authority%/healthz}
+  [[ -n $authority && $health == "http://$authority/healthz" && $authority != *['/?#@\']* ]] || return 1
+  [[ ${fields[2]} == "LOCAL_AUTHORITY=$authority" ]] || return 1
+  [[ ${fields[3]} == MANAGEMENT_AUTHORITY=* ]] || return 1
+  management=${fields[3]#MANAGEMENT_AUTHORITY=}
+  [[ -n $management && ${#management} -le 320 && $management != *[$' \t\r\n']* && $management != *['/?#@\']* ]] || return 1
+}
+
 validate_managed_links() {
   local state_root=$1
   local uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -50,11 +72,13 @@ recheck_parent() {
 
 root=''
 output=''
+validator=''
 while (($#)); do
   case "$1" in
     --root) root=${2-}; shift 2 ;;
     --output) output=${2-}; shift 2 ;;
-    *) printf '%s\n' 'usage: solodock-backup [--root STAGING_ROOT] --output ARCHIVE' >&2; exit 2 ;;
+    --validator) validator=${2-}; shift 2 ;;
+    *) printf '%s\n' 'usage: solodock-backup [--root STAGING_ROOT] [--validator PATH] --output ARCHIVE' >&2; exit 2 ;;
   esac
 done
 [[ $output = /* && ! -e $output && ! -L $output && ! -e $output.sha256 && ! -L $output.sha256 ]] || { printf '%s\n' 'output and checksum must be new absolute paths' >&2; exit 2; }
@@ -67,6 +91,13 @@ else
     exit 1
   fi
 fi
+if [[ -n $validator ]]; then
+  [[ -n $root ]] || { printf '%s\n' '--validator is available only with --root' >&2; exit 2; }
+else
+  validator="$script_dir/solodock"
+fi
+[[ -x $validator && ! -L $validator ]] || { printf '%s\n' 'backup validator is missing or unsafe' >&2; exit 2; }
+validator=$(realpath -e -- "$validator")
 state="$root/var/lib/solodock"
 config="$root/etc/solodock/config.toml"
 for component in "$root/var" "$root/var/lib" "$state" "$root/etc" "$root/etc/solodock" "$config"; do
@@ -76,6 +107,7 @@ for path in "$state" "$config"; do
   [[ -e $path && ! -L $path ]] || { printf '%s\n' 'required backup input is missing or unsafe' >&2; exit 1; }
 done
 [[ -d $state && -f $config ]] || { printf '%s\n' 'backup inputs have invalid types' >&2; exit 1; }
+inspect_packaged_config "$validator" "$config" || { printf '%s\n' 'backup configuration is not a valid packaged layout' >&2; exit 1; }
 if ! validate_managed_links "$state" || find "$state" -xdev \( ! -type d ! -type f ! -type l \) -print -quit | grep -q .; then
   printf '%s\n' 'state contains an unsafe link or unsupported file type' >&2
   exit 1

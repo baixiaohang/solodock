@@ -4,6 +4,25 @@ set -euo pipefail
 script_path=$(realpath -e -- "${BASH_SOURCE[0]}")
 script_dir=$(dirname -- "$script_path")
 
+inspect_packaged_config() {
+  local inspector=$1 config=$2 output health authority management
+  local -a fields
+  output=$("$inspector" inspect-packaged-config "$config") || return 1
+  mapfile -t fields <<<"$output"
+  [[ ${#fields[@]} == 4 ]] || return 1
+  [[ ${fields[0]} == 'FORMAT=solodock-packaged-config-v1' ]] || return 1
+  [[ ${fields[1]} == HEALTH_URL=* ]] || return 1
+  health=${fields[1]#HEALTH_URL=}
+  [[ -n $health && ${#health} -le 320 && $health != *[$' \t\r\n']* ]] || return 1
+  authority=${health#http://}
+  authority=${authority%/healthz}
+  [[ -n $authority && $health == "http://$authority/healthz" && $authority != *['/?#@\']* ]] || return 1
+  [[ ${fields[2]} == "LOCAL_AUTHORITY=$authority" ]] || return 1
+  [[ ${fields[3]} == MANAGEMENT_AUTHORITY=* ]] || return 1
+  management=${fields[3]#MANAGEMENT_AUTHORITY=}
+  [[ -n $management && ${#management} -le 320 && $management != *[$' \t\r\n']* && $management != *['/?#@\']* ]] || return 1
+}
+
 validate_managed_links() {
   local staging_root=$1
   local state_root="$staging_root/var/lib/solodock"
@@ -117,6 +136,7 @@ if ! validate_managed_links "$staging" || find "$staging" -xdev \( ! -type d ! -
   printf '%s\n' 'restored state contains an unsafe link or unsupported file type' >&2
   exit 1
 fi
+inspect_packaged_config "$validator" "$staging/etc/solodock/config.toml" || { printf '%s\n' 'restored configuration is not a valid packaged layout' >&2; exit 1; }
 chmod 0700 "$staging/var/lib/solodock"
 chmod 0600 "$staging/etc/solodock/config.toml"
 chown -R -h -- "$service_uid:$service_gid" "$staging"

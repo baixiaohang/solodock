@@ -39,6 +39,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let arguments = std::env::args_os().collect::<Vec<_>>();
     if arguments
         .get(1)
+        .is_some_and(|value| value == "inspect-packaged-config")
+    {
+        if arguments.len() != 3 {
+            return Err("usage: solodock inspect-packaged-config CONFIG_FILE".into());
+        }
+        let config_path = std::path::Path::new(&arguments[2]);
+        assume_config_owner_identity(config_path)?;
+        let config = Config::load_from(config_path)?;
+        print!("{}", config.packaged_inspection()?.render());
+        return Ok(());
+    }
+    if arguments
+        .get(1)
         .is_some_and(|value| value == "validate-restore")
     {
         if arguments.len() != 6 {
@@ -63,7 +76,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
         return Ok(());
     }
-    let config = Config::load()?;
+    let config = Config::load_runtime()?;
     solodock::telemetry::initialize();
 
     ensure_private_directory(&config.state_directory)?;
@@ -351,6 +364,32 @@ fn assume_restore_service_identity(uid: u32, gid: u32) -> Result<(), Box<dyn Err
     Ok(())
 }
 
+fn assume_config_owner_identity(path: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("packaged configuration must be a regular non-symlink file".into());
+    }
+    let current_uid = unsafe { libc::geteuid() };
+    if current_uid != 0 || metadata.uid() == 0 {
+        return Ok(());
+    }
+    let uid = metadata.uid();
+    let gid = metadata.gid();
+    // The inspector is an isolated, side-effect-free process. Dropping to the
+    // config owner lets Config::load_from enforce the same ownership rule as
+    // runtime even when a root packaging helper launched this command.
+    if unsafe {
+        libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(gid) != 0
+            || libc::setuid(uid) != 0
+    } {
+        return Err("failed to assume packaged configuration owner identity".into());
+    }
+    Ok(())
+}
+
 async fn validate_restore(
     state_directory: &std::path::Path,
     config_file: &std::path::Path,
@@ -360,6 +399,7 @@ async fn validate_restore(
     check_private(state_directory, true)?;
     check_private(config_file, false)?;
     let config = Config::load_from(config_file)?;
+    config.validate_packaged_layout()?;
     let key_path = state_directory.join("secrets/idempotency.key");
     check_private_tree(state_directory, &key_path, false)?;
     let key = std::fs::read(&key_path)?;

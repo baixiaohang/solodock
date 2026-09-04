@@ -34,6 +34,8 @@ The production binary embeds Vite output at compile time with `embed-ui`; no Nod
 
 `Config` canonicalizes the HTTPS `public_origin`, optional `webhook_public_origin`, and loopback `listen_address` into three HTTP authorities. A request reaches the router only after middleware derives one effective authority from URI authority and/or a single `Host` header and classifies it. The management authority serves the UI, management API, SSE, health, and favicon but never webhook paths. The webhook authority serves only the canonical registry webhook POST. A distinct local listen authority serves only exact `GET /healthz` and `GET /favicon.svg` probes. Missing, malformed, conflicting, or unknown authorities fail closed before routing; forwarding host headers are not authority inputs.
 
+The packaged systemd profile sets `SOLODOCK_PACKAGED_LAYOUT=1`. The same Rust `Config` validator fixes the config, state, and runtime identities to `/etc/solodock/config.toml`, `/var/lib/solodock`, and `/run/solodock` before managed directories or SQLite are opened. Source and test runs without that marker retain safe custom paths. The side-effect-free `inspect-packaged-config` command reuses this validator and emits only a versioned loopback health URL/authority and management authority for generation-bound shell helpers; Bash never parses TOML.
+
 ## Sources of truth
 
 | Fact | Authoritative source |
@@ -103,7 +105,7 @@ Replay retention and recovery-proof retention are separate lifecycles. Terminal 
 
 ## Docker and Compose boundary
 
-Production observation uses only `/var/run/docker.sock` and ignores `DOCKER_HOST`. If Docker is unavailable, the authenticated control plane remains available and catalog/health show degraded state; streams and mutations that need Docker fail before an effect.
+Production observation uses only `/var/run/docker.sock` and ignores `DOCKER_HOST`. The packaged unit orders after and softly wants Docker, but does not require or bind its lifecycle to Docker. If the socket is absent or Docker is unavailable, the authenticated control plane remains available and catalog/health show degraded state; streams and mutations that need Docker fail before an effect. A present path with the wrong type or group remains a deterministic installation security failure.
 
 The production Compose runner always executes `/usr/bin/docker`, clears inherited environment, disables implicit `.env`, and never invokes a shell. It can emit only closed argument vectors for version, validate, start, recreate, deploy-candidate, stop, restart, and remove. It has no build, pull, exec, down, volume-removal, or user-argument passthrough path.
 
