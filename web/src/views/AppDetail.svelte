@@ -72,6 +72,7 @@
   let webhookSecret = $state('')
   let webhookSaved = $state(false)
   let webhookRetry = $state<RetryIdentity | undefined>()
+  let disposed = false
   let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
   let editNetworkError = $derived(networkEditorError({ ownedDefaultNetwork: editOwnedDefaultNetwork, serviceDiscoveryEnabled: editServiceDiscovery, externalNetworks: editNetworks }))
   $effect(() => {
@@ -79,12 +80,21 @@
   })
 
   onMount(() => {
-    void load()
-    const source = openSse(`/api/v1/apps/${appId}/stats`, { stats: (event) => { stats = JSON.parse(event.data) as StatsSample } })
-    return () => { source.close(); webhookSecret = ''; webhookRetry = undefined }
+    disposed = false
+    void load().catch(() => {})
+    const source = openSse(`/api/v1/apps/${appId}/stats`, { stats: (event) => { if (!disposed) stats = JSON.parse(event.data) as StatsSample } })
+    return () => {
+      disposed = true
+      source.close()
+      webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
+      lifecycleKey = ''; lifecycleName = ''; deletionKey = ''; confirmationSlug = ''
+      editRetry = undefined; deployRetry = undefined; deletion = null
+      clearSensitiveEnvironmentValues(editEnvironmentRows); editEnvironmentRows = []; editFileRows = []
+    }
   })
 
   async function load() {
+    if (disposed) return
     const [loadedApp, page, loadedCredentials, loadedWebhook, loadedSettings] = await Promise.all([
       api<AppDetailResponse>(`/api/v1/apps/${appId}`),
       api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
@@ -92,6 +102,7 @@
       api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`).catch(() => null),
       api<SettingsResponse>('/api/v1/settings').catch(() => null),
     ])
+    if (disposed) return
     app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook
     allowedBindRoots = loadedSettings?.allowed_bind_roots ?? []
     healthLimits = loadedSettings?.configuration_limits?.health ?? null
@@ -104,50 +115,65 @@
   }
 
   async function saveWebhook() {
-    if (!webhook || !webhookSecret || !webhookSaved) return
+    if (disposed || !webhook || !webhookSecret || !webhookSaved) return
     const request = { expected_metadata_revision: webhook.configured ? webhook.metadata_revision : null, secret: webhookSecret }
-    webhookRetry = await writeOnlyRetryIdentity(
+    const nextRetry = await writeOnlyRetryIdentity(
       webhookRetry,
       { expected_metadata_revision: request.expected_metadata_revision },
       webhookSecret,
     )
+    if (disposed) return
+    webhookRetry = nextRetry
     actionBusy = true; error = null; formPresentation = null
     try {
-      webhook = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'PUT', idempotencyKey: webhookRetry.key })
+      const saved = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'PUT', idempotencyKey: webhookRetry.key })
+      if (disposed) return
+      webhook = saved
       webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
-    } catch { error = localized('Webhook configuration could not be saved. If the network result is uncertain, the same secret and idempotency key will be reused.') } finally { actionBusy = false }
+    } catch { if (!disposed) error = localized('Webhook configuration could not be saved. If the network result is uncertain, the same secret and idempotency key will be reused.') } finally { if (!disposed) actionBusy = false }
   }
 
   async function revokeWebhook() {
-    if (!webhook?.configured || !webhook.metadata_revision || !window.confirm($t('Revoking makes the old webhook secret invalid immediately. Periodic polling and already-claimed deployments are unaffected. Continue?'))) return
+    if (disposed || !webhook?.configured || !webhook.metadata_revision || !window.confirm($t('Revoking makes the old webhook secret invalid immediately. Periodic polling and already-claimed deployments are unaffected. Continue?'))) return
     const request = { expected_metadata_revision: webhook.metadata_revision }
     webhookRetry = retryIdentity(webhookRetry, request)
     actionBusy = true; error = null; formPresentation = null
     try {
-      webhook = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'DELETE', idempotencyKey: webhookRetry.key })
+      const revoked = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'DELETE', idempotencyKey: webhookRetry.key })
+      if (disposed) return
+      webhook = revoked
       webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
-    } catch { error = localized('Webhook revocation failed. Refresh the status and try again.') } finally { actionBusy = false }
+    } catch { if (!disposed) error = localized('Webhook revocation failed. Refresh the status and try again.') } finally { if (!disposed) actionBusy = false }
   }
 
   async function lifecycle(action: 'start' | 'stop' | 'restart') {
+    if (disposed) return
     actionBusy = true; error = null; formPresentation = null
     if (lifecycleName !== action || !lifecycleKey) { lifecycleName = action; lifecycleKey = crypto.randomUUID() }
-    try { await mutation(`/api/v1/apps/${appId}/actions/${action}`, undefined, { idempotencyKey: lifecycleKey }); lifecycleKey = ''; lifecycleName = ''; await load() }
-    catch { error = localized('Lifecycle operation failed. Application state or Docker/Compose capabilities may have changed.') }
-    finally { actionBusy = false }
+    try {
+      await mutation(`/api/v1/apps/${appId}/actions/${action}`, undefined, { idempotencyKey: lifecycleKey })
+      if (disposed) return
+      lifecycleKey = ''; lifecycleName = ''
+      await load()
+    }
+    catch { if (!disposed) error = localized('Lifecycle operation failed. Application state or Docker/Compose capabilities may have changed.') }
+    finally { if (!disposed) actionBusy = false }
   }
 
   async function previewDeletion() {
+    if (disposed) return
     actionBusy = true; error = null; formPresentation = null
     try {
-      deletion = await mutation(`/api/v1/apps/${appId}/deletion-preview`, { remove_container: removeContainer })
+      const preview = await mutation<DeletionPreviewResponse>(`/api/v1/apps/${appId}/deletion-preview`, { remove_container: removeContainer })
+      if (disposed) return
+      deletion = preview
       deletionKey = crypto.randomUUID()
       confirmationSlug = ''
-    } catch { error = localized('Could not generate the deletion preview.') } finally { actionBusy = false }
+    } catch { if (!disposed) error = localized('Could not generate the deletion preview.') } finally { if (!disposed) actionBusy = false }
   }
 
   async function confirmDeletion() {
-    if (!canConfirmDeletion(deletion, confirmationSlug, removeContainer)) return
+    if (disposed || !canConfirmDeletion(deletion, confirmationSlug, removeContainer)) return
     const confirmed = deletion
     if (!confirmed) return
     actionBusy = true; error = null; formPresentation = null
@@ -158,10 +184,11 @@
         expected_revision: confirmed.expected_revision,
         remove_container: removeContainer,
       }, { method: 'DELETE', idempotencyKey: deletionKey })
+      if (disposed) return
       deletion = null
       deletionKey = ''
       window.location.hash = '/'
-    } catch { error = localized('The deletion preview expired or application state changed. Generate it again.') } finally { actionBusy = false }
+    } catch { if (!disposed) error = localized('The deletion preview expired or application state changed. Generate it again.') } finally { if (!disposed) actionBusy = false }
   }
 
   function pretty(value: unknown): string { return JSON.stringify(value, null, 2) }
@@ -248,7 +275,7 @@
     if (path) clearFormIssuePath(path)
   }
   async function deploy() {
-    if (!app) return
+    if (disposed || !app) return
     const nonRollbackable = (app.draft?.volumes.length ?? 0) > 0 || (app.draft?.binds.length ?? 0) > 0
     if (nonRollbackable && !window.confirm($t('Deployments and rollbacks do not revert named volume or bind contents. Continue?'))) return
     actionBusy = true; error = null; formPresentation = null
@@ -263,31 +290,39 @@
     deployRetry = retryIdentity(deployRetry, request)
     try {
       const result = await mutation<{ deployment_id: string }>(`/api/v1/apps/${appId}/deployments`, request, { idempotencyKey: deployRetry.key })
+      if (disposed) return
       deployRetry = undefined
       window.location.hash = `/deployments/${result.deployment_id}`
-    } catch { error = localized('Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.') } finally { actionBusy = false }
+    } catch { if (!disposed) error = localized('Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.') } finally { if (!disposed) actionBusy = false }
   }
   async function validateDraft() {
+    if (disposed) return
     actionBusy = true; error = null; formPresentation = null; formIssues = []
-    try { validation = await mutation(`/api/v1/apps/${appId}/validate`, { draft: buildDraft() }); error = null }
+    try {
+      const result = await mutation<{ plan: ComposePlan; compose_yaml: string }>(`/api/v1/apps/${appId}/validate`, { draft: buildDraft() })
+      if (disposed) return
+      validation = result; error = null
+    }
     catch (cause) {
-      setFormError(cause, 'Configuration validation failed. Check Docker/Compose status and try again.')
-    } finally { actionBusy = false }
+      if (!disposed) setFormError(cause, 'Configuration validation failed. Check Docker/Compose status and try again.')
+    } finally { if (!disposed) actionBusy = false }
   }
   async function saveDraft() {
-    if (!app) return
+    if (disposed || !app) return
     actionBusy = true; error = null; formPresentation = null; formIssues = []
     try {
       const request = { expected_revision: app.draft_revision, draft: buildDraft() }
       editRetry = retryIdentity(editRetry, request)
       await mutation(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
+      if (disposed) return
       clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = editFileRows.map((row) => ({ ...row, value: row.sensitive ? '' : row.value })); editRetry = undefined
     } catch (cause) {
-      setFormError(cause, 'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.')
-    } finally { actionBusy = false }
+      if (!disposed) setFormError(cause, 'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.')
+    } finally { if (!disposed) actionBusy = false }
+    if (disposed) return
     if (error || formPresentation) return
-    try { await load(); startEditing() }
-    catch { error = localized('The configuration was saved but refresh failed. Reopen the application page to load the latest revision.') }
+    try { await load(); if (!disposed) startEditing() }
+    catch { if (!disposed) error = localized('The configuration was saved but refresh failed. Reopen the application page to load the latest revision.') }
   }
 </script>
 
