@@ -37,8 +37,8 @@ struct SessionCookies {
     csrf: String,
 }
 
-fn generated_password(label: &str) -> String {
-    format!("{label}-{}", Uuid::new_v4())
+fn generated_password() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 impl Harness {
@@ -373,8 +373,8 @@ async fn bootstrap_login_me_and_logout_follow_security_contract() {
 #[tokio::test]
 async fn password_change_gates_precede_credential_mutation() {
     let harness = Harness::new().await;
-    let old_password = generated_password("current-password");
-    let new_password = generated_password("new-password");
+    let old_password = generated_password();
+    let new_password = generated_password();
     assert_eq!(
         harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
@@ -555,9 +555,9 @@ async fn password_change_gates_precede_credential_mutation() {
 #[tokio::test]
 async fn invalid_current_password_uses_shared_throttle_without_revoking_session() {
     let harness = Harness::new().await;
-    let old_password = generated_password("current-password");
-    let wrong_password = generated_password("wrong-password-canary");
-    let new_password = generated_password("new-password-canary");
+    let old_password = generated_password();
+    let wrong_password = generated_password();
+    let new_password = generated_password();
     assert_eq!(
         harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
@@ -681,8 +681,8 @@ async fn invalid_current_password_uses_shared_throttle_without_revoking_session(
 #[tokio::test]
 async fn password_change_atomically_updates_credential_revokes_sessions_and_expires_cookies() {
     let harness = Harness::new().await;
-    let old_password = generated_password("old-password-canary");
-    let new_password = generated_password("new-password-canary");
+    let old_password = generated_password();
+    let new_password = generated_password();
     assert_eq!(
         harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
@@ -842,8 +842,8 @@ async fn password_change_atomically_updates_credential_revokes_sessions_and_expi
 #[tokio::test]
 async fn password_change_audit_failure_rolls_back_hash_sessions_throttle_and_cookies() {
     let harness = Harness::new().await;
-    let old_password = generated_password("old-password-canary");
-    let new_password = generated_password("new-password-canary");
+    let old_password = generated_password();
+    let new_password = generated_password();
     assert_eq!(
         harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
