@@ -28,6 +28,8 @@ pub enum RegistryError {
     PlatformNotFound,
     #[error("registry authentication is unsupported")]
     AuthUnsupported,
+    #[error("registry authentication realm is not trusted")]
+    AuthRealmUntrusted,
 }
 
 impl RegistryError {
@@ -46,6 +48,7 @@ impl RegistryError {
             Self::DigestMismatch => "REGISTRY_DIGEST_MISMATCH",
             Self::PlatformNotFound => "REGISTRY_PLATFORM_NOT_FOUND",
             Self::AuthUnsupported => "REGISTRY_AUTH_UNSUPPORTED",
+            Self::AuthRealmUntrusted => "REGISTRY_AUTH_REALM_UNTRUSTED",
         }
     }
 }
