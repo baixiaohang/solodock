@@ -348,23 +348,31 @@ async fn docker_unavailable_keeps_catalog_and_health_available_but_rejects_strea
 }
 
 #[tokio::test]
-async fn revoked_session_closes_sse_on_the_next_heartbeat_and_releases_permit() {
+async fn password_rotation_closes_sse_on_the_next_heartbeat_and_releases_permit() {
     let harness = Harness::new(true, true).await;
     let response = harness
         .get(&format!("/api/v1/apps/{}/events", harness.app_id), true)
         .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(harness.stream_gate.active(), 1);
-    tokio::time::pause();
     let body_task =
         tokio::spawn(async move { response.into_body().collect().await.unwrap().to_bytes() });
     tokio::task::yield_now().await;
-    harness.auth.revoke_all(Uuid::new_v4()).await.unwrap();
+    harness
+        .auth
+        .change_password(
+            "test fixture password".into(),
+            "new test fixture password".into(),
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(16)).await;
     tokio::time::resume();
     let body = tokio::time::timeout(std::time::Duration::from_secs(5), body_task)
         .await
-        .expect("revoked SSE session must close after the heartbeat")
+        .expect("password-rotated SSE session must close after the heartbeat")
         .unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("SESSION_EXPIRED"));

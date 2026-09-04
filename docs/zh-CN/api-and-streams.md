@@ -11,6 +11,7 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 - 登录建立 Secure、HttpOnly、SameSite=Strict session cookie；
 - authenticated mutation 同时要求与 `public_origin` 精确匹配的 `Origin` 和 double-submit `X-CSRF-Token`；
 - session 有期限，可 logout 或 revoke-all；SSE heartbeat 也会重新验证；
+- 已认证管理员只有在证明当前密码后才能轮换密码；成功轮换会撤销包括调用者在内的全部 session，并使两个浏览器 cookie 过期；
 - 登录限速、成功/失败及敏感管理动作写入审计，但不记录密码、cookie 或 secret。
 
 认证协议 endpoint 不使用业务 `Idempotency-Key`。它们依靠 singleton credential、一次性 token 或随机 session 建立自己的重放边界。
@@ -37,6 +38,10 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 Web client 会在解析 response body 前先处理 HTTP `401`，因此即使 Tunnel 或 WAF 替换为 HTML、空 body 或畸形 JSON，过期或已撤销的 session 仍会返回认证界面。其他非成功响应只在 media type 为 `application/json` 或 `+json`，且稳定错误 envelope 的 runtime shape 符合预期时才按 API 错误解析；否则保留真实 HTTP status，但使用本地 `HTTP_ERROR` 消息，绝不显示 response body。经过长度和字符约束的安全 `X-Request-ID` header 优先于有效 JSON `request_id`；不安全标识会被丢弃。
 
 logout 与全局 session revoke 仅在服务器确认成功后才改变浏览器的 authenticated 状态；`401` 仍走统一 unauthorized 路径。network、CSRF/WAF、throttling 或服务端失败会保留当前 authenticated view，并显示可重试的脱敏错误；transport failure 明确保持“结果未知”，不会伪报成功。
+
+`PUT /api/v1/me/password` 要求 authenticated session、精确 Origin、double-submit CSRF，以及只包含 `current_password` 与 `new_password` 的 JSON object。新密码复用 bootstrap 的 14–128 个 Unicode scalar、最多 512 bytes 规则。当前密码错误返回 HTTP 403 `CURRENT_PASSWORD_INVALID`；共享认证 cooldown 返回 HTTP 429 `AUTH_COOLDOWN`。该 endpoint 不使用也不要求 `Idempotency-Key`。成功时在单一事务中更新 Argon2id hash、删除全部 session、清空共享 throttle、追加脱敏的 `auth.password_change` audit event，使两个受管 cookie 过期并返回 204。任一事务失败都会保留旧 hash、session、throttle 和 audit 状态，且不使 cookie 过期。
+
+Web Settings 的安全表单只在 component memory 中保存密码值，confirmation 只用于 client-side 检查。确认收到 204 后才返回登录页。确定性 JSON 错误仍停留在 authenticated shell；无法确认的 network 或 proxy 结果不会自动重试，并提示管理员刷新后先尝试新密码，再决定是否重试。
 
 持久业务 mutation 必须携带 16–128 字节安全 ASCII `Idempotency-Key`。SQLite 保存 request fingerprint/HMAC、operation 状态和脱敏响应；相同 key 与相同 request 可 replay，换 body/route/method 会冲突。Registry credential 与 webhook secret 在前端 retry identity 中只保留 hash，并在后端 API 的受管 parsed buffer 中使用 zeroizing wrapper。
 

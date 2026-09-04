@@ -13,7 +13,12 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
-use solodock::{AppState, auth::AuthService, db::Database, router};
+use solodock::{
+    AppState,
+    auth::{AuthService, password::PasswordService},
+    db::Database,
+    router,
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing::{Instrument, instrument::WithSubscriber};
@@ -23,6 +28,12 @@ struct Harness {
     database: Database,
     app: axum::Router,
     bootstrap_token: String,
+}
+
+struct SessionCookies {
+    header: String,
+    session: String,
+    csrf: String,
 }
 
 impl Harness {
@@ -71,6 +82,45 @@ impl Harness {
             )
             .await
             .unwrap()
+    }
+
+    async fn login_session(&self, password: &str) -> SessionCookies {
+        let body = json!({"username":"admin","password":password});
+        let response = self
+            .app
+            .clone()
+            .oneshot(
+                self.request("POST", "/api/v1/auth/login", body.clone())
+                    .header(header::ORIGIN, "https://solodock.example.com")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let set_cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap().to_owned())
+            .collect();
+        let session = cookie_value(
+            set_cookies
+                .iter()
+                .find(|value| value.starts_with("__Host-solodock_session="))
+                .unwrap(),
+        );
+        let csrf = cookie_value(
+            set_cookies
+                .iter()
+                .find(|value| value.starts_with("__Host-solodock_csrf="))
+                .unwrap(),
+        );
+        SessionCookies {
+            header: format!("__Host-solodock_session={session}; __Host-solodock_csrf={csrf}"),
+            session,
+            csrf,
+        }
     }
 }
 
@@ -316,6 +366,574 @@ async fn bootstrap_login_me_and_logout_follow_security_contract() {
 }
 
 #[tokio::test]
+async fn password_change_gates_precede_credential_mutation() {
+    let harness = Harness::new().await;
+    let old_password = "correct horse battery";
+    assert_eq!(
+        harness.bootstrap(old_password).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let cookies = harness.login_session(old_password).await;
+    let original_credential: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let original_sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    let original_throttle: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT window_started_at, failure_count, blocked_until FROM auth_throttle WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let original_audits = harness.database.audit_count().await.unwrap();
+    let valid = json!({
+        "current_password": old_password,
+        "new_password": "new correct horse battery",
+    });
+
+    let missing_origin = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", valid.clone())
+                .header(header::COOKIE, &cookies.header)
+                .header("x-csrf-token", &cookies.csrf)
+                .body(Body::from(valid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(missing_origin, StatusCode::FORBIDDEN, "ORIGIN_INVALID").await;
+
+    let missing_csrf = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", valid.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &cookies.header)
+                .body(Body::from(valid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(missing_csrf, StatusCode::FORBIDDEN, "CSRF_INVALID").await;
+
+    let csrf_cookie = format!("__Host-solodock_csrf={}", cookies.csrf);
+    let unauthenticated = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", valid.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, csrf_cookie)
+                .header("x-csrf-token", &cookies.csrf)
+                .body(Body::from(valid.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(
+        unauthenticated,
+        StatusCode::UNAUTHORIZED,
+        "SESSION_REQUIRED",
+    )
+    .await;
+
+    for invalid in [
+        json!({"current_password":old_password,"new_password":"new correct horse battery","unexpected":true}),
+        json!({"current_password":old_password,"new_password":"too short"}),
+    ] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                harness
+                    .request("PUT", "/api/v1/me/password", invalid.clone())
+                    .header(header::ORIGIN, "https://solodock.example.com")
+                    .header(header::COOKIE, &cookies.header)
+                    .header("x-csrf-token", &cookies.csrf)
+                    .body(Body::from(invalid.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_error(
+            response,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "VALIDATION_FAILED",
+        )
+        .await;
+    }
+
+    let malformed = "{\"current_password\":";
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", json!({}))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &cookies.header)
+                .header("x-csrf-token", &cookies.csrf)
+                .body(Body::from(malformed))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "VALIDATION_FAILED",
+    )
+    .await;
+
+    let oversized = json!({
+        "current_password": "x".repeat(17 * 1024),
+        "new_password": "new correct horse battery",
+    });
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", oversized.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &cookies.header)
+                .header("x-csrf-token", &cookies.csrf)
+                .body(Body::from(oversized.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(
+        response,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "VALIDATION_FAILED",
+    )
+    .await;
+
+    let credential: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    let throttle: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT window_started_at, failure_count, blocked_until FROM auth_throttle WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(credential, original_credential);
+    assert_eq!(sessions, original_sessions);
+    assert_eq!(throttle, original_throttle);
+    assert_eq!(
+        harness.database.audit_count().await.unwrap(),
+        original_audits
+    );
+}
+
+#[tokio::test]
+async fn invalid_current_password_uses_shared_throttle_without_revoking_session() {
+    let harness = Harness::new().await;
+    let old_password = "correct horse battery";
+    let wrong_password = "wrong-current-password-canary";
+    let new_password = "new-password-secret-canary";
+    assert_eq!(
+        harness.bootstrap(old_password).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let cookies = harness.login_session(old_password).await;
+    let credential_before: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+
+    for _ in 0..5 {
+        let body = json!({"current_password":wrong_password,"new_password":new_password});
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                harness
+                    .request("PUT", "/api/v1/me/password", body.clone())
+                    .header(header::ORIGIN, "https://solodock.example.com")
+                    .header(header::COOKIE, &cookies.header)
+                    .header("x-csrf-token", &cookies.csrf)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let error = assert_error(response, StatusCode::FORBIDDEN, "CURRENT_PASSWORD_INVALID").await;
+        let error_text = error.to_string();
+        assert!(!error_text.contains(wrong_password));
+        assert!(!error_text.contains(new_password));
+    }
+
+    let body = json!({"current_password":old_password,"new_password":new_password});
+    let cooldown = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", body.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &cookies.header)
+                .header("x-csrf-token", &cookies.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(cooldown, StatusCode::TOO_MANY_REQUESTS, "AUTH_COOLDOWN").await;
+
+    let login = json!({"username":"admin","password":old_password});
+    let login_cooldown = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("POST", "/api/v1/auth/login", login.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .body(Body::from(login.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(
+        login_cooldown,
+        StatusCode::TOO_MANY_REQUESTS,
+        "AUTH_COOLDOWN",
+    )
+    .await;
+
+    let me = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("GET", "/api/v1/me", json!({}))
+                .header(header::COOKIE, &cookies.header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(me.status(), StatusCode::OK);
+    let failure_count: i64 =
+        sqlx::query_scalar("SELECT failure_count FROM auth_throttle WHERE singleton_id = 1")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    assert_eq!(failure_count, 5);
+    let credential_after: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(credential_after, credential_before);
+    let password_audits: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT actor, result, redacted_metadata FROM audit_events WHERE action = 'auth.password_change' ORDER BY id",
+    )
+    .fetch_all(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(password_audits.len(), 6);
+    assert!(
+        password_audits
+            .iter()
+            .all(|(actor, result, _)| actor == "admin" && result == "failure")
+    );
+    assert!(
+        password_audits[..5]
+            .iter()
+            .all(|(_, _, metadata)| metadata.contains("CURRENT_PASSWORD_INVALID"))
+    );
+    assert!(password_audits[5].2.contains("AUTH_COOLDOWN"));
+    let audit_text = format!("{password_audits:?}");
+    assert!(!audit_text.contains(wrong_password));
+    assert!(!audit_text.contains(new_password));
+}
+
+#[tokio::test]
+async fn password_change_atomically_updates_credential_revokes_sessions_and_expires_cookies() {
+    let harness = Harness::new().await;
+    let old_password = "old-password-secret-canary";
+    let new_password = "new-password-secret-canary";
+    assert_eq!(
+        harness.bootstrap(old_password).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let first = harness.login_session(old_password).await;
+    let second = harness.login_session(old_password).await;
+    let before: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    sqlx::query("UPDATE auth_throttle SET window_started_at = '2026-09-04T00:00:00Z', failure_count = 3 WHERE singleton_id = 1")
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    let body = json!({"current_password":old_password,"new_password":new_password});
+    let captured_logs = CaptureWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(captured_logs.clone())
+        .finish();
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", body.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &first.header)
+                .header("x-csrf-token", &first.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .instrument(tracing::info_span!("password_change_canary"))
+        .with_subscriber(subscriber)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let expired: Vec<_> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(expired.len(), 2);
+    assert!(expired.iter().all(|cookie| cookie.contains("Max-Age=0")));
+    let expired_session = expired
+        .iter()
+        .find(|cookie| cookie.starts_with("__Host-solodock_session=;"))
+        .expect("the session cookie must be expired");
+    let expired_csrf = expired
+        .iter()
+        .find(|cookie| cookie.starts_with("__Host-solodock_csrf=;"))
+        .expect("the CSRF cookie must be expired");
+    for cookie in [expired_session, expired_csrf] {
+        assert!(cookie.contains("Path=/"));
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(cookie.contains("Secure"));
+    }
+    assert!(expired_session.contains("HttpOnly"));
+    assert!(!expired_csrf.contains("HttpOnly"));
+    let response_body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(response_body.is_empty());
+
+    let after: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_ne!(after.0, before.0);
+    assert_ne!(after.1, before.1);
+    assert!(
+        PasswordService::default()
+            .verify(new_password.into(), after.0.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !PasswordService::default()
+            .verify(old_password.into(), after.0)
+            .await
+            .unwrap()
+    );
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0);
+    let throttle: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT window_started_at, failure_count, blocked_until FROM auth_throttle WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(throttle, (None, 0, None));
+    let password_audit: (String, String, String) = sqlx::query_as(
+        "SELECT actor, result, redacted_metadata FROM audit_events WHERE action = 'auth.password_change'",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(password_audit.0, "admin");
+    assert_eq!(password_audit.1, "success");
+    assert_eq!(password_audit.2, "{\"reason_code\":null}");
+
+    let stale_session = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("GET", "/api/v1/me", json!({}))
+                .header(header::COOKIE, &second.header)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(stale_session, StatusCode::UNAUTHORIZED, "SESSION_REQUIRED").await;
+
+    let old_login = json!({"username":"admin","password":old_password});
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("POST", "/api/v1/auth/login", old_login.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .body(Body::from(old_login.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_error(response, StatusCode::UNAUTHORIZED, "AUTH_INVALID").await;
+    let new_login = harness.login_session(new_password).await;
+    assert!(!new_login.session.is_empty());
+
+    let logs = captured_logs.contents();
+    let audit_text: String =
+        sqlx::query_scalar("SELECT GROUP_CONCAT(redacted_metadata, ',') FROM audit_events")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    for canary in [old_password, new_password, &first.session, &first.csrf] {
+        assert!(!logs.contains(canary));
+        assert!(!audit_text.contains(canary));
+    }
+}
+
+#[tokio::test]
+async fn password_change_audit_failure_rolls_back_hash_sessions_throttle_and_cookies() {
+    let harness = Harness::new().await;
+    let old_password = "old-password-secret-canary";
+    let new_password = "new-password-secret-canary";
+    assert_eq!(
+        harness.bootstrap(old_password).await.status(),
+        StatusCode::NO_CONTENT
+    );
+    let first = harness.login_session(old_password).await;
+    let second = harness.login_session(old_password).await;
+    sqlx::query("UPDATE auth_throttle SET window_started_at = '2026-09-04T00:00:00Z', failure_count = 3 WHERE singleton_id = 1")
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    let credential_before: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let throttle_before: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT window_started_at, failure_count, blocked_until FROM auth_throttle WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let audits_before = harness.database.audit_count().await.unwrap();
+    sqlx::query("CREATE TRIGGER reject_password_change_audit BEFORE INSERT ON audit_events WHEN NEW.action = 'auth.password_change' BEGIN SELECT RAISE(ABORT, 'audit disabled'); END")
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+
+    let body = json!({"current_password":old_password,"new_password":new_password});
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            harness
+                .request("PUT", "/api/v1/me/password", body.clone())
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &first.header)
+                .header("x-csrf-token", &first.csrf)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(!response.headers().contains_key(header::SET_COOKIE));
+    assert_error(
+        response,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "INTERNAL_ERROR",
+    )
+    .await;
+
+    let credential_after: (String, String) = sqlx::query_as(
+        "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let throttle_after: (Option<String>, i64, Option<String>) = sqlx::query_as(
+        "SELECT window_started_at, failure_count, blocked_until FROM auth_throttle WHERE singleton_id = 1",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(credential_after, credential_before);
+    assert_eq!(throttle_after, throttle_before);
+    assert_eq!(sessions, 2);
+    assert_eq!(harness.database.audit_count().await.unwrap(), audits_before);
+    assert!(
+        PasswordService::default()
+            .verify(old_password.into(), credential_after.0.clone())
+            .await
+            .unwrap()
+    );
+    assert!(
+        !PasswordService::default()
+            .verify(new_password.into(), credential_after.0)
+            .await
+            .unwrap()
+    );
+    for cookies in [&first, &second] {
+        let me = harness
+            .app
+            .clone()
+            .oneshot(
+                harness
+                    .request("GET", "/api/v1/me", json!({}))
+                    .header(header::COOKIE, &cookies.header)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(me.status(), StatusCode::OK);
+    }
+}
+
+#[tokio::test]
 async fn rejects_peer_origin_json_and_rolls_back_when_audit_fails() {
     let harness = Harness::new().await;
     let password = "correct horse battery";
@@ -452,13 +1070,14 @@ fn cookie_value(set_cookie: &str) -> String {
         .to_owned()
 }
 
-async fn assert_error(response: axum::response::Response, status: StatusCode, code: &str) {
+async fn assert_error(response: axum::response::Response, status: StatusCode, code: &str) -> Value {
     assert_eq!(response.status(), status);
     assert!(response.headers().contains_key("x-request-id"));
     let body: Value =
         serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
     assert_eq!(body["code"], code);
     assert!(body["request_id"].as_str().is_some());
+    body
 }
 
 #[derive(Clone, Default)]

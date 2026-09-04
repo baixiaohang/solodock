@@ -3,10 +3,15 @@ pub mod session;
 
 use std::{fs, path::PathBuf, sync::Arc};
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use sqlx::Row;
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
@@ -46,7 +51,24 @@ pub struct AuthService {
     clock: Arc<dyn Clock>,
     tokens: Arc<dyn TokenSource>,
     bootstrap_path: PathBuf,
-    login_guard: Arc<Mutex<()>>,
+    credential_guard: Arc<Mutex<()>>,
+    #[cfg(test)]
+    credential_test_gate: Option<Arc<CredentialTestGate>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct CredentialTestGate {
+    pause_login_after_verify: AtomicBool,
+    login_after_verify: Notify,
+    resume_login: Notify,
+    login_guard_attempted: Notify,
+    login_guard_acquired: Notify,
+    pause_rotation_after_verify: AtomicBool,
+    rotation_after_verify: Notify,
+    resume_rotation: Notify,
+    rotation_guard_attempted: Notify,
+    rotation_guard_acquired: Notify,
 }
 
 pub struct LoginSession {
@@ -71,7 +93,9 @@ impl AuthService {
             clock: Arc::new(SystemClock),
             tokens: Arc::new(SystemTokenSource),
             bootstrap_path,
-            login_guard: Arc::new(Mutex::new(())),
+            credential_guard: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            credential_test_gate: None,
         }
     }
 
@@ -88,7 +112,8 @@ impl AuthService {
             clock,
             tokens,
             bootstrap_path,
-            login_guard: Arc::new(Mutex::new(())),
+            credential_guard: Arc::new(Mutex::new(())),
+            credential_test_gate: None,
         }
     }
 
@@ -161,18 +186,35 @@ impl AuthService {
         password: String,
         request_id: Uuid,
     ) -> Result<LoginSession, AuthError> {
-        let _login_guard = self.login_guard.lock().await;
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate {
+            gate.login_guard_attempted.notify_one();
+        }
+        let _credential_guard = self.credential_guard.lock().await;
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate {
+            gate.login_guard_acquired.notify_one();
+        }
         let now = self.clock.now();
+        self.ensure_not_throttled(now, request_id, CredentialAttempt::Login)
+            .await?;
         let row = sqlx::query("SELECT password_hash FROM admin_credentials WHERE singleton_id = 1")
             .fetch_optional(self.database.pool())
             .await?
             .ok_or(AuthError::SetupRequired)?;
-        self.ensure_not_throttled(now, request_id).await?;
         let password_hash: String = row.get(0);
         let valid = username == "admin" && self.password.verify(password, password_hash).await?;
         if !valid {
-            self.record_login_failure(request_id, now).await?;
+            self.record_credential_failure(request_id, now, CredentialAttempt::Login)
+                .await?;
             return Err(AuthError::InvalidCredentials);
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate
+            && gate.pause_login_after_verify.load(Ordering::SeqCst)
+        {
+            gate.login_after_verify.notify_one();
+            gate.resume_login.notified().await;
         }
 
         let session_token = self.tokens.generate()?;
@@ -214,6 +256,76 @@ impl AuthService {
             created_at,
             expires_at: absolute_expires_at,
         })
+    }
+
+    pub async fn change_password(
+        &self,
+        current_password: String,
+        new_password: String,
+        request_id: Uuid,
+    ) -> Result<(), AuthError> {
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate {
+            gate.rotation_guard_attempted.notify_one();
+        }
+        let _credential_guard = self.credential_guard.lock().await;
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate {
+            gate.rotation_guard_acquired.notify_one();
+        }
+        let now = self.clock.now();
+        self.ensure_not_throttled(now, request_id, CredentialAttempt::PasswordChange)
+            .await?;
+        let password_hash: String = sqlx::query_scalar(
+            "SELECT password_hash FROM admin_credentials WHERE singleton_id = 1",
+        )
+        .fetch_optional(self.database.pool())
+        .await?
+        .ok_or(AuthError::SetupRequired)?;
+        if !self
+            .password
+            .verify(current_password, password_hash)
+            .await?
+        {
+            self.record_credential_failure(request_id, now, CredentialAttempt::PasswordChange)
+                .await?;
+            return Err(AuthError::CurrentPasswordInvalid);
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.credential_test_gate
+            && gate.pause_rotation_after_verify.load(Ordering::SeqCst)
+        {
+            gate.rotation_after_verify.notify_one();
+            gate.resume_rotation.notified().await;
+        }
+        let new_password_hash = self.password.hash(new_password).await?;
+        let now_text = format_time(now)?;
+        let mut transaction = self.database.pool().begin().await?;
+        sqlx::query(
+            "UPDATE admin_credentials SET password_hash = ?, updated_at = ? WHERE singleton_id = 1",
+        )
+        .bind(new_password_hash)
+        .bind(&now_text)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM sessions")
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("UPDATE auth_throttle SET window_started_at = NULL, failure_count = 0, blocked_until = NULL WHERE singleton_id = 1")
+            .execute(&mut *transaction)
+            .await?;
+        insert_audit(
+            &mut transaction,
+            "admin",
+            request_id,
+            "auth.password_change",
+            "success",
+            AuditMetadata::empty(),
+            &now_text,
+        )
+        .await?;
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub async fn authenticate(&self, token: &str) -> Result<AuthenticatedSession, AuthError> {
@@ -300,6 +412,7 @@ impl AuthService {
         &self,
         now: OffsetDateTime,
         request_id: Uuid,
+        attempt: CredentialAttempt,
     ) -> Result<(), AuthError> {
         let blocked_until: Option<String> =
             sqlx::query_scalar("SELECT blocked_until FROM auth_throttle WHERE singleton_id = 1")
@@ -312,9 +425,9 @@ impl AuthService {
                 let mut transaction = self.database.pool().begin().await?;
                 insert_audit(
                     &mut transaction,
-                    "anonymous",
+                    attempt.actor(),
                     request_id,
-                    "auth.login",
+                    attempt.action(),
                     "failure",
                     AuditMetadata::reason("AUTH_COOLDOWN"),
                     &now_text,
@@ -329,10 +442,11 @@ impl AuthService {
         Ok(())
     }
 
-    async fn record_login_failure(
+    async fn record_credential_failure(
         &self,
         request_id: Uuid,
         now: OffsetDateTime,
+        attempt: CredentialAttempt,
     ) -> Result<(), AuthError> {
         let mut transaction = self.database.pool().begin().await?;
         let row = sqlx::query(
@@ -365,11 +479,11 @@ impl AuthService {
         let now_text = format_time(now)?;
         insert_audit(
             &mut transaction,
-            "anonymous",
+            attempt.actor(),
             request_id,
-            "auth.login",
+            attempt.action(),
             "failure",
-            AuditMetadata::reason("AUTH_INVALID"),
+            AuditMetadata::reason(attempt.invalid_reason()),
             &now_text,
         )
         .await?;
@@ -387,6 +501,35 @@ impl AuthService {
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CredentialAttempt {
+    Login,
+    PasswordChange,
+}
+
+impl CredentialAttempt {
+    fn actor(self) -> &'static str {
+        match self {
+            Self::Login => "anonymous",
+            Self::PasswordChange => "admin",
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Login => "auth.login",
+            Self::PasswordChange => "auth.password_change",
+        }
+    }
+
+    fn invalid_reason(self) -> &'static str {
+        match self {
+            Self::Login => "AUTH_INVALID",
+            Self::PasswordChange => "CURRENT_PASSWORD_INVALID",
         }
     }
 }
@@ -422,6 +565,8 @@ pub enum AuthError {
     BootstrapTokenInvalid,
     #[error("credentials are invalid")]
     InvalidCredentials,
+    #[error("current password is invalid")]
+    CurrentPasswordInvalid,
     #[error("authentication cooldown is active")]
     Cooldown(i64),
     #[error("session is required")]
@@ -591,16 +736,17 @@ mod tests {
             Arc::new(TestTokens(AtomicUsize::new(0))),
         );
         for _ in 0..THROTTLE_LIMIT {
-            auth.record_login_failure(Uuid::new_v4(), clock.now())
+            auth.record_credential_failure(Uuid::new_v4(), clock.now(), CredentialAttempt::Login)
                 .await
                 .unwrap();
         }
         assert!(matches!(
-            auth.ensure_not_throttled(clock.now(), Uuid::new_v4()).await,
+            auth.ensure_not_throttled(clock.now(), Uuid::new_v4(), CredentialAttempt::Login)
+                .await,
             Err(AuthError::Cooldown(_))
         ));
         clock.advance(Duration::minutes(16));
-        auth.ensure_not_throttled(clock.now(), Uuid::new_v4())
+        auth.ensure_not_throttled(clock.now(), Uuid::new_v4(), CredentialAttempt::Login)
             .await
             .unwrap();
     }
@@ -668,6 +814,144 @@ mod tests {
         assert_eq!(login_audits, 6);
     }
 
+    async fn auth_with_credential_gate(
+        gate: Arc<CredentialTestGate>,
+    ) -> (tempfile::TempDir, Database, AuthService) {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let mut auth = AuthService::with_dependencies(
+            database.clone(),
+            root.path().join("bootstrap.token"),
+            Arc::new(TestClock::new(
+                OffsetDateTime::from_unix_timestamp(1_787_875_200).unwrap(),
+            )),
+            Arc::new(TestTokens(AtomicUsize::new(0))),
+        );
+        auth.credential_test_gate = Some(gate);
+        let now = format_time(auth.clock.now()).unwrap();
+        sqlx::query("INSERT INTO admin_credentials (singleton_id, username, password_hash, created_at, updated_at) VALUES (1, 'admin', ?, ?, ?)")
+            .bind(fast_test_password_hash("correct horse battery"))
+            .bind(&now)
+            .bind(&now)
+            .execute(database.pool())
+            .await
+            .unwrap();
+        (root, database, auth)
+    }
+
+    #[tokio::test]
+    async fn login_holds_the_credential_guard_through_session_commit() {
+        let gate = Arc::new(CredentialTestGate::default());
+        gate.pause_login_after_verify.store(true, Ordering::SeqCst);
+        let (_root, database, auth) = auth_with_credential_gate(gate.clone()).await;
+        let login_task = {
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
+                    .await
+            })
+        };
+        gate.login_after_verify.notified().await;
+        let rotation_task = {
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                auth.change_password(
+                    "correct horse battery".into(),
+                    "new correct horse battery".into(),
+                    Uuid::new_v4(),
+                )
+                .await
+            })
+        };
+        gate.rotation_guard_attempted.notified().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                gate.rotation_guard_acquired.notified(),
+            )
+            .await
+            .is_err(),
+            "rotation acquired the credential guard before login committed"
+        );
+
+        gate.pause_login_after_verify.store(false, Ordering::SeqCst);
+        gate.resume_login.notify_one();
+        let login_session = login_task.await.unwrap().unwrap();
+        rotation_task.await.unwrap().unwrap();
+        assert!(matches!(
+            auth.authenticate(login_session.session_token.expose())
+                .await,
+            Err(AuthError::SessionRequired)
+        ));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    #[tokio::test]
+    async fn rotation_holds_the_credential_guard_until_old_password_is_replaced() {
+        let gate = Arc::new(CredentialTestGate::default());
+        gate.pause_rotation_after_verify
+            .store(true, Ordering::SeqCst);
+        let (_root, database, auth) = auth_with_credential_gate(gate.clone()).await;
+        let rotation_task = {
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                auth.change_password(
+                    "correct horse battery".into(),
+                    "new correct horse battery".into(),
+                    Uuid::new_v4(),
+                )
+                .await
+            })
+        };
+        gate.rotation_after_verify.notified().await;
+        let login_task = {
+            let auth = auth.clone();
+            tokio::spawn(async move {
+                auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
+                    .await
+            })
+        };
+        gate.login_guard_attempted.notified().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                gate.login_guard_acquired.notified(),
+            )
+            .await
+            .is_err(),
+            "login acquired the credential guard before rotation committed"
+        );
+
+        gate.pause_rotation_after_verify
+            .store(false, Ordering::SeqCst);
+        gate.resume_rotation.notify_one();
+        rotation_task.await.unwrap().unwrap();
+        assert!(matches!(
+            login_task.await.unwrap(),
+            Err(AuthError::InvalidCredentials)
+        ));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+        assert!(matches!(
+            auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
+                .await,
+            Err(AuthError::InvalidCredentials)
+        ));
+        auth.login("admin", "new correct horse battery".into(), Uuid::new_v4())
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn auth_sqlite_lock_is_classified_as_busy_on_the_real_caller_path() {
         let root = tempdir().unwrap();
@@ -700,8 +984,12 @@ mod tests {
         drop(connections);
 
         assert!(matches!(
-            auth.record_login_failure(Uuid::new_v4(), auth.clock.now())
-                .await,
+            auth.record_credential_failure(
+                Uuid::new_v4(),
+                auth.clock.now(),
+                CredentialAttempt::Login,
+            )
+            .await,
             Err(AuthError::Database(DbError::Busy))
         ));
         sqlx::query("ROLLBACK").execute(&mut *lock).await.unwrap();

@@ -84,7 +84,11 @@ export function notifyUnauthorized(): void {
   unauthorizedHandler?.()
 }
 
-export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+export async function api<T>(
+  path: string,
+  init: RequestInit = {},
+  options: { expectedStatus?: number } = {},
+): Promise<T> {
   const response = await fetch(path, {
     ...init,
     credentials: 'same-origin',
@@ -94,6 +98,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (response.status === 401) unauthorizedHandler?.()
     throw new ApiError(response.status, await normalizeErrorResponse(response))
   }
+  if (options.expectedStatus !== undefined && response.status !== options.expectedStatus) {
+    throw new ApiError(response.status, {
+      code: 'HTTP_ERROR',
+      message: `Unexpected HTTP status ${response.status}`,
+      request_id: safeRequestId(response.headers.get('X-Request-ID')) ?? '',
+    })
+  }
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
 }
@@ -101,7 +112,7 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
 export async function mutation<T>(
   path: string,
   body?: unknown,
-  options: { method?: 'POST' | 'PUT' | 'DELETE'; idempotencyKey?: string } = {},
+  options: { method?: 'POST' | 'PUT' | 'DELETE'; idempotencyKey?: string; expectedStatus?: number } = {},
 ): Promise<T> {
   const csrf = readCookie('__Host-solodock_csrf')
   return api<T>(path, {
@@ -112,7 +123,7 @@ export async function mutation<T>(
       ...(options.idempotencyKey ? { 'Idempotency-Key': options.idempotencyKey } : {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-  })
+  }, { expectedStatus: options.expectedStatus })
 }
 
 export function readCookie(name: string): string | undefined {

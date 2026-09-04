@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/me/sessions/revoke-all", post(auth::revoke_all))
+        .route("/api/v1/me/password", put(auth::change_password))
         .layer(DefaultBodyLimit::max(16 * 1024));
     let draft_mutations = Router::new()
         .route("/api/v1/apps", post(mutations::create))

@@ -51,3 +51,11 @@ export async function revokeAll(): Promise<void> {
   await mutation<void>('/api/v1/me/sessions/revoke-all')
   auth.set({ kind: 'login' })
 }
+
+export async function changePassword(currentPassword: string, newPassword: string): Promise<void> {
+  await mutation<void>('/api/v1/me/password', {
+    current_password: currentPassword,
+    new_password: newPassword,
+  }, { method: 'PUT', expectedStatus: 204 })
+  auth.set({ kind: 'login' })
+}
