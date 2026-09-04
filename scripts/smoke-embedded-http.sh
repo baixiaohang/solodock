@@ -16,7 +16,8 @@ trap cleanup EXIT
 trap 'status=$?; printf "embedded HTTP smoke failed at line %s (status %s)\n" "$LINENO" "$status" >&2; [[ -r $fixture/stderr ]] && sed -n "1,120p" "$fixture/stderr" >&2; exit "$status"' ERR
 chmod 0700 "$fixture"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-origin='https://solodock.example.invalid'
+management_host='solodock.example.invalid'
+origin="https://$management_host"
 cat >"$fixture/config.toml" <<EOF
 schema_version = 1
 listen_address = "127.0.0.1:$port"
@@ -34,7 +35,8 @@ for _ in $(seq 1 100); do
   sleep 0.1
 done
 
-curl --fail --silent "http://127.0.0.1:$port/" >"$fixture/index"
+curl --fail --silent -H "host: $management_host" \
+  "http://127.0.0.1:$port/" >"$fixture/index"
 grep -q '<div id="app"></div>' "$fixture/index"
 grep -q 'href="/favicon.svg"' "$fixture/index"
 curl --fail --silent -D "$fixture/favicon.headers" \
@@ -43,23 +45,24 @@ grep -qi '^content-type: image/svg+xml' "$fixture/favicon.headers"
 grep -q '<svg' "$fixture/favicon.svg"
 asset=$(grep -oE '/assets/[^" ]+\.js' "$fixture/index" | head -n 1)
 [[ -n $asset ]]
-curl --fail --silent "http://127.0.0.1:$port$asset" >/dev/null
-curl --fail --silent -H 'accept: text/html' \
+curl --fail --silent -H "host: $management_host" \
+  "http://127.0.0.1:$port$asset" >/dev/null
+curl --fail --silent -H "host: $management_host" -H 'accept: text/html' \
   "http://127.0.0.1:$port/apps/fixture-spa-route" | cmp -s - "$fixture/index"
 
 bootstrap=$(tr -d '\n' <"$fixture/run/bootstrap.token")
 curl --fail --silent -X POST "http://127.0.0.1:$port/api/v1/auth/bootstrap" \
-  -H 'content-type: application/json' -H "origin: $origin" \
+  -H "host: $management_host" -H 'content-type: application/json' -H "origin: $origin" \
   --data "{\"bootstrap_token\":\"$bootstrap\",\"password\":\"correct horse battery\"}" >/dev/null
 curl --fail --silent -D "$fixture/login.headers" -o /dev/null \
   -X POST "http://127.0.0.1:$port/api/v1/auth/login" \
-  -H 'content-type: application/json' -H "origin: $origin" \
+  -H "host: $management_host" -H 'content-type: application/json' -H "origin: $origin" \
   --data '{"username":"admin","password":"correct horse battery"}'
 session=$(sed -n 's/^set-cookie: \(__Host-solodock_session=[^;]*\).*/\1/ip' "$fixture/login.headers")
 csrf_cookie=$(sed -n 's/^set-cookie: \(__Host-solodock_csrf=[^;]*\).*/\1/ip' "$fixture/login.headers")
 [[ -n $session && -n $csrf_cookie ]]
 curl --fail --silent "http://127.0.0.1:$port/api/v1/me" \
-  -H "cookie: $session; $csrf_cookie" | grep -q '"username":"admin"'
+  -H "host: $management_host" -H "cookie: $session; $csrf_cookie" | grep -q '"username":"admin"'
 
 kill -TERM "$pid"
 wait "$pid"
