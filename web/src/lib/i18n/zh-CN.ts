@@ -24,6 +24,7 @@ export const zhCN = {
   'SoloDock · unknown': 'SoloDock · unknown',
   'Revoke all sessions': '撤销全部会话',
   'Log out': '退出',
+  'The session action result could not be confirmed. Retry or reload before relying on it.': '无法确认会话操作结果。请重试或刷新页面后再据此判断。',
   'Initialize administrator': '初始化管理员',
   'Welcome back': '欢迎回来',
   'Enter the one-time token from the server bootstrap.token file and set the administrator password.': '输入服务器 bootstrap.token 文件中的一次性 token，并设置管理员密码。',

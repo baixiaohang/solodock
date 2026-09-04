@@ -34,6 +34,10 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 }
 ```
 
+Web client 会在解析 response body 前先处理 HTTP `401`，因此即使 Tunnel 或 WAF 替换为 HTML、空 body 或畸形 JSON，过期或已撤销的 session 仍会返回认证界面。其他非成功响应只在 media type 为 `application/json` 或 `+json`，且稳定错误 envelope 的 runtime shape 符合预期时才按 API 错误解析；否则保留真实 HTTP status，但使用本地 `HTTP_ERROR` 消息，绝不显示 response body。经过长度和字符约束的安全 `X-Request-ID` header 优先于有效 JSON `request_id`；不安全标识会被丢弃。
+
+logout 与全局 session revoke 仅在服务器确认成功后才改变浏览器的 authenticated 状态；`401` 仍走统一 unauthorized 路径。network、CSRF/WAF、throttling 或服务端失败会保留当前 authenticated view，并显示可重试的脱敏错误；transport failure 明确保持“结果未知”，不会伪报成功。
+
 持久业务 mutation 必须携带 16–128 字节安全 ASCII `Idempotency-Key`。SQLite 保存 request fingerprint/HMAC、operation 状态和脱敏响应；相同 key 与相同 request 可 replay，换 body/route/method 会冲突。Registry credential 与 webhook secret 在前端 retry identity 中只保留 hash，并在后端 API 的受管 parsed buffer 中使用 zeroizing wrapper。
 
 terminal replay record 通常在 24 小时后过期，但清理是低频 service operation，不再作为无关 mutation claim 的隐藏副作用。每个有界清理批次开始前，SoloDock 都会盘点所有由 finalizer 管理的 filesystem artifact，并保留其引用的 exact operation proof。任一 application、credential 或 webhook artifact inventory 不完整或无效时，本轮清理零删除。pending 与 interrupted record 永不按时间回收。

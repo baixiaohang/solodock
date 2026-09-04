@@ -1,5 +1,73 @@
 import type { ApiErrorBody } from './types'
 
+const MAX_REQUEST_ID_LENGTH = 128
+const REQUEST_ID_PATTERN = /^[A-Za-z0-9._:-]+$/
+
+function safeRequestId(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  return trimmed.length > 0
+    && trimmed.length <= MAX_REQUEST_ID_LENGTH
+    && REQUEST_ID_PATTERN.test(trimmed)
+    ? trimmed
+    : undefined
+}
+
+function isJsonContentType(value: string | null): boolean {
+  if (!value) return false
+  const mediaType = value.split(';', 1)[0].trim().toLowerCase()
+  return mediaType === 'application/json' || mediaType.endsWith('+json')
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function validIssues(value: unknown): value is NonNullable<ApiErrorBody['issues']> {
+  return Array.isArray(value) && value.every((issue) =>
+    isRecord(issue)
+    && typeof issue.path === 'string'
+    && typeof issue.code === 'string'
+    && typeof issue.message === 'string')
+}
+
+function fallbackError(status: number, requestId: string): ApiErrorBody {
+  return {
+    code: 'HTTP_ERROR',
+    message: `Request failed with HTTP status ${status}`,
+    request_id: requestId,
+  }
+}
+
+async function normalizeErrorResponse(response: Response): Promise<ApiErrorBody> {
+  const headerRequestId = safeRequestId(response.headers.get('X-Request-ID'))
+  const fallback = fallbackError(response.status, headerRequestId ?? '')
+  if (!isJsonContentType(response.headers.get('Content-Type'))) return fallback
+
+  let value: unknown
+  try {
+    value = await response.json()
+  } catch {
+    return fallback
+  }
+  if (!isRecord(value)
+    || typeof value.code !== 'string'
+    || value.code.length === 0
+    || typeof value.message !== 'string'
+    || value.message.length === 0
+    || (value.request_id !== undefined && safeRequestId(value.request_id) === undefined)
+    || (value.issues !== undefined && !validIssues(value.issues))) {
+    return fallback
+  }
+
+  return {
+    code: value.code,
+    message: value.message,
+    request_id: headerRequestId ?? safeRequestId(value.request_id) ?? '',
+    ...(value.issues === undefined ? {} : { issues: value.issues }),
+  }
+}
+
 export class ApiError extends Error {
   constructor(public status: number, public body: ApiErrorBody) {
     super(body.message)
@@ -23,9 +91,8 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers: { Accept: 'application/json', ...init.headers },
   })
   if (!response.ok) {
-    const body = (await response.json()) as ApiErrorBody
     if (response.status === 401) unauthorizedHandler?.()
-    throw new ApiError(response.status, body)
+    throw new ApiError(response.status, await normalizeErrorResponse(response))
   }
   if (response.status === 204) return undefined as T
   return (await response.json()) as T
