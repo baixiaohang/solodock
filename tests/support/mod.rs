@@ -17,11 +17,14 @@ pub struct TestAuth {
     pub cookie: String,
     #[allow(dead_code)]
     pub csrf: String,
+    #[allow(dead_code)]
+    pub password: String,
 }
 
 pub async fn seed_authenticated_session(database: &Database, bootstrap_path: PathBuf) -> TestAuth {
     let session_token = format!("test-session-{}", Uuid::new_v4());
     let csrf = format!("test-csrf-{}", Uuid::new_v4());
+    let password = format!("test-password-{}", Uuid::new_v4());
     let now = OffsetDateTime::now_utc();
     let created_at = format_time(now).unwrap();
     let idle_expires_at = format_time(now + Duration::hours(1)).unwrap();
@@ -32,8 +35,8 @@ pub async fn seed_authenticated_session(database: &Database, bootstrap_path: Pat
         Params::new(8, 1, 1, None).unwrap(),
     )
     .hash_password(
-        b"test fixture password",
-        &SaltString::encode_b64(b"solodock-fixture").unwrap(),
+        password.as_bytes(),
+        &SaltString::encode_b64(Uuid::new_v4().as_bytes()).unwrap(),
     )
     .unwrap()
     .to_string();
@@ -73,5 +76,6 @@ pub async fn seed_authenticated_session(database: &Database, bootstrap_path: Pat
         service: AuthService::new(database.clone(), bootstrap_path),
         cookie: format!("__Host-solodock_session={session_token}; __Host-solodock_csrf={csrf}"),
         csrf,
+        password,
     }
 }

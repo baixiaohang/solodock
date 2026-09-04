@@ -1,7 +1,8 @@
 <script lang="ts">
   import { bootstrap, login } from '../lib/auth'
   import { ApiError } from '../lib/api'
-  import { localized, messageText, t, type LocalizedMessage, type UserMessage } from '../lib/i18n'
+  import { localized, messageText, t, type UserMessage } from '../lib/i18n'
+  import { validatePassword } from '../lib/password'
   import LanguageSwitcher from './LanguageSwitcher.svelte'
 
   let { mode }: { mode: 'setup' | 'login' } = $props()
@@ -24,15 +25,6 @@
     } catch (cause) {
       error = cause instanceof ApiError ? authMessage(cause.body.code, cause.body.message) : localized('Could not connect to the control plane; try again later')
     } finally { busy = false }
-  }
-
-  function validatePassword(value: string): LocalizedMessage | null {
-    const trimmed = value.trim()
-    const scalarCount = Array.from(trimmed).length
-    const byteCount = new TextEncoder().encode(trimmed).length
-    return scalarCount >= 14 && scalarCount <= 128 && byteCount <= 512
-      ? null
-      : localized('Password must contain 14–128 Unicode characters, excluding leading and trailing whitespace')
   }
 
   function authMessage(code: string, message: string): UserMessage {

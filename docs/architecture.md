@@ -48,6 +48,8 @@ The production binary embeds Vite output at compile time with `embed-ui`; no Nod
 
 No SQLite projection may overwrite filesystem facts. If SQLite is lost, application and release query facts can be reconstructed from files, but administrator credentials, sessions, audit, and deployment history cannot be fabricated; bootstrap must run again.
 
+Login and administrator password rotation share one in-process credential guard and one persisted authentication throttle. Under that guard, rotation verifies the current Argon2id credential and derives the replacement before opening the commit transaction. The hash update, deletion of every session, throttle reset, and sanitized success audit then commit as one SQLite unit; failure rolls back all four. This ordering means an old-password login admitted before rotation is deleted by the rotation, while one admitted afterward observes the new hash. Session deletion is observed by subsequent API authentication and SSE heartbeat checks; it does not cancel a request that completed authentication before the transaction committed.
+
 The application header persists UUID, immutable slug, and `resource_name_schema_version`, but not the derived project name. The domain naming helper is the sole source of project, owned network, owned volume, and bridge names. Old schemas retain slug-based bridges; new schemas use UUID-token bridges. An asynchronous path holding only a UUID must reload validated metadata/catalog rather than guessing a resource name.
 
 ## Persistent layout

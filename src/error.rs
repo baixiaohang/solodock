@@ -298,6 +298,12 @@ impl ApiError {
                 "The username or password is invalid",
                 request_id,
             ),
+            AuthError::CurrentPasswordInvalid => Self::new(
+                StatusCode::FORBIDDEN,
+                "CURRENT_PASSWORD_INVALID",
+                "The current password is invalid",
+                request_id,
+            ),
             AuthError::Cooldown(seconds) => {
                 let mut error = Self::new(
                     StatusCode::TOO_MANY_REQUESTS,

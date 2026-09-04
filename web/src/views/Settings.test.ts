@@ -76,4 +76,14 @@ describe('Settings', () => {
     expect(keys).toEqual([keys[0], keys[0]])
     expect(sequence).toBe(1)
   })
+
+  it('keeps administrator password rotation available when display settings fail to load', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('offline') }))
+
+    render(Settings)
+
+    expect(await screen.findByText('管理员安全')).toBeTruthy()
+    expect(screen.getByLabelText('当前密码')).toBeTruthy()
+    expect(await screen.findByText('无法加载全局设置。')).toBeTruthy()
+  })
 })

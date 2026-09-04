@@ -48,6 +48,8 @@ Browser
 
 任何SQLite投影都不能反向覆盖filesystem事实。SQLite丢失后可以从文件恢复app/release查询事实，但不能伪造管理员、session、audit或deployment历史；必须重新bootstrap。
 
+login 与管理员密码轮换共享同一把进程内 credential guard 和同一份持久化认证 throttle。在该 guard 下，轮换先验证当前 Argon2id credential 并派生替换 hash，再开启提交事务。hash 更新、删除全部 session、throttle reset 和脱敏 success audit 作为同一 SQLite 单元提交；失败时四者全部回滚。该顺序保证轮换前获准的旧密码 login session 会被轮换删除，轮换后进入的 login 则读取新 hash。后续 API 认证和 SSE heartbeat 会观察到 session 删除；它不取消事务提交前已经完成认证的 request。
+
 App header 持久化 UUID、不可变 slug 与 `resource_name_schema_version`，不持久化可派生 project name。domain naming helper 是 project、owned network、owned volume 和 bridge 名称的唯一来源；旧 schema 保留 slug bridge，新 schema 使用 UUID token bridge。只持有 UUID 的异步路径必须重新读取已验证 metadata/catalog，不能猜测资源名。
 
 ## 持久化布局

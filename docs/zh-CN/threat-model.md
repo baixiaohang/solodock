@@ -10,6 +10,8 @@ SoloDock 假定唯一管理员和宿主 OS 可信；Registry、镜像、容器�
 
 secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入 API response、SQLite、release、audit、argv、tracing 或错误；日志使用完整、fail-closed 的动态已知 secret 集脱敏。内核、allocator、Docker daemon、Registry 服务端和管理员业务备份不在“内存中从未出现明文”的保证范围。备份含 secret，必须高敏保护。
 
+仅持有合法管理员 session 不能轮换 credential：该 route 还要求当前密码、精确 Origin 与 CSRF proof。无效 current-password 尝试与 login 共用 throttle，但使用独立的脱敏 audit action 和 HTTP 403 结果，因此不会伪装成 session 过期，也不泄露密码材料。轮换与 login 串行化，并在原子替换 hash 时撤销全部 session。这让密码泄露后的止损依赖一次成功轮换；本次不增加 MFA、account recovery、password history，也不增加用于取消 commit 前已获准 request 的 authentication epoch。
+
 受管 public/secret file 的宿主 leaf 为 `0444`，用于让显式 bind mount 的非 root 容器读取；其全部宿主 ancestor 仍为 `0700 solodock:solodock`，容器只看到 Compose 明确挂入的单个 leaf。该边界不隔离宿主 root、Docker daemon 控制者或拥有 Docker socket 的主体，也不允许受管容器浏览完整 state tree。只读性由 Compose `read_only: true` 和 immutable revision 共同执行；其他控制面 secret 不因该例外放宽。
 
 受管 state reader 在拼接或读取 leaf 前先验证来自 metadata 的文件名；root-relative 路径只接受普通组件，拒绝 `.`、`..`、absolute/prefix 和 symlink boundary。HMAC 负责内容完整性，不被当作延迟执行的路径消毒器；路径不合法时必须在读取目标内容前 fail closed。

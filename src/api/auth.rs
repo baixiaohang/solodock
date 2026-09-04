@@ -86,6 +86,13 @@ pub struct LoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PasswordChangeRequest {
+    current_password: String,
+    new_password: String,
+}
+
 #[derive(Serialize)]
 pub struct MeResponse {
     username: &'static str,
@@ -209,6 +216,23 @@ pub async fn revoke_all(
     state
         .auth
         .revoke_all(request_id.0)
+        .await
+        .map_err(|error| ApiError::from_auth(error, request_id))?;
+    Ok(expired_cookie_response())
+}
+
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    _authenticated: MutationAuthenticated,
+    payload: Result<Json<PasswordChangeRequest>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let Json(payload) = payload.map_err(|_| ApiError::validation(request_id))?;
+    PasswordService::validate(&payload.new_password)
+        .map_err(|_| ApiError::validation(request_id))?;
+    state
+        .auth
+        .change_password(payload.current_password, payload.new_password, request_id.0)
         .await
         .map_err(|error| ApiError::from_auth(error, request_id))?;
     Ok(expired_cookie_response())

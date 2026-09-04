@@ -11,6 +11,7 @@ SoloDock's management API and embedded UI share one HTTPS origin. In production,
 - Login establishes a Secure, HttpOnly, SameSite=Strict session cookie.
 - An authenticated mutation also requires an `Origin` exactly matching `public_origin` and a double-submit `X-CSRF-Token`.
 - Sessions expire and can be logged out or revoked globally; SSE heartbeat revalidates them.
+- An authenticated administrator can rotate the password only by proving the current password. A successful rotation revokes every session, including the caller, and expires both browser cookies.
 - Login throttling, successes/failures, and sensitive administrative actions are audited without recording passwords, cookies, or secrets.
 
 Authentication protocol endpoints do not use the business `Idempotency-Key`. Singleton credentials, one-time tokens, or random sessions provide their replay boundaries.
@@ -37,6 +38,10 @@ Every `/api/v1/**` response uses `Cache-Control: no-store` and an allowlisted DT
 The Web client handles an HTTP `401` before attempting to parse its body, so an expired or revoked session returns to authentication even when a tunnel or WAF substitutes HTML, an empty body, or malformed JSON. Other non-success responses are parsed as API errors only for `application/json` or `+json` media types and only when the stable error envelope has the expected runtime shape. Otherwise the client preserves the real HTTP status but uses a local `HTTP_ERROR` message without displaying the response body. A bounded, safe `X-Request-ID` header takes precedence over a valid JSON `request_id`; unsafe identifiers are discarded.
 
 Logout and global session revocation change the browser's authenticated state only after the server confirms success. A `401` still follows the common unauthorized path. Network, CSRF/WAF, throttling, and server failures keep the current authenticated view and present a retryable sanitized error; transport failures explicitly remain an unknown result rather than being reported as success.
+
+`PUT /api/v1/me/password` requires an authenticated session, exact Origin, double-submit CSRF, and a JSON object containing only `current_password` and `new_password`. The new password uses the same 14–128 Unicode scalar and 512-byte policy as bootstrap. A wrong current password returns HTTP 403 `CURRENT_PASSWORD_INVALID`; the shared authentication cooldown returns HTTP 429 `AUTH_COOLDOWN`. The endpoint does not use or require an `Idempotency-Key`. On success it atomically updates the Argon2id hash, deletes all sessions, clears the shared throttle, appends a sanitized `auth.password_change` audit event, expires both managed cookies, and returns 204. Any transaction failure preserves the old hash, sessions, throttle, and audit state and does not expire cookies.
+
+The Web Settings security form holds password values only in component memory and sends confirmation only as a client-side check. A confirmed 204 returns to login. Deterministic JSON errors remain in the authenticated shell; an unconfirmed network or proxy result is not retried automatically and directs the administrator to reload and test the new password before trying again.
 
 Persistent business mutations require a safe 16–128-byte ASCII `Idempotency-Key`. SQLite stores the request fingerprint/HMAC, operation state, and sanitized response. The same key and identical request may replay; changing the body, route, or method conflicts. Frontend retry identities keep only hashes of Registry credentials and webhook secrets, while the backend API uses zeroizing wrappers for managed parsed buffers.
 

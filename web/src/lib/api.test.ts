@@ -20,6 +20,25 @@ async function expectApiError(response: Response): Promise<ApiError> {
 }
 
 describe('API error normalization', () => {
+  it('rejects an unexpected successful status without parsing or exposing its body', async () => {
+    const response = new Response(JSON.stringify({ private: 'protocol detail' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json', 'X-Request-ID': 'protocol-request-200' },
+    })
+    const json = vi.spyOn(response, 'json')
+    vi.stubGlobal('fetch', vi.fn(async () => response))
+
+    await expect(api('/api/v1/test', {}, { expectedStatus: 204 })).rejects.toMatchObject({
+      status: 200,
+      body: {
+        code: 'HTTP_ERROR',
+        message: 'Unexpected HTTP status 200',
+        request_id: 'protocol-request-200',
+      },
+    })
+    expect(json).not.toHaveBeenCalled()
+  })
+
   it('handles an HTML 401 before parsing and returns a safe ApiError', async () => {
     const unauthorized = vi.fn()
     onUnauthorized(unauthorized)
