@@ -48,6 +48,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 - Image-suggestion POST JSON `Content-Type`, CSRF, credential reference, allowlisted success projection, and sanitized error display.
 - Field-level configuration `issues` locate the correct section/row without leaking public values, secrets, credentials, or host paths in responses or UI.
 - Registry/webhook secret write-only behavior, zeroization, rotation/revoke, and finalization.
+- Proof-aware idempotency cleanup: current webhook proof retention; rotate/revoke recovery after the old creation proof has expired; deterministic inventory-versus-transition serialization; more than 24 hours of finalizer failure followed by restart convergence; canonical pre-metadata crash retention; malformed metadata/revision/route/operation/status/response identity failing closed; and the 100-record terminal batch bound.
 - A secret canary never enters API, SSE, audit, tracing, errors, Compose, releases, SQLite, or argv.
 - Degraded inventory preserves the old redactor; incomplete cold-start inventory fails closed.
 

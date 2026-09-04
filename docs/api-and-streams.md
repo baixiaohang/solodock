@@ -36,6 +36,8 @@ Every `/api/v1/**` response uses `Cache-Control: no-store` and an allowlisted DT
 
 Persistent business mutations require a safe 16–128-byte ASCII `Idempotency-Key`. SQLite stores the request fingerprint/HMAC, operation state, and sanitized response. The same key and identical request may replay; changing the body, route, or method conflicts. Frontend retry identities keep only hashes of Registry credentials and webhook secrets, while the backend API uses zeroizing wrappers for managed parsed buffers.
 
+Terminal replay records normally expire after 24 hours, but cleanup is a low-frequency service operation rather than a side effect of claiming an unrelated mutation. Before each bounded cleanup batch, SoloDock inventories every finalizer-owned filesystem artifact and retains the exact operation proof it references. If any application, credential, or webhook artifact inventory is incomplete or invalid, that cleanup cycle deletes nothing. Pending and interrupted records are never time-collected.
+
 Endpoints are grouped around stable resources:
 
 - application catalog, detail, draft, validation, lifecycle, and deletion;

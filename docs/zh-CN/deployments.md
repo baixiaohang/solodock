@@ -93,4 +93,6 @@ candidate 达到 health policy 后才把 `active` 原子切向该 release，并�
 
 签名 webhook只表示“配置的 tag 可能变化”。有效请求原子写入 nonce claim、audit 和 per-app wake sequence；coalesced sequence 唤醒上述 PollCoordinator，并继续遵守 auto-deploy disabled、backoff、busy、suppression、drift 和健康门禁。
 
+Webhook secret revision 在被精确删除前始终是 recovery artifact。其创建 proof、operation temp，以及存在 stale revision 时由签名 metadata 指定的最新 configure/rotate/revoke transition proof，不参与普通 24 小时 replay cleanup。startup/background finalizer 只有在该 transition 是成功 response，且其中 configured 状态、metadata revision、secret revision 与当前签名 metadata 精确一致时，才可删除 stale revision。这也兼容旧 current revision 的创建 proof 在升级前已过期的实例；transition proof 缺失或不匹配时继续 fail closed。
+
 协议、Host 隔离和 WAF 约束见 [Webhook](webhooks.md)。应用资源模型见 [应用模型](application-model.md)，人工处置见 [运维](operations.md) 和 [恢复](recovery.md)。

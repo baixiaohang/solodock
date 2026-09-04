@@ -48,6 +48,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - 镜像建议 POST 的 JSON `Content-Type`、CSRF、credential reference、allowlist 成功投影及脱敏错误展示；
 - 配置字段级 `issues` 可定位对应区块/行，响应与 UI 不泄露 public 值、Secret、credential 或宿主路径；
 - Registry/webhook secret write-only、zeroize、rotation/revoke/finalizer；
+- proof-aware idempotency cleanup：current webhook proof retention、旧创建 proof 已过期后的 rotate/revoke recovery、确定性的 inventory/transition 串行化、finalizer 失败超过 24 小时后的 restart 收敛、canonical pre-metadata crash 保留、metadata/revision/route/operation/status/response identity 异常时 fail closed，以及 100 条 terminal batch 上限；
 - secret canary 不进入 API、SSE、audit、tracing、error、Compose、release、SQLite 或 argv；
 - degraded inventory保留旧 redactor，冷启动不完整 inventory fail closed。
 

@@ -7,12 +7,192 @@ use solodock::{
         BindMountInput, DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy,
         ManagedFileContent, ManagedFileInput, PublicFileContent, SecretOperation, normalize_draft,
     },
-    registry::{Platform, ResolvedImage},
+    mutation::{ClaimResult, IdempotencyService},
+    registry::{CredentialStore, Platform, ResolvedImage},
     security::secret::SecretValue,
     webhook::WebhookStore,
 };
 use tempfile::tempdir;
 use uuid::Uuid;
+
+#[tokio::test]
+async fn webhook_transition_proof_survives_gc_until_restart_recovery_converges() {
+    let root = tempdir().unwrap();
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let database = Database::open(&root.path().join("state.sqlite3"))
+        .await
+        .unwrap();
+    let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+    let integrity_key = service.integrity_key();
+    let apps =
+        AppStore::initialize_managed(root.path().join("apps"), integrity_key.clone(), vec![])
+            .unwrap();
+    let credentials = CredentialStore::initialize(
+        root.path().join("registry-credentials"),
+        integrity_key.clone(),
+    )
+    .unwrap();
+    let draft = normalize_draft(
+        DraftInput {
+            display_name: "Webhook recovery".into(),
+            discovery_image_ref: "registry.example/app:stable".into(),
+            credential_ref: None,
+            auto_deploy_enabled: false,
+            auto_deploy_acknowledged: false,
+            poll_interval_seconds: 300,
+            stop_grace_period_seconds: 10,
+            environment: EnvironmentInput::default(),
+            files: vec![],
+            ports: vec![],
+            volumes: vec![],
+            binds: vec![],
+            owned_default_network: true,
+            service_discovery_enabled: false,
+            networks: vec![],
+            health: HealthPolicy::default(),
+        },
+        &ExistingSecrets::default(),
+        &integrity_key,
+        &[],
+    )
+    .unwrap();
+    let app_id = Uuid::new_v4();
+    apps.create_app(
+        app_id,
+        "webhook-recovery",
+        Uuid::new_v4(),
+        Some((Uuid::new_v4(), &draft)),
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let webhooks = WebhookStore::new(apps.clone(), integrity_key);
+    let route = format!("/api/v1/apps/{app_id}/webhook");
+    let first_key = "recovery-first-webhook-key";
+    let first_operation = match service
+        .claim(&route, first_key, b"first", Uuid::new_v4())
+        .await
+        .unwrap()
+    {
+        ClaimResult::New(operation) => operation,
+        _ => unreachable!(),
+    };
+    let first = webhooks
+        .configure(
+            app_id,
+            None,
+            first_operation,
+            &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+        )
+        .unwrap();
+    service
+        .finish(
+            &route,
+            first_key,
+            200,
+            &serde_json::json!({
+                "configured": true,
+                "metadata_revision": first.metadata_revision,
+                "secret_revision": first.secret_revision,
+            })
+            .to_string(),
+            None,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+        .bind(first_operation.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+
+    let transition_key = "recovery-rotate-webhook-key";
+    let transition = match service
+        .claim(&route, transition_key, b"rotate", Uuid::new_v4())
+        .await
+        .unwrap()
+    {
+        ClaimResult::New(operation) => operation,
+        _ => unreachable!(),
+    };
+    let rotated = webhooks
+        .configure(
+            app_id,
+            Some(first.metadata_revision),
+            transition,
+            &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into()),
+        )
+        .unwrap();
+    service
+        .finish(
+            &route,
+            transition_key,
+            200,
+            &serde_json::json!({
+                "configured": true,
+                "metadata_revision": Uuid::new_v4(),
+                "secret_revision": rotated.secret_revision,
+            })
+            .to_string(),
+            None,
+            Uuid::new_v4(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        service
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .is_err()
+    );
+    let stale = apps
+        .app_directory(app_id)
+        .join("webhook-secret-revisions")
+        .join(first_operation.to_string());
+    assert!(stale.exists());
+
+    sqlx::query(
+        "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+    )
+    .bind(transition.to_string())
+    .execute(database.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        service
+            .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+            .await
+            .unwrap(),
+        0
+    );
+    let proof: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+            .bind(transition.to_string())
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+    assert_eq!(proof, 1);
+
+    sqlx::query("UPDATE idempotency_records SET response_body=? WHERE operation_id=?")
+        .bind(
+            serde_json::json!({
+                "configured": true,
+                "metadata_revision": rotated.metadata_revision,
+                "secret_revision": rotated.secret_revision,
+            })
+            .to_string(),
+        )
+        .bind(transition.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    let restarted = IdempotencyService::initialize(database, root.path()).unwrap();
+    restarted
+        .finalize_succeeded_webhook_revisions(&webhooks)
+        .await
+        .unwrap();
+    assert!(!stale.exists());
+}
 
 #[tokio::test]
 async fn deleted_database_rebuilds_index_without_fabricating_audit() {

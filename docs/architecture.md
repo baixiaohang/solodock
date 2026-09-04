@@ -95,6 +95,8 @@ In-memory catalog/redactor and SQLite projections are published only after the f
 
 Destructive recovery cleanup runs only before the HTTP listener starts. Runtime verified loaders, catalog refresh, and reconciliation use read-only scans; they cannot delete a concurrent writer's temporary artifact or a new revision not yet referenced by old metadata.
 
+Replay retention and recovery-proof retention are separate lifecycles. Terminal idempotency responses normally expire after 24 hours, while an exact proof remains protected for as long as an application/credential tombstone, webhook revision, or webhook operation temporary directory depends on it. Webhook inventory authenticates every canonical revision, including the current one. Stale revision cleanup is authorized by the successful transition named by the current signed `webhook.toml`, with its recorded response matched to the current metadata identity. The global mutation coordinator serializes artifact publication/finalization with fresh inventory through the bounded SQLite deletion commit. An incomplete inventory or unverifiable historical proof deletes nothing.
+
 ## Docker and Compose boundary
 
 Production observation uses only `/var/run/docker.sock` and ignores `DOCKER_HOST`. If Docker is unavailable, the authenticated control plane remains available and catalog/health show degraded state; streams and mutations that need Docker fail before an effect.

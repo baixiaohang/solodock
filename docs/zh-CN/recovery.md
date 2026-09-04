@@ -35,6 +35,7 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 - platform network drift：`solodock-services` 必须是 internal `bridge`、host bridge `sd-services` 并带精确 platform labels。同名 unmanaged 或漂移资源不会被接管；停止受影响发布并由管理员确认资源来源后再恢复。
 - deployment `interrupted`/`needs_attention`：依据 pending/active/actual exact facts从 detail 重试或人工回滚；未知 effect 不猜测性删除。
 - credential tombstone：startup/background finalizer 只在 ledger 已证明精确成功时清理；未知 marker fail closed。
+- finalizer proof 缺失：不要手工移除 application/credential tombstone 或 webhook revision。周期性 idempotency cleanup 会保留完整 filesystem artifact inventory 所引用的 proof；inventory 失败时零删除。proof 缺失或格式错误仍属于 fail-closed 恢复状态。
 - poll suppression：修复应用/health 后用人工 Deploy 或发布新 digest/config；不要直接改 SQLite。
 - webhook degraded：保持 endpoint fail closed，修复 `webhook.toml`、immutable secret revision 的 owner/mode/HMAC 后重启；不要手工编辑 secret metadata。SQLite 丢失会丢失 nonce history/wake operational state，但不会伪造 webhook audit。
 
