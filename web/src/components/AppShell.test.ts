@@ -1,11 +1,14 @@
 // @vitest-environment jsdom
-import { cleanup, render, screen } from '@testing-library/svelte'
+import { cleanup, render, screen, waitFor } from '@testing-library/svelte'
 import userEvent from '@testing-library/user-event'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import AppShell from './AppShell.svelte'
+import { ApiError } from '../lib/api'
+import { setLocale } from '../lib/i18n'
 
 afterEach(cleanup)
+beforeEach(() => setLocale('zh-CN', false))
 
 function stubViewport(mobile: boolean) {
   const listeners = new Set<() => void>()
@@ -128,5 +131,60 @@ describe('AppShell', () => {
     await user.click(summary)
     expect(screen.getByText('源码提交')).toBeTruthy()
     expect(screen.getByRole('link', { name: '应用' })).toBeTruthy()
+  })
+
+  it('shows a sanitized retryable API error with its safe request ID', async () => {
+    stubViewport(false)
+    const user = userEvent.setup()
+    const onRevokeAll = vi.fn(async () => {
+      throw new ApiError(403, { code: 'CSRF_INVALID', message: 'The CSRF token is invalid', request_id: 'request-42' })
+    })
+    render(AppShell, { route: '#/', onRevokeAll, onLogout: vi.fn() })
+
+    await user.click(screen.getByRole('button', { name: '撤销全部会话' }))
+
+    const text = (await screen.findByRole('alert')).textContent ?? ''
+    expect(text).toContain('CSRF_INVALID: The CSRF token is invalid')
+    expect(text).toContain('request-42')
+  })
+
+  it('reports an unconfirmed transport result without claiming success', async () => {
+    stubViewport(false)
+    const user = userEvent.setup()
+    render(AppShell, {
+      route: '#/',
+      onRevokeAll: vi.fn(),
+      onLogout: vi.fn(async () => { throw new TypeError('private network detail') }),
+    })
+
+    await user.click(screen.getByRole('button', { name: '退出' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('无法确认会话操作结果')
+    expect(alert.textContent).not.toContain('private network detail')
+  })
+
+  it('disables both session actions and prevents overlapping requests', async () => {
+    stubViewport(false)
+    const user = userEvent.setup()
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => { finish = resolve })
+    const onRevokeAll = vi.fn(() => pending)
+    const onLogout = vi.fn()
+    render(AppShell, { route: '#/', onRevokeAll, onLogout })
+    const revoke = screen.getByRole('button', { name: '撤销全部会话' })
+    const logoutButton = screen.getByRole('button', { name: '退出' })
+
+    await user.click(revoke)
+    await user.click(revoke)
+    await user.click(logoutButton)
+
+    expect(onRevokeAll).toHaveBeenCalledOnce()
+    expect(onLogout).not.toHaveBeenCalled()
+    expect(revoke.hasAttribute('disabled')).toBe(true)
+    expect(logoutButton.hasAttribute('disabled')).toBe(true)
+
+    finish()
+    await waitFor(() => expect(revoke.hasAttribute('disabled')).toBe(false))
   })
 })

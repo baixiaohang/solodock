@@ -34,6 +34,10 @@ Every `/api/v1/**` response uses `Cache-Control: no-store` and an allowlisted DT
 }
 ```
 
+The Web client handles an HTTP `401` before attempting to parse its body, so an expired or revoked session returns to authentication even when a tunnel or WAF substitutes HTML, an empty body, or malformed JSON. Other non-success responses are parsed as API errors only for `application/json` or `+json` media types and only when the stable error envelope has the expected runtime shape. Otherwise the client preserves the real HTTP status but uses a local `HTTP_ERROR` message without displaying the response body. A bounded, safe `X-Request-ID` header takes precedence over a valid JSON `request_id`; unsafe identifiers are discarded.
+
+Logout and global session revocation change the browser's authenticated state only after the server confirms success. A `401` still follows the common unauthorized path. Network, CSRF/WAF, throttling, and server failures keep the current authenticated view and present a retryable sanitized error; transport failures explicitly remain an unknown result rather than being reported as success.
+
 Persistent business mutations require a safe 16–128-byte ASCII `Idempotency-Key`. SQLite stores the request fingerprint/HMAC, operation state, and sanitized response. The same key and identical request may replay; changing the body, route, or method conflicts. Frontend retry identities keep only hashes of Registry credentials and webhook secrets, while the backend API uses zeroizing wrappers for managed parsed buffers.
 
 Terminal replay records normally expire after 24 hours, but cleanup is a low-frequency service operation rather than a side effect of claiming an unrelated mutation. Before each bounded cleanup batch, SoloDock inventories every finalizer-owned filesystem artifact and retains the exact operation proof it references. If any application, credential, or webhook artifact inventory is incomplete or invalid, that cleanup cycle deletes nothing. Pending and interrupted records are never time-collected.

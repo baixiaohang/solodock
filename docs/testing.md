@@ -43,6 +43,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 ### Identity and secrets
 
 - Bootstrap at most once; Origin, CSRF, session, revoke, and heartbeat behavior.
+- Web transport normalization handles `401` before parsing HTML, empty, or malformed bodies; preserves safe bounded request IDs without displaying raw responses; and keeps logout/revoke-all authenticated state on every unconfirmed failure while preventing overlapping actions.
 - Public/secret classification and `keep`/`replace`/`delete`.
 - Lossless row/bulk `KEY=VALUE` editing for public environment variables, including CRLF, blank lines, first `=`, duplicate/invalid keys, and line-number errors. Secrets never enter the textarea; masking, class conversion, rename, keep/replace/delete, and post-success clearing remain covered.
 - Image-suggestion POST JSON `Content-Type`, CSRF, credential reference, allowlisted success projection, and sanitized error display.

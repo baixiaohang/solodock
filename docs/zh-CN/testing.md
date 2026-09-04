@@ -43,6 +43,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 ### 身份与 secret
 
 - bootstrap 至多一次、Origin/CSRF/session/revoke/heartbeat；
+- Web transport normalization 在解析 HTML、空 body 或畸形 body 前处理 `401`，保留经过约束的安全 request ID 且不显示原始 response，并在 logout/revoke-all 的所有未确认失败中保持 authenticated 状态、阻止操作重叠；
 - public/secret 分类和 `keep`/`replace`/`delete`；
 - public 环境变量逐行/批量 `KEY=VALUE` 无损切换，覆盖 CRLF、空行、第一个 `=`、重复/非法 key 与行号错误；Secret 不进入文本框，并继续覆盖掩码、分类转换、rename、keep/replace/delete 和成功后清空；
 - 镜像建议 POST 的 JSON `Content-Type`、CSRF、credential reference、allowlist 成功投影及脱敏错误展示；

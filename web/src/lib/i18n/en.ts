@@ -22,6 +22,7 @@ export const en = {
   'SoloDock · unknown': 'SoloDock · unknown',
   'Revoke all sessions': 'Revoke all sessions',
   'Log out': 'Log out',
+  'The session action result could not be confirmed. Retry or reload before relying on it.': 'The session action result could not be confirmed. Retry or reload before relying on it.',
   'Initialize administrator': 'Initialize administrator',
   'Welcome back': 'Welcome back',
   'Enter the one-time token from the server bootstrap.token file and set the administrator password.': 'Enter the one-time token from the server bootstrap.token file and set the administrator password.',

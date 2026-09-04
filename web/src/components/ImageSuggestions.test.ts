@@ -60,7 +60,7 @@ describe('ImageSuggestions', () => {
       code: 'REGISTRY_CREDENTIAL_INVALID',
       message: 'The image registry request failed',
       request_id: '00000000-0000-0000-0000-000000000002',
-    }), { status: 422 })))
+    }), { status: 422, headers: { 'Content-Type': 'application/json' } })))
 
     const user = userEvent.setup()
     render(ImageSuggestions, {

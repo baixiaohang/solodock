@@ -2,8 +2,8 @@
   import { onMount } from 'svelte'
   import type { Snippet } from 'svelte'
   import { loadTimeSettings, timeSettings } from '../lib/time'
-  import { t } from '../lib/i18n'
-  import { api } from '../lib/api'
+  import { localized, messageText, t, type UserMessage } from '../lib/i18n'
+  import { ApiError, api } from '../lib/api'
   import { copyableInstallationIdentity, installationSummary, unknownInstallationIdentity } from '../lib/installationIdentity'
   import type { InstallationIdentity } from '../lib/types'
   import LanguageSwitcher from './LanguageSwitcher.svelte'
@@ -25,6 +25,9 @@
   let menuButton = $state<HTMLButtonElement>()
   let installation = $state<InstallationIdentity>(unknownInstallationIdentity)
   let identityCopied = $state(false)
+  let sessionActionPending = $state<'revoke' | 'logout' | null>(null)
+  let sessionActionError = $state<UserMessage | null>(null)
+  let sessionActionRequestId = $state('')
   let compactIdentity = $derived(installationSummary(installation, $t))
   let applicationsActive = $derived(route === '' || route === '#/' || /^#\/(apps|deployments)(\/|$)/.test(route))
   let credentialsActive = $derived(route === '#/credentials')
@@ -62,6 +65,25 @@
       identityCopied = false
     }
   }
+
+  async function runSessionAction(kind: 'revoke' | 'logout', action: () => void | Promise<void>) {
+    if (sessionActionPending) return
+    sessionActionPending = kind
+    sessionActionError = null
+    sessionActionRequestId = ''
+    try {
+      await action()
+    } catch (cause) {
+      if (cause instanceof ApiError) {
+        sessionActionError = `${cause.body.code}: ${cause.body.message}`
+        sessionActionRequestId = cause.body.request_id
+      } else {
+        sessionActionError = localized('The session action result could not be confirmed. Retry or reload before relying on it.')
+      }
+    } finally {
+      sessionActionPending = null
+    }
+  }
 </script>
 
 <svelte:window onkeydown={handleKeydown} />
@@ -85,8 +107,8 @@
     <nav class="user-actions" aria-label={$t('User actions')}>
       <LanguageSwitcher />
       <span class="user">admin</span>
-      <button class="topbar-action" type="button" onclick={() => void onRevokeAll()}>{$t('Revoke all sessions')}</button>
-      <button class="topbar-action" type="button" onclick={() => void onLogout()}>{$t('Log out')}</button>
+      <button class="topbar-action" type="button" disabled={sessionActionPending !== null} aria-busy={sessionActionPending === 'revoke'} onclick={() => void runSessionAction('revoke', onRevokeAll)}>{$t(sessionActionPending === 'revoke' ? 'Processing…' : 'Revoke all sessions')}</button>
+      <button class="topbar-action" type="button" disabled={sessionActionPending !== null} aria-busy={sessionActionPending === 'logout'} onclick={() => void runSessionAction('logout', onLogout)}>{$t(sessionActionPending === 'logout' ? 'Processing…' : 'Log out')}</button>
     </nav>
   </header>
 
@@ -133,6 +155,13 @@
       <button class="drawer-backdrop" type="button" aria-label={$t('Close primary navigation')} onclick={() => closeMenu(true)}></button>
     {/if}
     <div class="content-canvas">
+      {#if sessionActionError}
+        <p class="notice danger global-warning" role="alert">
+          {sessionActionRequestId
+            ? $t('{detail} (request {requestId})', { detail: messageText(sessionActionError, $t), requestId: sessionActionRequestId })
+            : messageText(sessionActionError, $t)}
+        </p>
+      {/if}
       {#if $timeSettings.unsupportedTimezone}<p class="notice warning global-warning" role="alert">{$t('This browser does not support {timezone}; times are temporarily displayed in UTC.', { timezone: $timeSettings.unsupportedTimezone })}</p>{/if}
       {#if children}{@render children()}{/if}
     </div>

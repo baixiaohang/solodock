@@ -43,9 +43,11 @@ export async function login(password: string): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
-  try { await mutation<void>('/api/v1/auth/logout') } finally { auth.set({ kind: 'login' }) }
+  await mutation<void>('/api/v1/auth/logout')
+  auth.set({ kind: 'login' })
 }
 
 export async function revokeAll(): Promise<void> {
-  try { await mutation<void>('/api/v1/me/sessions/revoke-all') } finally { auth.set({ kind: 'login' }) }
+  await mutation<void>('/api/v1/me/sessions/revoke-all')
+  auth.set({ kind: 'login' })
 }
