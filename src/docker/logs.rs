@@ -40,22 +40,15 @@ impl Drop for PatternStore {
 
 impl SecretRedactor {
     pub fn new(provider: &dyn SecretProvider) -> Self {
-        let mut patterns: Vec<_> = provider
-            .known_secrets()
-            .into_iter()
-            .filter(|secret| !secret.is_empty())
-            .collect();
-        patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        patterns.dedup();
         Self {
-            patterns: Arc::new(RwLock::new(PatternStore(patterns))),
+            patterns: Arc::new(RwLock::new(PatternStore(normalize_patterns(
+                provider.known_secrets(),
+            )))),
         }
     }
 
-    pub fn replace(&self, mut patterns: Vec<Vec<u8>>) {
-        patterns.retain(|secret| !secret.is_empty());
-        patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        patterns.dedup();
+    pub fn replace(&self, patterns: Vec<Vec<u8>>) {
+        let patterns = normalize_patterns(patterns);
         let mut current = self
             .patterns
             .write()
@@ -69,13 +62,9 @@ impl SecretRedactor {
             .patterns
             .write()
             .expect("redactor lock is not poisoned");
-        current
-            .0
-            .extend(patterns.into_iter().filter(|secret| !secret.is_empty()));
-        current
-            .0
-            .sort_by_key(|value| std::cmp::Reverse(value.len()));
-        current.0.dedup();
+        let mut combined = std::mem::take(&mut current.0);
+        combined.extend(patterns);
+        current.0 = normalize_patterns(combined);
     }
 
     /// Returns an operation-local redactor without publishing draft secrets to
@@ -87,11 +76,9 @@ impl SecretRedactor {
             .expect("redactor lock is not poisoned")
             .0
             .clone();
-        combined.extend(patterns.into_iter().filter(|secret| !secret.is_empty()));
-        combined.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        combined.dedup();
+        combined.extend(patterns);
         Self {
-            patterns: Arc::new(RwLock::new(PatternStore(combined))),
+            patterns: Arc::new(RwLock::new(PatternStore(normalize_patterns(combined)))),
         }
     }
 
@@ -99,6 +86,34 @@ impl SecretRedactor {
         let patterns = self.patterns.read().expect("redactor lock is not poisoned");
         redact_once(input, &patterns.0, MAX_REDACTED_BYTES)
     }
+}
+
+fn normalize_patterns(patterns: impl IntoIterator<Item = Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut normalized = Vec::new();
+    for mut secret in patterns {
+        if secret.is_empty() {
+            secret.zeroize();
+            continue;
+        }
+        for raw_line in secret.split(|byte| *byte == b'\n') {
+            let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+            if !line.is_empty() && line != secret {
+                normalized.push(line.to_vec());
+            }
+        }
+        normalized.push(secret);
+    }
+    normalized.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+
+    let mut unique: Vec<Vec<u8>> = Vec::with_capacity(normalized.len());
+    for mut pattern in normalized {
+        if unique.last().is_some_and(|previous| previous == &pattern) {
+            pattern.zeroize();
+        } else {
+            unique.push(pattern);
+        }
+    }
+    unique
 }
 
 #[derive(Default)]
@@ -375,5 +390,61 @@ mod tests {
         let local = global.with_additional([b"preview-only".to_vec()]);
         assert_eq!(local.redact(b"preview-only"), REDACTED);
         assert_eq!(global.redact(b"preview-only"), b"preview-only");
+    }
+
+    #[test]
+    fn normalizes_trailing_newlines_crlf_and_multiline_secrets() {
+        let redactor = SecretRedactor::new(&Secrets(vec![
+            b"token-with-lf\n".to_vec(),
+            b"token-with-crlf\r\n".to_vec(),
+            b"-----BEGIN KEY-----\nprivate-material\n-----END KEY-----\n".to_vec(),
+            b"\n\r\n".to_vec(),
+        ]));
+        for exposed_line in [
+            b"token-with-lf".as_slice(),
+            b"token-with-crlf".as_slice(),
+            b"-----BEGIN KEY-----".as_slice(),
+            b"private-material".as_slice(),
+            b"-----END KEY-----".as_slice(),
+        ] {
+            assert_eq!(redactor.redact(exposed_line), REDACTED);
+        }
+        assert_eq!(redactor.redact(b"unrelated"), b"unrelated");
+    }
+
+    #[test]
+    fn every_update_path_uses_the_same_pattern_normalization() {
+        let redactor = SecretRedactor::new(&Secrets(vec![b"initial\nline".to_vec()]));
+        assert_eq!(redactor.redact(b"line"), REDACTED);
+
+        redactor.replace(vec![b"replacement\r\nline".to_vec()]);
+        assert_eq!(redactor.redact(b"initial"), b"initial");
+        assert_eq!(redactor.redact(b"replacement"), REDACTED);
+        assert_eq!(redactor.redact(b"line"), REDACTED);
+
+        redactor.extend([b"extended\nsegment".to_vec()]);
+        assert_eq!(redactor.redact(b"extended"), REDACTED);
+        assert_eq!(redactor.redact(b"segment"), REDACTED);
+
+        let local = redactor.with_additional([b"local\r\nsecret".to_vec()]);
+        assert_eq!(local.redact(b"local"), REDACTED);
+        assert_eq!(local.redact(b"secret"), REDACTED);
+        assert_eq!(redactor.redact(b"local"), b"local");
+    }
+
+    #[test]
+    fn multiline_secret_lines_are_redacted_across_log_chunks() {
+        let redactor =
+            SecretRedactor::new(&Secrets(vec![b"first-line\r\nsecond-line\r\n".to_vec()]));
+        let mut framer = LogFramer::new(redactor);
+        assert!(
+            framer
+                .push(LogStreamKind::Stdout, b"2026-08-28T00:00:00Z first-")
+                .is_empty()
+        );
+        let first = framer.push(LogStreamKind::Stdout, b"line\nsecond-");
+        assert_eq!(first[0].message, "[REDACTED]");
+        let second = framer.push(LogStreamKind::Stdout, b"line\n");
+        assert_eq!(second[0].message, "[REDACTED]");
     }
 }
