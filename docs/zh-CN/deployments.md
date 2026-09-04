@@ -12,6 +12,8 @@ SoloDock 的 manual deploy、poll auto-deploy 和 rollback 共用唯一的 `Depl
 
 Registry credential 以 filesystem-first 方式保存在 `registry-credentials/<credential-id>/`：metadata 与 immutable secret revision 分离并受完整性校验。API 只返回 registry、username 和 revision 等 metadata，不回显 token。
 
+向 OCI Bearer token service 发送已保存的 username 或 token 前，SoloDock 会把 challenge realm 绑定到该 credential 的 Registry origin。自建 Registry 必须使用相同 scheme、精确 host 和 effective port；任何 cross-origin realm 都会在请求发出前被拒绝。Docker Hub 只有一个内置例外，即精确的 `https://auth.docker.io/token`；相似 host、其他 path、port 或 scheme 均不受信任。
+
 创建、轮换和删除都使用幂等 ledger 与 operation-owned artifact。删除先保留 exact tombstone，在成功响应持久化后由 API、background reconciler 或 startup finalizer 精确清理。任何 draft、active/pending 或历史 release 仍引用 credential 时，删除 fail closed。
 
 pull 只在 `/run/solodock/docker-config/<deployment-id>/config.json` 创建 operation-scoped Docker config。该目录和本项目持有的 credential buffer在所有退出路径清理/zeroize；清理不确定时 deployment 进入需要处理的安全故障，不用原 pull 错误掩盖。
