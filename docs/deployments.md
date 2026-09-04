@@ -6,7 +6,9 @@ Manual deploy, poll auto-deploy, and rollback share the sole `DeploymentSchedule
 
 The application page reads only the latest 20 deployments. Each deployment occupies one row containing creation time in the display timezone, status/phase, trigger, image or digest, and error code, plus an explicit details link. On mobile, content within one item may wrap, but two history entries are never placed side by side.
 
-An `UNCONFIGURED` application has no draft revision and cannot enter the scheduler, poller, webhook, or lifecycle Docker effect. It becomes deployable after the first complete draft save. PostgreSQL quick deployment treats "create configured application" and "schedule deployment" as separate idempotent stages. If scheduling fails, the application and revision remain recoverable and the detail page offers deployment continuation; data resources are not removed and the overall operation is not presented as rolled back.
+An `UNCONFIGURED` application has no draft revision and cannot enter the scheduler, poller, webhook, or lifecycle Docker effect. It becomes deployable after the first complete draft save. Before PostgreSQL quick deployment begins, the administrator must explicitly acknowledge both that named-volume data does not follow deployment rollback and that the generated password has been saved outside SoloDock. These acknowledgements record the administrator's confirmation; SoloDock cannot prove that the password was actually stored elsewhere. Changing or regenerating the password clears the password-saved acknowledgement.
+
+PostgreSQL quick deployment treats "create configured application" and "schedule deployment" as separate idempotent stages. If scheduling fails or its result cannot be confirmed, the application and revision remain recoverable and the detail page offers deployment continuation; the generated password is not displayed again, data resources are not removed, and the overall operation is not presented as rolled back.
 
 ## Registry credentials
 

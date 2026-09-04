@@ -6,7 +6,9 @@ SoloDock 的 manual deploy、poll auto-deploy 和 rollback 共用唯一的 `Depl
 
 应用页只读取最近 20 条 deployment，每个 deployment 以一整行展示显示时区下的创建时间、status/phase、trigger、镜像或 digest 和错误码，并通过明确链接进入详情；移动端只允许单项内部换行，不会把两条历史并排。
 
-`UNCONFIGURED` 应用没有 draft revision，不能进入 scheduler、poller、webhook 或 lifecycle Docker effect。第一次保存完整 draft 后才具备 deploy 条件。PostgreSQL 快速部署的“创建 configured app”和“调度 deployment”是两个独立幂等阶段；第二阶段失败会保留应用与 revision，并在详情页提供继续部署，不删除数据资源或伪造整体回滚。
+`UNCONFIGURED` 应用没有 draft revision，不能进入 scheduler、poller、webhook 或 lifecycle Docker effect。第一次保存完整 draft 后才具备 deploy 条件。开始 PostgreSQL 快速部署前，管理员必须分别明确确认命名卷数据不会随 deployment rollback 回退，以及生成的密码已保存到 SoloDock 之外。这些确认只记录管理员的 acknowledgement；SoloDock 无法证明密码是否真的已保存在其他位置。修改或重新生成密码会清除“密码已保存”确认。
+
+PostgreSQL 快速部署的“创建 configured app”和“调度 deployment”是两个独立幂等阶段；第二阶段失败或结果无法确认时会保留应用与 revision，并在详情页提供继续部署。生成的密码不会再次显示，数据资源不会被删除，整体操作也不会被伪装成已回滚。
 
 ## Registry credential
 
