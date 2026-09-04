@@ -22,6 +22,7 @@ use solodock::{
 use tempfile::TempDir;
 use tower::ServiceExt;
 use tracing::{Instrument, instrument::WithSubscriber};
+use uuid::Uuid;
 
 struct Harness {
     _root: TempDir,
@@ -34,6 +35,10 @@ struct SessionCookies {
     header: String,
     session: String,
     csrf: String,
+}
+
+fn generated_password(label: &str) -> String {
+    format!("{label}-{}", Uuid::new_v4())
 }
 
 impl Harness {
@@ -368,12 +373,13 @@ async fn bootstrap_login_me_and_logout_follow_security_contract() {
 #[tokio::test]
 async fn password_change_gates_precede_credential_mutation() {
     let harness = Harness::new().await;
-    let old_password = "correct horse battery";
+    let old_password = generated_password("current-password");
+    let new_password = generated_password("new-password");
     assert_eq!(
-        harness.bootstrap(old_password).await.status(),
+        harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
     );
-    let cookies = harness.login_session(old_password).await;
+    let cookies = harness.login_session(&old_password).await;
     let original_credential: (String, String) = sqlx::query_as(
         "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
     )
@@ -393,7 +399,7 @@ async fn password_change_gates_precede_credential_mutation() {
     let original_audits = harness.database.audit_count().await.unwrap();
     let valid = json!({
         "current_password": old_password,
-        "new_password": "new correct horse battery",
+        "new_password": new_password,
     });
 
     let missing_origin = harness
@@ -449,7 +455,7 @@ async fn password_change_gates_precede_credential_mutation() {
     .await;
 
     for invalid in [
-        json!({"current_password":old_password,"new_password":"new correct horse battery","unexpected":true}),
+        json!({"current_password":old_password,"new_password":new_password,"unexpected":true}),
         json!({"current_password":old_password,"new_password":"too short"}),
     ] {
         let response = harness
@@ -498,7 +504,7 @@ async fn password_change_gates_precede_credential_mutation() {
 
     let oversized = json!({
         "current_password": "x".repeat(17 * 1024),
-        "new_password": "new correct horse battery",
+        "new_password": new_password,
     });
     let response = harness
         .app
@@ -549,14 +555,14 @@ async fn password_change_gates_precede_credential_mutation() {
 #[tokio::test]
 async fn invalid_current_password_uses_shared_throttle_without_revoking_session() {
     let harness = Harness::new().await;
-    let old_password = "correct horse battery";
-    let wrong_password = "wrong-current-password-canary";
-    let new_password = "new-password-secret-canary";
+    let old_password = generated_password("current-password");
+    let wrong_password = generated_password("wrong-password-canary");
+    let new_password = generated_password("new-password-canary");
     assert_eq!(
-        harness.bootstrap(old_password).await.status(),
+        harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
     );
-    let cookies = harness.login_session(old_password).await;
+    let cookies = harness.login_session(&old_password).await;
     let credential_before: (String, String) = sqlx::query_as(
         "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
     )
@@ -582,8 +588,8 @@ async fn invalid_current_password_uses_shared_throttle_without_revoking_session(
             .unwrap();
         let error = assert_error(response, StatusCode::FORBIDDEN, "CURRENT_PASSWORD_INVALID").await;
         let error_text = error.to_string();
-        assert!(!error_text.contains(wrong_password));
-        assert!(!error_text.contains(new_password));
+        assert!(!error_text.contains(&wrong_password));
+        assert!(!error_text.contains(&new_password));
     }
 
     let body = json!({"current_password":old_password,"new_password":new_password});
@@ -668,21 +674,21 @@ async fn invalid_current_password_uses_shared_throttle_without_revoking_session(
     );
     assert!(password_audits[5].2.contains("AUTH_COOLDOWN"));
     let audit_text = format!("{password_audits:?}");
-    assert!(!audit_text.contains(wrong_password));
-    assert!(!audit_text.contains(new_password));
+    assert!(!audit_text.contains(&wrong_password));
+    assert!(!audit_text.contains(&new_password));
 }
 
 #[tokio::test]
 async fn password_change_atomically_updates_credential_revokes_sessions_and_expires_cookies() {
     let harness = Harness::new().await;
-    let old_password = "old-password-secret-canary";
-    let new_password = "new-password-secret-canary";
+    let old_password = generated_password("old-password-canary");
+    let new_password = generated_password("new-password-canary");
     assert_eq!(
-        harness.bootstrap(old_password).await.status(),
+        harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
     );
-    let first = harness.login_session(old_password).await;
-    let second = harness.login_session(old_password).await;
+    let first = harness.login_session(&old_password).await;
+    let second = harness.login_session(&old_password).await;
     let before: (String, String) = sqlx::query_as(
         "SELECT password_hash, updated_at FROM admin_credentials WHERE singleton_id = 1",
     )
@@ -753,13 +759,13 @@ async fn password_change_atomically_updates_credential_revokes_sessions_and_expi
     assert_ne!(after.1, before.1);
     assert!(
         PasswordService::default()
-            .verify(new_password.into(), after.0.clone())
+            .verify(new_password.clone(), after.0.clone())
             .await
             .unwrap()
     );
     assert!(
         !PasswordService::default()
-            .verify(old_password.into(), after.0)
+            .verify(old_password.clone(), after.0)
             .await
             .unwrap()
     );
@@ -813,7 +819,7 @@ async fn password_change_atomically_updates_credential_revokes_sessions_and_expi
         .await
         .unwrap();
     assert_error(response, StatusCode::UNAUTHORIZED, "AUTH_INVALID").await;
-    let new_login = harness.login_session(new_password).await;
+    let new_login = harness.login_session(&new_password).await;
     assert!(!new_login.session.is_empty());
 
     let logs = captured_logs.contents();
@@ -822,7 +828,12 @@ async fn password_change_atomically_updates_credential_revokes_sessions_and_expi
             .fetch_one(harness.database.pool())
             .await
             .unwrap();
-    for canary in [old_password, new_password, &first.session, &first.csrf] {
+    for canary in [
+        old_password.as_str(),
+        new_password.as_str(),
+        &first.session,
+        &first.csrf,
+    ] {
         assert!(!logs.contains(canary));
         assert!(!audit_text.contains(canary));
     }
@@ -831,14 +842,14 @@ async fn password_change_atomically_updates_credential_revokes_sessions_and_expi
 #[tokio::test]
 async fn password_change_audit_failure_rolls_back_hash_sessions_throttle_and_cookies() {
     let harness = Harness::new().await;
-    let old_password = "old-password-secret-canary";
-    let new_password = "new-password-secret-canary";
+    let old_password = generated_password("old-password-canary");
+    let new_password = generated_password("new-password-canary");
     assert_eq!(
-        harness.bootstrap(old_password).await.status(),
+        harness.bootstrap(&old_password).await.status(),
         StatusCode::NO_CONTENT
     );
-    let first = harness.login_session(old_password).await;
-    let second = harness.login_session(old_password).await;
+    let first = harness.login_session(&old_password).await;
+    let second = harness.login_session(&old_password).await;
     sqlx::query("UPDATE auth_throttle SET window_started_at = '2026-09-04T00:00:00Z', failure_count = 3 WHERE singleton_id = 1")
         .execute(harness.database.pool())
         .await
@@ -906,13 +917,13 @@ async fn password_change_audit_failure_rolls_back_hash_sessions_throttle_and_coo
     assert_eq!(harness.database.audit_count().await.unwrap(), audits_before);
     assert!(
         PasswordService::default()
-            .verify(old_password.into(), credential_after.0.clone())
+            .verify(old_password, credential_after.0.clone())
             .await
             .unwrap()
     );
     assert!(
         !PasswordService::default()
-            .verify(new_password.into(), credential_after.0)
+            .verify(new_password, credential_after.0)
             .await
             .unwrap()
     );

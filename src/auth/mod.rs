@@ -816,7 +816,7 @@ mod tests {
 
     async fn auth_with_credential_gate(
         gate: Arc<CredentialTestGate>,
-    ) -> (tempfile::TempDir, Database, AuthService) {
+    ) -> (tempfile::TempDir, Database, AuthService, String) {
         let root = tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let database = Database::open(&root.path().join("state.sqlite3"))
@@ -832,38 +832,36 @@ mod tests {
         );
         auth.credential_test_gate = Some(gate);
         let now = format_time(auth.clock.now()).unwrap();
+        let password = format!("test-password-{}", Uuid::new_v4());
         sqlx::query("INSERT INTO admin_credentials (singleton_id, username, password_hash, created_at, updated_at) VALUES (1, 'admin', ?, ?, ?)")
-            .bind(fast_test_password_hash("correct horse battery"))
+            .bind(fast_test_password_hash(&password))
             .bind(&now)
             .bind(&now)
             .execute(database.pool())
             .await
             .unwrap();
-        (root, database, auth)
+        (root, database, auth, password)
     }
 
     #[tokio::test]
     async fn login_holds_the_credential_guard_through_session_commit() {
         let gate = Arc::new(CredentialTestGate::default());
         gate.pause_login_after_verify.store(true, Ordering::SeqCst);
-        let (_root, database, auth) = auth_with_credential_gate(gate.clone()).await;
+        let (_root, database, auth, old_password) = auth_with_credential_gate(gate.clone()).await;
+        let new_password = format!("new-test-password-{}", Uuid::new_v4());
         let login_task = {
             let auth = auth.clone();
-            tokio::spawn(async move {
-                auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
-                    .await
-            })
+            let old_password = old_password.clone();
+            tokio::spawn(async move { auth.login("admin", old_password, Uuid::new_v4()).await })
         };
         gate.login_after_verify.notified().await;
         let rotation_task = {
             let auth = auth.clone();
+            let old_password = old_password.clone();
+            let new_password = new_password.clone();
             tokio::spawn(async move {
-                auth.change_password(
-                    "correct horse battery".into(),
-                    "new correct horse battery".into(),
-                    Uuid::new_v4(),
-                )
-                .await
+                auth.change_password(old_password, new_password, Uuid::new_v4())
+                    .await
             })
         };
         gate.rotation_guard_attempted.notified().await;
@@ -898,25 +896,22 @@ mod tests {
         let gate = Arc::new(CredentialTestGate::default());
         gate.pause_rotation_after_verify
             .store(true, Ordering::SeqCst);
-        let (_root, database, auth) = auth_with_credential_gate(gate.clone()).await;
+        let (_root, database, auth, old_password) = auth_with_credential_gate(gate.clone()).await;
+        let new_password = format!("new-test-password-{}", Uuid::new_v4());
         let rotation_task = {
             let auth = auth.clone();
+            let old_password = old_password.clone();
+            let new_password = new_password.clone();
             tokio::spawn(async move {
-                auth.change_password(
-                    "correct horse battery".into(),
-                    "new correct horse battery".into(),
-                    Uuid::new_v4(),
-                )
-                .await
+                auth.change_password(old_password, new_password, Uuid::new_v4())
+                    .await
             })
         };
         gate.rotation_after_verify.notified().await;
         let login_task = {
             let auth = auth.clone();
-            tokio::spawn(async move {
-                auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
-                    .await
-            })
+            let old_password = old_password.clone();
+            tokio::spawn(async move { auth.login("admin", old_password, Uuid::new_v4()).await })
         };
         gate.login_guard_attempted.notified().await;
         assert!(
@@ -943,11 +938,10 @@ mod tests {
             .unwrap();
         assert_eq!(sessions, 0);
         assert!(matches!(
-            auth.login("admin", "correct horse battery".into(), Uuid::new_v4())
-                .await,
+            auth.login("admin", old_password, Uuid::new_v4()).await,
             Err(AuthError::InvalidCredentials)
         ));
-        auth.login("admin", "new correct horse battery".into(), Uuid::new_v4())
+        auth.login("admin", new_password, Uuid::new_v4())
             .await
             .unwrap();
     }

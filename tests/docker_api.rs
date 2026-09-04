@@ -122,6 +122,7 @@ struct Harness {
     stream_tasks: TaskTracker,
     io_calls: Arc<AtomicUsize>,
     cookie: String,
+    password: String,
     app_id: Uuid,
 }
 
@@ -146,6 +147,7 @@ impl Harness {
                 .await;
         let auth = test_auth.service;
         let cookie = test_auth.cookie;
+        let password = test_auth.password;
 
         let app_id = Uuid::new_v4();
         let release_id = Uuid::new_v4();
@@ -260,6 +262,7 @@ impl Harness {
             stream_tasks,
             io_calls,
             cookie,
+            password,
             app_id,
         }
     }
@@ -361,8 +364,8 @@ async fn password_rotation_closes_sse_on_the_next_heartbeat_and_releases_permit(
     harness
         .auth
         .change_password(
-            "test fixture password".into(),
-            "new test fixture password".into(),
+            harness.password.clone(),
+            format!("new-test-password-{}", Uuid::new_v4()),
             Uuid::new_v4(),
         )
         .await
