@@ -7,36 +7,77 @@ use axum::{
     http::{HeaderName, HeaderValue, header},
     http::{Method, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use tracing::info;
 use uuid::Uuid;
 
 use super::AppState;
-use crate::error::RequestId;
+use crate::{config::CanonicalAuthority, error::RequestId};
 
 pub async fn host_isolation(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    let path_is_hook = request.uri().path().starts_with("/hooks/");
-    let host = request.headers().get_all(header::HOST);
-    let mut values = host.iter();
-    let host = values.next().and_then(|value| value.to_str().ok());
-    if values.next().is_some() {
-        return StatusCode::NOT_FOUND.into_response();
-    }
-    let webhook_host = state.webhooks.as_ref().is_some_and(|services| {
-        !services.authority.is_empty() && host == Some(services.authority.as_str())
-    });
-    if path_is_hook != webhook_host
-        || (path_is_hook
-            && (request.method() != Method::POST || !canonical_webhook_path(request.uri().path())))
+    let Ok(authority) = effective_authority(&request) else {
+        return isolated_not_found();
+    };
+    let path = request.uri().path();
+    let allowed = if authority == state.management_authority {
+        path != "/hooks" && !path.starts_with("/hooks/")
+    } else if state.webhook_authority.as_ref() == Some(&authority) {
+        request.method() == Method::POST
+            && request.uri().query().is_none()
+            && canonical_webhook_path(path)
+    } else if authority == state.local_probe_authority
+        && state.local_probe_authority != state.management_authority
     {
-        return StatusCode::NOT_FOUND.into_response();
+        request.method() == Method::GET
+            && request.uri().query().is_none()
+            && matches!(path, "/healthz" | "/favicon.svg")
+    } else {
+        false
+    };
+    if allowed {
+        next.run(request).await
+    } else {
+        isolated_not_found()
     }
-    next.run(request).await
+}
+
+fn effective_authority(request: &Request<Body>) -> Result<CanonicalAuthority, ()> {
+    let uri = request
+        .uri()
+        .authority()
+        .map(|value| CanonicalAuthority::parse_http(value.as_str()).map_err(|_| ()))
+        .transpose()?;
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts
+        .next()
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ())
+                .and_then(|value| CanonicalAuthority::parse_http(value).map_err(|_| ()))
+        })
+        .transpose()?;
+    if hosts.next().is_some() {
+        return Err(());
+    }
+    match (uri, host) {
+        (Some(uri), Some(host)) if uri == host => Ok(uri),
+        (Some(_), Some(_)) | (None, None) => Err(()),
+        (Some(authority), None) | (None, Some(authority)) => Ok(authority),
+    }
+}
+
+fn isolated_not_found() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::empty())
+        .expect("static isolation response is valid")
 }
 
 fn canonical_webhook_path(path: &str) -> bool {

@@ -77,9 +77,9 @@ GitHub **Release assets** are the long-lived stable distribution. **Actions arti
 
 ## Security prerequisites
 
-The service listens only on loopback and `public_origin` must use HTTPS. An external tunnel or reverse proxy, access control, and TLS are deployment prerequisites that SoloDock does not configure. The `solodock` user belongs to the `docker` group, which is effectively host root access; restrict host administrators, configuration files, and the Web login surface accordingly.
+The service listens only on loopback and `public_origin` must use HTTPS. An external tunnel or reverse proxy, access control, and TLS are deployment prerequisites that SoloDock does not configure. Configure the proxy to preserve the exact external `Host` from `public_origin`; rewriting it to the loopback upstream authority causes management requests to fail closed with `404`. `Forwarded`, `X-Forwarded-Host`, `X-Original-Host`, and similar headers are intentionally ignored for routing authority. The `solodock` user belongs to the `docker` group, which is effectively host root access; restrict host administrators, configuration files, and the Web login surface accordingly.
 
-When enabling webhooks, configure a distinct authority in `webhook_public_origin` and allow only the exact POST path at the external WAF. See [webhooks](webhooks.md) for signature, timestamp/nonce, retry, and 202 semantics.
+When enabling webhooks, configure a distinct authority in `webhook_public_origin` and allow only exact `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry` at the external WAF. The webhook authority rejects UI, management API, GET, and noncanonical paths; the management authority rejects webhook paths. See [webhooks](webhooks.md) for signature, timestamp/nonce, retry, and 202 semantics.
 
 Complete one-time bootstrap from `/run/solodock/bootstrap.token` after the first start. Routine checks:
 
@@ -88,6 +88,8 @@ systemctl status solodock.service
 journalctl -u solodock.service --since today
 curl --fail http://127.0.0.1:8080/healthz
 ```
+
+The loopback listen authority permanently exposes only exact `GET /healthz` and `GET /favicon.svg` when it differs from `public_origin`, so installed updaters can probe a strict-Host binary. It does not expose the sign-in page, other assets, management API, SSE, or webhook routes. For direct diagnostics, keep the configured loopback authority in the request URL; do not substitute forwarding headers.
 
 Authenticated `/api/v1/system/health` reports Docker, recovery, projection, deployment, poll coordinator, disk, and credential states separately. For `interrupted`, `needs_attention`, or an ownership collision, inspect deployment details and the exact `docker inspect` facts first. Do not prune, delete broadly, or retry speculatively.
 

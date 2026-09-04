@@ -49,6 +49,7 @@ mod tests {
         .oneshot(
             Request::builder()
                 .uri("/healthz")
+                .header("host", "example.com")
                 .body(Body::empty())
                 .unwrap(),
         )

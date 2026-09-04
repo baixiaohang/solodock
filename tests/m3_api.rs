@@ -598,7 +598,6 @@ impl Harness {
         }));
         state.webhooks = Some(Arc::new(WebhookServices {
             origin: "https://hooks.example.com".into(),
-            authority: "hooks.example.com".into(),
             store: WebhookStore::new(store.clone(), idempotency.integrity_key()),
             poll_states: poller.store.clone(),
             database: database.clone(),
@@ -606,6 +605,8 @@ impl Harness {
             limiter: WebhookRateLimiter::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(16)),
         }));
+        state.webhook_authority =
+            Some(solodock::config::CanonicalAuthority::parse_http("hooks.example.com").unwrap());
         let app = router(state.clone());
         Self {
             _root: root,
@@ -629,6 +630,7 @@ impl Harness {
         let mut request = Request::builder()
             .method("POST")
             .uri("/api/v1/apps")
+            .header(header::HOST, "solodock.example.com")
             .header(header::ORIGIN, "https://solodock.example.com")
             .header(header::COOKIE, &self.cookie)
             .header("x-csrf-token", &self.csrf)
@@ -689,6 +691,7 @@ impl Harness {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::HOST, "solodock.example.com")
             .header(header::ORIGIN, "https://solodock.example.com")
             .header(header::COOKIE, &self.cookie)
             .header("x-csrf-token", &self.csrf)
@@ -1239,6 +1242,7 @@ async fn unconfigured_app_first_revision_is_nullable_and_docker_actions_fail_clo
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/apps/{app_id}/webhook"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -1308,6 +1312,7 @@ async fn unconfigured_app_first_revision_is_nullable_and_docker_actions_fail_clo
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{app_id}/actions/start"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -1374,6 +1379,7 @@ async fn postgresql_preset_is_versioned_idempotent_and_never_echoes_password() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/app-presets")
+                .header(header::HOST, "solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -2442,6 +2448,7 @@ async fn route_specific_body_limits_reject_lifecycle_and_large_delete_payloads()
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{app_id}/actions/start"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -2460,6 +2467,7 @@ async fn route_specific_body_limits_reject_lifecycle_and_large_delete_payloads()
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{app_id}/deletion-preview"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -2764,6 +2772,7 @@ async fn live_bind_ancestor_blocks_start_but_preserves_stop_and_corrective_edit(
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{writer_id}/actions/start"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -2789,6 +2798,7 @@ async fn live_bind_ancestor_blocks_start_but_preserves_stop_and_corrective_edit(
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{writer_id}/actions/stop"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -2882,6 +2892,7 @@ async fn legacy_intra_app_bind_ancestor_conflict_does_not_block_stop() {
                 Request::builder()
                     .method("POST")
                     .uri(format!("/api/v1/apps/{app_id}/actions/{action}"))
+                    .header(header::HOST, "solodock.example.com")
                     .header(header::ORIGIN, "https://solodock.example.com")
                     .header(header::COOKIE, &harness.cookie)
                     .header("x-csrf-token", &harness.csrf)
@@ -2916,6 +2927,7 @@ async fn legacy_intra_app_bind_ancestor_conflict_does_not_block_stop() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{app_id}/actions/stop"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -3187,6 +3199,7 @@ async fn lifecycle_restart_guard_blocks_start_after_symlink_swap() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/api/v1/apps/{app_id}/actions/restart"))
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("x-csrf-token", &harness.csrf)
@@ -3565,6 +3578,7 @@ async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/settings")
+                .header(header::HOST, "solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .body(Body::empty())
                 .unwrap(),
@@ -3597,6 +3611,7 @@ async fn global_timezone_is_revisioned_idempotent_and_csrf_protected() {
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/settings")
+                .header(header::HOST, "solodock.example.com")
                 .header(header::ORIGIN, "https://solodock.example.com")
                 .header(header::COOKIE, &harness.cookie)
                 .header("idempotency-key", "settings-missing-csrf")

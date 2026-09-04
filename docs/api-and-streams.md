@@ -2,7 +2,7 @@
 
 > English (authoritative) · [简体中文](zh-CN/api-and-streams.md)
 
-SoloDock's management API and embedded UI share one HTTPS origin. In production, the process listens only on loopback and relies on an external tunnel/WAF/TLS endpoint for public access. The application still enforces authentication, Origin, CSRF, request-size, and authorization checks.
+SoloDock's management API and embedded UI share the canonical HTTPS authority from `public_origin`. In production, the process listens only on loopback and relies on an external tunnel/WAF/TLS endpoint for public access. The reverse proxy must preserve that external `Host`; `Forwarded`, `X-Forwarded-Host`, and similar headers never authorize routing. The application still enforces authority, authentication, Origin, CSRF, request-size, and authorization checks.
 
 ## Authentication boundary
 
@@ -17,6 +17,8 @@ SoloDock's management API and embedded UI share one HTTPS origin. In production,
 Authentication protocol endpoints do not use the business `Idempotency-Key`. Singleton credentials, one-time tokens, or random sessions provide their replay boundaries.
 
 ## Management API contract
+
+Requests with the management authority may reach management API, authentication, SSE, UI/assets, `/healthz`, and `/favicon.svg`, but never `/hooks/**`. The optional webhook authority accepts only exact `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`. When the loopback listen authority differs from management, it permanently accepts only exact `GET /healthz` and `GET /favicon.svg` for local updater compatibility. Every other authority/path/method combination returns a body-minimal `404` with `Cache-Control: no-store` without revealing configured authorities.
 
 Every `/api/v1/**` response uses `Cache-Control: no-store` and an allowlisted DTO rather than serializing Docker, Registry, or internal storage models directly. Errors keep a stable code, sanitized message, and `request_id`. Configuration validation may also include backward-compatible `issues`, each containing only a field path, stable code, and safe explanation without echoing input values, secrets, credentials, or host paths:
 

@@ -15,7 +15,6 @@ pub use store::{LoadedWebhook, WebhookMetadata, WebhookStatus, WebhookStore};
 #[derive(Clone)]
 pub struct WebhookServices {
     pub origin: String,
-    pub authority: String,
     pub store: WebhookStore,
     pub poll_states: PollStateStore,
     pub database: Database,

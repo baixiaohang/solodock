@@ -528,6 +528,15 @@ impl MutationHarness {
         let mut state = AppState {
             auth,
             public_origin: "https://solodock.example.com".into(),
+            management_authority: solodock::config::CanonicalAuthority::parse_http(
+                "solodock.example.com",
+            )
+            .unwrap(),
+            webhook_authority: None,
+            local_probe_authority: solodock::config::CanonicalAuthority::parse_http(
+                "solodock.example.com",
+            )
+            .unwrap(),
             observer,
             events: DockerEventHub::new(),
             stats: StatsHub::new(docker_api.clone(), shutdown.clone(), tasks.clone()),
@@ -603,7 +612,6 @@ impl MutationHarness {
         let poller = state.m4.as_ref().unwrap().poller.clone();
         state.webhooks = Some(Arc::new(WebhookServices {
             origin: "https://hooks.example.com".into(),
-            authority: "hooks.example.com".into(),
             store: WebhookStore::new(store.clone(), idempotency.integrity_key()),
             poll_states: poller.store.clone(),
             database: state.m3.as_ref().unwrap().database.clone(),
@@ -611,6 +619,8 @@ impl MutationHarness {
             limiter: WebhookRateLimiter::default(),
             permits: Arc::new(tokio::sync::Semaphore::new(16)),
         }));
+        state.webhook_authority =
+            Some(solodock::config::CanonicalAuthority::parse_http("hooks.example.com").unwrap());
         let app = router(state.clone());
         Self {
             _root: root,
@@ -696,6 +706,7 @@ impl MutationHarness {
         let mut request = Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::HOST, "solodock.example.com")
             .header(header::ORIGIN, "https://solodock.example.com")
             .header(header::COOKIE, &self.cookie)
             .header("x-csrf-token", &self.csrf);

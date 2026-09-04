@@ -32,6 +32,8 @@ Browser
 
 生产 binary 使用 `embed-ui` 编译期嵌入 Vite产物，不运行 Node服务。hashed asset可长缓存，HTML不缓存；`/api/**`和`/hooks/**`不会进入SPA fallback。接口边界见 [API 与实时流](api-and-streams.md)。
 
+`Config` 会把 HTTPS `public_origin`、可选 `webhook_public_origin` 与 loopback `listen_address` 规范化为三个 HTTP authority。Middleware 先从 URI authority 和/或单个 `Host` header 得到唯一有效 authority 并完成分类，之后 request 才能进入 router。Management authority 可访问 UI、management API、SSE、health 与 favicon，但不能访问 webhook path；webhook authority 只允许 canonical Registry webhook POST；若 local listen authority 与 management 不同，则仅允许精确的 `GET /healthz` 与 `GET /favicon.svg` probe。缺失、畸形、冲突或未知 authority 会在路由前 fail closed，forwarding host header 不构成 authority 输入。
+
 ## 唯一事实来源
 
 | 事实 | 权威来源 |

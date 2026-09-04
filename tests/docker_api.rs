@@ -241,6 +241,15 @@ impl Harness {
         let state = AppState {
             auth: auth.clone(),
             public_origin: "https://solodock.example.com".into(),
+            management_authority: solodock::config::CanonicalAuthority::parse_http(
+                "solodock.example.com",
+            )
+            .unwrap(),
+            webhook_authority: None,
+            local_probe_authority: solodock::config::CanonicalAuthority::parse_http(
+                "solodock.example.com",
+            )
+            .unwrap(),
             observer: DockerObserver::new(api.clone(), catalog, supervisor),
             events: DockerEventHub::new(),
             stats: StatsHub::new(api, shutdown.clone(), stream_tasks.clone()),
@@ -270,6 +279,7 @@ impl Harness {
     async fn get(&self, uri: &str, authenticated: bool) -> axum::response::Response {
         let mut request = Request::builder()
             .uri(uri)
+            .header(header::HOST, "solodock.example.com")
             .extension(ConnectInfo("127.0.0.1:1".parse::<SocketAddr>().unwrap()));
         if authenticated {
             request = request.header(header::COOKIE, &self.cookie);

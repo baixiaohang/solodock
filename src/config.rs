@@ -6,7 +6,7 @@ use std::{
 
 use serde::Deserialize;
 use thiserror::Error;
-use url::Url;
+use url::{Host, Url};
 
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/solodock/config.toml";
 
@@ -29,6 +29,9 @@ pub struct Config {
     pub listen_address: SocketAddr,
     pub public_origin: String,
     pub webhook_public_origin: Option<String>,
+    pub management_authority: CanonicalAuthority,
+    pub webhook_authority: Option<CanonicalAuthority>,
+    pub local_probe_authority: CanonicalAuthority,
     pub state_directory: PathBuf,
     pub runtime_directory: PathBuf,
     pub allowed_bind_roots: Vec<PathBuf>,
@@ -114,14 +117,22 @@ impl TryFrom<ConfigFile> for Config {
         if !listen_address.ip().is_loopback() {
             return Err(ConfigError::NonLoopback(listen_address));
         }
-        let public_origin = normalize_public_origin(&raw.public_origin)?;
-        let webhook_public_origin = raw
+        let (public_origin, management_authority) =
+            normalize_public_origin_with_authority(&raw.public_origin)?;
+        let normalized_webhook = raw
             .webhook_public_origin
             .as_deref()
-            .map(normalize_public_origin)
+            .map(normalize_public_origin_with_authority)
             .transpose()?;
-        if webhook_public_origin.as_ref() == Some(&public_origin) {
+        let (webhook_public_origin, webhook_authority) = normalized_webhook
+            .map(|(origin, authority)| (Some(origin), Some(authority)))
+            .unwrap_or((None, None));
+        let local_probe_authority = CanonicalAuthority::from_socket(listen_address);
+        if webhook_authority.as_ref() == Some(&management_authority) {
             return Err(ConfigError::WebhookOriginConflict);
+        }
+        if webhook_authority.as_ref() == Some(&local_probe_authority) {
+            return Err(ConfigError::WebhookLocalAuthorityConflict);
         }
         validate_managed_path("state_directory", &raw.state_directory)?;
         validate_managed_path("runtime_directory", &raw.runtime_directory)?;
@@ -139,6 +150,9 @@ impl TryFrom<ConfigFile> for Config {
             listen_address,
             public_origin,
             webhook_public_origin,
+            management_authority,
+            webhook_authority,
+            local_probe_authority,
             state_directory: raw.state_directory,
             runtime_directory: raw.runtime_directory,
             allowed_bind_roots,
@@ -218,7 +232,47 @@ fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CanonicalAuthority {
+    host: Host<String>,
+    port: u16,
+}
+
+impl CanonicalAuthority {
+    pub fn parse_http(value: &str) -> Result<Self, AuthorityError> {
+        parse_authority(value, 443)
+    }
+
+    pub fn from_socket(address: SocketAddr) -> Self {
+        Self {
+            host: match address.ip() {
+                std::net::IpAddr::V4(value) => Host::Ipv4(value),
+                std::net::IpAddr::V6(value) => Host::Ipv6(value),
+            },
+            port: address.port(),
+        }
+    }
+
+    pub fn explicit(&self) -> String {
+        format_authority(&self.host, self.port, false)
+    }
+
+    fn origin_authority(&self) -> String {
+        format_authority(&self.host, self.port, self.port == 443)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("invalid HTTP authority")]
+pub struct AuthorityError;
+
 pub fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
+    normalize_public_origin_with_authority(value).map(|(origin, _)| origin)
+}
+
+fn normalize_public_origin_with_authority(
+    value: &str,
+) -> Result<(String, CanonicalAuthority), ConfigError> {
     let parsed = Url::parse(value).map_err(|_| ConfigError::PublicOrigin)?;
     if parsed.scheme() != "https"
         || parsed.host_str().is_none()
@@ -230,30 +284,125 @@ pub fn normalize_public_origin(value: &str) -> Result<String, ConfigError> {
     {
         return Err(ConfigError::PublicOrigin);
     }
-    let host = parsed.host_str().ok_or(ConfigError::PublicOrigin)?;
-    let host = if host.contains(':') {
-        format!("[{host}]")
-    } else {
-        host.to_ascii_lowercase()
+    let host = match parsed.host().ok_or(ConfigError::PublicOrigin)? {
+        Host::Domain(value) => Host::Domain(value.to_owned()),
+        Host::Ipv4(value) => Host::Ipv4(value),
+        Host::Ipv6(value) => Host::Ipv6(value),
     };
-    Ok(match parsed.port() {
-        Some(port) if port != 443 => format!("https://{host}:{port}"),
-        _ => format!("https://{host}"),
-    })
+    let authority = canonical_authority(host, parsed.port().unwrap_or(443))
+        .map_err(|_| ConfigError::PublicOrigin)?;
+    Ok((
+        format!("https://{}", authority.origin_authority()),
+        authority,
+    ))
 }
 
 pub fn origin_authority(origin: &str) -> Result<String, ConfigError> {
-    let parsed = Url::parse(origin).map_err(|_| ConfigError::PublicOrigin)?;
-    let host = parsed.host_str().ok_or(ConfigError::PublicOrigin)?;
-    let host = if host.contains(':') {
-        format!("[{host}]")
+    normalize_public_origin_with_authority(origin)
+        .map(|(_, authority)| authority.origin_authority())
+}
+
+fn parse_authority(value: &str, default_port: u16) -> Result<CanonicalAuthority, AuthorityError> {
+    if value.is_empty()
+        || !value.is_ascii()
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || value
+            .bytes()
+            .any(|byte| matches!(byte, b'@' | b'/' | b'\\' | b'?' | b'#' | b'%'))
+    {
+        return Err(AuthorityError);
+    }
+    let (host_text, port, bracketed) = if let Some(rest) = value.strip_prefix('[') {
+        let close = rest.find(']').ok_or(AuthorityError)?;
+        let host = &rest[..close];
+        let suffix = &rest[close + 1..];
+        let port = if suffix.is_empty() {
+            default_port
+        } else {
+            parse_port(suffix.strip_prefix(':').ok_or(AuthorityError)?)?
+        };
+        (host, port, true)
     } else {
-        host.to_ascii_lowercase()
+        if value.matches(':').count() > 1 {
+            return Err(AuthorityError);
+        }
+        match value.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && !port.is_empty() => {
+                (host, parse_port(port)?, false)
+            }
+            Some(_) => return Err(AuthorityError),
+            None => (value, default_port, false),
+        }
     };
-    Ok(match parsed.port() {
-        Some(port) if port != 443 => format!("{host}:{port}"),
-        _ => host,
-    })
+    let host_text = host_text.strip_suffix('.').unwrap_or(host_text);
+    if host_text.is_empty() {
+        return Err(AuthorityError);
+    }
+    let host = if bracketed {
+        Host::Ipv6(host_text.parse().map_err(|_| AuthorityError)?)
+    } else {
+        Host::parse(host_text).map_err(|_| AuthorityError)?
+    };
+    canonical_authority(host, port)
+}
+
+fn parse_port(value: &str) -> Result<u16, AuthorityError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(AuthorityError);
+    }
+    value.parse::<u16>().map_err(|_| AuthorityError)
+}
+
+fn canonical_authority(
+    mut host: Host<String>,
+    port: u16,
+) -> Result<CanonicalAuthority, AuthorityError> {
+    if let Host::Domain(domain) = &mut host {
+        *domain = domain
+            .strip_suffix('.')
+            .unwrap_or(domain)
+            .to_ascii_lowercase();
+    }
+    if let Host::Domain(domain) = &host
+        && !valid_dns_name(domain)
+    {
+        return Err(AuthorityError);
+    }
+    Ok(CanonicalAuthority { host, port })
+}
+
+fn valid_dns_name(value: &str) -> bool {
+    value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+}
+
+fn format_authority(host: &Host<String>, port: u16, omit_port: bool) -> String {
+    let host = match host {
+        Host::Domain(value) => value.to_ascii_lowercase(),
+        Host::Ipv4(value) => value.to_string(),
+        Host::Ipv6(value) => format!("[{value}]"),
+    };
+    if omit_port {
+        host
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn validate_managed_path(field: &'static str, path: &Path) -> Result<(), ConfigError> {
@@ -332,6 +481,8 @@ pub enum ConfigError {
     PublicOrigin,
     #[error("webhook_public_origin must use a different authority from public_origin")]
     WebhookOriginConflict,
+    #[error("webhook_public_origin must use a different authority from listen_address")]
+    WebhookLocalAuthorityConflict,
     #[error("{0} must be an absolute normalized path")]
     ManagedPath(&'static str),
     #[error("allowed bind root is sensitive or overlaps SoloDock state")]
@@ -376,6 +527,8 @@ mod tests {
     fn validates_and_normalizes_configuration() {
         let config = Config::try_from(raw()).unwrap();
         assert_eq!(config.public_origin, "https://example.com");
+        assert_eq!(config.management_authority.explicit(), "example.com:443");
+        assert_eq!(config.local_probe_authority.explicit(), "127.0.0.1:8080");
     }
 
     #[test]
@@ -391,12 +544,98 @@ mod tests {
             origin_authority(config.webhook_public_origin.as_deref().unwrap()).unwrap(),
             "hooks.example.com"
         );
+        assert_eq!(
+            config.webhook_authority.unwrap().explicit(),
+            "hooks.example.com:443"
+        );
         let mut value = raw();
         value.webhook_public_origin = Some("https://example.com".into());
         assert!(matches!(
             Config::try_from(value),
             Err(ConfigError::WebhookOriginConflict)
         ));
+    }
+
+    #[test]
+    fn canonical_authorities_normalize_dns_default_ports_and_ip_addresses() {
+        assert_eq!(
+            CanonicalAuthority::parse_http("EXAMPLE.com")
+                .unwrap()
+                .explicit(),
+            "example.com:443"
+        );
+        assert_eq!(
+            CanonicalAuthority::parse_http("example.com:443"),
+            CanonicalAuthority::parse_http("example.com")
+        );
+        assert_eq!(
+            CanonicalAuthority::parse_http("127.0.0.1:8080")
+                .unwrap()
+                .explicit(),
+            "127.0.0.1:8080"
+        );
+        assert_eq!(
+            CanonicalAuthority::parse_http("[0:0:0:0:0:0:0:1]:8080")
+                .unwrap()
+                .explicit(),
+            "[::1]:8080"
+        );
+        for invalid in [
+            "",
+            "user@example.com",
+            "example.com/path",
+            "example.com?query",
+            "example.com#fragment",
+            "ex%61mple.com",
+            "example_com",
+            "example.com:443:444",
+            "example.com:+443",
+            "[::1",
+            "[::1]extra",
+            "[::1]:+8080",
+            "éxample.com",
+        ] {
+            assert_eq!(
+                CanonicalAuthority::parse_http(invalid),
+                Err(AuthorityError),
+                "{invalid} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_webhook_authority_that_matches_local_probe() {
+        let mut value = raw();
+        value.listen_address = "127.0.0.1:443".into();
+        value.webhook_public_origin = Some("https://127.0.0.1".into());
+        assert!(matches!(
+            Config::try_from(value),
+            Err(ConfigError::WebhookLocalAuthorityConflict)
+        ));
+    }
+
+    #[test]
+    fn permits_management_authority_to_match_local_probe_for_loopback_development() {
+        let mut value = raw();
+        value.listen_address = "127.0.0.1:8443".into();
+        value.public_origin = "https://127.0.0.1:8443".into();
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(config.management_authority, config.local_probe_authority);
+    }
+
+    #[test]
+    fn public_origins_canonicalize_ipv4_ipv6_and_non_default_ports() {
+        let mut value = raw();
+        value.public_origin = "https://127.0.0.1:8443".into();
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(config.public_origin, "https://127.0.0.1:8443");
+        assert_eq!(config.management_authority.explicit(), "127.0.0.1:8443");
+
+        let mut value = raw();
+        value.public_origin = "https://[0:0:0:0:0:0:0:1]:443".into();
+        let config = Config::try_from(value).unwrap();
+        assert_eq!(config.public_origin, "https://[::1]");
+        assert_eq!(config.management_authority.explicit(), "[::1]:443");
     }
 
     #[test]

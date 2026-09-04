@@ -8,6 +8,8 @@
 
 SoloDock 假定唯一管理员和宿主 OS 可信；Registry、镜像、容器输出、Docker/Compose 输出、浏览器输入和反向代理输入均不可信。Docker socket 和 `docker` group 在效果上等同宿主 root，因此 Web 身份认证、loopback 监听、固定动作与 systemd hardening 是纵深防御，不是对恶意宿主管理员的隔离。
 
+Reverse proxy 提供的 authority 输入不可信。SoloDock 将 management 路由绑定到 canonical `public_origin` authority，并且只允许独立 webhook authority 访问唯一 canonical POST path。未知、缺失、重复、畸形或 URI/`Host` 冲突的 authority 会在 API 或 asset 路由前 fail closed；forwarding header 与来源 IP 都不会扩展任一 surface。独立 loopback authority 仅暴露两个非敏感 updater probe，不暴露 login、API、SSE、UI 或 webhook 行为。
+
 secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入 API response、SQLite、release、audit、argv、tracing 或错误；日志使用完整、fail-closed 的动态已知 secret 集脱敏。内核、allocator、Docker daemon、Registry 服务端和管理员业务备份不在“内存中从未出现明文”的保证范围。备份含 secret，必须高敏保护。
 
 仅持有合法管理员 session 不能轮换 credential：该 route 还要求当前密码、精确 Origin 与 CSRF proof。无效 current-password 尝试与 login 共用 throttle，但使用独立的脱敏 audit action 和 HTTP 403 结果，因此不会伪装成 session 过期，也不泄露密码材料。轮换与 login 串行化，并在原子替换 hash 时撤销全部 session。这让密码泄露后的止损依赖一次成功轮换；本次不增加 MFA、account recovery、password history，也不增加用于取消 commit 前已获准 request 的 authentication epoch。
@@ -22,7 +24,7 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 资源防护包括请求/body/stream/log buffer 上限、单一 Compose mutation、最多两个 Registry resolve、poll jitter/backoff、busy coalescing 和失败 target suppression。它不承诺抵御拥有宿主 root、Docker daemon控制权或合法管理员 session 的攻击者，也不提供多租户隔离。
 
-Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
+Webhook hostname 是独立的公开攻击面：在 HMAC 处理前，其 authority 只接受 `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`，management、local probe 与 webhook surface 不会交叉路由；之后只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。
 
 volume、bind 和 external network 不会被自动删除，但其中数据也不会随 release 回滚。External network 与其成员属于 daemon 共享状态：SoloDock 对成员数量设置上限，在共享 deadline 内完整 inspect 成员 full ID 和有效 DNS names，任何截断或部分成功都 fail closed。Alias 冲突只对已经通过 filesystem/ownership policy 精确确认的旧 container full ID 放行；app label、名称和短 ID 不构成替换权限。
 

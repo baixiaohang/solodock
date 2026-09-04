@@ -2,7 +2,7 @@
 
 > [English](../api-and-streams.md)（权威版本） · 简体中文
 
-SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程只监听 loopback，由外部 Tunnel/WAF/TLS 提供公网入口；应用自身仍执行认证、Origin、CSRF、请求大小和权限检查。
+SoloDock 的管理 API 与嵌入式 UI 使用 `public_origin` 的 canonical HTTPS authority。生产进程只监听 loopback，由外部 Tunnel/WAF/TLS 提供公网入口；reverse proxy 必须保留该外部 `Host`，`Forwarded`、`X-Forwarded-Host` 等 header 不会授权路由。应用自身仍执行 authority、认证、Origin、CSRF、请求大小和权限检查。
 
 ## 认证边界
 
@@ -17,6 +17,8 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 认证协议 endpoint 不使用业务 `Idempotency-Key`。它们依靠 singleton credential、一次性 token 或随机 session 建立自己的重放边界。
 
 ## 管理 API 契约
+
+Management authority 可访问 management API、认证、SSE、UI/assets、`/healthz` 与 `/favicon.svg`，但不能访问 `/hooks/**`。可选 webhook authority 只接受精确的 `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`。当 loopback listen authority 与 management 不同时，它永久仅接受精确的 `GET /healthz` 与 `GET /favicon.svg`，以兼容本地 updater；其他所有 authority/path/method 组合都返回 body-minimal 且带 `Cache-Control: no-store` 的 `404`，不会透露已配置 authority。
 
 所有 `/api/v1/**` 响应使用 `Cache-Control: no-store`，并返回 allowlist DTO，不直接序列化 Docker、Registry 或内部存储 model。错误保持稳定的 code、脱敏 message 和 `request_id`。配置校验错误还可带向后兼容的 `issues`；每项只含字段路径、稳定 code 和安全说明，不回显输入值、Secret、credential 或宿主路径：
 

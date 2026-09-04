@@ -24,6 +24,7 @@ use tokio_util::{sync::CancellationToken, task::TaskTracker};
 
 use crate::{
     auth::AuthService,
+    config::{CanonicalAuthority, origin_authority},
     docker::{
         AppCatalog, DockerObserver,
         events::DockerEventHub,
@@ -38,6 +39,9 @@ use crate::{
 pub struct AppState {
     pub auth: AuthService,
     pub public_origin: String,
+    pub management_authority: CanonicalAuthority,
+    pub webhook_authority: Option<CanonicalAuthority>,
+    pub local_probe_authority: CanonicalAuthority,
     pub observer: DockerObserver,
     pub events: DockerEventHub,
     pub stats: StatsHub,
@@ -57,6 +61,10 @@ impl AppState {
         public_origin: String,
         state_directory: PathBuf,
     ) -> Self {
+        let management_authority = CanonicalAuthority::parse_http(
+            &origin_authority(&public_origin).expect("test public origin must be canonical"),
+        )
+        .expect("test public authority must be canonical");
         let api = Arc::new(UnavailableDocker);
         let supervisor = DockerSupervisor::new();
         let shutdown = CancellationToken::new();
@@ -64,6 +72,9 @@ impl AppState {
         Self {
             auth,
             public_origin,
+            local_probe_authority: management_authority.clone(),
+            management_authority,
+            webhook_authority: None,
             observer: DockerObserver::new(api.clone(), AppCatalog::default(), supervisor),
             events: DockerEventHub::new(),
             stats: StatsHub::new(api, shutdown.clone(), stream_tasks.clone()),

@@ -251,14 +251,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         poller,
     });
     let webhook_origin = config.webhook_public_origin.clone().unwrap_or_default();
-    let webhook_authority = if webhook_origin.is_empty() {
-        String::new()
-    } else {
-        solodock::config::origin_authority(&webhook_origin)?
-    };
     let webhooks = Some(Arc::new(WebhookServices {
         origin: webhook_origin,
-        authority: webhook_authority,
         store: webhook_store.clone(),
         poll_states: m4.poller.store.clone(),
         database: database.clone(),
@@ -272,6 +266,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let state = AppState {
         auth,
         public_origin: config.public_origin,
+        management_authority: config.management_authority,
+        webhook_authority: config.webhook_authority,
+        local_probe_authority: config.local_probe_authority,
         observer,
         events: event_hub,
         stats,
