@@ -157,6 +157,7 @@ impl ApiError {
             DomainError::BindOutsideAllowedRoot => "BIND_OUTSIDE_ALLOWED_ROOT",
             DomainError::BindSymlink => "BIND_SYMLINK",
             DomainError::BindChanged => "BIND_CHANGED",
+            DomainError::BindSourceAncestorConflict => "BIND_SOURCE_ANCESTOR_CONFLICT",
             DomainError::BindRwAckRequired => "BIND_RW_ACK_REQUIRED",
             DomainError::PortConflict => "PORT_CONFLICT",
             DomainError::FeatureNotAvailable => "FEATURE_NOT_AVAILABLE",

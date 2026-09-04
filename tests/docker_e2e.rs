@@ -33,7 +33,7 @@ use bollard::{
     },
     query_parameters::{
         CreateContainerOptionsBuilder, ListContainersOptionsBuilder, RemoveContainerOptionsBuilder,
-        WaitContainerOptionsBuilder,
+        StopContainerOptionsBuilder, WaitContainerOptionsBuilder,
     },
 };
 use futures_util::{FutureExt, StreamExt};
@@ -78,6 +78,117 @@ use uuid::Uuid;
 const CONTAINERD_SCENARIO_TIMEOUT: Duration = Duration::from_secs(240);
 const CONTAINERD_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTAINERD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[tokio::test]
+#[ignore = "requires a dedicated Docker-in-Docker daemon"]
+async fn sigterm_bind_swap_invalidates_candidate_and_rollback_identities() {
+    let endpoint = std::env::var("SOLODOCK_TEST_DOCKER_HOST").unwrap();
+    let shared_root = std::env::var("SOLODOCK_E2E_SHARED_FIXTURE_ROOT")
+        .expect("SOLODOCK_E2E_SHARED_FIXTURE_ROOT must be shared with the isolated daemon");
+    let docker = Docker::connect_with_http(&endpoint, 5, API_DEFAULT_VERSION)
+        .unwrap()
+        .negotiate_version()
+        .await
+        .unwrap();
+    let fixture = tempfile::Builder::new()
+        .prefix("solodock-bind-sigterm-")
+        .tempdir_in(shared_root)
+        .unwrap();
+    std::fs::set_permissions(fixture.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let bind_root = fixture.path().join("parent");
+    let child = bind_root.join("child");
+    std::fs::create_dir_all(&child).unwrap();
+    let allowed = [bind_root.clone()];
+    let target = [solodock::domain::BindMountInput {
+        source: child.display().to_string(),
+        target_path: "/data".into(),
+        readonly: true,
+        acknowledge_non_rollbackable: false,
+    }];
+    let run_token = Uuid::new_v4();
+    let labels = HashMap::from([("com.solodock.test-run".into(), run_token.to_string())]);
+
+    let candidate_before = solodock::domain::validate_binds(&target, &allowed).unwrap();
+    let predecessor = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-bind-predecessor-{run_token}"))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "trap 'mv /writer/child /writer/displaced; ln -s /etc /writer/child; exit 0' TERM; while :; do sleep 1; done".into(),
+                ]),
+                labels: Some(labels.clone()),
+                host_config: Some(HostConfig {
+                    binds: Some(vec![format!("{}:/writer", bind_root.display())]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    docker.start_container(&predecessor, None).await.unwrap();
+    docker
+        .stop_container(
+            &predecessor,
+            Some(StopContainerOptionsBuilder::default().t(10).build()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        solodock::domain::validate_binds(&target, &allowed),
+        Err(solodock::domain::DomainError::BindSymlink)
+    ));
+    assert!(!candidate_before.is_empty());
+    remove_test_container(&docker, &predecessor, run_token).await;
+
+    std::fs::remove_file(&child).unwrap();
+    std::fs::rename(bind_root.join("displaced"), &child).unwrap();
+    let rollback_before = solodock::domain::validate_binds(&target, &allowed).unwrap();
+    let candidate = docker
+        .create_container(
+            Some(
+                CreateContainerOptionsBuilder::default()
+                    .name(&format!("solodock-bind-candidate-{run_token}"))
+                    .build(),
+            ),
+            ContainerCreateBody {
+                image: Some("alpine:3.20".into()),
+                cmd: Some(vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "trap 'mv /writer/child /writer/candidate-displaced; mkdir /writer/child; exit 0' TERM; while :; do sleep 1; done".into(),
+                ]),
+                labels: Some(labels),
+                host_config: Some(HostConfig {
+                    binds: Some(vec![format!("{}:/writer", bind_root.display())]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    docker.start_container(&candidate, None).await.unwrap();
+    docker
+        .stop_container(
+            &candidate,
+            Some(StopContainerOptionsBuilder::default().t(10).build()),
+        )
+        .await
+        .unwrap();
+    let rollback_after = solodock::domain::validate_binds(&target, &allowed).unwrap();
+    assert_ne!(rollback_after, rollback_before);
+    remove_test_container(&docker, &candidate, run_token).await;
+}
 
 #[tokio::test]
 #[ignore = "requires a dedicated Docker-in-Docker daemon"]
@@ -1641,7 +1752,11 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
         for action in [
             ComposeAction::Stop,
             ComposeAction::Start,
-            ComposeAction::Restart,
+            // Restart is intentionally expressed as two guarded effects by
+            // the lifecycle API so bind identities can be revalidated in
+            // between.
+            ComposeAction::Stop,
+            ComposeAction::Start,
         ] {
             runner
                 .run(action, context())

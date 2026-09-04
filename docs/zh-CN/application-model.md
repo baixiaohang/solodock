@@ -67,7 +67,10 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 - root/source 不能与 state、runtime、Docker socket、敏感系统目录或 daemon 实际 data-root 重叠；
 - validate、preview 和每次 Docker effect 前都会重新检查 canonical path、symlink、device/inode 和 data-root；
 - 默认只读；每一条 read-write bind 都必须在对应行显式确认“不能随 release 回滚”，改回只读或重新切为读写会重置该确认；
+- read-write source 不得成为同一配置或其他正在运行的受管应用中任一 bind source 的严格祖先；相同 source 与兄弟 source 不属于祖先冲突；
 - SoloDock 不创建、`chown`、`chmod`、备份或删除 source。
+
+保存 draft 时会执行早期祖先检查。每个 start-like effect 都会基于其他受管应用的 fresh live inventory 重复检查。应用替换或 restart 会先停止其 exact owned writer container、确认已退出，再重新验证目标路径，之后才允许启动。跨应用冲突只以 `BIND_SOURCE_ANCESTOR_CONFLICT` 阻止冲突应用的 start、deploy、restart、rollback 或 recovery；SoloDock 不会自动停止另一应用，read、stop 与用于修复配置的 edit 仍保持可用。
 
 ### Network
 

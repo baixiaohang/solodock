@@ -68,6 +68,8 @@ candidate 达到 health policy 后才把 `active` 原子切向该 release，并�
 
 确定性 candidate identity/apply/health 失败且现场被证明属于该 candidate 时，系统进入同一补偿路径：有旧 active 时先用 candidate release 的宽限停止失败 candidate，再自动恢复并重新验证旧 release；没有旧 active 时先按 candidate 宽限显式 stop，再执行精确 `rm --force` 并复核 container 已不存在。rollback 重新执行旧 release 所需的 digest pull、resource/bind/data-root/candidate preflight、fixed Compose action、post-observation 和健康门禁，而不是直接信任历史 YAML 或旧 container。
 
+每次替换、补偿恢复与手工 rollback 都具有 stop-to-start bind guard。SoloDock 会先确认 exact predecessor 或 candidate writer 已退出，再 fresh 解析不可变 target release 的 bind source，检查 allowlist、symlink、device/inode 事实并盘点其他 live application，之后才执行下一次 Compose start-like action。路径变化或 read-write ancestor 冲突会让 deployment 保持 interrupted 或 needs-attention；任何 candidate 或 predecessor 都不能绕过失败的 guard 启动。
+
 首次部署没有旧 active 时，失败清理只针对已经 claim 并写入 `post_container_id` 的 exact candidate；remove 结果和最终 absence 必须确认。任何 unknown effect、ownership collision，或 marker 后不同 full ID 的 replacement 都保留 pending/现场并标记 `interrupted` 或 `needs_attention`。
 
 终态不变量是：`failed` 表示 candidate side effect 已被证明不存在，`rolled_back` 表示旧 active 已重新 apply 并通过 fresh identity/health verification；补偿执行或复核失败只能进入 `needs_attention`/`interrupted` 并保留 pending 与 exact recovery facts，不能伪装成已清理的终态。所有补偿和 rollback 都保留 volume、bind 内容与 network，不传 volume 删除参数。

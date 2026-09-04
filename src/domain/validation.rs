@@ -133,6 +133,26 @@ pub fn normalize_draft_with_issues(
     hmac_key: &[u8],
     allowed_bind_roots: &[PathBuf],
 ) -> Result<NormalizedDraft, DraftValidationError> {
+    normalize_draft_with_options(input, existing, hmac_key, allowed_bind_roots, true)
+}
+
+pub(crate) fn normalize_existing_draft(
+    input: DraftInput,
+    existing: &ExistingSecrets,
+    hmac_key: &[u8],
+    allowed_bind_roots: &[PathBuf],
+) -> Result<NormalizedDraft, DomainError> {
+    normalize_draft_with_options(input, existing, hmac_key, allowed_bind_roots, false)
+        .map_err(|error| error.error)
+}
+
+fn normalize_draft_with_options(
+    input: DraftInput,
+    existing: &ExistingSecrets,
+    hmac_key: &[u8],
+    allowed_bind_roots: &[PathBuf],
+    enforce_bind_plan: bool,
+) -> Result<NormalizedDraft, DraftValidationError> {
     validate_display_name(&input.display_name).map_err(|error| {
         DraftValidationError::at(
             error,
@@ -190,7 +210,7 @@ pub fn normalize_draft_with_issues(
     let mut volumes = input.volumes;
     validate_volumes(&volumes)?;
     let mut binds = input.binds;
-    validate_binds_detailed(&binds, allowed_bind_roots)?;
+    validate_binds_detailed_with_options(&binds, allowed_bind_roots, enforce_bind_plan)?;
     validate_mount_target_conflicts(&files, &file_request_indexes, &volumes, &binds)?;
     volumes.sort_by_key(volume_sort_key);
     binds.sort_by(|left, right| left.target_path.cmp(&right.target_path));
@@ -991,9 +1011,24 @@ pub fn validate_binds(
     validate_binds_detailed(binds, allowed_roots).map_err(|error| error.error)
 }
 
+pub(crate) fn validate_existing_binds(
+    binds: &[BindMountInput],
+    allowed_roots: &[PathBuf],
+) -> Result<Vec<BindIdentity>, DomainError> {
+    validate_binds_detailed_with_options(binds, allowed_roots, false).map_err(|error| error.error)
+}
+
 fn validate_binds_detailed(
     binds: &[BindMountInput],
     allowed_roots: &[PathBuf],
+) -> Result<Vec<BindIdentity>, DraftValidationError> {
+    validate_binds_detailed_with_options(binds, allowed_roots, true)
+}
+
+fn validate_binds_detailed_with_options(
+    binds: &[BindMountInput],
+    allowed_roots: &[PathBuf],
+    enforce_bind_plan: bool,
 ) -> Result<Vec<BindIdentity>, DraftValidationError> {
     if binds.len() > 16 {
         return Err(DraftValidationError::at(
@@ -1054,6 +1089,24 @@ fn validate_binds_detailed(
             })?,
         );
     }
+    if enforce_bind_plan {
+        let planned = result
+            .iter()
+            .zip(binds)
+            .map(|(identity, bind)| BindSafetySource {
+                identity: identity.clone(),
+                readonly: bind.readonly,
+            })
+            .collect::<Vec<_>>();
+        validate_bind_plan(&planned, &[]).map_err(|error| {
+            DraftValidationError::at(
+                error,
+                "binds",
+                "BIND_SOURCE_ANCESTOR_CONFLICT",
+                "A read-write bind source must not be an ancestor of another bind source",
+            )
+        })?;
+    }
     Ok(result)
 }
 
@@ -1064,6 +1117,41 @@ pub struct BindIdentity {
     pub device: u64,
     #[cfg(unix)]
     pub inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindSafetySource {
+    pub identity: BindIdentity,
+    pub readonly: bool,
+}
+
+/// Validates target binds against themselves and a fresh inventory of other live applications.
+/// Conflicts solely within the existing inventory do not block an unrelated target.
+pub fn validate_bind_plan(
+    target: &[BindSafetySource],
+    existing: &[BindSafetySource],
+) -> Result<(), DomainError> {
+    for (index, left) in target.iter().enumerate() {
+        if target[index + 1..]
+            .iter()
+            .any(|right| bind_sources_conflict(left, right))
+            || existing
+                .iter()
+                .any(|right| bind_sources_conflict(left, right))
+        {
+            return Err(DomainError::BindSourceAncestorConflict);
+        }
+    }
+    Ok(())
+}
+
+fn bind_sources_conflict(left: &BindSafetySource, right: &BindSafetySource) -> bool {
+    (!left.readonly
+        && left.identity.path != right.identity.path
+        && right.identity.path.starts_with(&left.identity.path))
+        || (!right.readonly
+            && left.identity.path != right.identity.path
+            && left.identity.path.starts_with(&right.identity.path))
 }
 
 pub fn validate_bind_source(
@@ -1524,6 +1612,8 @@ pub enum DomainError {
     BindSymlink,
     #[error("bind source changed")]
     BindChanged,
+    #[error("read-write bind source is an ancestor of another bind source")]
+    BindSourceAncestorConflict,
     #[error("read-write bind requires acknowledgement")]
     BindRwAckRequired,
     #[error("published port conflicts with another port")]
@@ -1545,6 +1635,7 @@ impl DomainError {
             Self::BindOutsideAllowedRoot => "BIND_OUTSIDE_ALLOWED_ROOT",
             Self::BindSymlink => "BIND_SYMLINK",
             Self::BindChanged => "BIND_CHANGED",
+            Self::BindSourceAncestorConflict => "BIND_SOURCE_ANCESTOR_CONFLICT",
             Self::BindRwAckRequired => "BIND_RW_ACK_REQUIRED",
             Self::PortConflict => "PORT_CONFLICT",
             Self::FeatureNotAvailable => "FEATURE_NOT_AVAILABLE",
@@ -1722,6 +1813,102 @@ mod tests {
         let serialized = serde_json::to_string(&error.issues).unwrap();
         assert!(!serialized.contains("public-canary"));
         assert!(!serialized.contains(bind_source.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn bind_plan_rejects_only_strict_read_write_ancestors() {
+        let identity = |path: &str| BindIdentity {
+            path: PathBuf::from(path),
+            #[cfg(unix)]
+            device: 1,
+            #[cfg(unix)]
+            inode: 1,
+        };
+        let source = |path: &str, readonly: bool| BindSafetySource {
+            identity: identity(path),
+            readonly,
+        };
+
+        assert_eq!(
+            validate_bind_plan(
+                &[source("/srv/data", false), source("/srv/data/child", true)],
+                &[],
+            ),
+            Err(DomainError::BindSourceAncestorConflict)
+        );
+        assert_eq!(
+            validate_bind_plan(
+                &[source("/srv/data/child", true)],
+                &[source("/srv/data", false)],
+            ),
+            Err(DomainError::BindSourceAncestorConflict)
+        );
+        assert!(
+            validate_bind_plan(
+                &[source("/srv/data", true), source("/srv/data/child", false)],
+                &[],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_bind_plan(
+                &[source("/srv/data", false), source("/srv/data", true)],
+                &[],
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_bind_plan(
+                &[source("/srv/data/left", false)],
+                &[source("/srv/data/right", true)],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn bind_plan_uses_canonical_sources_and_rejects_symlink_aliases() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = root.path().join("parent");
+        let child = parent.join("child");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&child).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+        let binds = vec![
+            BindMountInput {
+                source: parent.display().to_string(),
+                target_path: "/parent".into(),
+                readonly: false,
+                acknowledge_non_rollbackable: true,
+            },
+            BindMountInput {
+                source: child.display().to_string(),
+                target_path: "/child".into(),
+                readonly: true,
+                acknowledge_non_rollbackable: false,
+            },
+        ];
+        assert_eq!(
+            validate_binds(&binds, &[root.path().to_path_buf()]).unwrap_err(),
+            DomainError::BindSourceAncestorConflict
+        );
+
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&child, &alias).unwrap();
+        let aliased = [BindMountInput {
+            source: alias.display().to_string(),
+            target_path: "/alias".into(),
+            readonly: true,
+            acknowledge_non_rollbackable: false,
+        }];
+        assert_eq!(
+            validate_binds(&aliased, &[root.path().to_path_buf()]).unwrap_err(),
+            DomainError::BindSymlink
+        );
     }
 
     #[test]

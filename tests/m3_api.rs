@@ -26,6 +26,7 @@ use solodock::{
     db::Database,
     deploy::{
         DeploymentEngine, DeploymentLedger, DeploymentScheduler, FixedImagePuller, HealthVerifier,
+        ImagePuller, PullError,
     },
     docker::{
         AppCatalog, DockerObserver,
@@ -56,6 +57,42 @@ struct FakeCompose {
     validated_yaml: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     actions: Arc<std::sync::Mutex<Vec<ComposeAction>>>,
     contexts: Arc<std::sync::Mutex<Vec<(ComposeAction, u16)>>>,
+    stop_scenario: Option<Arc<StopScenario>>,
+}
+
+struct StopScenario {
+    source: std::path::PathBuf,
+    replacement: Option<std::path::PathBuf>,
+    mutate_on_stop: usize,
+    stop_calls: std::sync::atomic::AtomicUsize,
+    phase: std::sync::atomic::AtomicUsize,
+}
+
+impl StopScenario {
+    fn apply(&self, action: ComposeAction) {
+        use std::sync::atomic::Ordering;
+        match action {
+            ComposeAction::Stop => {
+                let stop = self.stop_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                self.phase
+                    .store(if stop == 1 { 1 } else { 3 }, Ordering::SeqCst);
+                if stop == self.mutate_on_stop {
+                    let displaced = self.source.with_extension(format!("stopped-{stop}"));
+                    fs::rename(&self.source, displaced).unwrap();
+                    if let Some(target) = &self.replacement {
+                        std::os::unix::fs::symlink(target, &self.source).unwrap();
+                    } else {
+                        fs::create_dir(&self.source).unwrap();
+                        fs::set_permissions(&self.source, fs::Permissions::from_mode(0o700))
+                            .unwrap();
+                    }
+                }
+            }
+            ComposeAction::DeployCandidate => self.phase.store(2, Ordering::SeqCst),
+            ComposeAction::Start => self.phase.store(4, Ordering::SeqCst),
+            _ => {}
+        }
+    }
 }
 
 struct MissingDocker;
@@ -292,6 +329,9 @@ impl ComposeRunner for FakeCompose {
             .lock()
             .unwrap()
             .push((action, context.stop_grace_period_seconds));
+        if let Some(scenario) = &self.stop_scenario {
+            scenario.apply(action);
+        }
         match action {
             ComposeAction::Version => Ok(ComposeOutput {
                 stdout: b"2.24.0\n".to_vec(),
@@ -312,6 +352,112 @@ impl ComposeRunner for FakeCompose {
                 stderr: vec![],
             }),
         }
+    }
+}
+
+#[derive(Default)]
+struct NoopPuller;
+
+#[async_trait]
+impl ImagePuller for NoopPuller {
+    async fn pull(
+        &self,
+        _deployment_id: Uuid,
+        _resolved: &solodock::registry::ResolvedImage,
+        _credential: Option<&solodock::registry::LoadedCredential>,
+        _redaction: Vec<Vec<u8>>,
+    ) -> Result<(), PullError> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ScenarioDocker {
+    scenario: Option<Arc<StopScenario>>,
+    records: std::sync::Mutex<Option<(ContainerRecord, ContainerRecord)>>,
+}
+
+impl ScenarioDocker {
+    fn install(&self, active: ContainerRecord, candidate: ContainerRecord) {
+        *self.records.lock().unwrap() = Some((active, candidate));
+    }
+
+    fn observed(&self) -> Vec<ContainerRecord> {
+        let Some((active, candidate)) = self.records.lock().unwrap().clone() else {
+            return Vec::new();
+        };
+        let phase = self
+            .scenario
+            .as_ref()
+            .map(|scenario| scenario.phase.load(std::sync::atomic::Ordering::SeqCst))
+            .unwrap_or_default();
+        let mut value = match phase {
+            0 | 4 => active,
+            1 => active,
+            2 | 3 => candidate,
+            _ => return Vec::new(),
+        };
+        if matches!(phase, 1 | 3) {
+            value.status = ContainerStatus::Exited;
+        }
+        vec![value]
+    }
+}
+
+#[async_trait]
+impl DockerReadApi for ScenarioDocker {
+    async fn probe(&self) -> Result<ProbeSnapshot, DockerError> {
+        Ok(ready_probe())
+    }
+
+    async fn list_managed_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+        Ok(self.observed())
+    }
+
+    async fn list_compose_app_containers(
+        &self,
+        _project_name: &str,
+    ) -> Result<Vec<ContainerRecord>, DockerError> {
+        Ok(self.observed())
+    }
+
+    async fn inspect_container(&self, id: &str) -> Result<ContainerRecord, DockerError> {
+        self.observed()
+            .into_iter()
+            .find(|container| container.id == id)
+            .ok_or_else(|| {
+                DockerError::new(solodock::docker::models::DockerErrorKind::ContainerChanged)
+            })
+    }
+
+    async fn events(&self) -> Result<DockerStream<RawDockerEvent>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
+    }
+
+    async fn logs(
+        &self,
+        _id: &str,
+        _request: LogRequest,
+    ) -> Result<DockerStream<LogChunk>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
+    }
+
+    async fn stats(&self, _id: &str) -> Result<DockerStream<RawStats>, DockerError> {
+        Ok(Box::pin(futures_util::stream::empty()))
+    }
+
+    async fn inspect_volume(
+        &self,
+        _name: &str,
+    ) -> Result<Option<solodock::docker::models::DockerResource>, DockerError> {
+        Ok(None)
+    }
+
+    async fn inspect_network(
+        &self,
+        _name: &str,
+    ) -> Result<Option<solodock::docker::models::DockerNetworkResource>, DockerError> {
+        Ok(None)
     }
 }
 
@@ -337,6 +483,14 @@ impl Harness {
     }
 
     async fn new_with_docker(docker: Arc<dyn DockerReadApi>) -> Self {
+        Self::new_with_components(docker, None, None).await
+    }
+
+    async fn new_with_components(
+        docker: Arc<dyn DockerReadApi>,
+        stop_scenario: Option<Arc<StopScenario>>,
+        puller: Option<Arc<dyn ImagePuller>>,
+    ) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let state_directory = root.path().join("state");
@@ -361,7 +515,10 @@ impl Harness {
             IdempotencyService::initialize(database.clone(), &state_directory).unwrap();
         let store =
             AppStore::initialize_verified(apps.clone(), idempotency.integrity_key()).unwrap();
-        let fake_compose = Arc::new(FakeCompose::default());
+        let fake_compose = Arc::new(FakeCompose {
+            stop_scenario,
+            ..FakeCompose::default()
+        });
         let validated_yaml = fake_compose.validated_yaml.clone();
         let compose_actions = fake_compose.actions.clone();
         let compose_contexts = fake_compose.contexts.clone();
@@ -398,20 +555,25 @@ impl Harness {
         )
         .unwrap();
         let ledger = DeploymentLedger::new(database.clone());
-        let puller = FixedImagePuller::new(
-            state_directory.clone(),
-            runtime_directory.join("pull"),
-            docker.clone(),
-            state.shutdown.clone(),
-            state.stream_tasks.clone(),
-        )
-        .unwrap();
+        let puller: Arc<dyn ImagePuller> = match puller {
+            Some(puller) => puller,
+            None => Arc::new(
+                FixedImagePuller::new(
+                    state_directory.clone(),
+                    runtime_directory.join("pull"),
+                    docker.clone(),
+                    state.shutdown.clone(),
+                    state.stream_tasks.clone(),
+                )
+                .unwrap(),
+            ),
+        };
         let engine = DeploymentEngine {
             store: store.clone(),
             credentials: credentials.clone(),
             resolver: RegistryResolver::production().unwrap(),
             ledger: ledger.clone(),
-            puller: Arc::new(puller),
+            puller,
             compose: state.m3.as_ref().unwrap().compose.clone(),
             docker,
             health: HealthVerifier::new(state.observer.api(), state.shutdown.clone()),
@@ -576,6 +738,115 @@ impl Harness {
         .unwrap();
         self.catalog.replace(&self.store.scan_read_only().unwrap());
     }
+
+    fn publish_pending(
+        &self,
+        app_id: Uuid,
+        release_id: Uuid,
+        image: &str,
+        source_release_id: Option<Uuid>,
+    ) -> solodock::app_store::releases::ReleaseV2 {
+        let metadata = self.store.read_metadata(app_id).unwrap();
+        let digest = image.split('@').nth(1).unwrap().to_owned();
+        let release = self
+            .store
+            .publish_v2_release(
+                &metadata,
+                release_id,
+                &solodock::registry::ResolvedImage {
+                    source_image_ref: metadata
+                        .discovery_image_ref
+                        .clone()
+                        .expect("configured app"),
+                    logical_registry: "registry.example".into(),
+                    repository: "app".into(),
+                    source_tag: "stable".into(),
+                    source_descriptor_digest: digest.clone(),
+                    index_digest: None,
+                    manifest_digest: digest.clone(),
+                    runnable_image_ref: image.into(),
+                    platform: solodock::registry::Platform::canonical("linux", "amd64", None)
+                        .unwrap(),
+                    local_image_id: digest,
+                },
+                solodock::app_store::releases::ReleaseTrigger::Manual,
+                source_release_id,
+            )
+            .unwrap();
+        self.store.set_pending(app_id, release_id).unwrap();
+        self.catalog.replace(&self.store.scan_read_only().unwrap());
+        release
+    }
+
+    fn install_legacy_signed_binds(
+        &self,
+        app_id: Uuid,
+        revision_id: Uuid,
+        binds: Vec<solodock::domain::BindMountInput>,
+    ) {
+        #[derive(serde::Serialize)]
+        struct Canonical<'a> {
+            metadata: &'a solodock::domain::ConfigMetadata,
+            public_environment: &'a [solodock::domain::PublicEnvInput],
+            public_files: &'a std::collections::BTreeMap<String, String>,
+        }
+
+        let loaded = solodock::app_store::config_revision::load(
+            &self.store.app_directory(app_id),
+            revision_id,
+        )
+        .unwrap();
+        let mut metadata = loaded.metadata;
+        let mut binds = binds;
+        binds.sort_by(|left, right| left.target_path.cmp(&right.target_path));
+        metadata.binds = binds;
+        metadata.config_sha256.clear();
+        let canonical = serde_json::to_vec(&Canonical {
+            metadata: &metadata,
+            public_environment: &loaded.public_environment,
+            public_files: &loaded.public_files,
+        })
+        .unwrap();
+        metadata.config_sha256 = Sha256::digest(canonical)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let config_sha256 = metadata.config_sha256.clone();
+        let path = self
+            .store
+            .app_directory(app_id)
+            .join("config-revisions")
+            .join(revision_id.to_string())
+            .join("config.toml");
+        fs::write(&path, toml::to_string(&metadata).unwrap()).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut app = self.store.read_metadata(app_id).unwrap();
+        app.draft_config_sha256 = Some(config_sha256);
+        solodock::app_store::atomic::AtomicWriter::write(
+            &self.store.app_directory(app_id).join("app.toml"),
+            toml::to_string(&app).unwrap().as_bytes(),
+            0o600,
+        )
+        .unwrap();
+        let verified = solodock::app_store::config_revision::load_verified(
+            &self.store.app_directory(app_id),
+            revision_id,
+            &self.idempotency.integrity_key(),
+        )
+        .unwrap();
+        verified
+            .normalize_verified(
+                app.display_name.clone(),
+                app.discovery_image_ref.clone().unwrap(),
+                app.credential_ref,
+                app.auto_deploy_enabled,
+                app.poll_interval_seconds,
+                &self.idempotency.integrity_key(),
+                &self.store.allowed_bind_roots(),
+            )
+            .unwrap();
+        self.catalog.replace(&self.store.scan_read_only().unwrap());
+    }
 }
 
 fn delete_fingerprint(harness: &Harness, route: &str, request: &Value) -> Vec<u8> {
@@ -622,6 +893,40 @@ fn mutable(value: Value) -> Value {
     let mut value = value;
     value.as_object_mut().unwrap().remove("slug");
     value
+}
+
+fn release_container(
+    id: char,
+    app_id: Uuid,
+    release: &solodock::app_store::releases::ReleaseV2,
+) -> ContainerRecord {
+    let mut container = owned_container(id, app_id, release.id, true);
+    container.configured_image_ref = Some(release.runnable_image_ref.clone());
+    container.image_id = Some(release.local_image_id.clone());
+    container
+}
+
+async fn wait_for_deployment(
+    harness: &Harness,
+    deployment_id: Uuid,
+) -> solodock::deploy::DeploymentRecord {
+    for _ in 0..500 {
+        if let Some(record) = harness
+            .state
+            .m4
+            .as_ref()
+            .unwrap()
+            .ledger
+            .get(deployment_id)
+            .await
+            .unwrap()
+            && record.status.is_terminal()
+        {
+            return record;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("deployment did not become terminal");
 }
 
 fn draft_with_owned_volume(secret: &str, logical_name: &str) -> Value {
@@ -2305,6 +2610,602 @@ async fn draft_validation_returns_safe_field_issues_for_preview_and_save() {
     let replay: Value = serde_json::from_str(&replay).unwrap();
     assert_eq!(replay["issues"], saved["issues"]);
     assert_eq!(replay["idempotency_replayed"], true);
+}
+
+#[tokio::test]
+async fn draft_save_rejects_a_cross_application_read_write_bind_ancestor() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let parent = bind_root.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let harness = Harness::new().await;
+    harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+
+    let mut writer = draft("writer-secret");
+    writer["slug"] = json!("writer");
+    writer["binds"] = json!([{
+        "source": parent,
+        "target_path": "/data",
+        "readonly": false,
+        "acknowledge_non_rollbackable": true
+    }]);
+    let (status, created) = body(harness.create(Some("bind-ancestor-writer"), &writer).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let writer_id: Uuid = serde_json::from_str::<Value>(&created).unwrap()["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    harness.publish_active(
+        writer_id,
+        Uuid::new_v4(),
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+
+    let (status, unconfigured) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps",
+                Some("bind-ancestor-reader-create"),
+                &json!({"slug": "reader"}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let reader_id = serde_json::from_str::<Value>(&unconfigured).unwrap()["app"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut reader = mutable_draft("reader-secret");
+    reader["binds"] = json!([{
+        "source": child,
+        "target_path": "/data",
+        "readonly": true,
+        "acknowledge_non_rollbackable": false
+    }]);
+    let (status, rejected) = body(
+        harness
+            .mutate(
+                "PUT",
+                &format!("/api/v1/apps/{reader_id}/draft"),
+                Some("bind-ancestor-reader"),
+                &json!({"expected_revision": null, "draft": reader}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let rejected: Value = serde_json::from_str(&rejected).unwrap();
+    assert_eq!(rejected["code"], "BIND_SOURCE_ANCESTOR_CONFLICT");
+    assert_eq!(rejected["issues"][0]["path"], "binds");
+}
+
+#[tokio::test]
+async fn live_bind_ancestor_blocks_start_but_preserves_stop_and_corrective_edit() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let parent = bind_root.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let docker = Arc::new(ScriptedDocker::default());
+    let harness = Harness::new_with_docker(docker.clone()).await;
+    harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+
+    let mut writer = draft("writer-secret");
+    writer["slug"] = json!("writer");
+    writer["binds"] = json!([{
+        "source": parent,
+        "target_path": "/data",
+        "readonly": false,
+        "acknowledge_non_rollbackable": true
+    }]);
+    let (status, writer) = body(harness.create(Some("live-bind-writer"), &writer).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{writer}");
+    let writer: Value = serde_json::from_str(&writer).unwrap();
+    let writer_id: Uuid = writer["app"]["id"].as_str().unwrap().parse().unwrap();
+    let writer_revision = writer["app"]["config_revision"].as_str().unwrap();
+
+    let mut reader = draft("reader-secret");
+    reader["binds"] = json!([{
+        "source": child,
+        "target_path": "/data",
+        "readonly": true,
+        "acknowledge_non_rollbackable": false
+    }]);
+    let (status, reader) = body(harness.create(Some("live-bind-reader"), &reader).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{reader}");
+    let reader: Value = serde_json::from_str(&reader).unwrap();
+    let reader_id: Uuid = reader["app"]["id"].as_str().unwrap().parse().unwrap();
+    let writer_release = Uuid::new_v4();
+    let reader_release = Uuid::new_v4();
+    harness.publish_active(
+        writer_id,
+        writer_release,
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+    harness.publish_active(
+        reader_id,
+        reader_release,
+        &format!("registry.example/app@sha256:{}", "b".repeat(64)),
+    );
+    harness.compose_actions.lock().unwrap().clear();
+
+    docker.set(vec![vec![owned_container(
+        'b',
+        reader_id,
+        reader_release,
+        true,
+    )]]);
+    let start = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/apps/{writer_id}/actions/start"))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("x-csrf-token", &harness.csrf)
+                .header("idempotency-key", "live-bind-writer-start")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, start) = body(start).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{start}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&start).unwrap()["code"],
+        "BIND_SOURCE_ANCESTOR_CONFLICT"
+    );
+    assert!(harness.compose_actions.lock().unwrap().is_empty());
+
+    docker.set(vec![Vec::new()]);
+    let stop = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/apps/{writer_id}/actions/stop"))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("x-csrf-token", &harness.csrf)
+                .header("idempotency-key", "live-bind-writer-stop")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stop.status(), StatusCode::OK);
+
+    let corrective = mutable_draft("writer-secret");
+    let saved = harness
+        .mutate(
+            "PUT",
+            &format!("/api/v1/apps/{writer_id}/draft"),
+            Some("live-bind-writer-corrective-edit"),
+            &json!({"expected_revision": writer_revision, "draft": corrective}),
+        )
+        .await;
+    assert_eq!(saved.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn legacy_intra_app_bind_ancestor_conflict_does_not_block_stop() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let parent = bind_root.path().join("parent");
+    let child = parent.join("child");
+    fs::create_dir(&parent).unwrap();
+    fs::create_dir(&child).unwrap();
+    fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let docker = Arc::new(ScriptedDocker::default());
+    let harness = Harness::new_with_docker(docker.clone()).await;
+    harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+
+    let mut input = draft("legacy-bind-secret");
+    input["binds"] = json!([{
+        "source": parent,
+        "target_path": "/data",
+        "readonly": false,
+        "acknowledge_non_rollbackable": true
+    }]);
+    let (status, created) = body(harness.create(Some("legacy-bind-create"), &input).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision_id: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let legacy_binds = serde_json::from_value(json!([
+        {
+            "source": parent,
+            "target_path": "/data",
+            "readonly": false,
+            "acknowledge_non_rollbackable": true
+        },
+        {
+            "source": child,
+            "target_path": "/child",
+            "readonly": true,
+            "acknowledge_non_rollbackable": false
+        }
+    ]))
+    .unwrap();
+    harness.install_legacy_signed_binds(app_id, revision_id, legacy_binds);
+    let release_id = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        release_id,
+        &format!("registry.example/app@sha256:{}", "c".repeat(64)),
+    );
+    harness.compose_actions.lock().unwrap().clear();
+    for (action, key) in [
+        ("start", "legacy-bind-start"),
+        ("restart", "legacy-bind-restart"),
+    ] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/actions/{action}"))
+                    .header(header::ORIGIN, "https://solodock.example.com")
+                    .header(header::COOKIE, &harness.cookie)
+                    .header("x-csrf-token", &harness.csrf)
+                    .header("idempotency-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, response) = body(response).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["code"],
+            "BIND_SOURCE_ANCESTOR_CONFLICT"
+        );
+    }
+    assert!(harness.compose_actions.lock().unwrap().is_empty());
+    let running = owned_container('c', app_id, release_id, true);
+    let mut exited = running.clone();
+    exited.status = ContainerStatus::Exited;
+    docker.set(vec![
+        vec![running.clone()],
+        vec![running.clone()],
+        vec![running],
+        vec![exited],
+    ]);
+
+    let stopped = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/apps/{app_id}/actions/stop"))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("x-csrf-token", &harness.csrf)
+                .header("idempotency-key", "legacy-bind-stop")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, stopped) = body(stopped).await;
+    assert_eq!(status, StatusCode::OK, "{stopped}");
+    assert_eq!(
+        harness.compose_actions.lock().unwrap().as_slice(),
+        &[ComposeAction::Stop]
+    );
+}
+
+#[tokio::test]
+async fn deployment_engine_post_stop_guard_blocks_candidate_apply_after_symlink_swap() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = bind_root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+    let scenario = Arc::new(StopScenario {
+        source: source.clone(),
+        replacement: Some(outside.path().to_path_buf()),
+        mutate_on_stop: 1,
+        stop_calls: std::sync::atomic::AtomicUsize::new(0),
+        phase: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let docker = Arc::new(ScenarioDocker {
+        scenario: Some(scenario.clone()),
+        ..ScenarioDocker::default()
+    });
+    let harness =
+        Harness::new_with_components(docker.clone(), Some(scenario), Some(Arc::new(NoopPuller)))
+            .await;
+    harness
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+
+    let mut input = draft("candidate-guard-secret");
+    input["binds"] = json!([{
+        "source": source,
+        "target_path": "/data",
+        "readonly": true,
+        "acknowledge_non_rollbackable": false
+    }]);
+    let (status, created) =
+        body(harness.create(Some("candidate-guard-create"), &input).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision_id: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let active_id = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        active_id,
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+    let active = harness.store.load_v2_release(app_id, active_id).unwrap();
+    let candidate_id = Uuid::new_v4();
+    let candidate = harness.publish_pending(
+        app_id,
+        candidate_id,
+        &format!("registry.example/app@sha256:{}", "b".repeat(64)),
+        Some(active_id),
+    );
+    let active_container = release_container('a', app_id, &active);
+    let active_container_id = active_container.id.clone();
+    docker.install(active_container, release_container('b', app_id, &candidate));
+    harness.compose_actions.lock().unwrap().clear();
+
+    let response = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/deployments"),
+            Some("candidate-post-stop-guard"),
+            &json!({
+                "expected_draft_revision": revision_id,
+                "expected_active_release_id": active_id,
+                "expected_pending_release_id": candidate_id,
+                "expected_actual_release_id": active_id,
+                "expected_actual_container_id": active_container_id,
+                "acknowledge_non_rollbackable_data": true
+            }),
+        )
+        .await;
+    let (status, response) = body(response).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    let deployment_id: Uuid = serde_json::from_str::<Value>(&response).unwrap()["deployment_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let terminal = wait_for_deployment(&harness, deployment_id).await;
+    assert!(matches!(
+        terminal.status,
+        solodock::deploy::DeploymentStatus::Failed
+            | solodock::deploy::DeploymentStatus::Interrupted
+            | solodock::deploy::DeploymentStatus::NeedsAttention
+    ));
+    assert_eq!(
+        harness.compose_actions.lock().unwrap().as_slice(),
+        &[ComposeAction::Stop]
+    );
+}
+
+#[tokio::test]
+async fn deployment_engine_compensation_guard_blocks_predecessor_restore_after_inode_swap() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let source = bind_root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+    let scenario = Arc::new(StopScenario {
+        source: source.clone(),
+        replacement: None,
+        mutate_on_stop: 2,
+        stop_calls: std::sync::atomic::AtomicUsize::new(0),
+        phase: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let docker = Arc::new(ScenarioDocker {
+        scenario: Some(scenario.clone()),
+        ..ScenarioDocker::default()
+    });
+    let harness =
+        Harness::new_with_components(docker.clone(), Some(scenario), Some(Arc::new(NoopPuller)))
+            .await;
+    harness
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+
+    let mut input = draft("compensation-guard-secret");
+    input["binds"] = json!([{
+        "source": source,
+        "target_path": "/data",
+        "readonly": true,
+        "acknowledge_non_rollbackable": false
+    }]);
+    input["health"] = json!({"policy":"healthy"});
+    let (status, created) = body(
+        harness
+            .create(Some("compensation-guard-create"), &input)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision_id: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let active_id = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        active_id,
+        &format!("registry.example/app@sha256:{}", "c".repeat(64)),
+    );
+    let active = harness.store.load_v2_release(app_id, active_id).unwrap();
+    let candidate_id = Uuid::new_v4();
+    let candidate = harness.publish_pending(
+        app_id,
+        candidate_id,
+        &format!("registry.example/app@sha256:{}", "d".repeat(64)),
+        Some(active_id),
+    );
+    let active_container = release_container('c', app_id, &active);
+    let active_container_id = active_container.id.clone();
+    let mut candidate_container = release_container('d', app_id, &candidate);
+    candidate_container.health = HealthStatus::Unhealthy;
+    docker.install(active_container, candidate_container);
+    harness.compose_actions.lock().unwrap().clear();
+
+    let response = harness
+        .mutate(
+            "POST",
+            &format!("/api/v1/apps/{app_id}/deployments"),
+            Some("compensation-post-stop-guard"),
+            &json!({
+                "expected_draft_revision": revision_id,
+                "expected_active_release_id": active_id,
+                "expected_pending_release_id": candidate_id,
+                "expected_actual_release_id": active_id,
+                "expected_actual_container_id": active_container_id,
+                "acknowledge_non_rollbackable_data": true
+            }),
+        )
+        .await;
+    let (status, response) = body(response).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    let deployment_id: Uuid = serde_json::from_str::<Value>(&response).unwrap()["deployment_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let terminal = wait_for_deployment(&harness, deployment_id).await;
+    assert_eq!(
+        terminal.status,
+        solodock::deploy::DeploymentStatus::NeedsAttention
+    );
+    assert_eq!(
+        harness.compose_actions.lock().unwrap().as_slice(),
+        &[
+            ComposeAction::Stop,
+            ComposeAction::DeployCandidate,
+            ComposeAction::Stop
+        ]
+    );
+}
+
+#[tokio::test]
+async fn lifecycle_restart_guard_blocks_start_after_symlink_swap() {
+    let bind_root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let source = bind_root.path().join("source");
+    fs::create_dir(&source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o700)).unwrap();
+    let scenario = Arc::new(StopScenario {
+        source: source.clone(),
+        replacement: Some(outside.path().to_path_buf()),
+        mutate_on_stop: 1,
+        stop_calls: std::sync::atomic::AtomicUsize::new(0),
+        phase: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let docker = Arc::new(ScenarioDocker {
+        scenario: Some(scenario.clone()),
+        ..ScenarioDocker::default()
+    });
+    let harness = Harness::new_with_components(docker.clone(), Some(scenario), None).await;
+    harness
+        .store
+        .replace_allowed_bind_roots(vec![bind_root.path().to_path_buf()]);
+    let mut input = draft("restart-guard-secret");
+    input["binds"] = json!([{
+        "source": source,
+        "target_path": "/data",
+        "readonly": true,
+        "acknowledge_non_rollbackable": false
+    }]);
+    let (status, created) = body(harness.create(Some("restart-guard-create"), &input).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let app_id: Uuid = serde_json::from_str::<Value>(&created).unwrap()["app"]["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let release_id = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        release_id,
+        &format!("registry.example/app@sha256:{}", "e".repeat(64)),
+    );
+    let release = harness.store.load_v2_release(app_id, release_id).unwrap();
+    let container = release_container('e', app_id, &release);
+    docker.install(container.clone(), container);
+    harness.compose_actions.lock().unwrap().clear();
+
+    let response = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/apps/{app_id}/actions/restart"))
+                .header(header::ORIGIN, "https://solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .header("x-csrf-token", &harness.csrf)
+                .header("idempotency-key", "restart-post-stop-guard")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, response) = body(response).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["code"],
+        "BIND_CHANGED"
+    );
+    assert_eq!(
+        harness.compose_actions.lock().unwrap().as_slice(),
+        &[ComposeAction::Stop]
+    );
 }
 
 #[tokio::test]

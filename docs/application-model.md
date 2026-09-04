@@ -67,7 +67,10 @@ SQLite global settings maintain the allowed bind roots. The default list is empt
 - neither root nor source may overlap state, runtime, the Docker socket, sensitive system directories, or the daemon's actual data root;
 - validate, preview, and every Docker effect recheck the canonical path, symlinks, device/inode, and data root;
 - binds are read-only by default; each read-write bind must explicitly acknowledge in its own row that release rollback cannot revert it, and changing to read-only and back resets that acknowledgment;
+- a read-write source must not be a strict ancestor of any other bind source in the same configuration or in another running managed application; identical sources and sibling sources are not ancestor conflicts;
 - SoloDock never creates, `chown`s, `chmod`s, backs up, or deletes a source.
+
+Saving a draft performs an early ancestor check. Every start-like effect repeats the check against a fresh inventory of live managed applications. An application replacement or restart first stops its exact owned writer container, confirms that it exited, and then revalidates the target paths before starting anything. A cross-application conflict blocks only start, deploy, restart, rollback, or recovery of the conflicting application with `BIND_SOURCE_ANCESTOR_CONFLICT`; SoloDock never stops the other application automatically, and read, stop, and corrective edit operations remain available.
 
 ### Networks
 
