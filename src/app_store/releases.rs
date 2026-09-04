@@ -108,7 +108,8 @@ impl AppStore {
         if draft.metadata.config_sha256 != draft_config_sha256 {
             return Err(StoreError::ContentInvalid);
         }
-        let revision_directory = app_directory
+        let revision_directory = self
+            .canonical_app_directory(app.id)
             .join("config-revisions")
             .join(draft_revision.to_string());
         let (compose, _) = generate(
@@ -215,7 +216,7 @@ impl AppStore {
             return Err(StoreError::ContentInvalid);
         }
         let revision_directory = self
-            .app_directory(app_id)
+            .canonical_app_directory(app_id)
             .join("config-revisions")
             .join(release.config_revision.to_string());
         let canonical = matches_canonical(

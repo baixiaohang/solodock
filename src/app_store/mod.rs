@@ -23,6 +23,7 @@ use crate::security::permissions::{PermissionError, check_private, ensure_privat
 #[derive(Clone)]
 pub struct AppStore {
     apps_directory: PathBuf,
+    canonical_apps_directory: PathBuf,
     integrity_key: Option<Arc<Vec<u8>>>,
     allowed_bind_roots: Arc<RwLock<Vec<PathBuf>>>,
 }
@@ -31,6 +32,7 @@ impl AppStore {
     pub fn initialize(apps_directory: PathBuf) -> Result<Self, StoreError> {
         ensure_private_directory(&apps_directory)?;
         Ok(Self {
+            canonical_apps_directory: apps_directory.clone(),
             apps_directory,
             integrity_key: None,
             allowed_bind_roots: Arc::new(RwLock::new(Vec::new())),
@@ -56,11 +58,31 @@ impl AppStore {
         Ok(store)
     }
 
+    /// Initialize a store whose managed files live below a staging root while
+    /// path-sensitive Compose artifacts retain their installed path identity.
+    /// This is used by offline package/restore validation; runtime callers
+    /// should use [`Self::initialize_managed`].
+    pub fn initialize_managed_relocated(
+        apps_directory: PathBuf,
+        canonical_apps_directory: PathBuf,
+        integrity_key: Vec<u8>,
+        allowed_bind_roots: Vec<PathBuf>,
+    ) -> Result<Self, StoreError> {
+        if !canonical_apps_directory.is_absolute() {
+            return Err(StoreError::ContentInvalid);
+        }
+        let mut store =
+            Self::initialize_managed(apps_directory, integrity_key, allowed_bind_roots)?;
+        store.canonical_apps_directory = canonical_apps_directory;
+        Ok(store)
+    }
+
     pub fn scan(&self) -> Result<recovery::RecoveryReport, StoreError> {
         config_revision::normalize_managed_file_permissions(&self.apps_directory)?;
         let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_with_options(
+        recovery::scan_relocated_with_options(
             &self.apps_directory,
+            &self.canonical_apps_directory,
             self.integrity_key.as_deref().map(Vec::as_slice),
             &allowed_bind_roots,
         )
@@ -71,8 +93,9 @@ impl AppStore {
     /// temporary or newly published-but-not-yet-referenced artifacts.
     pub fn scan_read_only(&self) -> Result<recovery::RecoveryReport, StoreError> {
         let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_read_only_with_options(
+        recovery::scan_read_only_relocated(
             &self.apps_directory,
+            &self.canonical_apps_directory,
             self.integrity_key.as_deref().map(Vec::as_slice),
             &allowed_bind_roots,
         )
@@ -105,6 +128,10 @@ impl AppStore {
 
     pub fn app_directory(&self, app_id: Uuid) -> PathBuf {
         self.apps_directory.join(app_id.to_string())
+    }
+
+    pub(crate) fn canonical_app_directory(&self, app_id: Uuid) -> PathBuf {
+        self.canonical_apps_directory.join(app_id.to_string())
     }
 
     pub fn create_app(

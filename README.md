@@ -77,7 +77,7 @@ Published Releases provide a long-lived, attested package for Ubuntu 24.04 x86_6
 
 The versioned archive contains the embedded SoloDock binary, installer, updater, backup/restore helpers, package verifier and install manifest, systemd unit, configuration example, checksums, source identity, and operator documentation. Verify the Release `SHA256SUMS` attestation and checksums before running the packaged installer.
 
-The installer creates a dedicated `solodock` system account, installs the binary, updater, backup/restore helpers, manifest, and systemd unit as one identity-qualified generation, and preserves existing configuration and state. It does not start the service by default.
+The installer creates a dedicated `solodock` system account, installs the binary, updater, backup/restore helpers, manifest, and systemd unit as one identity-qualified generation, and preserves existing configuration and state. Official packages require `/etc/solodock/config.toml`, `/var/lib/solodock`, and `/run/solodock`; a custom loopback listen port remains supported and is read by the updater from the verified configuration. It does not start the service by default.
 
 Before startup:
 

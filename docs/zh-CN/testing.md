@@ -49,6 +49,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - Dashboard generation 会 abort 被替代的 load，阻止迟到响应发布状态或打开 SSE，关闭旧的和构造到一半的 source 集，并把 live stats source 限制为八条。Deployment detail polling 同时最多保留一个 request 和一个 timer，以有上限的指数退避重试瞬时错误，成功后恢复一秒节奏，并在 terminal、路由切换或 teardown 时停止；
 - 前端 mutation retry 测试覆盖普通 request body、write-only secret digest 与手工管理的 lifecycle/deletion key。Network、未通过校验的 HTML/proxy 错误和 HTTP 5xx 保留 exact key；通过校验的 backend JSON 4xx 与确认成功会清除 key。Secret canary 不进入 error、UI 或浏览器 storage；
 - Authority routing 测试通过 production middleware 覆盖 management、webhook 和独立 local-probe authority，包括 DNS/default-port 与 IPv4/IPv6 规范化、URI/`Host` 一致性、缺失/重复/非法/未知/仅 forwarding 输入、精确 webhook method/path/UUID、携带合法 session 的跨 surface request、body-minimal no-store 拒绝，以及最小 health/favicon probe 契约；
+- Package layout 测试通过 production Rust inspector 与 runtime marker 覆盖固定 config/state/runtime 身份、自定义 IPv4 与带方括号 IPv6 loopback probe、非法 marker 和 effect 前拒绝。Package fixture 证明 custom layout 或畸形 inspector output 时 installer/updater/backup/restore 零 mutation、updater 无 override URL 派生、Docker socket 缺失与非法的区别，以及 unit 对 Docker 只有 `After`/`Wants` 顺序；
 - public/secret 分类和 `keep`/`replace`/`delete`；
 - public 环境变量逐行/批量 `KEY=VALUE` 无损切换，覆盖 CRLF、空行、第一个 `=`、重复/非法 key 与行号错误；Secret 不进入文本框，并继续覆盖掩码、分类转换、rename、keep/replace/delete 和成功后清空；
 - 镜像建议 POST 的 JSON `Content-Type`、CSRF、credential reference、allowlist 成功投影及脱敏错误展示；
@@ -66,7 +67,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - active/pending canonical symlink、mode/owner、HMAC、config/release/Compose验证；
 - public/secret managed leaf 精确 `0444`、ancestor 保持 `0700`，restrictive umask 下发布 mode 不收窄；startup 仅迁移 canonical legacy `0400`/`0600`，runtime scan 不改权限，unsafe drift fail closed；
 - SQLite 丢失后的可重建事实和不可伪造的认证/audit历史；
-- backup/restore拒绝 escaping link、hard link、special file和不兼容 state。
+- backup/restore 拒绝 escaping link、hard link、special file，以及不兼容或非 package state。可用 root 的全链测试在私有 staging root 下存放 fixture，同时为 `/var/lib/solodock` 生成 canonical Compose，再以 service identity 校验 relocated tree。
 
 ### Docker 与 Compose
 

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 validator="${CARGO_TARGET_DIR:-target}/release/solodock"
+export SOLODOCK_SMOKE_REAL_BINARY
+SOLODOCK_SMOKE_REAL_BINARY=$(realpath -e -- "$validator")
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 managed_install_dir() {
@@ -44,7 +46,10 @@ capture_install_snapshot() {
   find "$root/usr/local/lib/solodock/generations" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | LC_ALL=C sort
 }
 fake="$fixture/solodock"
-printf '#!/bin/sh\nexit 0\n' >"$fake"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ "${1-}" = inspect-packaged-config ]; then exec "$SOLODOCK_SMOKE_REAL_BINARY" "$@"; fi' \
+  'exit 0' >"$fake"
 chmod 0755 "$fake"
 stamped_binary="$fixture/stamped-binary"
 cp /bin/true "$stamped_binary"
@@ -95,6 +100,54 @@ if find "$snapshot_failure_root/usr/local/lib/solodock" -maxdepth 1 -type d -nam
   printf '%s\n' 'snapshot failure left an installer transaction behind' >&2
   exit 1
 fi
+custom_layout_install_root="$fixture/custom-layout-install-root"
+"$install_package_010/install.sh" --version 0.1.0 --destdir "$custom_layout_install_root" >/dev/null
+sed -i 's#^state_directory = .*#state_directory = "/srv/solodock-state"#' "$custom_layout_install_root/etc/solodock/config.toml"
+custom_layout_before="$fixture/custom-layout-install-before"
+custom_layout_after="$fixture/custom-layout-install-after"
+capture_install_snapshot "$custom_layout_install_root" >"$custom_layout_before"
+custom_layout_config_sha=$(sha256sum "$custom_layout_install_root/etc/solodock/config.toml" | awk '{print $1}')
+if "$install_package_011/install.sh" --version 0.1.1 --destdir "$custom_layout_install_root" >"$fixture/custom-layout-install.stdout" 2>"$fixture/custom-layout-install.stderr"; then
+  printf '%s\n' 'installer accepted a custom packaged state layout' >&2
+  exit 1
+fi
+grep -Fq 'packaged configuration preflight failed' "$fixture/custom-layout-install.stderr"
+capture_install_snapshot "$custom_layout_install_root" >"$custom_layout_after"
+cmp "$custom_layout_before" "$custom_layout_after"
+[[ $(sha256sum "$custom_layout_install_root/etc/solodock/config.toml" | awk '{print $1}') == "$custom_layout_config_sha" ]]
+
+invalid_socket_root="$fixture/invalid-socket-root"
+mkdir -p "$invalid_socket_root/var/run"
+: >"$invalid_socket_root/var/run/docker.sock"
+if "$install_package_010/install.sh" --version 0.1.0 --destdir "$invalid_socket_root" >"$fixture/invalid-socket.stdout" 2>"$fixture/invalid-socket.stderr"; then
+  printf '%s\n' 'installer accepted a non-socket Docker path' >&2
+  exit 1
+fi
+grep -Fq 'Docker socket has an unsafe type or group' "$fixture/invalid-socket.stderr"
+[[ ! -e $invalid_socket_root/usr/local/lib/solodock ]]
+
+wrong_group=$(id -Gn | tr ' ' '\n' | awk '$0 != "docker" { print; exit }')
+[[ -n $wrong_group ]]
+wrong_group_socket_root="$fixture/wrong-group-socket-root"
+mkdir -p "$wrong_group_socket_root/var/run"
+python3 - "$wrong_group_socket_root/var/run/docker.sock" <<'PY'
+import socket
+import sys
+
+sock = socket.socket(socket.AF_UNIX)
+sock.bind(sys.argv[1])
+sock.close()
+PY
+[[ -S $wrong_group_socket_root/var/run/docker.sock ]]
+chgrp "$wrong_group" "$wrong_group_socket_root/var/run/docker.sock"
+if "$install_package_010/install.sh" --version 0.1.0 --destdir "$wrong_group_socket_root" >"$fixture/wrong-group-socket.stdout" 2>"$fixture/wrong-group-socket.stderr"; then
+  printf '%s\n' 'installer accepted a Docker socket with the wrong group' >&2
+  exit 1
+fi
+grep -Fq 'Docker socket has an unsafe type or group' "$fixture/wrong-group-socket.stderr"
+[[ ! -e $wrong_group_socket_root/usr/local/lib/solodock ]]
+
+sed -i 's#^public_origin = .*#public_origin = "https://[::1]:8443"#' "$fixture/root/etc/solodock/config.toml"
 printf '# retained\n' >>"$fixture/root/etc/solodock/config.toml"
 "$install_package_011/install.sh" --version 0.1.1 --destdir "$fixture/root" >/dev/null
 grep -q retained "$fixture/root/etc/solodock/config.toml"
@@ -130,10 +183,11 @@ done
 
 ./packaging/solodock-update --help >/dev/null
 if ./packaging/solodock-update --health-url 'http://0.0.0.0:8080/healthz' >"$fixture/update.stdout" 2>"$fixture/update.stderr"; then
-  printf '%s\n' 'updater accepted a non-loopback health URL' >&2
+  printf '%s\n' 'updater retained the removed health URL override' >&2
   exit 1
 fi
 [[ ! -s $fixture/update.stdout ]]
+grep -Fq 'usage: solodock-update' "$fixture/update.stderr"
 
 update_package="$fixture/update-package"
 fake_bin="$fixture/fake-bin"
@@ -371,6 +425,7 @@ printf '%s\n' \
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  '[[ -z ${SOLODOCK_SMOKE_CURL_LOG:-} ]] || printf "%s\n" "$*" >>"$SOLODOCK_SMOKE_CURL_LOG"' \
   'for argument in "$@"; do' \
   '  [[ $argument == --write-out ]] && { printf "%s" image/svg+xml; exit 0; }' \
   'done' \
@@ -378,7 +433,11 @@ printf '%s\n' \
 chmod 0755 "$fake_bin/sudo" "$fake_bin/systemctl" "$fake_bin/curl"
 
 new_binary="$fixture/new-solodock"
-printf '%s\n' '#!/bin/sh' 'exit 0' '# new package binary' >"$new_binary"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ "${1-}" = inspect-packaged-config ]; then exec "$SOLODOCK_SMOKE_REAL_BINARY" "$@"; fi' \
+  'exit 0' \
+  '# new package binary' >"$new_binary"
 chmod 0755 "$new_binary"
 trusted_sha=$(printf '%040d' 0)
 main_package="$fixture/main-package"
@@ -407,14 +466,20 @@ run_successful_update() {
   local initial_package=$2
   local selected_channel=${3-}
   local legacy_install=${4-0}
+  local listen_override=${5-}
   local root="$fixture/$name-root"
   local backups="$fixture/$name-backups"
   local systemctl_log="$fixture/$name-systemctl.log"
   local gh_trace="$fixture/$name-gh.log"
   local output="$fixture/$name.stdout"
+  local curl_log="$fixture/$name-curl.log"
   local initial_version
   initial_version=$(<"$initial_package/VERSION")
   "$initial_package/install.sh" --version "$initial_version" --destdir "$root" >/dev/null
+  sed -i 's#^public_origin = .*#public_origin = "https://[::1]:8443"#' "$root/etc/solodock/config.toml"
+  if [[ -n $listen_override ]]; then
+    sed -i "s#^listen_address = .*#listen_address = \"$listen_override\"#" "$root/etc/solodock/config.toml"
+  fi
   if [[ $legacy_install == 1 ]]; then
     local generation legacy name
     generation=$(managed_install_dir "$root")
@@ -430,6 +495,7 @@ run_successful_update() {
     cp -- "$legacy/solodock.service" "$root/etc/systemd/system/solodock.service"
   fi
   : >"$systemctl_log"
+  : >"$curl_log"
   local channel_args=()
   [[ -z $selected_channel ]] || channel_args=(--channel "$selected_channel")
   PATH="$fake_bin:$PATH" \
@@ -441,8 +507,9 @@ run_successful_update() {
     SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
     SOLODOCK_SMOKE_GH_LOG="$gh_trace" \
     SOLODOCK_SMOKE_SYSTEMCTL_LOG="$systemctl_log" \
+    SOLODOCK_SMOKE_CURL_LOG="$curl_log" \
     ./packaging/solodock-update "${channel_args[@]}" --backup-dir "$backups" >"$output"
-  printf '%s\n' "$root" "$backups" "$systemctl_log" "$output" "$gh_trace"
+  printf '%s\n' "$root" "$backups" "$systemctl_log" "$output" "$gh_trace" "$curl_log"
 }
 
 mapfile -t main_result < <(run_successful_update main-success "$old_main_package" '' 1)
@@ -458,6 +525,69 @@ find "$main_backups" -maxdepth 1 -type f -name '*.tar' -print -quit | grep -q .
 find "$main_backups" -maxdepth 1 -type f -name '*.tar.sha256' -print -quit | grep -q .
 grep -Fq 'from CI run 123' "$main_output"
 grep -qx 'CHANNEL=main' "$main_install/INSTALL_MANIFEST"
+
+mapfile -t ipv6_result < <(run_successful_update ipv6-success "$old_main_package" main 0 '[::1]:9124')
+ipv6_curl_log=${ipv6_result[5]}
+grep -Fq 'http://[::1]:9124/healthz' "$ipv6_curl_log"
+grep -Fq 'http://[::1]:9124/favicon.svg' "$ipv6_curl_log"
+
+custom_update_root="$fixture/custom-update-root"
+"$old_main_package/install.sh" --version "main-${old_main_sha:0:12}" --destdir "$custom_update_root" >/dev/null
+sed -i 's#^state_directory = .*#state_directory = "/srv/solodock-state"#' "$custom_update_root/etc/solodock/config.toml"
+capture_install_snapshot "$custom_update_root" >"$fixture/custom-update-before"
+: >"$fixture/custom-update-systemctl.log"
+: >"$fixture/custom-update-sudo.log"
+if PATH="$fake_bin:$PATH" \
+  SOLODOCK_UPDATE_TEST_MODE=1 \
+  SOLODOCK_UPDATE_TEST_ROOT="$custom_update_root" \
+  SOLODOCK_SMOKE_PACKAGE="$main_package" \
+  SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
+  SOLODOCK_SMOKE_GH_LOG="$fixture/custom-update-gh.log" \
+  SOLODOCK_SMOKE_SYSTEMCTL_LOG="$fixture/custom-update-systemctl.log" \
+  SOLODOCK_SMOKE_SUDO_LOG="$fixture/custom-update-sudo.log" \
+  ./packaging/solodock-update --channel main --backup-dir "$fixture/custom-update-backups" >"$fixture/custom-update.stdout" 2>"$fixture/custom-update.stderr"; then
+  printf '%s\n' 'updater accepted a custom packaged state layout' >&2
+  exit 1
+fi
+grep -Fq 'downloaded package rejected the installed packaged configuration' "$fixture/custom-update.stderr"
+capture_install_snapshot "$custom_update_root" >"$fixture/custom-update-after"
+cmp "$fixture/custom-update-before" "$fixture/custom-update-after"
+if grep -Eq '(^| )(stop solodock\.service|.*solodock-backup|.*install\.sh)($| )' "$fixture/custom-update-sudo.log"; then
+  printf '%s\n' 'custom-layout updater preflight reached a mutation command' >&2
+  exit 1
+fi
+[[ ! -e $fixture/custom-update-backups ]]
+
+malformed_inspector="$fixture/malformed-inspector"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'if [ "${1-}" = inspect-packaged-config ]; then printf "%s\n" FORMAT=wrong HEALTH_URL=http://127.0.0.1:8080/healthz; fi' \
+  'exit 0' >"$malformed_inspector"
+chmod 0755 "$malformed_inspector"
+malformed_package="$fixture/malformed-package"
+./packaging/stage-package.sh --binary "$malformed_inspector" --output "$malformed_package" --source-sha "$trusted_sha" --version "main-${trusted_sha:0:12}" --channel main
+malformed_root="$fixture/malformed-root"
+"$old_main_package/install.sh" --version "main-${old_main_sha:0:12}" --destdir "$malformed_root" >/dev/null
+: >"$fixture/malformed-systemctl.log"
+: >"$fixture/malformed-sudo.log"
+if PATH="$fake_bin:$PATH" \
+  SOLODOCK_UPDATE_TEST_MODE=1 \
+  SOLODOCK_UPDATE_TEST_ROOT="$malformed_root" \
+  SOLODOCK_SMOKE_PACKAGE="$malformed_package" \
+  SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
+  SOLODOCK_SMOKE_GH_LOG="$fixture/malformed-gh.log" \
+  SOLODOCK_SMOKE_SYSTEMCTL_LOG="$fixture/malformed-systemctl.log" \
+  SOLODOCK_SMOKE_SUDO_LOG="$fixture/malformed-sudo.log" \
+  ./packaging/solodock-update --channel main --backup-dir "$fixture/malformed-backups" >"$fixture/malformed.stdout" 2>"$fixture/malformed.stderr"; then
+  printf '%s\n' 'updater accepted malformed packaged-config inspector output' >&2
+  exit 1
+fi
+grep -Fq 'downloaded package rejected the installed packaged configuration' "$fixture/malformed.stderr"
+if grep -Eq '(^| )(stop solodock\.service|.*solodock-backup|.*install\.sh)($| )' "$fixture/malformed-sudo.log"; then
+  printf '%s\n' 'malformed inspector output reached a mutation command' >&2
+  exit 1
+fi
+[[ ! -e $fixture/malformed-backups ]]
 
 : >"$main_systemctl_log"
 PATH="$fake_bin:$PATH" \
@@ -747,10 +877,38 @@ printf '%s\n' \
   'exit 2' >"$restore_identity_bin/getent"
 chmod 0755 "$restore_identity_bin/getent"
 ln -s /tmp "$fixture/.solodock-backup-predictable.tmp"
-./packaging/solodock-backup --root "$fixture/root" --output "$fixture/backup.tar" >/dev/null
+./packaging/solodock-backup --root "$fixture/root" --validator "$validator" --output "$fixture/backup.tar" >/dev/null
 (cd "$fixture" && sha256sum -c backup.tar.sha256 >/dev/null)
 tar -tf "$fixture/backup.tar" | grep -q '^var/lib/solodock/'
 [[ $(stat -c '%a' "$fixture/backup.tar") == 600 ]]
+
+custom_backup_root="$fixture/custom-backup-root"
+cp -a "$fixture/root" "$custom_backup_root"
+sed -i 's#^state_directory = .*#state_directory = "/srv/solodock-state"#' "$custom_backup_root/etc/solodock/config.toml"
+if ./packaging/solodock-backup --root "$custom_backup_root" --validator "$validator" --output "$fixture/custom-backup.tar" >"$fixture/custom-backup.stdout" 2>"$fixture/custom-backup.stderr"; then
+  printf '%s\n' 'backup accepted a custom packaged state layout' >&2
+  exit 1
+fi
+grep -Fq 'backup configuration is not a valid packaged layout' "$fixture/custom-backup.stderr"
+[[ ! -e $fixture/custom-backup.tar && ! -e $fixture/custom-backup.tar.sha256 ]]
+if find "$fixture" -maxdepth 1 -name '.solodock-backup.*' -print -quit | grep -q .; then
+  printf '%s\n' 'custom-layout backup created a temporary output' >&2
+  exit 1
+fi
+
+custom_restore_tree="$fixture/custom-restore-tree"
+mkdir -m 0700 "$custom_restore_tree"
+tar -C "$custom_restore_tree" -xf "$fixture/backup.tar"
+sed -i 's#^state_directory = .*#state_directory = "/srv/solodock-state"#' "$custom_restore_tree/etc/solodock/config.toml"
+tar --format=pax -C "$custom_restore_tree" -cf "$fixture/custom-restore.tar" var/lib/solodock etc/solodock/config.toml
+sha256sum "$fixture/custom-restore.tar" >"$fixture/custom-restore.tar.sha256"
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/custom-restore.tar" --checksum "$fixture/custom-restore.tar.sha256" --output "$fixture/custom-restored" --validator "$validator" >"$fixture/custom-restore.stdout" 2>"$fixture/custom-restore.stderr"; then
+  printf '%s\n' 'restore accepted a custom packaged state layout' >&2
+  exit 1
+fi
+grep -Fq 'restored configuration is not a valid packaged layout' "$fixture/custom-restore.stderr"
+[[ ! -e $fixture/custom-restored ]]
 
 race_bin="$fixture/backup-race-bin"
 mkdir -m 0700 "$race_bin"
@@ -764,7 +922,7 @@ chmod 0755 "$race_bin/tar"
 SOLODOCK_TEST_TAR_REACHED="$fixture/tar-reached" \
 SOLODOCK_TEST_TAR_CONTINUE="$fixture/tar-continue" \
 PATH="$race_bin:$PATH" \
-  ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/raced-backup.tar" >"$fixture/raced-backup.stdout" 2>"$fixture/raced-backup.stderr" &
+  ./packaging/solodock-backup --root "$fixture/root" --validator "$validator" --output "$fixture/raced-backup.tar" >"$fixture/raced-backup.stdout" 2>"$fixture/raced-backup.stderr" &
 race_pid=$!
 for _ in {1..500}; do
   [[ -e $fixture/tar-reached ]] && break
@@ -786,7 +944,7 @@ rm -f -- "$fixture/tar-reached" "$fixture/tar-continue"
 SOLODOCK_TEST_TAR_REACHED="$fixture/tar-reached" \
 SOLODOCK_TEST_TAR_CONTINUE="$fixture/tar-continue" \
 PATH="$race_bin:$PATH" \
-  ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/replaced-backup-parent/backup.tar" >"$fixture/replaced-backup.stdout" 2>"$fixture/replaced-backup.stderr" &
+  ./packaging/solodock-backup --root "$fixture/root" --validator "$validator" --output "$fixture/replaced-backup-parent/backup.tar" >"$fixture/replaced-backup.stdout" 2>"$fixture/replaced-backup.stderr" &
 race_pid=$!
 for _ in {1..500}; do
   [[ -e $fixture/tar-reached ]] && break
@@ -908,6 +1066,7 @@ publication_validator="$fixture/publication-validator"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
+  'if [[ ${1-} == inspect-packaged-config ]]; then exec "$SOLODOCK_TEST_REAL_VALIDATOR" "$@"; fi' \
   '"$SOLODOCK_TEST_REAL_VALIDATOR" "$@"' \
   ': >"$SOLODOCK_TEST_VALIDATOR_REACHED"' \
   'while [[ ! -e $SOLODOCK_TEST_VALIDATOR_CONTINUE ]]; do sleep 0.01; done' >"$publication_validator"
@@ -942,14 +1101,14 @@ PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TES
 cmp "$fixture/root/etc/solodock/config.toml" "$fixture/restored-with-version-validator/etc/solodock/config.toml"
 
 mkdir -m 0777 "$fixture/unsafe-backup-parent"
-if ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/unsafe-backup-parent/backup.tar" >"$fixture/unsafe-parent.stdout" 2>"$fixture/unsafe-parent.stderr"; then
+if ./packaging/solodock-backup --root "$fixture/root" --validator "$validator" --output "$fixture/unsafe-backup-parent/backup.tar" >"$fixture/unsafe-parent.stdout" 2>"$fixture/unsafe-parent.stderr"; then
   printf '%s\n' 'backup accepted a group/other-writable output parent' >&2
   exit 1
 fi
 [[ ! -e $fixture/unsafe-backup-parent/backup.tar ]]
 
 ln -s /tmp "$fixture/root/var/lib/solodock/unsafe-link"
-if ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/unsafe.tar" >"$fixture/unsafe.stdout" 2>"$fixture/unsafe.stderr"; then
+if ./packaging/solodock-backup --root "$fixture/root" --validator "$validator" --output "$fixture/unsafe.tar" >"$fixture/unsafe.stdout" 2>"$fixture/unsafe.stderr"; then
   printf '%s\n' 'backup accepted a symlink inside state' >&2
   exit 1
 fi

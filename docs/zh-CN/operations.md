@@ -50,6 +50,10 @@ sudo "$package/install.sh" --version "${tag#v}"
 
 package 中经过 checksum 绑定的 `INSTALL_MANIFEST` 记录其 `stable` channel、版本、source commit 与完整 package 内容身份。installer 验证 manifest 后，会准备一个不可变且以身份限定的 generation，其中同时包含 binary、manifest、updater、package verifier、backup/restore helper 与 systemd unit。它先快照所有现有公开入口，再切换 helper 和 unit，最后以 `/usr/local/bin/solodock` 作为安装身份 commit marker；事务提交前任何失败都会恢复全部入口并移除不完整 generation，确保可见 binary、helper、unit 与 manifest 始终来自同一个 package。`/usr/local/bin/solodock-restore` 默认解析同 generation 的 `solodock` sibling binary 作为 validator。backup 与 restore 输出必须位于调用管理员拥有、group/other 不可写的 canonical directory；每一级祖先必须由管理员或 root 拥有，任何可写祖先还必须具备 sticky-directory 保护。helper 会把所有临时与发布路径锚定到已检查的目录身份，在发布前后复核 path/device/inode，使用排他且不可预测的临时名，并且绝不替换已有 archive、checksum 或 restore target。除非首次安装显式使用 `--enable-now`，installer 不启动服务，也不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`；应完成配置与离线备份后再启动。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
 
+官方 packaged profile 把 config 固定为 `/etc/solodock/config.toml`、state 固定为 `/var/lib/solodock`、runtime 固定为 `/run/solodock`。`listen_address` 仍可配置，但必须是显式 loopback socket；public origin 仍可配置为 canonical HTTPS origin。Systemd unit 通过精确的 `SOLODOCK_PACKAGED_LAYOUT=1` 选择该 profile。Runtime 会在创建受管目录或打开 SQLite 前拒绝非法 marker 或路径漂移。Installer、updater、backup 与 restore 都会在自身 mutation boundary 前调用 package generation 中无副作用的 Rust config inspector，不会在 Bash 中解析或跟随任意 TOML 路径。
+
+已有自定义路径的源码部署必须先迁移，才能使用 package updater：停止旧服务，独立备份实际配置的 state 与 config，把完整 state 移到 `/var/lib/solodock` 并设置精确 `solodock:solodock` owner 和文档规定的 mode，把 config 安装到 `/etc/solodock/config.toml` 并设置 `state_directory = "/var/lib/solodock"`、`runtime_directory = "/run/solodock"`，然后先用旧 binary 在固定布局上验收，再运行 `solodock-update`。新安装验收前保留独立的迁移前备份。新版 updater 的 preflight 会在停服务前拒绝不兼容配置，它本身不能代替迁移备份。
+
 ### 已验证的 stable 与 main 升级
 
 installer 同时安装 `/usr/local/bin/solodock-update`。先由日常管理员账号完成一次登录；令牌只需具备读取仓库、Release 或 Actions artifact 与 artifact attestation 所需的权限。不要把 token 写入脚本、配置或命令行：
@@ -69,17 +73,19 @@ updater 会先复用已有或免密的 `sudo` 授权；需要密码时才在交�
 
 stable discovery 下载精确命名的 Ubuntu archive、`SHA256SUMS` 与 `SOURCE_SHA`；它把 Release tag 解析到 commit，要求 canonical tag 与 package version 一致，并针对 `.github/workflows/release.yml`、精确 tag ref、commit 与 GitHub-hosted runner 验证 checksum attestation。main discovery 则选择最新成功的 `push` CI，保留既有 `.github/workflows/ci.yml`、branch、commit 与 GitHub-hosted runner attestation policy。artifact/attestation 缺失或过期、Release identity 变化或非法，以及任何 source、version 或 checksum 不匹配都会 fail closed。
 
-discovery 之后，两个 channel 进入同一个 package validation 与 apply 路径。currentness 要求已安装 manifest 中的完整 package identity、当前不可变 generation、binary、updater、package verifier、backup/restore helper、对应受管 symlink 与 systemd unit 全部和已验证 package 一致。若只有 package identity 或 helper 变化而 binary digest 不变（包括 main→stable），updater 会事务性发布新 generation 并检查运行中服务，不停服务也不调用 binary。binary 确有变化时才停止 SoloDock，在 `/var/backups/solodock/` 创建离线控制面备份，事务性发布 stable SemVer 或 `main-<commit SHA prefix>` generation，启动并检查 loopback `/healthz` 与 `/favicon.svg`。调用新 binary 前安装失败时，只有完整恢复并验收旧 package generation 后，updater 才会重启旧服务；任何 rollback 操作或验收失败都会让 installer 返回可区分的不完整回滚状态、保留事务现场，并由 updater 保持或置为停服并给出人工恢复指引，绝不启动当前残留 link 指向的 binary。新 binary 被调用后则遵守 forward-only 门禁。临时下载在所有退出路径清理，应用容器、volume 和 bind 数据始终不在操作范围内。
+discovery 之后，两个 channel 进入同一个 package validation 与 apply 路径。在停止服务、进行离线备份或调用 installer 前，updater 会用已完整验证的下载 binary 检查 `/etc/solodock/config.toml`；custom layout 或畸形 inspector output 会直接失败，不使用 fallback 值。精确的 IPv4 或带方括号 IPv6 loopback `/healthz` URL 也来自该记录，不再有 `--health-url` override。currentness 要求已安装 manifest 中的完整 package identity、当前不可变 generation、binary、updater、package verifier、backup/restore helper、对应受管 symlink 与 systemd unit 全部和已验证 package 一致。若只有 package identity 或 helper 变化而 binary digest 不变（包括 main→stable），updater 会事务性发布新 generation 并检查运行中服务，不停服务也不调用 binary。binary 确有变化时才停止 SoloDock，在 `/var/backups/solodock/` 创建离线控制面备份，事务性发布 stable SemVer 或 `main-<commit SHA prefix>` generation，启动并检查 loopback `/healthz` 与 `/favicon.svg`。调用新 binary 前安装失败时，只有完整恢复并验收旧 package generation 后，updater 才会重启旧服务；任何 rollback 操作或验收失败都会让 installer 返回可区分的不完整回滚状态、保留事务现场，并由 updater 保持或置为停服并给出人工恢复指引，绝不启动当前残留 link 指向的 binary。新 binary 被调用后则遵守 forward-only 门禁。临时下载在所有退出路径清理，应用容器、volume 和 bind 数据始终不在操作范围内。
 
 认证后，sidebar 会读取 `/api/v1/system/installation` 并显示同一安装身份。stable 安装显示 SemVer、channel 与短 source commit；main 安装显示 `main` 与 source commit。展开条目可查看完整 source SHA 和 package identity，便于提交 issue。endpoint 每次请求都会读取固定受管 symlink 与 manifest，因此 package-only channel 变更无需重启 SoloDock，下一次页面加载即可看到。正常本地源码运行显示 `development`；受管 manifest 缺失、损坏或格式不规范时显示 `unknown`，但不会让其他控制面能力降级。公开 `/healthz` 与未认证登录页不会暴露该指纹。
 
-这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。channel、repository、main selector、备份目录或 loopback 端口细节见 `solodock-update --help`。
+这是一项管理员显式触发的维护操作，不应直接放入无人值守 timer。新 binary 一旦被尝试启动，健康失败不会自动切回旧 binary，因为 SQLite migration 是 forward-only；此时保留备份和现场，按本页与[恢复](recovery.md)流程检查。channel、repository、main selector 和备份目录选项见 `solodock-update --help`；loopback probe 地址始终来自已安装 config。
 
 GitHub **Release asset** 是长期保留的稳定分发；**Actions artifact** 是 main channel 使用、保留 30 天的开发产物；**GitHub Packages** 是 container 与语言 package 的另一套 registry，SoloDock 不向其发布，也不依赖它。
 
 ## 安全前置条件
 
 服务只监听 loopback，`public_origin` 必须是 HTTPS。外部 tunnel 或 reverse proxy、访问控制和 TLS 是部署前置条件，不由 SoloDock 配置。Proxy 必须保留 `public_origin` 的精确外部 `Host`；若改写为 loopback upstream authority，management request 会以 `404` fail closed。`Forwarded`、`X-Forwarded-Host`、`X-Original-Host` 等 header 会被有意忽略，不能提供路由 authority。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
+
+官方 unit 对 Docker 只有 `After=`/`Wants=` 顺序。socket 缺失或 daemon 停止属于受支持的 degraded 状态：SoloDock 继续运行，`/healthz`、认证、filesystem catalog 和 recovery 信息仍可用，需要 Docker 的操作继续返回具体 degraded 错误。若 `/var/run/docker.sock` 已存在，installer 仍要求它是由配置的 `docker` group 拥有的 Unix socket；普通文件、symlink 或错误 group 的 socket 绝不会按 degraded 放行。首次导入非空 legacy TOML bind roots 时，如必须观察 Docker data root 才能证明无重叠，仍保持 fail closed。
 
 启用 webhook 时还需设置不同 authority 的 `webhook_public_origin`，并在外部 WAF 只放行精确的 `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`。Webhook authority 会拒绝 UI、management API、GET 和非 canonical path；management authority 会拒绝 webhook path。签名、timestamp/nonce、重试和 202 语义见 [Webhook 说明](webhooks.md)。
 
@@ -129,5 +135,7 @@ sudo /usr/local/bin/solodock-backup --output /secure/new/solodock-control-plane.
 ```
 
 archive 含应用、Registry credential 和 webhook secret，必须按高敏数据限制读取并另行加密。它保留 immutable revision 中的 network mode 与 aliases，但不包含业务 volume、bind 数据、Docker image/container 或 network；恢复前必须单独重建所需 external network，每个工作负载也必须有独立且验证过 restore 的数据备份。
+
+Backup helper 会从自身不可变 package generation 解析 `solodock` binary，并在创建 archive 或临时输出前验证固定 packaged layout。Restore 会在修改 owner/mode 或发布目标前对解出的 config 执行同一检查。自定义路径 config 会被拒绝，不会被部分归档或静默跟随。
 
 恢复 archive 或处理 degraded/interrupted 状态前，按 [恢复](recovery.md) 的 fail-closed 流程操作；安全前提见 [威胁模型](threat-model.md)。
