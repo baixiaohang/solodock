@@ -16,13 +16,18 @@ export function appendDeduplicatedLog(
 
 export function openSse(path: string, handlers: Record<string, (event: MessageEvent<string>) => void>): EventSource {
   const source = new EventSource(path, { withCredentials: true })
-  for (const [name, handler] of Object.entries(handlers)) source.addEventListener(name, handler as EventListener)
-  source.addEventListener('stream_error', ((event: MessageEvent<string>) => {
-    try {
-      if ((JSON.parse(event.data) as { code?: string }).code === 'SESSION_EXPIRED') notifyUnauthorized()
-    } catch {
-      // Stable server events are JSON; malformed events do not reach application state.
-    }
-  }) as EventListener)
-  return source
+  try {
+    for (const [name, handler] of Object.entries(handlers)) source.addEventListener(name, handler as EventListener)
+    source.addEventListener('stream_error', ((event: MessageEvent<string>) => {
+      try {
+        if ((JSON.parse(event.data) as { code?: string }).code === 'SESSION_EXPIRED') notifyUnauthorized()
+      } catch {
+        // Stable server events are JSON; malformed events do not reach application state.
+      }
+    }) as EventListener)
+    return source
+  } catch (cause) {
+    source.close()
+    throw cause
+  }
 }

@@ -12,15 +12,76 @@
   let error: UserMessage | null = null
   let stats: Record<string, StatsSample> = {}
   let sources: EventSource[] = []
+  let controller: AbortController | undefined
+  let generation = 0
+  let disposed = false
 
-  onMount(() => { void load(); return () => sources.forEach((source) => source.close()) })
+  onMount(() => {
+    disposed = false
+    void load()
+    return () => {
+      disposed = true
+      generation += 1
+      controller?.abort()
+      controller = undefined
+      closeSources(sources)
+      sources = []
+    }
+  })
+
+  function closeSources(current: EventSource[]) {
+    current.forEach((source) => source.close())
+  }
+
+  function isCurrent(loadGeneration: number): boolean {
+    return !disposed && generation === loadGeneration
+  }
 
   async function load() {
+    if (disposed) return
+    const loadGeneration = ++generation
+    controller?.abort()
+    const loadController = new AbortController()
+    controller = loadController
     try {
-      ;[health, apps] = await Promise.all([api<SystemHealth>('/api/v1/system/health'), api<AppsResponse>('/api/v1/apps')])
-      sources.forEach((source) => source.close())
-      sources = (apps?.apps ?? []).filter((app) => app.actual).slice(0, 8).map((app) => openSse(`/api/v1/apps/${app.id}/stats`, { stats: (event) => { stats = { ...stats, [app.id]: JSON.parse(event.data) as StatsSample } } }))
-    } catch { error = localized('Could not load read-only observation data') }
+      const [loadedHealth, loadedApps] = await Promise.all([
+        api<SystemHealth>('/api/v1/system/health', { signal: loadController.signal }),
+        api<AppsResponse>('/api/v1/apps', { signal: loadController.signal }),
+      ])
+      if (!isCurrent(loadGeneration)) return
+
+      closeSources(sources)
+      sources = []
+      stats = {}
+      const nextSources: EventSource[] = []
+      try {
+        for (const app of loadedApps.apps.filter((candidate) => candidate.actual).slice(0, 8)) {
+          const source = openSse(`/api/v1/apps/${app.id}/stats`, {
+            stats: (event) => {
+              if (isCurrent(loadGeneration)) {
+                stats = { ...stats, [app.id]: JSON.parse(event.data) as StatsSample }
+              }
+            },
+          })
+          nextSources.push(source)
+        }
+      } catch (cause) {
+        closeSources(nextSources)
+        throw cause
+      }
+      if (!isCurrent(loadGeneration)) {
+        closeSources(nextSources)
+        return
+      }
+      health = loadedHealth
+      apps = loadedApps
+      sources = nextSources
+      error = null
+    } catch {
+      if (isCurrent(loadGeneration)) error = localized('Could not load read-only observation data')
+    } finally {
+      if (isCurrent(loadGeneration) && controller === loadController) controller = undefined
+    }
   }
 </script>
 

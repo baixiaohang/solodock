@@ -3,7 +3,7 @@
   import { api, mutation } from '../lib/api'
   import type { RegistryCredential } from '../lib/types'
   import { clearWriteOnlyCredential, writeOnlyRetryIdentity } from '../lib/deploymentState'
-  import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   let credentials = $state<RegistryCredential[]>([])
   let registry = $state('')
@@ -22,13 +22,26 @@
   async function create() {
     busy = true; error = null
     const request = { registry, username, secret }
-    createRetry = await writeOnlyRetryIdentity(createRetry, { registry, username }, secret)
+    let created = false
     try {
+      createRetry = await writeOnlyRetryIdentity(createRetry, { registry, username }, secret)
       await mutation('/api/v1/registry-credentials', request, { idempotencyKey: createRetry.key })
-      registry = ''; username = ''; createRetry = undefined; await load()
-    } catch { error = localized('Registry credential creation failed. Re-entering the same token can reuse the original request identity.') } finally {
-      const secretField = { secret }; clearWriteOnlyCredential(secretField); secret = secretField.secret; busy = false
+      created = true
+      registry = ''; username = ''; createRetry = undefined
+    } catch (cause) {
+      const failure = mutationFailure(createRetry, cause)
+      createRetry = failure.retry
+      error = localized(failure.outcome === 'outcome_unknown'
+        ? 'The secret mutation outcome could not be confirmed. Re-entering the same secret with unchanged fields will reuse its request identity.'
+        : 'The secret mutation was not applied. Review the current state before re-entering it; the next attempt will use a new request identity.')
+    } finally {
+      const secretField = { secret }; clearWriteOnlyCredential(secretField); secret = secretField.secret
     }
+    if (created) {
+      try { await load() }
+      catch { error = localized('The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.') }
+    }
+    busy = false
   }
   function beginRotate(item: RegistryCredential) {
     rotating = item; rotateUsername = item.username; rotateSecret = ''; rotateRetry = undefined
@@ -37,25 +50,51 @@
     if (!rotating || !rotateSecret) return
     busy = true; error = null
     const request = { expected_revision: rotating.revision, username: rotateUsername, secret_operation: 'replace', secret: rotateSecret }
-    rotateRetry = await writeOnlyRetryIdentity(rotateRetry, {
-      credentialId: rotating.id, expected_revision: rotating.revision, username: rotateUsername, secret_operation: 'replace',
-    }, rotateSecret)
+    let rotated = false
     try {
+      rotateRetry = await writeOnlyRetryIdentity(rotateRetry, {
+        credentialId: rotating.id, expected_revision: rotating.revision, username: rotateUsername, secret_operation: 'replace',
+      }, rotateSecret)
       await mutation(`/api/v1/registry-credentials/${rotating.id}`, request, { method: 'PUT', idempotencyKey: rotateRetry.key })
-      rotating = null; rotateRetry = undefined; await load()
-    } catch { error = localized('Credential rotation failed. Re-entering the same token is safe to retry.') } finally {
-      const secretField = { secret: rotateSecret }; clearWriteOnlyCredential(secretField); rotateSecret = secretField.secret; busy = false
+      rotated = true
+      rotating = null; rotateRetry = undefined
+    } catch (cause) {
+      const failure = mutationFailure(rotateRetry, cause)
+      rotateRetry = failure.retry
+      error = localized(failure.outcome === 'outcome_unknown'
+        ? 'The secret mutation outcome could not be confirmed. Re-entering the same secret with unchanged fields will reuse its request identity.'
+        : 'The secret mutation was not applied. Review the current state before re-entering it; the next attempt will use a new request identity.')
+    } finally {
+      const secretField = { secret: rotateSecret }; clearWriteOnlyCredential(secretField); rotateSecret = secretField.secret
     }
+    if (rotated) {
+      try { await load() }
+      catch { error = localized('The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.') }
+    }
+    busy = false
   }
   async function remove(item: RegistryCredential) {
     if (!window.confirm($t('Delete {registry} / {username}? The request will be rejected if an application or release still references it.', { registry: item.registry, username: item.username }))) return
     busy = true; error = null
     const request = { expected_revision: item.revision }
-    deleteRetry = retryIdentity(deleteRetry, request)
+    deleteRetry = retryIdentity(deleteRetry, { credentialId: item.id, ...request })
+    let removed = false
     try {
       await mutation(`/api/v1/registry-credentials/${item.id}`, request, { method: 'DELETE', idempotencyKey: deleteRetry.key })
-      deleteRetry = undefined; await load()
-    } catch { error = localized('The credential is in use or its state changed.') } finally { busy = false }
+      removed = true
+      deleteRetry = undefined
+    } catch (cause) {
+      const failure = mutationFailure(deleteRetry, cause)
+      deleteRetry = failure.retry
+      error = localized(failure.outcome === 'outcome_unknown'
+        ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+        : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+    }
+    if (removed) {
+      try { await load() }
+      catch { error = localized('The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.') }
+    }
+    busy = false
   }
 </script>
 

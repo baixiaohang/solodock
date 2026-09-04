@@ -31,6 +31,13 @@ function validIssues(value: unknown): value is NonNullable<ApiErrorBody['issues'
     && typeof issue.message === 'string')
 }
 
+export type MutationOutcome = 'known_not_applied' | 'outcome_unknown'
+
+interface NormalizedErrorResponse {
+  body: ApiErrorBody
+  trustedBackendEnvelope: boolean
+}
+
 function fallbackError(status: number, requestId: string): ApiErrorBody {
   return {
     code: 'HTTP_ERROR',
@@ -39,16 +46,18 @@ function fallbackError(status: number, requestId: string): ApiErrorBody {
   }
 }
 
-async function normalizeErrorResponse(response: Response): Promise<ApiErrorBody> {
+async function normalizeErrorResponse(response: Response): Promise<NormalizedErrorResponse> {
   const headerRequestId = safeRequestId(response.headers.get('X-Request-ID'))
   const fallback = fallbackError(response.status, headerRequestId ?? '')
-  if (!isJsonContentType(response.headers.get('Content-Type'))) return fallback
+  if (!isJsonContentType(response.headers.get('Content-Type'))) {
+    return { body: fallback, trustedBackendEnvelope: false }
+  }
 
   let value: unknown
   try {
     value = await response.json()
   } catch {
-    return fallback
+    return { body: fallback, trustedBackendEnvelope: false }
   }
   if (!isRecord(value)
     || typeof value.code !== 'string'
@@ -57,19 +66,26 @@ async function normalizeErrorResponse(response: Response): Promise<ApiErrorBody>
     || value.message.length === 0
     || (value.request_id !== undefined && safeRequestId(value.request_id) === undefined)
     || (value.issues !== undefined && !validIssues(value.issues))) {
-    return fallback
+    return { body: fallback, trustedBackendEnvelope: false }
   }
 
   return {
-    code: value.code,
-    message: value.message,
-    request_id: headerRequestId ?? safeRequestId(value.request_id) ?? '',
-    ...(value.issues === undefined ? {} : { issues: value.issues }),
+    body: {
+      code: value.code,
+      message: value.message,
+      request_id: headerRequestId ?? safeRequestId(value.request_id) ?? '',
+      ...(value.issues === undefined ? {} : { issues: value.issues }),
+    },
+    trustedBackendEnvelope: true,
   }
 }
 
 export class ApiError extends Error {
-  constructor(public status: number, public body: ApiErrorBody) {
+  constructor(
+    public readonly status: number,
+    public readonly body: ApiErrorBody,
+    public readonly mutationOutcome: MutationOutcome = 'outcome_unknown',
+  ) {
     super(body.message)
   }
 }
@@ -96,7 +112,14 @@ export async function api<T>(
   })
   if (!response.ok) {
     if (response.status === 401) unauthorizedHandler?.()
-    throw new ApiError(response.status, await normalizeErrorResponse(response))
+    const normalized = await normalizeErrorResponse(response)
+    throw new ApiError(
+      response.status,
+      normalized.body,
+      normalized.trustedBackendEnvelope && response.status >= 400 && response.status < 500
+        ? 'known_not_applied'
+        : 'outcome_unknown',
+    )
   }
   if (options.expectedStatus !== undefined && response.status !== options.expectedStatus) {
     throw new ApiError(response.status, {

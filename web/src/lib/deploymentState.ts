@@ -1,5 +1,5 @@
 import type { DeploymentStatus } from './types'
-import { retryIdentity, type RetryIdentity } from './mutationState'
+import { LocalMutationValidationError, retryIdentity, type RetryIdentity } from './mutationState'
 
 export function isTerminalDeployment(status: DeploymentStatus): boolean {
   return !['queued', 'running'].includes(status)
@@ -14,7 +14,12 @@ export async function writeOnlyRetryIdentity(
   publicBody: unknown,
   secret: string,
 ): Promise<RetryIdentity> {
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret))
+  let digest: ArrayBuffer
+  try {
+    digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(secret))
+  } catch {
+    throw new LocalMutationValidationError('Could not prepare the write-only retry identity')
+  }
   const secretSha256 = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
   return retryIdentity(previous, { publicBody, secretSha256 })
 }
