@@ -16,6 +16,8 @@ describe('bounded SSE state', () => {
 
   it('provides stable drift text and generic unknown fallback', () => {
     expect(driftText('IMAGE_REF_MISMATCH')).toContain('镜像')
+    expect(driftText('DEPLOYMENT_PENDING')).toBe('存在待处理的版本部署')
+    expect(driftText('ORPHAN_CONTAINER')).toBe('检测到孤立的托管容器')
     expect(driftText('FUTURE_CODE')).toBe('检测到未知漂移')
     expect(appendBounded([1, 2], 3, 2)).toEqual([2, 3])
   })
