@@ -35,6 +35,7 @@ Before the new binary is invoked, the installer transaction restores and verifie
 - **Platform-network drift:** `solodock-services` must be an internal `bridge` using host bridge `sd-services` and exact platform labels. SoloDock does not adopt a same-named unmanaged or drifted resource. Stop affected releases and have an administrator confirm the resource source before recovery.
 - **Deployment `interrupted`/`needs_attention`:** use exact pending/active/actual facts in details to retry or manually roll back. Never speculatively delete an unknown effect.
 - **Credential tombstone:** startup/background finalizers clean only when the ledger proves exact success; unknown markers fail closed.
+- **Missing finalizer proof:** do not remove an application/credential tombstone or webhook revision manually. Periodic idempotency cleanup retains proofs referenced by a complete filesystem artifact inventory and performs no deletion when that inventory fails. A missing or malformed proof remains a fail-closed recovery condition.
 - **Poll suppression:** after repairing the application/health, use manual Deploy or publish a new digest/config. Do not edit SQLite directly.
 - **Degraded webhook:** keep the endpoint fail closed. Repair owner/mode/HMAC of `webhook.toml` and its immutable secret revision, then restart. Do not edit secret metadata manually. Losing SQLite loses nonce history and wake operational state but does not fabricate webhook audit.
 

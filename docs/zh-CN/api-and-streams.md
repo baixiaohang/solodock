@@ -36,6 +36,8 @@ SoloDock 的管理 API 与嵌入式 UI 使用同一 HTTPS origin。生产进程�
 
 持久业务 mutation 必须携带 16–128 字节安全 ASCII `Idempotency-Key`。SQLite 保存 request fingerprint/HMAC、operation 状态和脱敏响应；相同 key 与相同 request 可 replay，换 body/route/method 会冲突。Registry credential 与 webhook secret 在前端 retry identity 中只保留 hash，并在后端 API 的受管 parsed buffer 中使用 zeroizing wrapper。
 
+terminal replay record 通常在 24 小时后过期，但清理是低频 service operation，不再作为无关 mutation claim 的隐藏副作用。每个有界清理批次开始前，SoloDock 都会盘点所有由 finalizer 管理的 filesystem artifact，并保留其引用的 exact operation proof。任一 application、credential 或 webhook artifact inventory 不完整或无效时，本轮清理零删除。pending 与 interrupted record 永不按时间回收。
+
 接口按稳定资源分组：
 
 - app catalog、detail、draft、validate、lifecycle 和 deletion；

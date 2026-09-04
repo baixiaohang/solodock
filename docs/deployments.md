@@ -91,4 +91,6 @@ Disabling the switch prevents future polls but does not cancel a deployment alre
 
 A signed webhook states only that the configured Registry tag may have changed. A valid request atomically records nonce claim, audit, and per-application wake sequence. The coalesced sequence wakes `PollCoordinator`, which still applies auto-deploy-disabled, backoff, busy, suppression, drift, and health-gate policies.
 
+Webhook secret revisions remain recovery artifacts until they are deleted exactly. Their creation proofs, operation temporaries, and—while stale revisions exist—the latest signed configure/rotate/revoke transition proof are excluded from ordinary 24-hour replay cleanup. A startup or background finalizer may delete stale revisions only when that transition is a successful response whose configured state and metadata/secret revision identity exactly match the current signed metadata. This also supports upgrades where an old current revision's creation proof had already expired; a missing or mismatched transition proof remains fail closed.
+
 See [webhooks](webhooks.md) for the protocol, Host isolation, and WAF constraints; [application model](application-model.md) for resources; and [operations](operations.md) and [recovery](recovery.md) for manual intervention.

@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -24,6 +25,15 @@ pub struct IdempotencyService {
     key: std::sync::Arc<KeyMaterial>,
     #[cfg(test)]
     fail_next_effect_marker: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    gc_test_gate: std::sync::Arc<std::sync::Mutex<Option<GcTestGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct GcTestGate {
+    candidates_selected: std::sync::Arc<tokio::sync::Notify>,
+    resume: std::sync::Arc<tokio::sync::Notify>,
 }
 
 #[derive(Zeroize, ZeroizeOnDrop)]
@@ -133,6 +143,8 @@ impl IdempotencyService {
             key: std::sync::Arc::new(KeyMaterial(key)),
             #[cfg(test)]
             fail_next_effect_marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            gc_test_gate: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -258,20 +270,114 @@ impl IdempotencyService {
         &self,
         store: &crate::webhook::WebhookStore,
     ) -> Result<(), IdempotencyError> {
-        for (app_id, operation_id) in store.pending_cleanup()? {
-            let route = format!("/api/v1/apps/{app_id}/webhook");
-            let row = sqlx::query("SELECT status,response_status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
-                .bind(route)
-                .bind(operation_id.to_string())
-                .fetch_optional(self.database.pool())
-                .await?;
-            match row.map(|row| (row.get::<String, _>(0), row.get::<Option<i64>, _>(1))) {
-                Some((status, Some(200))) if status == "succeeded" => {
-                    store.discard_operation_temp(app_id, operation_id)?;
-                    store.cleanup_unreferenced(app_id)?;
+        let inventory = store.recovery_inventory()?;
+        for app in inventory.apps {
+            let stale = app
+                .revisions
+                .iter()
+                .filter(|revision| !revision.current)
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                continue;
+            }
+            let route = format!("/api/v1/apps/{}/webhook", app.app_id);
+            if let Some(metadata) = app.metadata {
+                let row = sqlx::query("SELECT rowid,status,response_status,response_body FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                    .bind(&route)
+                    .bind(metadata.last_operation_id.to_string())
+                    .fetch_optional(self.database.pool())
+                    .await?;
+                let Some(row) = row else {
+                    // A v0.1.0 instance may already have collected the proof
+                    // for its long-lived current metadata. If a later rotate
+                    // published its canonical revision but crashed before
+                    // metadata publication, that exact interrupted operation
+                    // must remain resumable. Skip all cleanup for the app;
+                    // without either such an operation or transition authority
+                    // the stale state remains invalid and fail-closed.
+                    let mut resumable_operation_owned_revision = false;
+                    for revision in &stale {
+                        let own = sqlx::query("SELECT status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                            .bind(&route)
+                            .bind(revision.operation_id.to_string())
+                            .fetch_optional(self.database.pool())
+                            .await?;
+                        if own.is_some_and(|own| {
+                            matches!(own.get::<String, _>(0).as_str(), "pending" | "interrupted")
+                        }) {
+                            resumable_operation_owned_revision = true;
+                        }
+                    }
+                    if resumable_operation_owned_revision {
+                        continue;
+                    }
+                    return Err(IdempotencyError::RecordInvalid);
+                };
+                let transition_rowid = row.get::<i64, _>(0);
+                let status = row.get::<String, _>(1);
+                if matches!(status.as_str(), "pending" | "interrupted") {
+                    continue;
                 }
-                Some((status, _)) if matches!(status.as_str(), "pending" | "interrupted") => {}
-                _ => return Err(IdempotencyError::RecordInvalid),
+                let response_status = row.get::<Option<i64>, _>(2);
+                let response_body = row.get::<Option<String>, _>(3);
+                if status != "succeeded"
+                    || response_status != Some(200)
+                    || !response_body
+                        .as_deref()
+                        .is_some_and(|body| webhook_transition_response_matches(body, &metadata))
+                {
+                    return Err(IdempotencyError::RecordInvalid);
+                }
+                let mut future_operation_owned_revision = false;
+                for revision in &stale {
+                    let row = sqlx::query("SELECT rowid,status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                        .bind(&route)
+                        .bind(revision.operation_id.to_string())
+                        .fetch_optional(self.database.pool())
+                        .await?;
+                    let Some(row) = row else {
+                        // A pre-v0.1.1 creation proof may already have been
+                        // collected. The newer signed transition remains the
+                        // cleanup authority for that historical revision.
+                        continue;
+                    };
+                    let operation_rowid = row.get::<i64, _>(0);
+                    if operation_rowid < transition_rowid {
+                        continue;
+                    }
+                    if operation_rowid == transition_rowid {
+                        return Err(IdempotencyError::RecordInvalid);
+                    }
+                    match row.get::<String, _>(1).as_str() {
+                        "pending" | "interrupted" => {
+                            future_operation_owned_revision = true;
+                        }
+                        _ => return Err(IdempotencyError::RecordInvalid),
+                    }
+                }
+                if future_operation_owned_revision {
+                    // During rotate, a later canonical directory is visible
+                    // before its metadata. The older current transition must
+                    // not authorize broad cleanup of that future artifact.
+                    continue;
+                }
+                store.cleanup_unreferenced(app.app_id)?;
+            } else {
+                // A canonical revision can become visible immediately before
+                // configure publishes metadata. It remains owned by its exact
+                // operation until that request resumes; no other proof may be
+                // used to infer that the revision is disposable.
+                for revision in stale {
+                    let row = sqlx::query("SELECT status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                        .bind(&route)
+                        .bind(revision.operation_id.to_string())
+                        .fetch_optional(self.database.pool())
+                        .await?;
+                    match row.map(|row| row.get::<String, _>(0)) {
+                        Some(status) if matches!(status.as_str(), "pending" | "interrupted") => {}
+                        _ => return Err(IdempotencyError::RecordInvalid),
+                    }
+                }
             }
         }
         Ok(())
@@ -281,20 +387,22 @@ impl IdempotencyService {
         &self,
         store: &crate::webhook::WebhookStore,
     ) -> Result<(), IdempotencyError> {
-        for (app_id, operation_id) in store.operation_temps()? {
-            let route = format!("/api/v1/apps/{app_id}/webhook");
-            let row = sqlx::query("SELECT status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
-                .bind(route)
-                .bind(operation_id.to_string())
-                .fetch_optional(self.database.pool())
-                .await?;
-            match row.map(|row| row.get::<String, _>(0)) {
-                Some(status)
-                    if matches!(status.as_str(), "interrupted" | "failed" | "succeeded") =>
-                {
-                    store.discard_operation_temp(app_id, operation_id)?;
+        for app in store.recovery_inventory()?.apps {
+            let route = format!("/api/v1/apps/{}/webhook", app.app_id);
+            for operation_id in app.operation_temps {
+                let row = sqlx::query("SELECT status FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
+                    .bind(&route)
+                    .bind(operation_id.to_string())
+                    .fetch_optional(self.database.pool())
+                    .await?;
+                match row.map(|row| row.get::<String, _>(0)) {
+                    Some(status)
+                        if matches!(status.as_str(), "interrupted" | "failed" | "succeeded") =>
+                    {
+                        store.discard_operation_temp(app.app_id, operation_id)?;
+                    }
+                    _ => return Err(IdempotencyError::RecordInvalid),
                 }
-                _ => return Err(IdempotencyError::RecordInvalid),
             }
         }
         Ok(())
@@ -312,11 +420,6 @@ impl IdempotencyService {
         let now = format_time(OffsetDateTime::now_utc())?;
         let operation_id = Uuid::new_v4();
         let mut tx = self.database.pool().begin().await?;
-        let retention_cutoff = format_time(OffsetDateTime::now_utc() - time::Duration::hours(24))?;
-        sqlx::query("DELETE FROM idempotency_records WHERE rowid IN (SELECT rowid FROM idempotency_records WHERE status IN ('succeeded','failed') AND updated_at < ? ORDER BY updated_at LIMIT 100)")
-            .bind(retention_cutoff)
-            .execute(&mut *tx)
-            .await?;
         let inserted = sqlx::query("INSERT OR IGNORE INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,created_at,updated_at) VALUES ('admin',?,?,?,?, 'pending',?,?)")
             .bind(route).bind(&key_hmac).bind(request_hmac).bind(operation_id.to_string()).bind(&now).bind(&now).execute(&mut *tx).await?.rows_affected();
         if inserted == 1 {
@@ -348,6 +451,125 @@ impl IdempotencyService {
             "pending" => Err(IdempotencyError::InProgress),
             _ => Err(IdempotencyError::RecordInvalid),
         }
+    }
+
+    /// Builds a fresh, complete inventory before any terminal replay proof is collected.
+    /// A failure from any store aborts the inventory so callers cannot mistake it for an empty set.
+    pub fn protected_operation_ids(
+        &self,
+        apps: &crate::app_store::AppStore,
+        credentials: &CredentialStore,
+        webhooks: &crate::webhook::WebhookStore,
+    ) -> Result<HashSet<Uuid>, IdempotencyError> {
+        let mut protected = HashSet::new();
+        protected.extend(
+            apps.tombstones()?
+                .into_iter()
+                .map(|(_, operation_id)| operation_id),
+        );
+        protected.extend(
+            credentials
+                .tombstones()?
+                .into_iter()
+                .map(|(_, operation_id)| operation_id),
+        );
+        protected.extend(
+            webhooks
+                .recovery_inventory()?
+                .apps
+                .into_iter()
+                .flat_map(|app| {
+                    let has_stale = app.revisions.iter().any(|revision| !revision.current);
+                    let authority = has_stale
+                        .then(|| app.metadata.map(|metadata| metadata.last_operation_id))
+                        .flatten();
+                    app.revisions
+                        .into_iter()
+                        .map(|revision| revision.operation_id)
+                        .chain(app.operation_temps)
+                        .chain(authority)
+                        .collect::<Vec<_>>()
+                }),
+        );
+        Ok(protected)
+    }
+
+    /// Deletes at most 100 expired terminal replay records that have no filesystem owner.
+    pub async fn gc_terminal_records(
+        &self,
+        protected: &HashSet<Uuid>,
+    ) -> Result<u64, IdempotencyError> {
+        let retention_cutoff = format_time(OffsetDateTime::now_utc() - time::Duration::hours(24))?;
+        let candidates = sqlx::query(
+            "SELECT rowid,operation_id FROM idempotency_records WHERE status IN ('succeeded','failed') AND updated_at < ? ORDER BY updated_at",
+        )
+        .bind(&retention_cutoff)
+        .fetch_all(self.database.pool())
+        .await?;
+        let rows = candidates
+            .into_iter()
+            .filter_map(|row| {
+                let operation_id = row.get::<String, _>(1).parse::<Uuid>().ok()?;
+                (!protected.contains(&operation_id)).then(|| (row.get::<i64, _>(0), operation_id))
+            })
+            .take(100)
+            .collect::<Vec<_>>();
+
+        #[cfg(test)]
+        let test_gate = {
+            self.gc_test_gate
+                .lock()
+                .expect("GC test gate is not poisoned")
+                .take()
+        };
+        #[cfg(test)]
+        if let Some(gate) = test_gate {
+            gate.candidates_selected.notify_one();
+            gate.resume.notified().await;
+        }
+
+        let mut tx = self.database.pool().begin().await?;
+        let mut deleted = 0;
+        for (rowid, operation_id) in rows {
+            deleted += sqlx::query("DELETE FROM idempotency_records WHERE rowid=? AND operation_id=? AND status IN ('succeeded','failed') AND updated_at < ?")
+                .bind(rowid)
+                .bind(operation_id.to_string())
+                .bind(&retention_cutoff)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
+    pub async fn gc_with_artifact_inventory(
+        &self,
+        apps: &crate::app_store::AppStore,
+        credentials: &CredentialStore,
+        webhooks: &crate::webhook::WebhookStore,
+    ) -> Result<u64, IdempotencyError> {
+        let protected = self.protected_operation_ids(apps, credentials, webhooks)?;
+        self.gc_terminal_records(&protected).await
+    }
+
+    #[cfg(test)]
+    fn install_gc_test_gate(
+        &self,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        let selected = std::sync::Arc::new(tokio::sync::Notify::new());
+        let resume = std::sync::Arc::new(tokio::sync::Notify::new());
+        *self
+            .gc_test_gate
+            .lock()
+            .expect("GC test gate is not poisoned") = Some(GcTestGate {
+            candidates_selected: selected.clone(),
+            resume: resume.clone(),
+        });
+        (selected, resume)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -587,6 +809,31 @@ impl IdempotencyService {
     }
 }
 
+fn webhook_transition_response_matches(
+    body: &str,
+    metadata: &crate::webhook::WebhookMetadata,
+) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    value.get("configured").and_then(|value| value.as_bool()) == Some(metadata.enabled)
+        && value
+            .get("metadata_revision")
+            .and_then(|value| value.as_str())
+            == Some(metadata.metadata_revision.to_string().as_str())
+        && match metadata.secret_revision {
+            Some(revision) => {
+                value
+                    .get("secret_revision")
+                    .and_then(|value| value.as_str())
+                    == Some(revision.to_string().as_str())
+            }
+            None => value
+                .get("secret_revision")
+                .is_some_and(serde_json::Value::is_null),
+        }
+}
+
 fn hmac(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("32-byte HMAC key");
     mac.update(value);
@@ -632,11 +879,798 @@ mod deployment_tests {
     use crate::{
         app_store::AppStore,
         deploy::ScheduledResolvedTarget,
+        domain::{DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy, normalize_draft},
+        mutation::AppMutationCoordinator,
         registry::{CredentialStore, Platform, ResolvedImage},
         security::secret::SecretValue,
         webhook::WebhookStore,
     };
     use std::os::unix::fs::PermissionsExt;
+
+    async fn insert_old_record(
+        database: &Database,
+        operation_id: Uuid,
+        status: &str,
+        ordinal: usize,
+    ) {
+        sqlx::query("INSERT INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,response_status,response_body,created_at,updated_at) VALUES ('admin',?,?,?,?,?,200,'{}','2020-01-01T00:00:00Z','2020-01-01T00:00:00Z')")
+            .bind(format!("/fixture/{ordinal}"))
+            .bind(vec![ordinal as u8; 32])
+            .bind(vec![ordinal as u8; 32])
+            .bind(operation_id.to_string())
+            .bind(status)
+            .execute(database.pool())
+            .await
+            .unwrap();
+    }
+
+    fn configured_app(apps: &AppStore, key: &[u8], slug: &str) -> Uuid {
+        let draft = normalize_draft(
+            DraftInput {
+                display_name: slug.into(),
+                discovery_image_ref: "registry.example/app:stable".into(),
+                credential_ref: None,
+                auto_deploy_enabled: false,
+                auto_deploy_acknowledged: false,
+                poll_interval_seconds: 300,
+                stop_grace_period_seconds: 10,
+                environment: EnvironmentInput::default(),
+                files: vec![],
+                ports: vec![],
+                volumes: vec![],
+                binds: vec![],
+                owned_default_network: true,
+                service_discovery_enabled: true,
+                networks: vec![],
+                health: HealthPolicy::default(),
+            },
+            &ExistingSecrets::default(),
+            key,
+            &[],
+        )
+        .unwrap();
+        let app_id = Uuid::new_v4();
+        apps.create_app(
+            app_id,
+            slug,
+            Uuid::new_v4(),
+            Some((Uuid::new_v4(), &draft)),
+            OffsetDateTime::now_utc(),
+        )
+        .unwrap();
+        app_id
+    }
+
+    async fn claim_webhook_operation(
+        service: &IdempotencyService,
+        app_id: Uuid,
+        key: &str,
+    ) -> (String, Uuid) {
+        let route = format!("/api/v1/apps/{app_id}/webhook");
+        let operation = match service
+            .claim(&route, key, key.as_bytes(), Uuid::new_v4())
+            .await
+            .unwrap()
+        {
+            ClaimResult::New(operation) => operation,
+            _ => panic!("webhook operation must be new"),
+        };
+        (route, operation)
+    }
+
+    async fn finish_webhook_operation(
+        service: &IdempotencyService,
+        route: &str,
+        key: &str,
+        metadata: &crate::webhook::WebhookMetadata,
+    ) {
+        let body = serde_json::json!({
+            "configured": metadata.enabled,
+            "metadata_revision": metadata.metadata_revision,
+            "secret_revision": metadata.secret_revision,
+        })
+        .to_string();
+        service
+            .finish(route, key, 200, &body, None, Uuid::new_v4())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn gc_keeps_protected_and_nonterminal_records_and_deletes_at_most_one_batch() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let protected_id = Uuid::new_v4();
+        insert_old_record(&database, protected_id, "succeeded", 0).await;
+        insert_old_record(&database, Uuid::new_v4(), "pending", 1).await;
+        insert_old_record(&database, Uuid::new_v4(), "interrupted", 2).await;
+        for ordinal in 3..108 {
+            insert_old_record(&database, Uuid::new_v4(), "failed", ordinal).await;
+        }
+
+        let deleted = service
+            .gc_terminal_records(&HashSet::from([protected_id]))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 100);
+        let protected_status: String =
+            sqlx::query_scalar("SELECT status FROM idempotency_records WHERE operation_id=?")
+                .bind(protected_id.to_string())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(protected_status, "succeeded");
+        let nonterminal: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM idempotency_records WHERE status IN ('pending','interrupted')",
+        )
+        .fetch_one(database.pool())
+        .await
+        .unwrap();
+        assert_eq!(nonterminal, 2);
+    }
+
+    #[tokio::test]
+    async fn fresh_inventory_covers_every_finalizer_artifact_kind() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let key = service.integrity_key();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), key.clone(), vec![]).unwrap();
+        let credentials =
+            CredentialStore::initialize(root.path().join("registry-credentials"), key.clone())
+                .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), key.clone());
+
+        let deleted_app = apps
+            .create_app(
+                Uuid::new_v4(),
+                "deleted-app",
+                Uuid::new_v4(),
+                None,
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        let app_operation = Uuid::new_v4();
+        apps.tombstone(deleted_app.id, app_operation).unwrap();
+
+        let credential_id = Uuid::new_v4();
+        credentials
+            .create(
+                credential_id,
+                Uuid::new_v4(),
+                "registry.example",
+                "fixture",
+                &SecretValue::new("credential-secret".into()),
+            )
+            .unwrap();
+        let credential_operation = Uuid::new_v4();
+        credentials
+            .tombstone(credential_id, credential_operation)
+            .unwrap();
+
+        let webhook_app = configured_app(&apps, &key, "webhook-app");
+        let stale_revision_operation = Uuid::new_v4();
+        let first = webhooks
+            .configure(
+                webhook_app,
+                None,
+                stale_revision_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        let current_operation = Uuid::new_v4();
+        let current = webhooks
+            .configure(
+                webhook_app,
+                Some(first.metadata_revision),
+                current_operation,
+                &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into()),
+            )
+            .unwrap();
+        let temp_operation = Uuid::new_v4();
+        let temporary = apps
+            .app_directory(webhook_app)
+            .join("webhook-secret-revisions")
+            .join(format!(".solodock-webhook-tmp-{}", temp_operation.simple()));
+        std::fs::create_dir(&temporary).unwrap();
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let protected = service
+            .protected_operation_ids(&apps, &credentials, &webhooks)
+            .unwrap();
+        assert!(protected.contains(&app_operation));
+        assert!(protected.contains(&credential_operation));
+        assert!(protected.contains(&stale_revision_operation));
+        assert!(protected.contains(&current_operation));
+        assert!(protected.contains(&current.last_operation_id));
+        assert!(protected.contains(&temp_operation));
+    }
+
+    #[tokio::test]
+    async fn current_webhook_revision_proof_is_retained_with_its_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "current-proof");
+        let (route, operation) =
+            claim_webhook_operation(&service, app_id, "current-webhook-proof-0001").await;
+        let metadata = webhooks
+            .configure(
+                app_id,
+                None,
+                operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, "current-webhook-proof-0001", &metadata).await;
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(operation.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        insert_old_record(&database, Uuid::new_v4(), "failed", 240).await;
+
+        assert_eq!(
+            service
+                .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+                .await
+                .unwrap(),
+            1
+        );
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+                .bind(operation.to_string())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(retained, 1);
+    }
+
+    #[tokio::test]
+    async fn rotate_transition_proof_cleans_stale_revision_without_old_creation_proof() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "rotate-authority");
+        let (first_route, first_operation) =
+            claim_webhook_operation(&service, app_id, "webhook-first-proof-00001").await;
+        let first = webhooks
+            .configure(
+                app_id,
+                None,
+                first_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &first_route, "webhook-first-proof-00001", &first).await;
+        sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+            .bind(first_operation.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        let (route, transition) =
+            claim_webhook_operation(&service, app_id, "webhook-rotate-proof-0001").await;
+        let rotated = webhooks
+            .configure(
+                app_id,
+                Some(first.metadata_revision),
+                transition,
+                &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, "webhook-rotate-proof-0001", &rotated).await;
+        let stale_path = apps
+            .app_directory(app_id)
+            .join("webhook-secret-revisions")
+            .join(first_operation.to_string());
+        assert!(stale_path.exists());
+
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(transition.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            service
+                .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+                .await
+                .unwrap(),
+            0
+        );
+        let restarted = IdempotencyService::initialize(database, root.path()).unwrap();
+        restarted
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .unwrap();
+        assert!(!stale_path.exists());
+    }
+
+    #[tokio::test]
+    async fn revoke_transition_proof_authorizes_cleanup_but_identity_mismatch_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "revoke-authority");
+        let (first_route, first_operation) =
+            claim_webhook_operation(&service, app_id, "webhook-revoke-first-001").await;
+        let first = webhooks
+            .configure(
+                app_id,
+                None,
+                first_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &first_route, "webhook-revoke-first-001", &first).await;
+        sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+            .bind(first_operation.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let (route, transition) =
+            claim_webhook_operation(&service, app_id, "webhook-revoke-proof-0001").await;
+        let revoked = webhooks
+            .revoke(app_id, first.metadata_revision, transition)
+            .unwrap();
+        service
+            .finish(
+                &route,
+                "webhook-revoke-proof-0001",
+                200,
+                &serde_json::json!({
+                    "configured": false,
+                    "metadata_revision": Uuid::new_v4(),
+                    "secret_revision": null,
+                })
+                .to_string(),
+                None,
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        let stale_path = apps
+            .app_directory(app_id)
+            .join("webhook-secret-revisions")
+            .join(first_operation.to_string());
+        assert!(
+            service
+                .finalize_succeeded_webhook_revisions(&webhooks)
+                .await
+                .is_err()
+        );
+        assert!(stale_path.exists());
+
+        sqlx::query("UPDATE idempotency_records SET response_body=? WHERE operation_id=?")
+            .bind(
+                serde_json::json!({
+                    "configured": false,
+                    "metadata_revision": revoked.metadata_revision,
+                    "secret_revision": null,
+                })
+                .to_string(),
+            )
+            .bind(transition.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        service
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .unwrap();
+        assert!(!stale_path.exists());
+    }
+
+    #[tokio::test]
+    async fn canonical_revision_without_metadata_keeps_its_exact_interrupted_proof() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "canonical-crash");
+        let (route, operation) =
+            claim_webhook_operation(&service, app_id, "webhook-crash-window-0001").await;
+        webhooks
+            .configure(
+                app_id,
+                None,
+                operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        std::fs::remove_file(apps.app_directory(app_id).join("webhook.toml")).unwrap();
+        service
+            .mark_interrupted(&route, "webhook-crash-window-0001", Uuid::new_v4())
+            .await
+            .unwrap();
+        service
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .unwrap();
+        let artifact = apps
+            .app_directory(app_id)
+            .join("webhook-secret-revisions")
+            .join(operation.to_string());
+        assert!(artifact.exists());
+        assert_eq!(
+            service
+                .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+                .await
+                .unwrap(),
+            0
+        );
+        sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+            .bind(operation.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        assert!(
+            service
+                .finalize_succeeded_webhook_revisions(&webhooks)
+                .await
+                .is_err()
+        );
+        assert!(artifact.exists());
+    }
+
+    #[tokio::test]
+    async fn upgrade_missing_current_proof_allows_pre_metadata_rotate_to_resume() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "rotate-crash-window");
+        let (route, first_operation) =
+            claim_webhook_operation(&service, app_id, "rotate-crash-first-key-01").await;
+        let first = webhooks
+            .configure(
+                app_id,
+                None,
+                first_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, "rotate-crash-first-key-01", &first).await;
+        let metadata_path = apps.app_directory(app_id).join("webhook.toml");
+        let old_metadata = std::fs::read(&metadata_path).unwrap();
+        // v0.1.0 could collect the proof for a webhook that remained current
+        // for more than 24 hours before this instance was upgraded.
+        sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+            .bind(first_operation.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+
+        let rotate_key = "rotate-crash-second-key-01";
+        let (_, rotate_operation) = claim_webhook_operation(&service, app_id, rotate_key).await;
+        let second_secret = SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into());
+        webhooks
+            .configure(
+                app_id,
+                Some(first.metadata_revision),
+                rotate_operation,
+                &second_secret,
+            )
+            .unwrap();
+        crate::app_store::atomic::AtomicWriter::write(&metadata_path, &old_metadata, 0o600)
+            .unwrap();
+        service
+            .mark_interrupted(&route, rotate_key, Uuid::new_v4())
+            .await
+            .unwrap();
+        let rotate_artifact = apps
+            .app_directory(app_id)
+            .join("webhook-secret-revisions")
+            .join(rotate_operation.to_string());
+
+        service
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .unwrap();
+        assert!(rotate_artifact.exists());
+        let protected = service
+            .protected_operation_ids(&apps, &credentials, &webhooks)
+            .unwrap();
+        assert!(protected.contains(&rotate_operation));
+        assert!(matches!(
+            service
+                .claim(&route, rotate_key, rotate_key.as_bytes(), Uuid::new_v4())
+                .await
+                .unwrap(),
+            ClaimResult::Resume(operation) if operation == rotate_operation
+        ));
+        let resumed = webhooks
+            .configure(
+                app_id,
+                Some(first.metadata_revision),
+                rotate_operation,
+                &second_secret,
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, rotate_key, &resumed).await;
+        service
+            .finalize_succeeded_webhook_revisions(&webhooks)
+            .await
+            .unwrap();
+        assert!(rotate_artifact.exists());
+        assert!(webhooks.load_current(app_id).is_ok());
+        assert!(
+            !apps
+                .app_directory(app_id)
+                .join("webhook-secret-revisions")
+                .join(first_operation.to_string())
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_cleanup_filesystem_failure_retains_proof_until_restart_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "cleanup-failure");
+        let (route, first_operation) =
+            claim_webhook_operation(&service, app_id, "cleanup-failure-first-001").await;
+        let first = webhooks
+            .configure(
+                app_id,
+                None,
+                first_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, "cleanup-failure-first-001", &first).await;
+        // Metadata A is durable, but its response finish was uncertain. The
+        // later successful transition must supersede this older interrupted
+        // creation proof.
+        sqlx::query("UPDATE idempotency_records SET status='interrupted',response_status=NULL,response_body=NULL WHERE operation_id=?")
+            .bind(first_operation.to_string())
+            .execute(database.pool())
+            .await
+            .unwrap();
+        let transition_key = "cleanup-failure-rotate-01";
+        let (_, transition) = claim_webhook_operation(&service, app_id, transition_key).await;
+        let rotated = webhooks
+            .configure(
+                app_id,
+                Some(first.metadata_revision),
+                transition,
+                &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into()),
+            )
+            .unwrap();
+        finish_webhook_operation(&service, &route, transition_key, &rotated).await;
+        let stale = apps
+            .app_directory(app_id)
+            .join("webhook-secret-revisions")
+            .join(first_operation.to_string());
+        webhooks.fail_next_cleanup_remove_for_test();
+        assert!(
+            service
+                .finalize_succeeded_webhook_revisions(&webhooks)
+                .await
+                .is_err()
+        );
+        assert!(stale.exists());
+
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(transition.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        insert_old_record(&database, Uuid::new_v4(), "failed", 246).await;
+        assert_eq!(
+            service
+                .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+                .await
+                .unwrap(),
+            1
+        );
+        let proof: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+                .bind(transition.to_string())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(proof, 1);
+
+        let restarted = IdempotencyService::initialize(database, root.path()).unwrap();
+        let restarted_webhooks = WebhookStore::new(apps, restarted.integrity_key());
+        restarted
+            .finalize_succeeded_webhook_revisions(&restarted_webhooks)
+            .await
+            .unwrap();
+        assert!(!stale.exists());
+    }
+
+    #[tokio::test]
+    async fn catalog_guard_serializes_inventory_delete_and_webhook_transition() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let credentials = CredentialStore::initialize(
+            root.path().join("registry-credentials"),
+            service.integrity_key(),
+        )
+        .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        let app_id = configured_app(&apps, &service.integrity_key(), "inventory-race");
+        let initial_operation = Uuid::new_v4();
+        let first = webhooks
+            .configure(
+                app_id,
+                None,
+                initial_operation,
+                &SecretValue::new("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into()),
+            )
+            .unwrap();
+        insert_old_record(&database, Uuid::new_v4(), "failed", 245).await;
+        let runtime = root.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let coordinator = AppMutationCoordinator::new(runtime).unwrap();
+        let (selected, resume) = service.install_gc_test_gate();
+
+        let gc_service = service.clone();
+        let gc_apps = apps.clone();
+        let gc_credentials = credentials.clone();
+        let gc_webhooks = webhooks.clone();
+        let gc_coordinator = coordinator.clone();
+        let gc = tokio::spawn(async move {
+            let _catalog = gc_coordinator.catalog_lock().await;
+            gc_service
+                .gc_with_artifact_inventory(&gc_apps, &gc_credentials, &gc_webhooks)
+                .await
+                .unwrap()
+        });
+        selected.notified().await;
+
+        let transitioned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transition_seen = transitioned.clone();
+        let transition_store = webhooks.clone();
+        let transition_coordinator = coordinator.clone();
+        let transition = Uuid::new_v4();
+        let rotate = tokio::spawn(async move {
+            let _catalog = transition_coordinator.catalog_lock().await;
+            transition_store
+                .configure(
+                    app_id,
+                    Some(first.metadata_revision),
+                    transition,
+                    &SecretValue::new("Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA".into()),
+                )
+                .unwrap();
+            transition_seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert!(!transitioned.load(std::sync::atomic::Ordering::SeqCst));
+
+        resume.notify_one();
+        assert_eq!(gc.await.unwrap(), 1);
+        rotate.await.unwrap();
+        assert!(transitioned.load(std::sync::atomic::Ordering::SeqCst));
+        let protected = service
+            .protected_operation_ids(&apps, &credentials, &webhooks)
+            .unwrap();
+        assert!(protected.contains(&initial_operation));
+        assert!(protected.contains(&transition));
+    }
+
+    #[tokio::test]
+    async fn inventory_failure_prevents_every_gc_delete() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let database = Database::open(&root.path().join("state.sqlite3"))
+            .await
+            .unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        let key = service.integrity_key();
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), key.clone(), vec![]).unwrap();
+        let credentials =
+            CredentialStore::initialize(root.path().join("registry-credentials"), key.clone())
+                .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), key);
+        insert_old_record(&database, Uuid::new_v4(), "failed", 0).await;
+        std::fs::create_dir_all(apps.apps_directory().join(".trash").join("invalid-entry"))
+            .unwrap();
+
+        assert!(
+            service
+                .gc_with_artifact_inventory(&apps, &credentials, &webhooks)
+                .await
+                .is_err()
+        );
+        let records: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records")
+            .fetch_one(database.pool())
+            .await
+            .unwrap();
+        assert_eq!(records, 1);
+    }
 
     #[tokio::test]
     async fn startup_discards_only_ledger_owned_webhook_operation_temps() {
@@ -645,7 +1679,7 @@ mod deployment_tests {
         let database = Database::open(&root.path().join("state.sqlite3"))
             .await
             .unwrap();
-        let service = IdempotencyService::initialize(database, root.path()).unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
         let apps =
             AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
                 .unwrap();
@@ -850,7 +1884,7 @@ mod deployment_tests {
         let database = Database::open(&root.path().join("state.sqlite3"))
             .await
             .unwrap();
-        let service = IdempotencyService::initialize(database, root.path()).unwrap();
+        let service = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
         let store = CredentialStore::initialize(
             root.path().join("registry-credentials"),
             service.integrity_key(),
@@ -898,7 +1932,7 @@ mod deployment_tests {
         }
 
         let first_id = Uuid::new_v4();
-        let (_, first_tombstone) =
+        let (first_operation, first_tombstone) =
             completed_deletion(&service, &store, first_id, "credential-delete-remove-0001").await;
         store.fail_next_finalize_remove_for_test();
         assert!(
@@ -908,7 +1942,36 @@ mod deployment_tests {
                 .is_err()
         );
         assert!(first_tombstone.exists());
-        service
+
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(first_operation.to_string())
+        .execute(database.pool())
+        .await
+        .unwrap();
+        insert_old_record(&database, Uuid::new_v4(), "failed", 91).await;
+        let apps =
+            AppStore::initialize_managed(root.path().join("apps"), service.integrity_key(), vec![])
+                .unwrap();
+        let webhooks = WebhookStore::new(apps.clone(), service.integrity_key());
+        assert_eq!(
+            service
+                .gc_with_artifact_inventory(&apps, &store, &webhooks)
+                .await
+                .unwrap(),
+            1
+        );
+        let proof_status: String =
+            sqlx::query_scalar("SELECT status FROM idempotency_records WHERE operation_id=?")
+                .bind(first_operation.to_string())
+                .fetch_one(database.pool())
+                .await
+                .unwrap();
+        assert_eq!(proof_status, "succeeded");
+
+        let restarted = IdempotencyService::initialize(database.clone(), root.path()).unwrap();
+        restarted
             .finalize_succeeded_credential_tombstones(&store)
             .await
             .unwrap();

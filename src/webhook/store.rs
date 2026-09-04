@@ -60,10 +60,32 @@ pub struct LoadedWebhook {
     pub secret: SecretValue,
 }
 
+#[derive(Clone, Debug)]
+pub struct WebhookRecoveryInventory {
+    pub apps: Vec<WebhookRecoveryApp>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WebhookRecoveryApp {
+    pub app_id: Uuid,
+    pub metadata: Option<WebhookMetadata>,
+    pub revisions: Vec<WebhookRecoveryRevision>,
+    pub operation_temps: Vec<Uuid>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WebhookRecoveryRevision {
+    pub revision_id: Uuid,
+    pub operation_id: Uuid,
+    pub current: bool,
+}
+
 #[derive(Clone)]
 pub struct WebhookStore {
     apps: AppStore,
     key: Arc<Vec<u8>>,
+    #[cfg(test)]
+    fail_next_cleanup_remove: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WebhookStore {
@@ -71,6 +93,8 @@ impl WebhookStore {
         Self {
             apps,
             key: Arc::new(key),
+            #[cfg(test)]
+            fail_next_cleanup_remove: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -427,75 +451,30 @@ impl WebhookStore {
             };
             if remove {
                 check_private_tree(self.apps.apps_directory(), &entry.path(), true)?;
+                #[cfg(test)]
+                if self
+                    .fail_next_cleanup_remove
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(std::io::Error::other("injected webhook cleanup failure").into());
+                }
                 fs::remove_dir_all(entry.path())?;
             }
         }
         sync_directory(&revisions)
     }
 
-    pub fn pending_cleanup(&self) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
-        let mut values = Vec::new();
-        for entry in fs::read_dir(self.apps.apps_directory())? {
-            let entry = entry?;
-            let Some(app_id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|value| value.parse::<Uuid>().ok())
-            else {
-                continue;
-            };
-            if entry.file_name() != std::ffi::OsStr::new(&app_id.to_string()) {
-                continue;
-            }
-            let metadata = match self.load_metadata(app_id) {
-                Ok(value) => Some(value),
-                Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
-                // A damaged optional webhook substate remains fail closed and
-                // is repairable through management APIs. Never infer a
-                // cleanup set from metadata that could not be authenticated.
-                Err(StoreError::ContentInvalid | StoreError::Permission(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            let revisions = entry.path().join("webhook-secret-revisions");
-            let revisions = match fs::read_dir(revisions) {
-                Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            for revision in revisions {
-                let revision = revision?;
-                let text = revision.file_name().to_string_lossy().into_owned();
-                if let Some(simple) = text.strip_prefix(".solodock-webhook-tmp-") {
-                    check_private_tree(self.apps.apps_directory(), &revision.path(), true)?;
-                    let operation =
-                        Uuid::parse_str(simple).map_err(|_| StoreError::ContentInvalid)?;
-                    if simple != operation.simple().to_string() {
-                        return Err(StoreError::ContentInvalid);
-                    }
-                    values.push((app_id, operation));
-                    continue;
-                }
-                let revision_id = Uuid::parse_str(&text).map_err(|_| StoreError::ContentInvalid)?;
-                if text != revision_id.to_string() {
-                    return Err(StoreError::ContentInvalid);
-                }
-                if metadata.as_ref().and_then(|value| value.secret_revision) == Some(revision_id) {
-                    continue;
-                }
-                self.load_revision(app_id, revision_id, None)?;
-                let revision: SecretRevision =
-                    toml::from_str(&fs::read_to_string(revision.path().join("revision.toml"))?)
-                        .map_err(|_| StoreError::ContentInvalid)?;
-                values.push((app_id, revision.operation_id));
-            }
-        }
-        values.sort_unstable();
-        values.dedup();
-        Ok(values)
+    #[cfg(test)]
+    pub(crate) fn fail_next_cleanup_remove_for_test(&self) {
+        self.fail_next_cleanup_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    pub fn operation_temps(&self) -> Result<Vec<(Uuid, Uuid)>, StoreError> {
-        let mut values = Vec::new();
+    /// Returns one integrity-checked view of every webhook artifact that can
+    /// depend on an idempotency proof. GC and finalizers must share this view
+    /// so damaged metadata can never be interpreted as an empty dependency set.
+    pub fn recovery_inventory(&self) -> Result<WebhookRecoveryInventory, StoreError> {
+        let mut apps = Vec::new();
         for entry in fs::read_dir(self.apps.apps_directory())? {
             let entry = entry?;
             let Some(app_id) = entry
@@ -513,33 +492,82 @@ impl WebhookStore {
                 return Err(StoreError::SymlinkBoundary);
             }
             check_private_tree(self.apps.apps_directory(), &entry.path(), true)?;
-            let revisions = entry.path().join("webhook-secret-revisions");
-            let revisions = match fs::read_dir(revisions) {
+            let metadata = match self.load_metadata(app_id) {
+                Ok(value) => Some(value),
+                Err(StoreError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            let revisions_path = entry.path().join("webhook-secret-revisions");
+            let revisions = match fs::read_dir(&revisions_path) {
                 Ok(value) => value,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if metadata
+                        .as_ref()
+                        .is_some_and(|value| value.secret_revision.is_some())
+                    {
+                        return Err(StoreError::ContentInvalid);
+                    }
+                    continue;
+                }
                 Err(error) => return Err(error.into()),
             };
+            check_private_tree(self.apps.apps_directory(), &revisions_path, true)?;
+            let mut canonical = Vec::new();
+            let mut operation_temps = Vec::new();
+            let mut found_current = metadata
+                .as_ref()
+                .and_then(|value| value.secret_revision)
+                .is_none();
             for revision in revisions {
                 let revision = revision?;
+                let file_type = revision.file_type()?;
+                if file_type.is_symlink() || !file_type.is_dir() {
+                    return Err(StoreError::SymlinkBoundary);
+                }
                 let text = revision.file_name().to_string_lossy().into_owned();
-                let Some(simple) = text.strip_prefix(".solodock-webhook-tmp-") else {
+                if let Some(simple) = text.strip_prefix(".solodock-webhook-tmp-") {
+                    check_private_tree(self.apps.apps_directory(), &revision.path(), true)?;
+                    let operation =
+                        Uuid::parse_str(simple).map_err(|_| StoreError::ContentInvalid)?;
+                    if simple != operation.simple().to_string() {
+                        return Err(StoreError::ContentInvalid);
+                    }
+                    validate_revision_directory_entries(
+                        self.apps.apps_directory(),
+                        &revision.path(),
+                        true,
+                    )?;
+                    operation_temps.push(operation);
                     continue;
-                };
-                let operation = Uuid::parse_str(simple).map_err(|_| StoreError::ContentInvalid)?;
-                if simple != operation.simple().to_string() {
+                }
+                let revision_id = Uuid::parse_str(&text).map_err(|_| StoreError::ContentInvalid)?;
+                if text != revision_id.to_string() {
                     return Err(StoreError::ContentInvalid);
                 }
-                check_private_tree(self.apps.apps_directory(), &revision.path(), true)?;
-                validate_revision_directory_entries(
-                    self.apps.apps_directory(),
-                    &revision.path(),
-                    true,
-                )?;
-                values.push((app_id, operation));
+                let (record, _) = self.load_revision_record(app_id, revision_id, None)?;
+                let current =
+                    metadata.as_ref().and_then(|value| value.secret_revision) == Some(revision_id);
+                found_current |= current;
+                canonical.push(WebhookRecoveryRevision {
+                    revision_id,
+                    operation_id: record.operation_id,
+                    current,
+                });
             }
+            if !found_current {
+                return Err(StoreError::ContentInvalid);
+            }
+            canonical.sort_unstable_by_key(|value| value.revision_id);
+            operation_temps.sort_unstable();
+            apps.push(WebhookRecoveryApp {
+                app_id,
+                metadata,
+                revisions: canonical,
+                operation_temps,
+            });
         }
-        values.sort_unstable();
-        Ok(values)
+        apps.sort_unstable_by_key(|value| value.app_id);
+        Ok(WebhookRecoveryInventory { apps })
     }
 
     pub fn discard_operation_temp(
@@ -616,12 +644,23 @@ impl WebhookStore {
         revision_id: Uuid,
         metadata: Option<&WebhookMetadata>,
     ) -> Result<SecretValue, StoreError> {
+        self.load_revision_record(app_id, revision_id, metadata)
+            .map(|(_, secret)| secret)
+    }
+
+    fn load_revision_record(
+        &self,
+        app_id: Uuid,
+        revision_id: Uuid,
+        metadata: Option<&WebhookMetadata>,
+    ) -> Result<(SecretRevision, SecretValue), StoreError> {
         let directory = self
             .apps
             .app_directory(app_id)
             .join("webhook-secret-revisions")
             .join(revision_id.to_string());
         check_private_tree(self.apps.apps_directory(), &directory, true)?;
+        validate_revision_directory_entries(self.apps.apps_directory(), &directory, false)?;
         let revision_path = directory.join("revision.toml");
         check_private_tree(self.apps.apps_directory(), &revision_path, false)?;
         let revision: SecretRevision = toml::from_str(&fs::read_to_string(revision_path)?)
@@ -649,7 +688,7 @@ impl WebhookStore {
             return Err(StoreError::ContentInvalid);
         }
         let value = SecretValue::new(URL_SAFE_NO_PAD.encode(&raw));
-        Ok(value)
+        Ok((revision, value))
     }
 
     fn sign_metadata(&self, value: &WebhookMetadata) -> String {

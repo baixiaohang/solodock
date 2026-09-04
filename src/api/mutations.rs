@@ -862,15 +862,22 @@ pub fn start_projection_reconciler(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut gc_interval = tokio::time::interval(Duration::from_secs(60 * 60));
         loop {
-            tokio::select! {
+            let run_gc = tokio::select! {
                 () = cancellation.cancelled() => break,
-                () = state.m3.as_ref().expect("M3 services configured").reconcile_notify.notified() => {},
-                () = tokio::time::sleep(Duration::from_secs(2)) => {},
-            }
+                () = state.m3.as_ref().expect("M3 services configured").reconcile_notify.notified() => false,
+                () = tokio::time::sleep(Duration::from_secs(2)) => false,
+                _ = gc_interval.tick() => true,
+            };
             let Some(services) = state.m3.as_deref() else {
                 break;
             };
+            // Finalizers and proof-aware GC mutate or retire the same
+            // filesystem dependencies as API mutations. Keep the shared
+            // coordinator guard through inventory, candidate selection, and
+            // the bounded DELETE commit.
+            let _catalog = services.coordinator.catalog_lock().await;
             if services.projection_degraded.load(Ordering::Acquire) {
                 let outcome = refresh_outcome(&state, services).await;
                 if outcome.catalog_published {
@@ -931,6 +938,15 @@ pub fn start_projection_reconciler(
                     services.projection_degraded.store(true, Ordering::Release);
                     services.reconcile_notify.notify_one();
                 }
+            }
+            if run_gc
+                && let (Some(m4), Some(webhooks)) = (state.m4.as_deref(), state.webhooks.as_deref())
+                && let Err(error) = services
+                    .idempotency
+                    .gc_with_artifact_inventory(&services.store, &m4.credentials, &webhooks.store)
+                    .await
+            {
+                tracing::warn!(error = %error, "idempotency garbage collection skipped");
             }
         }
     })
@@ -2143,6 +2159,7 @@ pub async fn delete_app(
         body,
     } = claim
     {
+        let _catalog = services.coordinator.catalog_lock().await;
         let tombstone = services.store.tombstone_path(app_id, operation_id);
         if std::fs::symlink_metadata(&tombstone).is_ok() {
             let publication = publish_deletion(&state, services, app_id).await;
