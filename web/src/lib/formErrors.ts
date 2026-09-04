@@ -1,5 +1,6 @@
 import { ApiError } from './api'
 import { messageText, translate, type Translate, type UserMessage } from './i18n'
+import { LocalMutationValidationError } from './mutationState'
 
 export interface FormIssue {
   path: string
@@ -7,7 +8,7 @@ export interface FormIssue {
   message: UserMessage
 }
 
-export class FormValidationError extends Error {
+export class FormValidationError extends LocalMutationValidationError {
   constructor(public issues: FormIssue[]) {
     super(issues[0] ? messageText(issues[0].message) : 'The form is invalid')
   }

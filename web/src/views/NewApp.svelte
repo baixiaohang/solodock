@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { api, mutation } from '../lib/api'
-  import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import type { AppMutationResponse, SettingsResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   let slug = $state('')
@@ -14,7 +14,13 @@
   async function submit() {
     const request = { slug }; retry = retryIdentity(retry, request); busy = true; error = null
     try { const result = await mutation<AppMutationResponse>('/api/v1/apps', request, { idempotencyKey: retry.key }); retry = undefined; window.location.hash = `/apps/${result.app.id}` }
-    catch { error = localized('The service name is invalid or already exists, or the result is uncertain. A retry will reuse the same idempotency key.') } finally { busy = false }
+    catch (cause) {
+      const failure = mutationFailure(retry, cause)
+      retry = failure.retry
+      error = localized(failure.outcome === 'outcome_unknown'
+        ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+        : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+    } finally { busy = false }
   }
 </script>
 <main class="page-shell narrow"><a class="back" href="#/">← {$t('Back to application console')}</a><div class="page-heading"><div><p class="eyebrow">{$t('CREATE')}</p><h1>{$t('New service')}</h1><p class="muted">{$t('Register the service name first, then configure and deploy it.')}</p></div></div>

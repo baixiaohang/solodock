@@ -62,6 +62,7 @@ function configuredApp(id: string, name: string) {
 
 afterEach(() => {
   cleanup()
+  vi.useRealTimers()
   MockEventSource.instances = []
   auth.set({ kind: 'loading' })
   window.location.hash = ''
@@ -112,6 +113,53 @@ describe('route resource identity', () => {
 
     await userEvent.setup().click(screen.getByRole('button', { name: '启动' }))
     await waitFor(() => expect(mutationUrls).toEqual([`/api/v1/apps/${appB.id}/actions/start`]))
+  })
+
+  it('applies known-versus-unknown retry semantics to a manual lifecycle key', async () => {
+    const currentApp = appDetail('00000000-0000-4000-8000-000000000003', 'Lifecycle App')
+    const keys: string[] = []
+    let mutationCount = 0
+
+    vi.stubGlobal('EventSource', MockEventSource)
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })))
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/v1/me')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/system/installation')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/settings')) return new Response(JSON.stringify(settings), { status: 200 })
+      if (url.endsWith('/registry-credentials')) return new Response('[]', { status: 200 })
+      if (url.endsWith('/webhook')) return new Response('{}', { status: 404 })
+      if (url.endsWith('/deployments?limit=20')) return new Response(JSON.stringify({ items: [], next_cursor: null }), { status: 200 })
+      if (url.endsWith(`/apps/${currentApp.id}/actions/start`) && init?.method === 'POST') {
+        keys.push(new Headers(init.headers).get('Idempotency-Key') ?? '')
+        mutationCount += 1
+        if (mutationCount === 1) throw new TypeError('connection reset')
+        if (mutationCount === 2 || mutationCount === 5) return new Response(JSON.stringify({ code: 'CONFLICT', message: 'safe conflict', request_id: `known-${mutationCount}` }), { status: 409, headers: { 'Content-Type': 'application/json' } })
+        if (mutationCount === 3) return new Response(JSON.stringify({ code: 'INTERNAL_ERROR', message: 'safe failure', request_id: 'unknown-500' }), { status: 500, headers: { 'Content-Type': 'application/json' } })
+        return new Response('{}', { status: 200 })
+      }
+      if (url.endsWith(`/apps/${currentApp.id}`)) return new Response(JSON.stringify(currentApp), { status: 200 })
+      throw new Error(`unexpected request: ${url}`)
+    }))
+    let sequence = 0
+    vi.stubGlobal('crypto', { randomUUID: () => `00000000-0000-4000-8000-${String(++sequence).padStart(12, '0')}` })
+
+    window.location.hash = `#/apps/${currentApp.id}`
+    auth.set({ kind: 'authenticated', me: { username: 'admin', session: { created_at: '', expires_at: '' } } })
+    render(App)
+    expect(await screen.findByText('Lifecycle App')).toBeTruthy()
+    const user = userEvent.setup()
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      await user.click(screen.getByRole('button', { name: '启动' }))
+      await waitFor(() => expect(keys).toHaveLength(attempt))
+    }
+
+    expect(keys[0]).toBe(keys[1])
+    expect(keys[2]).not.toBe(keys[1])
+    expect(keys[2]).toBe(keys[3])
+    expect(keys[4]).not.toBe(keys[3])
+    expect(sequence).toBe(3)
   })
 
   it('remounts deployment details so polling and rollback stay bound to B', async () => {
@@ -180,6 +228,97 @@ describe('route resource identity', () => {
     await userEvent.setup().click(screen.getByRole('button', { name: /Roll back|回滚/ }))
     await waitFor(() => expect(mutationUrls).toEqual([`/api/v1/deployments/${deploymentB}/rollback`]))
     expect(requestedDeployments).toEqual([deploymentA, deploymentB])
+  })
+
+  it('cancels an already scheduled A deployment poll when switching to terminal B', async () => {
+    vi.useFakeTimers()
+    const deploymentA = '00000000-0000-4000-8000-000000000013'
+    const deploymentB = '00000000-0000-4000-8000-000000000014'
+    const requests: string[] = []
+
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })))
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith('/api/v1/me')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/system/installation')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/settings')) return new Response(JSON.stringify(settings), { status: 200 })
+      if (url.endsWith(`/deployments/${deploymentA}`)) {
+        requests.push(deploymentA)
+        return new Response(JSON.stringify({
+          id: deploymentA, app_id: '00000000-0000-4000-8000-000000000021', status: 'running', phase: 'deploying',
+          trigger: 'manual', transitions: [], warnings: [], available_actions: [],
+        }), { status: 200 })
+      }
+      if (url.endsWith(`/deployments/${deploymentB}`)) {
+        requests.push(deploymentB)
+        return new Response(JSON.stringify({
+          id: deploymentB, app_id: '00000000-0000-4000-8000-000000000022', status: 'failed', phase: 'terminal',
+          trigger: 'manual', transitions: [], warnings: [], available_actions: [],
+        }), { status: 200 })
+      }
+      throw new Error(`unexpected request: ${url}`)
+    }))
+
+    window.location.hash = `#/deployments/${deploymentA}`
+    auth.set({ kind: 'authenticated', me: { username: 'admin', session: { created_at: '', expires_at: '' } } })
+    render(App)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requests).toEqual([deploymentA])
+
+    window.location.hash = `#/deployments/${deploymentB}`
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(requests).toEqual([deploymentA, deploymentB])
+
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(requests).toEqual([deploymentA, deploymentB])
+  })
+
+  it('does not continue a pending rollback lookup after switching deployments', async () => {
+    const deploymentA = '00000000-0000-4000-8000-000000000015'
+    const deploymentB = '00000000-0000-4000-8000-000000000016'
+    const appA = appDetail('00000000-0000-4000-8000-000000000023', 'App A')
+    let resolveLookup!: (response: Response) => void
+    const lookup = new Promise<Response>((resolve) => { resolveLookup = resolve })
+    const rollbackRequests: string[] = []
+
+    vi.stubGlobal('confirm', vi.fn(() => true))
+    vi.stubGlobal('matchMedia', vi.fn(() => ({ matches: false, addEventListener() {}, removeEventListener() {} })))
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/api/v1/me')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/system/installation')) return new Response('{}', { status: 200 })
+      if (url.endsWith('/api/v1/settings')) return new Response(JSON.stringify(settings), { status: 200 })
+      if (url.endsWith(`/deployments/${deploymentA}/rollback`) && init?.method === 'POST') {
+        rollbackRequests.push(url)
+        return new Response(JSON.stringify({ deployment_id: deploymentA }), { status: 202 })
+      }
+      if (url.endsWith(`/deployments/${deploymentA}`)) return new Response(JSON.stringify({
+        id: deploymentA, app_id: appA.id, status: 'failed', phase: 'terminal', trigger: 'manual',
+        transitions: [], warnings: [], available_actions: ['rollback'],
+      }), { status: 200 })
+      if (url.endsWith(`/deployments/${deploymentB}`)) return new Response(JSON.stringify({
+        id: deploymentB, app_id: '00000000-0000-4000-8000-000000000024', status: 'failed', phase: 'terminal', trigger: 'manual',
+        transitions: [], warnings: [], available_actions: [],
+      }), { status: 200 })
+      if (url.endsWith(`/apps/${appA.id}`)) return lookup
+      throw new Error(`unexpected request: ${url}`)
+    }))
+
+    window.location.hash = `#/deployments/${deploymentA}`
+    auth.set({ kind: 'authenticated', me: { username: 'admin', session: { created_at: '', expires_at: '' } } })
+    render(App)
+    await userEvent.setup().click(await screen.findByRole('button', { name: /Roll back|回滚/ }))
+
+    window.location.hash = `#/deployments/${deploymentB}`
+    window.dispatchEvent(new HashChangeEvent('hashchange'))
+    expect(await screen.findByText(deploymentB)).toBeTruthy()
+    resolveLookup(new Response(JSON.stringify(appA), { status: 200 }))
+    await lookup
+    await Promise.resolve()
+
+    expect(rollbackRequests).toEqual([])
+    expect(window.location.hash).toBe(`#/deployments/${deploymentB}`)
   })
 
   it('does not navigate when an A deploy response arrives after switching to B', async () => {

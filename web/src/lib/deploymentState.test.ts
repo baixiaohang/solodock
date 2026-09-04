@@ -1,5 +1,8 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { clearWriteOnlyCredential, isTerminalDeployment, writeOnlyRetryIdentity } from './deploymentState'
+import { LocalMutationValidationError } from './mutationState'
+
+afterEach(() => vi.restoreAllMocks())
 
 describe('deployment state', () => {
   it('polls only queued and running deployments', () => {
@@ -34,5 +37,10 @@ describe('deployment state', () => {
     )
     expect(JSON.stringify(identity)).not.toContain(secret)
     expect(identity.fingerprint).toContain('secretSha256')
+  })
+
+  it('classifies a local digest failure before any mutation as known not applied', async () => {
+    vi.spyOn(crypto.subtle, 'digest').mockRejectedValueOnce(new Error('local crypto unavailable'))
+    await expect(writeOnlyRetryIdentity(undefined, {}, crypto.randomUUID())).rejects.toBeInstanceOf(LocalMutationValidationError)
   })
 })

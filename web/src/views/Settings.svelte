@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import { mutation } from '../lib/api'
-  import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { applyTimeSettings, loadTimeSettings, timeSettings } from '../lib/time'
   import type { SettingsResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
@@ -45,8 +45,12 @@
       selected = settings.display_timezone
       bindRoots = [...(settings.allowed_bind_roots ?? [])]
       saved = true
-    } catch {
-      error = localized('Save failed. Settings may have changed in another page; refresh and try again.')
+    } catch (cause) {
+      const failure = mutationFailure(retry, cause)
+      retry = failure.retry
+      error = localized(failure.outcome === 'outcome_unknown'
+        ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+        : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
     } finally {
       busy = false
     }

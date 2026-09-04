@@ -30,6 +30,7 @@ describe('API error normalization', () => {
 
     await expect(api('/api/v1/test', {}, { expectedStatus: 204 })).rejects.toMatchObject({
       status: 200,
+      mutationOutcome: 'outcome_unknown',
       body: {
         code: 'HTTP_ERROR',
         message: 'Unexpected HTTP status 200',
@@ -51,6 +52,7 @@ describe('API error normalization', () => {
     expect(unauthorized).toHaveBeenCalledOnce()
     expect(error).toMatchObject({
       status: 401,
+      mutationOutcome: 'outcome_unknown',
       body: { code: 'HTTP_ERROR', message: 'Request failed with HTTP status 401', request_id: 'edge-request-1' },
     })
     expect(error).not.toBeInstanceOf(SyntaxError)
@@ -87,6 +89,7 @@ describe('API error normalization', () => {
     const error = await expectApiError(response)
 
     expect(error.status).toBe(response.status)
+    expect(error.mutationOutcome).toBe('outcome_unknown')
     expect(error.body).toEqual({
       code: 'HTTP_ERROR',
       message: `Request failed with HTTP status ${response.status}`,
@@ -108,6 +111,19 @@ describe('API error normalization', () => {
     }))
 
     expect(error.body).toEqual(body)
+    expect(error.mutationOutcome).toBe('known_not_applied')
+  })
+
+  it('classifies validated 4xx envelopes as known and validated 5xx envelopes as unknown', async () => {
+    const known = await expectApiError(new Response(JSON.stringify({
+      code: 'CONFLICT', message: 'The request was rejected', request_id: 'known-request',
+    }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+    const unknown = await expectApiError(new Response(JSON.stringify({
+      code: 'UNAVAILABLE', message: 'The service failed', request_id: 'unknown-request',
+    }), { status: 503, headers: { 'Content-Type': 'application/json' } }))
+
+    expect(known.mutationOutcome).toBe('known_not_applied')
+    expect(unknown.mutationOutcome).toBe('outcome_unknown')
   })
 
   it('prefers a safe header request ID and rejects unsafe or oversized IDs', async () => {

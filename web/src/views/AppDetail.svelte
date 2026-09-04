@@ -4,7 +4,7 @@
   import { openSse } from '../lib/sse'
   import { configuredScopeText, driftText, formatBytes, mountKindText, networkKindText, networkModeText, shortRef, stateText } from '../lib/presentation'
   import { locale, localized, messageText, t, type MessageKey, type UserMessage } from '../lib/i18n'
-  import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import { credentialsForReference } from '../lib/registryReference'
   import { canConfirmDeletion } from '../lib/deletionState'
   import { pollNeedsAttention, pollOutcomeText } from '../lib/pollingState'
@@ -117,20 +117,28 @@
   async function saveWebhook() {
     if (disposed || !webhook || !webhookSecret || !webhookSaved) return
     const request = { expected_metadata_revision: webhook.configured ? webhook.metadata_revision : null, secret: webhookSecret }
-    const nextRetry = await writeOnlyRetryIdentity(
-      webhookRetry,
-      { expected_metadata_revision: request.expected_metadata_revision },
-      webhookSecret,
-    )
-    if (disposed) return
-    webhookRetry = nextRetry
     actionBusy = true; error = null; formPresentation = null
     try {
+      const nextRetry = await writeOnlyRetryIdentity(
+        webhookRetry,
+        { expected_metadata_revision: request.expected_metadata_revision },
+        webhookSecret,
+      )
+      if (disposed) return
+      webhookRetry = nextRetry
       const saved = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'PUT', idempotencyKey: webhookRetry.key })
       if (disposed) return
       webhook = saved
       webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
-    } catch { if (!disposed) error = localized('Webhook configuration could not be saved. If the network result is uncertain, the same secret and idempotency key will be reused.') } finally { if (!disposed) actionBusy = false }
+    } catch (cause) {
+      if (!disposed) {
+        const failure = mutationFailure(webhookRetry, cause)
+        webhookRetry = failure.retry
+        error = localized(failure.outcome === 'outcome_unknown'
+          ? 'The secret mutation outcome could not be confirmed. Re-entering the same secret with unchanged fields will reuse its request identity.'
+          : 'The secret mutation was not applied. Review the current state before re-entering it; the next attempt will use a new request identity.')
+      }
+    } finally { if (!disposed) actionBusy = false }
   }
 
   async function revokeWebhook() {
@@ -143,7 +151,15 @@
       if (disposed) return
       webhook = revoked
       webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
-    } catch { if (!disposed) error = localized('Webhook revocation failed. Refresh the status and try again.') } finally { if (!disposed) actionBusy = false }
+    } catch (cause) {
+      if (!disposed) {
+        const failure = mutationFailure(webhookRetry, cause)
+        webhookRetry = failure.retry
+        error = localized(failure.outcome === 'outcome_unknown'
+          ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+          : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+      }
+    } finally { if (!disposed) actionBusy = false }
   }
 
   async function lifecycle(action: 'start' | 'stop' | 'restart') {
@@ -154,9 +170,19 @@
       await mutation(`/api/v1/apps/${appId}/actions/${action}`, undefined, { idempotencyKey: lifecycleKey })
       if (disposed) return
       lifecycleKey = ''; lifecycleName = ''
-      await load()
+      try { await load() }
+      catch { if (!disposed) error = localized('The lifecycle operation succeeded, but refreshing the application failed. Reload the page to see the latest state.') }
     }
-    catch { if (!disposed) error = localized('Lifecycle operation failed. Application state or Docker/Compose capabilities may have changed.') }
+    catch (cause) {
+      if (!disposed) {
+        const failure = mutationFailure(lifecycleKey || undefined, cause)
+        lifecycleKey = failure.retry ?? ''
+        if (!lifecycleKey) lifecycleName = ''
+        error = localized(failure.outcome === 'outcome_unknown'
+          ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+          : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+      }
+    }
     finally { if (!disposed) actionBusy = false }
   }
 
@@ -176,6 +202,7 @@
     if (disposed || !canConfirmDeletion(deletion, confirmationSlug, removeContainer)) return
     const confirmed = deletion
     if (!confirmed) return
+    if (!deletionKey) deletionKey = crypto.randomUUID()
     actionBusy = true; error = null; formPresentation = null
     try {
       await mutation(`/api/v1/apps/${appId}`, {
@@ -188,7 +215,15 @@
       deletion = null
       deletionKey = ''
       window.location.hash = '/'
-    } catch { if (!disposed) error = localized('The deletion preview expired or application state changed. Generate it again.') } finally { if (!disposed) actionBusy = false }
+    } catch (cause) {
+      if (!disposed) {
+        const failure = mutationFailure(deletionKey || undefined, cause)
+        deletionKey = failure.retry ?? ''
+        error = localized(failure.outcome === 'outcome_unknown'
+          ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+          : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+      }
+    } finally { if (!disposed) actionBusy = false }
   }
 
   function pretty(value: unknown): string { return JSON.stringify(value, null, 2) }
@@ -293,7 +328,15 @@
       if (disposed) return
       deployRetry = undefined
       window.location.hash = `/deployments/${result.deployment_id}`
-    } catch { if (!disposed) error = localized('Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.') } finally { if (!disposed) actionBusy = false }
+    } catch (cause) {
+      if (!disposed) {
+        const failure = mutationFailure(deployRetry, cause)
+        deployRetry = failure.retry
+        error = localized(failure.outcome === 'outcome_unknown'
+          ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+          : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+      }
+    } finally { if (!disposed) actionBusy = false }
   }
   async function validateDraft() {
     if (disposed) return
@@ -317,7 +360,13 @@
       if (disposed) return
       clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = editFileRows.map((row) => ({ ...row, value: row.sensitive ? '' : row.value })); editRetry = undefined
     } catch (cause) {
-      if (!disposed) setFormError(cause, 'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.')
+      if (!disposed) {
+        const failure = mutationFailure(editRetry, cause)
+        editRetry = failure.retry
+        setFormError(cause, failure.outcome === 'outcome_unknown'
+          ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
+          : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
+      }
     } finally { if (!disposed) actionBusy = false }
     if (disposed) return
     if (error || formPresentation) return

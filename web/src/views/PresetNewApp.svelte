@@ -1,6 +1,6 @@
 <script lang="ts">
   import { api, mutation } from '../lib/api'
-  import { retryIdentity, type RetryIdentity } from '../lib/mutationState'
+  import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import type { AppDetailResponse, AppMutationResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   import { presetDescription } from '../lib/presets'
@@ -68,6 +68,7 @@
     }
 
     const confirmedNonRollbackableData = acknowledgeNonRollbackableData
+    let mutationStage: 'create' | 'deploy' | undefined
     busy = true
     error = null
     confirmationError = null
@@ -81,11 +82,13 @@
           variables: { major, username, database, password, initdb_args: '' },
         }
         createRetry = retryIdentity(createRetry, request)
+        mutationStage = 'create'
         const created = await mutation<AppMutationResponse>('/api/v1/apps/from-preset', request, {
           idempotencyKey: createRetry.key,
         })
         createdAppId = created.app.id
         createRetry = undefined
+        mutationStage = undefined
         password = ''
       }
       if (!deployRequest) {
@@ -101,6 +104,7 @@
         deployRetry = retryIdentity(undefined, deployRequest)
       }
       if (!deployRetry) deployRetry = retryIdentity(undefined, deployRequest)
+      mutationStage = 'deploy'
       const deployment = await mutation<{ deployment_id: string }>(
         `/api/v1/apps/${createdAppId}/deployments`,
         deployRequest,
@@ -109,10 +113,24 @@
       deployRetry = undefined
       deployRequest = null
       window.location.hash = `/deployments/${deployment.deployment_id}`
-    } catch {
+    } catch (cause) {
+      const currentRetry = mutationStage === 'create'
+        ? createRetry
+        : mutationStage === 'deploy'
+          ? deployRetry
+          : undefined
+      const failure = mutationFailure(currentRetry, cause)
+      if (mutationStage === 'create') createRetry = failure.retry
+      if (mutationStage === 'deploy') deployRetry = failure.retry
       error = createdAppId
-        ? localized('The service and configuration were created, but deployment was not confirmed. The generated password cannot be shown again. Retry here or continue from the service detail page.')
-        : localized('Creation failed. If the network result is uncertain, the same password and idempotency key will be reused.')
+        ? localized(mutationStage === 'deploy' && failure.outcome === 'outcome_unknown'
+          ? 'The service and configuration were created, but the deployment outcome could not be confirmed. The generated password cannot be shown again. Retrying here will reuse the unchanged deployment request and idempotency key, or continue from the service detail page.'
+          : mutationStage === 'deploy'
+            ? 'The service and configuration were created, but deployment was rejected. The generated password cannot be shown again. Retrying here will use a new idempotency key, or continue from the service detail page.'
+            : 'The service and configuration were created, but deployment could not be prepared. The generated password cannot be shown again. Retry here or continue from the service detail page.')
+        : localized(failure.outcome === 'outcome_unknown'
+          ? 'Creation failed. If the network result is uncertain, the same password and idempotency key will be reused.'
+          : 'Creation was rejected. Review the fields before trying again; the next attempt will use a new idempotency key.')
     } finally {
       busy = false
     }
