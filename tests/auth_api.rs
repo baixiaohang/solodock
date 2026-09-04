@@ -69,6 +69,7 @@ impl Harness {
         Request::builder()
             .method(method)
             .uri(uri)
+            .header(header::HOST, "solodock.example.com")
             .header(header::CONTENT_TYPE, "application/json")
             .extension(ConnectInfo(
                 "127.0.0.1:43210".parse::<SocketAddr>().unwrap(),

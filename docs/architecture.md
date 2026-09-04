@@ -32,6 +32,8 @@ See [product scope](product-scope.md) for capabilities and non-goals, and [appli
 
 The production binary embeds Vite output at compile time with `embed-ui`; no Node service runs. Hashed assets may use long-lived caching, while HTML is uncached. `/api/**` and `/hooks/**` never enter SPA fallback. See [API and streams](api-and-streams.md).
 
+`Config` canonicalizes the HTTPS `public_origin`, optional `webhook_public_origin`, and loopback `listen_address` into three HTTP authorities. A request reaches the router only after middleware derives one effective authority from URI authority and/or a single `Host` header and classifies it. The management authority serves the UI, management API, SSE, health, and favicon but never webhook paths. The webhook authority serves only the canonical registry webhook POST. A distinct local listen authority serves only exact `GET /healthz` and `GET /favicon.svg` probes. Missing, malformed, conflicting, or unknown authorities fail closed before routing; forwarding host headers are not authority inputs.
+
 ## Sources of truth
 
 | Fact | Authoritative source |

@@ -79,9 +79,9 @@ GitHub **Release asset** 是长期保留的稳定分发；**Actions artifact** �
 
 ## 安全前置条件
 
-服务只监听 loopback，`public_origin` 必须是 HTTPS。外部 tunnel 或 reverse proxy、访问控制和 TLS 是部署前置条件，不由 SoloDock 配置。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
+服务只监听 loopback，`public_origin` 必须是 HTTPS。外部 tunnel 或 reverse proxy、访问控制和 TLS 是部署前置条件，不由 SoloDock 配置。Proxy 必须保留 `public_origin` 的精确外部 `Host`；若改写为 loopback upstream authority，management request 会以 `404` fail closed。`Forwarded`、`X-Forwarded-Host`、`X-Original-Host` 等 header 会被有意忽略，不能提供路由 authority。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
 
-启用 webhook 时还需设置不同 authority 的 `webhook_public_origin`，并在外部 WAF 只放行精确 POST path。签名、timestamp/nonce、重试和 202 语义见 [Webhook 说明](webhooks.md)。
+启用 webhook 时还需设置不同 authority 的 `webhook_public_origin`，并在外部 WAF 只放行精确的 `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`。Webhook authority 会拒绝 UI、management API、GET 和非 canonical path；management authority 会拒绝 webhook path。签名、timestamp/nonce、重试和 202 语义见 [Webhook 说明](webhooks.md)。
 
 首次启动从 `/run/solodock/bootstrap.token` 完成一次性 bootstrap。日常查看：
 
@@ -90,6 +90,8 @@ systemctl status solodock.service
 journalctl -u solodock.service --since today
 curl --fail http://127.0.0.1:8080/healthz
 ```
+
+当 loopback listen authority 与 `public_origin` 不同时，它永久只暴露精确的 `GET /healthz` 与 `GET /favicon.svg`，让已安装 updater 能探测 strict-Host binary；它不暴露登录页、其他 asset、management API、SSE 或 webhook route。直接诊断时应在 request URL 使用已配置 loopback authority，不能用 forwarding header 替代。
 
 认证后的 `/api/v1/system/health` 分开展示 Docker、恢复、projection、deployment、poll coordinator、磁盘与 credential 状态。`interrupted`、`needs_attention` 或 ownership collision 需要先按 deployment detail 与精确 `docker inspect` 处理，不能 prune、宽泛删除或猜测性重跑。
 
