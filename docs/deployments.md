@@ -12,6 +12,8 @@ An `UNCONFIGURED` application has no draft revision and cannot enter the schedul
 
 Registry credentials use filesystem-first storage under `registry-credentials/<credential-id>/`, separating metadata from immutable secret revisions and integrity-checking both. The API returns metadata such as registry, username, and revision, but never token plaintext.
 
+Before sending a saved username or token to an OCI Bearer token service, SoloDock binds the challenge realm to the credential's Registry origin. A custom Registry must use the same scheme, exact host, and effective port; every cross-origin realm is rejected before a request is sent. Docker Hub has one built-in exception, exactly `https://auth.docker.io/token`; similar hosts, alternate paths, ports, or schemes are not trusted.
+
 Create, rotate, and delete use an idempotency ledger and operation-owned artifacts. Delete first retains an exact tombstone. After the successful response is durable, the API, background reconciler, or startup finalizer removes it exactly. Delete fails closed while any draft, active/pending, or historical release references the credential.
 
 Pull creates an operation-scoped Docker config only at `/run/solodock/docker-config/<deployment-id>/config.json`. This directory and credential buffers held by the process are cleaned or zeroized on every exit path. If cleanup is uncertain, the deployment records a security failure requiring attention rather than hiding it behind the original pull error.
