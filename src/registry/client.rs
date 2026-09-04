@@ -8,7 +8,7 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use super::{
-    auth::parse_bearer,
+    auth::{parse_bearer, validate_bearer_realm},
     error::RegistryError,
     manifest::{self, DOCKER_LIST, DOCKER_MANIFEST, OCI_INDEX, OCI_MANIFEST},
     reference::ImageReference,
@@ -214,6 +214,7 @@ impl RegistryResolver {
                 return Err(RegistryError::AuthUnsupported);
             } else {
                 let challenge = parse_bearer(challenge, self.allow_http_loopback)?;
+                validate_bearer_realm(image, &challenge.realm, self.allow_http_loopback)?;
                 let mut url = challenge.realm;
                 {
                     let mut pairs = url.query_pairs_mut();
@@ -419,6 +420,7 @@ impl RegistryResolver {
             .get(header::WWW_AUTHENTICATE)
             .ok_or(RegistryError::CredentialRequired)?;
         let challenge = parse_bearer(challenge, self.allow_http_loopback)?;
+        validate_bearer_realm(image, &challenge.realm, self.allow_http_loopback)?;
         let mut url = challenge.realm;
         {
             let mut pairs = url.query_pairs_mut();
@@ -1001,5 +1003,85 @@ mod tests {
             .unwrap_err();
         server.await.unwrap();
         assert!(matches!(error, RegistryError::AuthUnsupported));
+    }
+
+    #[tokio::test]
+    async fn manifest_auth_rejects_cross_origin_realm_before_any_token_request() {
+        let registry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry_address = registry.local_addr().unwrap();
+        let attacker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_address = attacker.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = registry.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{attacker_address}/token\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let image = ImageReference::parse(&format!("{registry_address}/team/app:latest")).unwrap();
+        let credential = SecretValue::new("must-not-leave-process".into());
+        let error = RegistryResolver::for_test_http()
+            .unwrap()
+            .resolve(
+                &image,
+                &Platform::canonical("linux", "amd64", None).unwrap(),
+                Some(("fixture-user", &credential)),
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, RegistryError::AuthRealmUntrusted));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), attacker.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn blob_auth_rejects_cross_origin_realm_before_any_token_request() {
+        let registry = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let registry_address = registry.local_addr().unwrap();
+        let attacker = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let attacker_address = attacker.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = registry.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{attacker_address}/token\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let image = ImageReference::parse(&format!("{registry_address}/team/app:latest")).unwrap();
+        let credential = SecretValue::new("must-not-leave-process".into());
+        let error = RegistryResolver::for_test_http()
+            .unwrap()
+            .fetch_blob_authenticated(
+                &image,
+                &format!("sha256:{}", "a".repeat(64)),
+                Some(("fixture-user", &credential)),
+            )
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(matches!(error, RegistryError::AuthRealmUntrusted));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), attacker.accept())
+                .await
+                .is_err()
+        );
     }
 }
