@@ -48,7 +48,7 @@ package="$download_dir/solodock-package"
 sudo "$package/install.sh" --version "${tag#v}"
 ```
 
-package 中经过 checksum 绑定的 `INSTALL_MANIFEST` 记录其 `stable` channel、版本、source commit 与完整 package 内容身份。installer 验证 manifest 后，会准备一个不可变且以身份限定的 generation，其中同时包含 binary、manifest、updater、package verifier、backup/restore helper 与 systemd unit。它先快照所有现有公开入口，再切换 helper 和 unit，最后以 `/usr/local/bin/solodock` 作为安装身份 commit marker；事务提交前任何失败都会恢复全部入口并移除不完整 generation，确保可见 binary、helper、unit 与 manifest 始终来自同一个 package。`/usr/local/bin/solodock-restore` 默认解析同 generation 的 `solodock` sibling binary 作为 validator。除非首次安装显式使用 `--enable-now`，installer 不启动服务，也不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`；应完成配置与离线备份后再启动。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
+package 中经过 checksum 绑定的 `INSTALL_MANIFEST` 记录其 `stable` channel、版本、source commit 与完整 package 内容身份。installer 验证 manifest 后，会准备一个不可变且以身份限定的 generation，其中同时包含 binary、manifest、updater、package verifier、backup/restore helper 与 systemd unit。它先快照所有现有公开入口，再切换 helper 和 unit，最后以 `/usr/local/bin/solodock` 作为安装身份 commit marker；事务提交前任何失败都会恢复全部入口并移除不完整 generation，确保可见 binary、helper、unit 与 manifest 始终来自同一个 package。`/usr/local/bin/solodock-restore` 默认解析同 generation 的 `solodock` sibling binary 作为 validator。backup 与 restore 输出必须位于调用管理员拥有、group/other 不可写的 canonical directory；每一级祖先必须由管理员或 root 拥有，任何可写祖先还必须具备 sticky-directory 保护。helper 会把所有临时与发布路径锚定到已检查的目录身份，在发布前后复核 path/device/inode，使用排他且不可预测的临时名，并且绝不替换已有 archive、checksum 或 restore target。除非首次安装显式使用 `--enable-now`，installer 不启动服务，也不覆盖 `/etc/solodock/config.toml` 或 `/var/lib/solodock`；应完成配置与离线备份后再启动。含新 SQLite migration 的升级是 forward-only，不能只切回旧 binary。
 
 ### 已验证的 stable 与 main 升级
 

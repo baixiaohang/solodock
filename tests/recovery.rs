@@ -1,4 +1,8 @@
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{
+    fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
+    process::Command,
+};
 
 use solodock::{
     app_store::{AppStore, releases::ReleaseTrigger},
@@ -458,8 +462,35 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         String::from_utf8_lossy(&backup.stderr)
     );
     let restored = fixture.path().join("restored");
+    let identity_bin = fixture.path().join("identity-bin");
+    fs::create_dir(&identity_bin).unwrap();
+    fs::set_permissions(&identity_bin, fs::Permissions::from_mode(0o700)).unwrap();
+    let invoking_uid = fs::metadata(fixture.path()).unwrap().uid();
+    let invoking_gid = fs::metadata(fixture.path()).unwrap().gid();
+    // Root-capable CI must prove the same identity drop as the production
+    // helper; ordinary developer runs validate the already-non-root path.
+    let (uid, gid) = if invoking_uid == 0 {
+        (999, 999)
+    } else {
+        (invoking_uid, invoking_gid)
+    };
+    let getent = identity_bin.join("getent");
+    fs::write(
+        &getent,
+        format!(
+            "#!/bin/sh\ncase \"$1:$2\" in\npasswd:solodock) printf 'solodock:x:{uid}:{gid}::/nonexistent:/usr/sbin/nologin\\n';;\ngroup:{gid}) printf 'solodock:x:{gid}:\\n';;\n*) exit 2;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&getent, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        identity_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let restore = Command::new(manifest.join("packaging/solodock-restore"))
         .current_dir(manifest)
+        .env("PATH", path)
         .args(["--archive"])
         .arg(&archive)
         .args(["--checksum"])
@@ -473,6 +504,20 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         restore.status.success(),
         "{}",
         String::from_utf8_lossy(&restore.stderr)
+    );
+    assert_eq!(fs::metadata(&restored).unwrap().uid(), uid);
+    assert_eq!(fs::metadata(&restored).unwrap().gid(), gid);
+    assert_eq!(
+        fs::metadata(restored.join("var/lib/solodock"))
+            .unwrap()
+            .uid(),
+        uid
+    );
+    assert_eq!(
+        fs::metadata(restored.join("etc/solodock/config.toml"))
+            .unwrap()
+            .uid(),
+        uid
     );
     let restored_app = restored
         .join("var/lib/solodock/apps")
@@ -500,18 +545,20 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::read_link(restored_app.join("pending")).unwrap(),
         std::path::PathBuf::from(format!("releases/{pending}"))
     );
-    let restored_store = AppStore::initialize_managed(
-        restored.join("var/lib/solodock/apps"),
-        key.clone(),
-        vec![bind_root],
-    )
-    .unwrap();
-    let restored_webhook = WebhookStore::new(restored_store, key);
-    assert!(
-        restored_webhook
-            .load_current(app_id)
-            .unwrap()
-            .secret
-            .constant_time_eq(webhook_secret.expose())
-    );
+    if invoking_uid != 0 {
+        let restored_store = AppStore::initialize_managed(
+            restored.join("var/lib/solodock/apps"),
+            key.clone(),
+            vec![bind_root],
+        )
+        .unwrap();
+        let restored_webhook = WebhookStore::new(restored_store, key);
+        assert!(
+            restored_webhook
+                .load_current(app_id)
+                .unwrap()
+                .secret
+                .constant_time_eq(webhook_secret.expose())
+        );
+    }
 }

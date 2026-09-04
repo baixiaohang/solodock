@@ -729,17 +729,224 @@ mkdir -m 0700 -p "$fixture/root/var/lib/solodock/secrets"
 head -c 32 /dev/zero >"$fixture/root/var/lib/solodock/secrets/idempotency.key"
 chmod 0600 "$fixture/root/var/lib/solodock/secrets/idempotency.key"
 chmod 0600 "$fixture/root/etc/solodock/config.toml"
+restore_identity_bin="$fixture/restore-identity-bin"
+mkdir -m 0700 "$restore_identity_bin"
+restore_uid=$(id -u)
+restore_gid=$(id -g)
+if [[ $restore_uid == 0 ]]; then
+  # Root-capable CI exercises the production root-unpack -> non-root
+  # validator transition instead of validating as root.
+  restore_uid=999
+  restore_gid=999
+fi
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'if [[ $1 == passwd && $2 == solodock ]]; then printf "solodock:x:%s:%s::/nonexistent:/usr/sbin/nologin\n" "$SOLODOCK_TEST_UID" "$SOLODOCK_TEST_GID"; exit 0; fi' \
+  'if [[ $1 == group && $2 == "$SOLODOCK_TEST_GID" ]]; then printf "solodock:x:%s:\n" "$SOLODOCK_TEST_GID"; exit 0; fi' \
+  'exit 2' >"$restore_identity_bin/getent"
+chmod 0755 "$restore_identity_bin/getent"
+ln -s /tmp "$fixture/.solodock-backup-predictable.tmp"
 ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/backup.tar" >/dev/null
 (cd "$fixture" && sha256sum -c backup.tar.sha256 >/dev/null)
 tar -tf "$fixture/backup.tar" | grep -q '^var/lib/solodock/'
 [[ $(stat -c '%a' "$fixture/backup.tar") == 600 ]]
-./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/restored" --validator "$validator" >/dev/null
+
+race_bin="$fixture/backup-race-bin"
+mkdir -m 0700 "$race_bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  ': >"$SOLODOCK_TEST_TAR_REACHED"' \
+  'while [[ ! -e $SOLODOCK_TEST_TAR_CONTINUE ]]; do sleep 0.01; done' \
+  'exec /usr/bin/tar "$@"' >"$race_bin/tar"
+chmod 0755 "$race_bin/tar"
+SOLODOCK_TEST_TAR_REACHED="$fixture/tar-reached" \
+SOLODOCK_TEST_TAR_CONTINUE="$fixture/tar-continue" \
+PATH="$race_bin:$PATH" \
+  ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/raced-backup.tar" >"$fixture/raced-backup.stdout" 2>"$fixture/raced-backup.stderr" &
+race_pid=$!
+for _ in {1..500}; do
+  [[ -e $fixture/tar-reached ]] && break
+  kill -0 "$race_pid" 2>/dev/null || { printf '%s\n' 'backup race fixture exited before tar' >&2; exit 1; }
+  sleep 0.01
+done
+[[ -e $fixture/tar-reached ]]
+printf '%s\n' 'attacker-checksum-canary' >"$fixture/raced-backup.tar.sha256"
+: >"$fixture/tar-continue"
+if wait "$race_pid"; then
+  printf '%s\n' 'backup replaced a checksum that appeared concurrently' >&2
+  exit 1
+fi
+[[ ! -e $fixture/raced-backup.tar ]]
+grep -Fxq 'attacker-checksum-canary' "$fixture/raced-backup.tar.sha256"
+
+mkdir -m 0700 "$fixture/replaced-backup-parent"
+rm -f -- "$fixture/tar-reached" "$fixture/tar-continue"
+SOLODOCK_TEST_TAR_REACHED="$fixture/tar-reached" \
+SOLODOCK_TEST_TAR_CONTINUE="$fixture/tar-continue" \
+PATH="$race_bin:$PATH" \
+  ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/replaced-backup-parent/backup.tar" >"$fixture/replaced-backup.stdout" 2>"$fixture/replaced-backup.stderr" &
+race_pid=$!
+for _ in {1..500}; do
+  [[ -e $fixture/tar-reached ]] && break
+  kill -0 "$race_pid" 2>/dev/null || { printf '%s\n' 'backup parent race fixture exited before tar' >&2; exit 1; }
+  sleep 0.01
+done
+[[ -e $fixture/tar-reached ]]
+mv -- "$fixture/replaced-backup-parent" "$fixture/displaced-backup-parent"
+mkdir -m 0700 "$fixture/replaced-backup-parent"
+: >"$fixture/tar-continue"
+if wait "$race_pid"; then
+  printf '%s\n' 'backup accepted a replaced output parent' >&2
+  exit 1
+fi
+[[ ! -e $fixture/replaced-backup-parent/backup.tar ]]
+if find "$fixture/displaced-backup-parent" -maxdepth 1 -name '.solodock-backup.*' -print -quit | grep -q .; then
+  printf '%s\n' 'backup left a secret temporary file after parent replacement' >&2
+  exit 1
+fi
+
+mkdir -m 0777 "$fixture/unsafe-restore-parent"
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/unsafe-restore-parent/restored" --validator "$validator" >"$fixture/unsafe-restore-parent.stdout" 2>"$fixture/unsafe-restore-parent.stderr"; then
+  printf '%s\n' 'restore accepted a group/other-writable output parent' >&2
+  exit 1
+fi
+[[ ! -e $fixture/unsafe-restore-parent/restored ]]
+
+missing_identity_bin="$fixture/missing-identity-bin"
+mkdir -m 0700 "$missing_identity_bin"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 2' >"$missing_identity_bin/getent"
+chmod 0755 "$missing_identity_bin/getent"
+if PATH="$missing_identity_bin:$PATH" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/missing-account-restore" --validator "$validator" >"$fixture/missing-account.stdout" 2>"$fixture/missing-account.stderr"; then
+  printf '%s\n' 'restore accepted a missing solodock service account' >&2
+  exit 1
+fi
+[[ ! -e $fixture/missing-account-restore ]]
+
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID=0 SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/root-account-restore" --validator "$validator" >"$fixture/root-account.stdout" 2>"$fixture/root-account.stderr"; then
+  printf '%s\n' 'restore accepted root as the solodock service identity' >&2
+  exit 1
+fi
+[[ ! -e $fixture/root-account-restore ]]
+
+unexpected_uid=1001
+unexpected_gid=1001
+if [[ $unexpected_uid == "$(id -u)" && $unexpected_gid == "$(id -g)" ]]; then
+  unexpected_uid=1002
+  unexpected_gid=1002
+fi
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$unexpected_uid" SOLODOCK_TEST_GID="$unexpected_gid" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/non-system-account-restore" --validator "$validator" >"$fixture/non-system-account.stdout" 2>"$fixture/non-system-account.stderr"; then
+  printf '%s\n' 'restore accepted an unexpected non-system service identity' >&2
+  exit 1
+fi
+[[ ! -e $fixture/non-system-account-restore ]]
+
+malicious_tree="$fixture/config-link-tree"
+mkdir -m 0700 "$malicious_tree"
+tar -C "$malicious_tree" -xf "$fixture/backup.tar"
+printf '%s\n' 'external-config-canary' >"$fixture/config-canary"
+chmod 0644 "$fixture/config-canary"
+rm -- "$malicious_tree/etc/solodock/config.toml"
+ln -s "$fixture/config-canary" "$malicious_tree/etc/solodock/config.toml"
+tar --format=pax -C "$malicious_tree" -cf "$fixture/config-link.tar" var/lib/solodock etc/solodock/config.toml
+sha256sum "$fixture/config-link.tar" >"$fixture/config-link.tar.sha256"
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/config-link.tar" --checksum "$fixture/config-link.tar.sha256" --output "$fixture/config-link-restored" --validator "$validator" >"$fixture/config-link.stdout" 2>"$fixture/config-link.stderr"; then
+  printf '%s\n' 'restore accepted a symlink config' >&2
+  exit 1
+fi
+grep -Fxq 'external-config-canary' "$fixture/config-canary"
+[[ $(stat -c '%a' "$fixture/config-canary") == 644 ]]
+[[ ! -e $fixture/config-link-restored ]]
+
+restore_race_bin="$fixture/restore-race-bin"
+mkdir -m 0700 "$restore_race_bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  'for argument in "$@"; do' \
+  '  if [[ $argument == -xf ]]; then' \
+  '    : >"$SOLODOCK_TEST_TAR_REACHED"' \
+  '    while [[ ! -e $SOLODOCK_TEST_TAR_CONTINUE ]]; do sleep 0.01; done' \
+  '    break' \
+  '  fi' \
+  'done' \
+  'exec /usr/bin/tar "$@"' >"$restore_race_bin/tar"
+chmod 0755 "$restore_race_bin/tar"
+ln -s "$restore_identity_bin/getent" "$restore_race_bin/getent"
+mkdir -m 0700 "$fixture/replaced-restore-parent"
+rm -f -- "$fixture/tar-reached" "$fixture/tar-continue"
+PATH="$restore_race_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+SOLODOCK_TEST_TAR_REACHED="$fixture/tar-reached" SOLODOCK_TEST_TAR_CONTINUE="$fixture/tar-continue" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/replaced-restore-parent/restored" --validator "$validator" >"$fixture/replaced-restore.stdout" 2>"$fixture/replaced-restore.stderr" &
+race_pid=$!
+for _ in {1..500}; do
+  [[ -e $fixture/tar-reached ]] && break
+  kill -0 "$race_pid" 2>/dev/null || { printf '%s\n' 'restore parent race fixture exited before extraction' >&2; exit 1; }
+  sleep 0.01
+done
+[[ -e $fixture/tar-reached ]]
+mv -- "$fixture/replaced-restore-parent" "$fixture/displaced-restore-parent"
+mkdir -m 0700 "$fixture/replaced-restore-parent"
+: >"$fixture/tar-continue"
+if wait "$race_pid"; then
+  printf '%s\n' 'restore accepted a replaced output parent' >&2
+  exit 1
+fi
+[[ ! -e $fixture/replaced-restore-parent/restored ]]
+if find "$fixture/displaced-restore-parent" -maxdepth 1 -name '.solodock-restore.*' -print -quit | grep -q .; then
+  printf '%s\n' 'restore left a staging directory after parent replacement' >&2
+  exit 1
+fi
+
+publication_validator="$fixture/publication-validator"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -euo pipefail' \
+  '"$SOLODOCK_TEST_REAL_VALIDATOR" "$@"' \
+  ': >"$SOLODOCK_TEST_VALIDATOR_REACHED"' \
+  'while [[ ! -e $SOLODOCK_TEST_VALIDATOR_CONTINUE ]]; do sleep 0.01; done' >"$publication_validator"
+chmod 0755 "$publication_validator"
+SOLODOCK_TEST_REAL_VALIDATOR="$(realpath -e -- "$validator")" SOLODOCK_TEST_VALIDATOR_REACHED="$fixture/validator-reached" SOLODOCK_TEST_VALIDATOR_CONTINUE="$fixture/validator-continue" \
+PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/concurrent-restore" --validator "$publication_validator" >"$fixture/concurrent-restore.stdout" 2>"$fixture/concurrent-restore.stderr" &
+race_pid=$!
+for _ in {1..500}; do
+  [[ -e $fixture/validator-reached ]] && break
+  kill -0 "$race_pid" 2>/dev/null || { printf '%s\n' 'restore publication fixture exited before validation' >&2; exit 1; }
+  sleep 0.01
+done
+[[ -e $fixture/validator-reached ]]
+mkdir -m 0700 "$fixture/concurrent-restore"
+printf '%s\n' 'concurrent-target-canary' >"$fixture/concurrent-restore/canary"
+: >"$fixture/validator-continue"
+if wait "$race_pid"; then
+  printf '%s\n' 'restore replaced a concurrently created target' >&2
+  exit 1
+fi
+grep -Fxq 'concurrent-target-canary' "$fixture/concurrent-restore/canary"
+
+PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/restored" --validator "$validator" >/dev/null
 cmp "$fixture/root/etc/solodock/config.toml" "$fixture/restored/etc/solodock/config.toml"
-"$package_root_install/solodock-restore" \
+PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$restore_uid" SOLODOCK_TEST_GID="$restore_gid" \
+  "$package_root_install/solodock-restore" \
   --archive "$fixture/backup.tar" \
   --checksum "$fixture/backup.tar.sha256" \
   --output "$fixture/restored-with-version-validator" >/dev/null
 cmp "$fixture/root/etc/solodock/config.toml" "$fixture/restored-with-version-validator/etc/solodock/config.toml"
+
+mkdir -m 0777 "$fixture/unsafe-backup-parent"
+if ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/unsafe-backup-parent/backup.tar" >"$fixture/unsafe-parent.stdout" 2>"$fixture/unsafe-parent.stderr"; then
+  printf '%s\n' 'backup accepted a group/other-writable output parent' >&2
+  exit 1
+fi
+[[ ! -e $fixture/unsafe-backup-parent/backup.tar ]]
 
 ln -s /tmp "$fixture/root/var/lib/solodock/unsafe-link"
 if ./packaging/solodock-backup --root "$fixture/root" --output "$fixture/unsafe.tar" >"$fixture/unsafe.stdout" 2>"$fixture/unsafe.stderr"; then

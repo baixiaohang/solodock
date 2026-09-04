@@ -41,9 +41,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .get(1)
         .is_some_and(|value| value == "validate-restore")
     {
-        if arguments.len() != 4 {
-            return Err("usage: solodock validate-restore STATE_DIRECTORY CONFIG_FILE".into());
+        if arguments.len() != 6 {
+            return Err("usage: solodock validate-restore STATE_DIRECTORY CONFIG_FILE SERVICE_UID SERVICE_GID".into());
         }
+        let service_uid = arguments[4]
+            .to_str()
+            .ok_or("service UID is invalid")?
+            .parse::<u32>()?;
+        let service_gid = arguments[5]
+            .to_str()
+            .ok_or("service GID is invalid")?
+            .parse::<u32>()?;
+        if service_uid == 0 || service_gid == 0 {
+            return Err("service UID/GID must be non-root".into());
+        }
+        assume_restore_service_identity(service_uid, service_gid)?;
         validate_restore(
             std::path::Path::new(&arguments[2]),
             std::path::Path::new(&arguments[3]),
@@ -320,6 +332,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn assume_restore_service_identity(uid: u32, gid: u32) -> Result<(), Box<dyn Error>> {
+    #[cfg(unix)]
+    {
+        let current_uid = unsafe { libc::geteuid() };
+        let current_gid = unsafe { libc::getegid() };
+        if current_uid == 0 {
+            if unsafe { libc::setgroups(0, std::ptr::null()) } != 0
+                || unsafe { libc::setgid(gid) } != 0
+                || unsafe { libc::setuid(uid) } != 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+        } else if current_uid != uid || current_gid != gid {
+            return Err("validator identity does not match the target service owner".into());
+        }
+        if unsafe { libc::geteuid() } != uid || unsafe { libc::getegid() } != gid {
+            return Err("validator could not assume the target service identity".into());
+        }
+    }
+    Ok(())
+}
+
 async fn validate_restore(
     state_directory: &std::path::Path,
     config_file: &std::path::Path,
@@ -327,6 +361,7 @@ async fn validate_restore(
     use solodock::security::permissions::{check_private, check_private_tree};
 
     check_private(state_directory, true)?;
+    check_private(config_file, false)?;
     let config = Config::load_from(config_file)?;
     let key_path = state_directory.join("secrets/idempotency.key");
     check_private_tree(state_directory, &key_path, false)?;

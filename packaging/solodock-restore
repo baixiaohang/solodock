@@ -5,12 +5,13 @@ script_path=$(realpath -e -- "${BASH_SOURCE[0]}")
 script_dir=$(dirname -- "$script_path")
 
 validate_managed_links() {
-  local state_root=$1
+  local staging_root=$1
+  local state_root="$staging_root/var/lib/solodock"
   local uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
   local link relative target app
   while IFS= read -r -d '' link; do
-    relative=${link#"$state_root/"}
-    if [[ ! $relative =~ ^apps/($uuid)/(active|pending)$ ]]; then
+    relative=${link#"$staging_root/"}
+    if [[ ! $relative =~ ^var/lib/solodock/apps/($uuid)/(active|pending)$ ]]; then
       return 1
     fi
     app=${BASH_REMATCH[1]}
@@ -18,7 +19,37 @@ validate_managed_links() {
     if [[ ! $target =~ ^releases/($uuid)$ || ! -d $state_root/apps/$app/$target || -L $state_root/apps/$app/$target ]]; then
       return 1
     fi
-  done < <(find "$state_root" -xdev -type l -print0)
+  done < <(find "$staging_root" -xdev -type l -print0)
+}
+
+open_safe_parent() {
+  local candidate=$1 component component_uid component_mode
+  parent_real=$(realpath -e -- "$candidate") || return 1
+  [[ $parent_real == "$candidate" && -d $parent_real && ! -L $parent_real ]] || return 1
+  component=$parent_real
+  while :; do
+    component_uid=$(stat -c '%u' -- "$component") || return 1
+    component_mode=$(stat -c '%a' -- "$component") || return 1
+    [[ $component_uid == 0 || $component_uid == "$(id -u)" ]] || return 1
+    if ((8#$component_mode & 8#022)); then
+      ((8#$component_mode & 8#1000)) || return 1
+    fi
+    [[ $component == / ]] && break
+    component=$(dirname -- "$component")
+  done
+  parent_uid=$(stat -c '%u' -- "$parent_real") || return 1
+  parent_mode=$(stat -c '%a' -- "$parent_real") || return 1
+  [[ $parent_uid == "$(id -u)" && $((8#$parent_mode & 8#022)) -eq 0 ]] || return 1
+  parent_path_identity=$(stat -Lc '%d:%i' -- "$parent_real") || return 1
+  exec {parent_fd}<"$parent_real" || return 1
+  parent_anchor="/proc/$$/fd/$parent_fd"
+  [[ $(stat -Lc '%d:%i' -- "$parent_anchor") == "$parent_path_identity" ]] || return 1
+}
+
+recheck_parent() {
+  [[ $(realpath -e -- "$parent") == "$parent_real" \
+    && $(stat -Lc '%d:%i' -- "$parent") == "$parent_path_identity" \
+    && $(stat -Lc '%d:%i' -- "$parent_anchor") == "$parent_path_identity" ]]
 }
 
 archive=''
@@ -42,10 +73,28 @@ if [[ -z $validator ]]; then
   fi
 fi
 [[ -x $validator && ! -L $validator ]] || { printf '%s\n' 'restore validator is missing or unsafe' >&2; exit 2; }
+validator=$(realpath -e -- "$validator")
 [[ $archive = /* && -f $archive && ! -L $archive && $checksum = /* && -f $checksum && ! -L $checksum ]] || { printf '%s\n' 'archive/checksum inputs are unsafe' >&2; exit 2; }
 [[ $output = /* && ! -e $output && ! -L $output ]] || { printf '%s\n' 'output must be a new absolute directory' >&2; exit 2; }
 parent=$(dirname -- "$output")
-[[ -d $parent && ! -L $parent && $(realpath -e -- "$parent") == "$parent" ]] || { printf '%s\n' 'output parent is unsafe' >&2; exit 2; }
+open_safe_parent "$parent" || { printf '%s\n' 'output parent or one of its ancestors is unsafe' >&2; exit 2; }
+output_name=$(basename -- "$output")
+anchored_output="$parent_anchor/$output_name"
+[[ ! -e $anchored_output && ! -L $anchored_output ]] || { printf '%s\n' 'output must remain a new directory' >&2; exit 2; }
+account=$(getent passwd solodock || true)
+[[ -n $account && $account != *$'\n'* ]] || { printf '%s\n' 'solodock service account is missing or ambiguous' >&2; exit 1; }
+IFS=: read -r account_name _ service_uid service_gid account_comment account_home account_shell <<<"$account"
+group=$(getent group "$service_gid" || true)
+[[ -n $group && $group != *$'\n'* ]] || { printf '%s\n' 'solodock service group is missing or ambiguous' >&2; exit 1; }
+IFS=: read -r group_name _ group_gid _ <<<"$group"
+invoking_uid=$(id -u)
+invoking_gid=$(id -g)
+if [[ $account_name != solodock || ! $service_uid =~ ^[0-9]+$ || $service_uid -eq 0 || $service_uid -gt 4294967295 || ! $service_gid =~ ^[0-9]+$ || $service_gid -eq 0 || $service_gid -gt 4294967295 || $group_name != solodock || $group_gid != "$service_gid" || $account_home != /nonexistent || $account_shell != /usr/sbin/nologin ]] \
+  || { [[ $invoking_uid == 0 ]] && ((service_uid >= 1000 || service_gid >= 1000)); } \
+  || { [[ $invoking_uid != 0 ]] && [[ $service_uid != "$invoking_uid" || $service_gid != "$invoking_gid" ]]; }; then
+  printf '%s\n' 'solodock service account is invalid' >&2
+  exit 1
+fi
 expected=$(awk 'NR==1 && $1 ~ /^[0-9a-f]{64}$/ {print $1}' "$checksum")
 [[ -n $expected && $expected == $(sha256sum "$archive" | awk '{print $1}') ]] || { printf '%s\n' 'backup checksum mismatch' >&2; exit 1; }
 while IFS= read -r name; do
@@ -57,22 +106,32 @@ if tar -tvf "$archive" | awk 'substr($1,1,1) ~ /^[hbcps]$/ {found=1} END {exit !
   exit 1
 fi
 umask 077
-staging=$(mktemp -d "$parent/.solodock-restore.XXXXXX")
+recheck_parent || { printf '%s\n' 'output parent identity changed before restore' >&2; exit 1; }
+staging=$(mktemp -d "$parent_anchor/.solodock-restore.XXXXXX")
 trap 'rm -rf -- "$staging"' EXIT
 chmod 0700 "$staging"
 tar --no-same-owner --no-same-permissions -C "$staging" -xf "$archive"
-[[ -d $staging/var/lib/solodock && -f $staging/etc/solodock/config.toml ]] || { printf '%s\n' 'archive is incomplete' >&2; exit 1; }
-if ! validate_managed_links "$staging/var/lib/solodock" || find "$staging" -xdev \( ! -type d ! -type f ! -type l \) -print -quit | grep -q .; then
+[[ -d $staging/var/lib/solodock && ! -L $staging/var/lib/solodock \
+  && -f $staging/etc/solodock/config.toml && ! -L $staging/etc/solodock/config.toml ]] || { printf '%s\n' 'archive is incomplete or contains an unsafe config' >&2; exit 1; }
+if ! validate_managed_links "$staging" || find "$staging" -xdev \( ! -type d ! -type f ! -type l \) -print -quit | grep -q .; then
   printf '%s\n' 'restored state contains an unsafe link or unsupported file type' >&2
   exit 1
 fi
 chmod 0700 "$staging/var/lib/solodock"
 chmod 0600 "$staging/etc/solodock/config.toml"
-"$validator" validate-restore "$staging/var/lib/solodock" "$staging/etc/solodock/config.toml" >/dev/null
+chown -R -h -- "$service_uid:$service_gid" "$staging"
+(
+  cd -- "$staging"
+  "$validator" validate-restore var/lib/solodock etc/solodock/config.toml "$service_uid" "$service_gid" >/dev/null
+)
 sync -f "$staging/var/lib/solodock"
 sync -f "$staging/etc/solodock/config.toml"
-[[ ! -e $output && ! -L $output ]] || { printf '%s\n' 'output appeared during restore' >&2; exit 1; }
-mv -T -- "$staging" "$output"
-sync -f "$parent"
+recheck_parent || { printf '%s\n' 'output parent identity changed before publication' >&2; exit 1; }
+[[ ! -e $anchored_output && ! -L $anchored_output ]] || { printf '%s\n' 'output appeared during restore' >&2; exit 1; }
+mv -T --no-clobber -- "$staging" "$anchored_output"
+[[ ! -e $staging && -d $anchored_output && ! -L $anchored_output ]] || { printf '%s\n' 'output appeared during restore publication' >&2; exit 1; }
+sync -f "$parent_anchor"
+recheck_parent || { printf '%s\n' 'output parent identity changed during publication' >&2; exit 1; }
 trap - EXIT
+exec {parent_fd}<&-
 printf '%s\n' 'backup verified and extracted to a new staging directory; no live state was changed'
