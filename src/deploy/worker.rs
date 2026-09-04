@@ -278,6 +278,14 @@ impl DeploymentEngine {
         let binds = self
             .validate_runtime_paths_fresh(m3, &loaded.metadata)
             .await?;
+        crate::api::mutations::validate_bind_plan_against_live_apps(
+            state,
+            m3,
+            record.app_id,
+            &loaded.metadata,
+        )
+        .await
+        .map_err(EngineError::Stable)?;
         let final_predecessor = self.schedule_predecessor(&record).await?;
         if final_predecessor.as_ref().map(|value| value.id.as_str())
             != predecessor.as_ref().map(|value| value.id.as_str())
@@ -320,18 +328,64 @@ impl DeploymentEngine {
             .expected_actual_release_id
             .map(|release| self.context(record.app_id, release))
             .transpose()?;
-        let compose_result = deploy_candidate_after_predecessor(
-            self.compose.as_ref(),
-            predecessor_context,
-            self.context(record.app_id, candidate_id)?,
-        )
-        .await;
-        if matches!(compose_result, Err(SequencedComposeError::Stop)) {
-            self.restore_predecessor(&record, predecessor.as_ref())
-                .await?;
-            return Err(EngineError::Interrupted);
+        let predecessor_binds = if let Some(release_id) = record.expected_actual_release_id {
+            let release = self
+                .store
+                .load_v2_release(record.app_id, release_id)
+                .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+            let predecessor_config = config_revision::load_verified(
+                &self.store.app_directory(record.app_id),
+                release.config_revision,
+                self.store
+                    .integrity_key()
+                    .map_err(|_| EngineError::Internal)?,
+            )
+            .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+            self.validate_runtime_paths_fresh(m3, &predecessor_config.metadata)
+                .await?
+        } else {
+            Vec::new()
+        };
+        if let Some(predecessor_context) = predecessor_context {
+            if self
+                .compose
+                .run(ComposeAction::Stop, predecessor_context)
+                .await
+                .is_err()
+            {
+                return Err(EngineError::Interrupted);
+            }
+            let stopped = self.schedule_predecessor(&record).await?;
+            if !matches!(stopped, Some(ref value) if value.status == ContainerStatus::Exited) {
+                return Err(EngineError::Interrupted);
+            }
         }
-        if let Err(SequencedComposeError::Apply(error)) = compose_result {
+        let post_stop_binds = self
+            .validate_runtime_paths_fresh(m3, &loaded.metadata)
+            .await?;
+        if post_stop_binds != binds {
+            return Err(EngineError::Stable("BIND_CHANGED"));
+        }
+        for identity in &post_stop_binds {
+            crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
+                .map_err(|_| EngineError::Stable("BIND_CHANGED"))?;
+        }
+        crate::api::mutations::validate_bind_plan_against_live_apps(
+            state,
+            m3,
+            record.app_id,
+            &loaded.metadata,
+        )
+        .await
+        .map_err(EngineError::Stable)?;
+        let compose_result = self
+            .compose
+            .run(
+                ComposeAction::DeployCandidate,
+                self.context(record.app_id, candidate_id)?,
+            )
+            .await;
+        if let Err(error) = compose_result {
             if matches!(error, ComposeError::Cancelled) {
                 return Err(EngineError::Interrupted);
             }
@@ -362,14 +416,26 @@ impl DeploymentEngine {
                             | ComposeError::UnsafePath
                     ) =>
                 {
-                    self.restore_predecessor(&record, predecessor.as_ref())
-                        .await?;
+                    self.restore_predecessor(
+                        state,
+                        m3,
+                        &record,
+                        predecessor.as_ref(),
+                        &predecessor_binds,
+                    )
+                    .await?;
                     self.cleanup_pending(record.app_id, candidate_id)?;
                     Err(EngineError::Stable(error.public_code()))
                 }
                 FailedApplyObservation::NoEffect => {
-                    self.restore_predecessor(&record, predecessor.as_ref())
-                        .await?;
+                    self.restore_predecessor(
+                        state,
+                        m3,
+                        &record,
+                        predecessor.as_ref(),
+                        &predecessor_binds,
+                    )
+                    .await?;
                     Err(EngineError::Interrupted)
                 }
             };
@@ -1240,6 +1306,14 @@ impl DeploymentEngine {
             crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
                 .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
         }
+        crate::api::mutations::validate_bind_plan_against_live_apps(
+            state,
+            m3,
+            record.app_id,
+            &loaded.metadata,
+        )
+        .await
+        .map_err(EngineError::NeedsAttention)?;
         if loaded.metadata.service_discovery_enabled {
             let app = state
                 .observer
@@ -1254,21 +1328,48 @@ impl DeploymentEngine {
             .await
             .map_err(|error| EngineError::NeedsAttention(error.public_code()))?;
         }
-        rollback_candidate_to_predecessor(
-            self.compose.as_ref(),
-            self.context(record.app_id, candidate)?,
-            self.context(record.app_id, old_id)?,
+        self.compose
+            .run(ComposeAction::Stop, self.context(record.app_id, candidate)?)
+            .await
+            .map_err(|_| EngineError::NeedsAttention("ROLLBACK_FAILED"))?;
+        let stopped_candidate = self
+            .observe_owned_candidate(record.app_id, candidate, None)
+            .await?;
+        if stopped_candidate.id != fresh_candidate.id
+            || stopped_candidate.status != ContainerStatus::Exited
+        {
+            return Err(EngineError::NeedsAttention("ROLLBACK_FAILED"));
+        }
+        let post_stop_binds = self
+            .validate_runtime_paths_fresh(m3, &loaded.metadata)
+            .await?;
+        if post_stop_binds != binds {
+            return Err(EngineError::NeedsAttention("BIND_CHANGED"));
+        }
+        for identity in &post_stop_binds {
+            crate::domain::revalidate_bind_identity(identity, &m3.store.allowed_bind_roots())
+                .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
+        }
+        crate::api::mutations::validate_bind_plan_against_live_apps(
+            state,
+            m3,
+            record.app_id,
+            &loaded.metadata,
         )
         .await
-        .map_err(|error| match error {
-            SequencedComposeError::Stop => EngineError::NeedsAttention("ROLLBACK_FAILED"),
-            SequencedComposeError::Apply(
+        .map_err(EngineError::NeedsAttention)?;
+        self.compose
+            .run(
+                ComposeAction::DeployCandidate,
+                self.context(record.app_id, old_id)?,
+            )
+            .await
+            .map_err(|error| match error {
                 ComposeError::ValidationFailed
                 | ComposeError::OutputInvalid
-                | ComposeError::UnsafePath,
-            ) => EngineError::NeedsAttention("ROLLBACK_FAILED"),
-            SequencedComposeError::Apply(_) => EngineError::Interrupted,
-        })?;
+                | ComposeError::UnsafePath => EngineError::NeedsAttention("ROLLBACK_FAILED"),
+                _ => EngineError::Interrupted,
+            })?;
         let container = self
             .observe_owned_candidate(record.app_id, old_id, Some(&fresh_candidate.id))
             .await?;
@@ -1322,8 +1423,11 @@ impl DeploymentEngine {
 
     async fn restore_predecessor(
         &self,
+        state: &AppState,
+        services: &M3Services,
         record: &DeploymentRecord,
         predecessor: Option<&ContainerRecord>,
+        expected_bind_identities: &[crate::domain::BindIdentity],
     ) -> Result<(), EngineError> {
         let Some(predecessor) = predecessor else {
             return Ok(());
@@ -1334,6 +1438,36 @@ impl DeploymentEngine {
         let release_id = record
             .expected_actual_release_id
             .ok_or(EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        let release = self
+            .store
+            .load_v2_release(record.app_id, release_id)
+            .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        let loaded = config_revision::load_verified(
+            &self.store.app_directory(record.app_id),
+            release.config_revision,
+            self.store
+                .integrity_key()
+                .map_err(|_| EngineError::Internal)?,
+        )
+        .map_err(|_| EngineError::NeedsAttention("PREDECESSOR_RESTORE_FAILED"))?;
+        let identities = self
+            .validate_runtime_paths_fresh(services, &loaded.metadata)
+            .await?;
+        if identities != expected_bind_identities {
+            return Err(EngineError::NeedsAttention("BIND_CHANGED"));
+        }
+        for identity in &identities {
+            crate::domain::revalidate_bind_identity(identity, &services.store.allowed_bind_roots())
+                .map_err(|_| EngineError::NeedsAttention("BIND_CHANGED"))?;
+        }
+        crate::api::mutations::validate_bind_plan_against_live_apps(
+            state,
+            services,
+            record.app_id,
+            &loaded.metadata,
+        )
+        .await
+        .map_err(EngineError::NeedsAttention)?;
         self.compose
             .run(
                 ComposeAction::Start,
@@ -1416,44 +1550,6 @@ fn release_run_context(
         stop_grace_period_seconds,
         redaction_patterns: Vec::new(),
     })
-}
-
-#[derive(Debug)]
-enum SequencedComposeError {
-    Stop,
-    Apply(ComposeError),
-}
-
-async fn deploy_candidate_after_predecessor(
-    compose: &dyn ComposeRunner,
-    predecessor: Option<RunContext>,
-    candidate: RunContext,
-) -> Result<crate::compose::ComposeOutput, SequencedComposeError> {
-    if let Some(predecessor) = predecessor {
-        compose
-            .run(ComposeAction::Stop, predecessor)
-            .await
-            .map_err(|_| SequencedComposeError::Stop)?;
-    }
-    compose
-        .run(ComposeAction::DeployCandidate, candidate)
-        .await
-        .map_err(SequencedComposeError::Apply)
-}
-
-async fn rollback_candidate_to_predecessor(
-    compose: &dyn ComposeRunner,
-    candidate: RunContext,
-    predecessor: RunContext,
-) -> Result<crate::compose::ComposeOutput, SequencedComposeError> {
-    compose
-        .run(ComposeAction::Stop, candidate)
-        .await
-        .map_err(|_| SequencedComposeError::Stop)?;
-    compose
-        .run(ComposeAction::DeployCandidate, predecessor)
-        .await
-        .map_err(SequencedComposeError::Apply)
 }
 
 async fn record_terminal_error(ledger: &DeploymentLedger, deployment_id: Uuid, error: EngineError) {
@@ -1674,95 +1770,6 @@ mod tests {
             mounts: Vec::new(),
             networks: Vec::new(),
         }
-    }
-
-    fn context(stop_grace_period_seconds: u16) -> RunContext {
-        RunContext {
-            project_name: "solodock-example".into(),
-            project_directory: "/var/lib/solodock/apps/example".into(),
-            compose_file: format!("/var/lib/solodock/{stop_grace_period_seconds}.yaml").into(),
-            timeout: Duration::from_secs(u64::from(stop_grace_period_seconds) + 60),
-            stop_grace_period_seconds,
-            redaction_patterns: Vec::new(),
-        }
-    }
-
-    #[derive(Default)]
-    struct RecordingCompose {
-        calls: Mutex<Vec<(ComposeAction, u16)>>,
-        fail_at: Mutex<Option<usize>>,
-    }
-
-    impl RecordingCompose {
-        fn failing_at(call: usize) -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
-                fail_at: Mutex::new(Some(call)),
-            }
-        }
-
-        fn calls(&self) -> Vec<(ComposeAction, u16)> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ComposeRunner for RecordingCompose {
-        async fn run(
-            &self,
-            action: ComposeAction,
-            context: RunContext,
-        ) -> Result<ComposeOutput, ComposeError> {
-            let mut calls = self.calls.lock().unwrap();
-            calls.push((action, context.stop_grace_period_seconds));
-            let call = calls.len();
-            drop(calls);
-            if *self.fail_at.lock().unwrap() == Some(call) {
-                *self.fail_at.lock().unwrap() = None;
-                Err(ComposeError::UnknownEffect)
-            } else {
-                Ok(ComposeOutput {
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                })
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn replacement_stops_predecessor_with_its_grace_before_candidate_apply() {
-        let compose = RecordingCompose::default();
-        deploy_candidate_after_predecessor(&compose, Some(context(60)), context(10))
-            .await
-            .unwrap();
-        assert_eq!(
-            compose.calls(),
-            vec![
-                (ComposeAction::Stop, 60),
-                (ComposeAction::DeployCandidate, 10),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_candidate_is_stopped_with_its_grace_before_predecessor_restore() {
-        let compose = RecordingCompose::failing_at(2);
-        assert!(matches!(
-            deploy_candidate_after_predecessor(&compose, Some(context(10)), context(60)).await,
-            Err(SequencedComposeError::Apply(ComposeError::UnknownEffect))
-        ));
-        rollback_candidate_to_predecessor(&compose, context(60), context(10))
-            .await
-            .unwrap();
-        assert_eq!(
-            compose.calls(),
-            vec![
-                (ComposeAction::Stop, 10),
-                (ComposeAction::DeployCandidate, 60),
-                (ComposeAction::Stop, 60),
-                (ComposeAction::DeployCandidate, 10),
-            ]
-        );
     }
 
     #[test]

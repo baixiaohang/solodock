@@ -15,7 +15,6 @@ use crate::{
         ManagedFileContent, ManagedFileInput, NormalizedDraft, PublicEnvInput, SecretEnvInput,
         SecretOperation,
         dto::{DraftResponse, ManagedFileResponse},
-        normalize_draft,
     },
     security::permissions::{
         LEGACY_MANAGED_FILE_MODES, MANAGED_FILE_MODE, check_private, check_private_tree,
@@ -50,7 +49,7 @@ impl LoadedRevision {
         hmac_key: &[u8],
         allowed_bind_roots: &[PathBuf],
     ) -> Result<NormalizedDraft, DomainError> {
-        let mut normalized = normalize_draft(
+        let mut normalized = crate::domain::validation::normalize_existing_draft(
             self.input(
                 display_name,
                 discovery_image_ref,

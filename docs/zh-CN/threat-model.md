@@ -16,6 +16,8 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 部署只信任严格解析并校验 digest/header/body/platform 的 Registry 结果，不验证 Cosign/Sigstore 签名。tag race 不能改变已调度 candidate，但 Registry/镜像供应链仍可能提供恶意内容。容器 capabilities、mount 和 Compose 由 typed generator 限制；bind allowlist 和 Docker data-root overlap 每次 effect 前 fail closed。
 
+拥有 read-write bind 的受管容器在该 source 范围内属于不可信宿主文件系统 writer。因此，SoloDock 会拒绝这个 source 成为另一 bind source 严格祖先的任何计划。同一应用替换时，系统先停止并确认 exact writer，再 fresh 解析和复核 bind；另一应用中的冲突 writer 会阻止 start-like action，且绝不会被自动停止。这关闭了受管 SIGTERM path-swap 窗口，但不承诺抵御 host root 或能并发修改 allowed path 的独立进程。
+
 资源防护包括请求/body/stream/log buffer 上限、单一 Compose mutation、最多两个 Registry resolve、poll jitter/backoff、busy coalescing 和失败 target suppression。它不承诺抵御拥有宿主 root、Docker daemon控制权或合法管理员 session 的攻击者，也不提供多租户隔离。
 
 Webhook hostname 是独立的公开攻击面：只信任当前 filesystem secret 对固定 body/path/timestamp/nonce 的 HMAC，不信任代理来源 IP、payload image facts 或转发 header。Nonce/wake/audit 原子持久化，body、并发和 rate map 都有固定上限；无效请求不写持久 audit/replay，以避免外部存储放大。该边界不替代外部 Tunnel/WAF rate limit。

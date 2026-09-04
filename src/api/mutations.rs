@@ -39,7 +39,7 @@ use crate::{
     },
     domain::{
         DesiredState, DraftInput, DraftValidationError, ExistingSecrets, NormalizedDraft,
-        normalize_draft_with_issues, validate_slug,
+        ValidationIssue, normalize_draft_with_issues, validate_slug,
     },
     error::{ApiError, RequestId},
     mutation::{
@@ -421,6 +421,9 @@ pub async fn update_draft(
         }
     };
     validate_registry_credential(&state, &draft, request_id)?;
+    if let Err(error) = validate_bind_plan_against_stored_apps(services, app_id, &draft.metadata) {
+        return finish_draft_validation_error(services, &route, raw_key, error, request_id).await;
+    }
     let metadata = match services.store.update_draft(
         app_id,
         payload.expected_revision,
@@ -537,6 +540,8 @@ pub async fn validate(
     )
     .map_err(|error| ApiError::draft_validation(error, request_id))?;
     validate_registry_credential(&state, &draft, request_id)?;
+    validate_bind_plan_against_stored_apps(services, app_id, &draft.metadata)
+        .map_err(|error| ApiError::draft_validation(error, request_id))?;
     let bind_identities = validate_runtime_paths(&state, services, &draft.metadata)
         .await
         .map_err(|code| ApiError::conflict(code, request_id))?;
@@ -1115,6 +1120,21 @@ fn load_verified_active(
     services: &M3Services,
     app_id: Uuid,
 ) -> Result<VerifiedActive, &'static str> {
+    load_verified_active_with_bind_guard(services, app_id, true)
+}
+
+fn load_verified_active_for_stop(
+    services: &M3Services,
+    app_id: Uuid,
+) -> Result<VerifiedActive, &'static str> {
+    load_verified_active_with_bind_guard(services, app_id, false)
+}
+
+fn load_verified_active_with_bind_guard(
+    services: &M3Services,
+    app_id: Uuid,
+    enforce_bind_guard: bool,
+) -> Result<VerifiedActive, &'static str> {
     let report = services
         .store
         .scan_read_only()
@@ -1134,11 +1154,16 @@ fn load_verified_active(
         .ok_or("ACTIVE_RELEASE_CONFIG_UNKNOWN")?;
     let loaded =
         load_config(services, app_id, revision).map_err(|_| "ACTIVE_RELEASE_CONFIG_UNKNOWN")?;
-    verify_active_compose(services, &app, release_id, &loaded)
-        .map_err(|_| "ACTIVE_COMPOSE_INVALID")?;
-    let bind_identities =
+    if enforce_bind_guard {
+        verify_active_compose(services, &app, release_id, &loaded)
+            .map_err(|_| "ACTIVE_COMPOSE_INVALID")?;
+    }
+    let bind_identities = if enforce_bind_guard {
         crate::domain::validate_binds(&loaded.metadata.binds, &services.store.allowed_bind_roots())
-            .map_err(|_| "BIND_INVALID")?;
+            .map_err(|error| error.public_code())?
+    } else {
+        Vec::new()
+    };
     let compose_file = services
         .store
         .app_directory(app_id)
@@ -1154,9 +1179,17 @@ fn load_verified_active(
     })
 }
 
-fn load_verified_pending(
+fn load_verified_pending_for_stop(
     services: &M3Services,
     app_id: Uuid,
+) -> Result<VerifiedActive, &'static str> {
+    load_verified_pending_with_bind_guard(services, app_id, false)
+}
+
+fn load_verified_pending_with_bind_guard(
+    services: &M3Services,
+    app_id: Uuid,
+    enforce_bind_guard: bool,
 ) -> Result<VerifiedActive, &'static str> {
     let report = services
         .store
@@ -1172,7 +1205,7 @@ fn load_verified_pending(
         return Err("APP_UNCONFIGURED");
     }
     if app.active_release_id.is_some() {
-        return load_verified_active(services, app_id);
+        return load_verified_active_with_bind_guard(services, app_id, enforce_bind_guard);
     }
     let release_id = app.pending_release_id.ok_or("APP_DEPLOY_REQUIRED")?;
     let release = services
@@ -1184,9 +1217,12 @@ fn load_verified_pending(
     }
     let loaded = load_config(services, app_id, release.config_revision)
         .map_err(|_| "PENDING_RELEASE_CONFIG_UNKNOWN")?;
-    let bind_identities =
+    let bind_identities = if enforce_bind_guard {
         crate::domain::validate_binds(&loaded.metadata.binds, &services.store.allowed_bind_roots())
-            .map_err(|_| "BIND_INVALID")?;
+            .map_err(|error| error.public_code())?
+    } else {
+        Vec::new()
+    };
     Ok(VerifiedActive {
         app,
         release_id,
@@ -1268,6 +1304,147 @@ pub(crate) async fn validate_runtime_paths(
     )
 }
 
+fn bind_safety_sources(
+    metadata: &crate::domain::ConfigMetadata,
+    allowed_roots: &[PathBuf],
+    enforce_internal_plan: bool,
+) -> Result<Vec<crate::domain::BindSafetySource>, crate::domain::DomainError> {
+    let identities = if enforce_internal_plan {
+        crate::domain::validate_binds(&metadata.binds, allowed_roots)?
+    } else {
+        crate::domain::validation::validate_existing_binds(&metadata.binds, allowed_roots)?
+    };
+    Ok(identities
+        .into_iter()
+        .zip(&metadata.binds)
+        .map(|(identity, bind)| crate::domain::BindSafetySource {
+            identity,
+            readonly: bind.readonly,
+        })
+        .collect())
+}
+
+fn bind_inventory_draft_error() -> DraftValidationError {
+    DraftValidationError {
+        error: crate::domain::DomainError::ConfigInvalid,
+        issues: vec![ValidationIssue {
+            path: "binds".into(),
+            code: "BIND_INVENTORY_INCOMPLETE",
+            message: "Existing application bind inventory could not be verified".into(),
+        }],
+    }
+}
+
+fn bind_draft_error(error: crate::domain::DomainError) -> DraftValidationError {
+    let code = error.public_code();
+    let message = error.to_string();
+    DraftValidationError {
+        error,
+        issues: vec![ValidationIssue {
+            path: "binds".into(),
+            code,
+            message,
+        }],
+    }
+}
+
+fn validate_bind_plan_against_stored_apps(
+    services: &M3Services,
+    target_app_id: Uuid,
+    target: &crate::domain::ConfigMetadata,
+) -> Result<(), DraftValidationError> {
+    let allowed_roots = services.store.allowed_bind_roots();
+    let target_sources =
+        bind_safety_sources(target, &allowed_roots, true).map_err(bind_draft_error)?;
+    let mut existing = Vec::new();
+    let report = services
+        .store
+        .scan_read_only()
+        .map_err(|_| bind_inventory_draft_error())?;
+    if !report.issues.is_empty() {
+        return Err(bind_inventory_draft_error());
+    }
+    for recovered in report
+        .valid_apps
+        .iter()
+        .filter(|app| app.app_id != target_app_id)
+    {
+        let mut revisions = [
+            recovered.active_config_revision,
+            recovered.pending_config_revision,
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        revisions.sort_unstable();
+        revisions.dedup();
+        for revision in revisions {
+            let loaded = load_config(services, recovered.app_id, revision)
+                .map_err(|_| bind_inventory_draft_error())?;
+            existing.extend(
+                bind_safety_sources(&loaded.metadata, &allowed_roots, false)
+                    .map_err(|_| bind_inventory_draft_error())?,
+            );
+        }
+    }
+    crate::domain::validate_bind_plan(&target_sources, &existing).map_err(bind_draft_error)
+}
+
+pub(crate) async fn validate_bind_plan_against_live_apps(
+    state: &AppState,
+    services: &M3Services,
+    target_app_id: Uuid,
+    target: &crate::domain::ConfigMetadata,
+) -> Result<(), &'static str> {
+    let allowed_roots = services.store.allowed_bind_roots();
+    let target_sources =
+        bind_safety_sources(target, &allowed_roots, true).map_err(|error| error.public_code())?;
+    let report = services
+        .store
+        .scan_read_only()
+        .map_err(|_| "BIND_INVENTORY_INCOMPLETE")?;
+    if !report.issues.is_empty() {
+        return Err("BIND_INVENTORY_INCOMPLETE");
+    }
+    let mut existing = Vec::new();
+    for recovered in report
+        .valid_apps
+        .iter()
+        .filter(|app| app.app_id != target_app_id)
+    {
+        let app = AppCatalogEntry::from(recovered);
+        let Some(container) = mutation_container_policy(state, &app, true)
+            .await
+            .map_err(|_| "BIND_INVENTORY_INCOMPLETE")?
+        else {
+            continue;
+        };
+        if container.status == ContainerStatus::Exited {
+            continue;
+        }
+        let release_id =
+            crate::docker::ownership::validate_syntactic_identity(&container.labels, &app)
+                .ok_or("BIND_INVENTORY_INCOMPLETE")?
+                .release_id;
+        let revision = if recovered.active_release_id == Some(release_id) {
+            recovered.active_config_revision
+        } else if recovered.pending_release_id == Some(release_id) {
+            recovered.pending_config_revision
+        } else {
+            None
+        }
+        .ok_or("BIND_INVENTORY_INCOMPLETE")?;
+        let loaded = load_config(services, recovered.app_id, revision)
+            .map_err(|_| "BIND_INVENTORY_INCOMPLETE")?;
+        existing.extend(
+            bind_safety_sources(&loaded.metadata, &allowed_roots, false)
+                .map_err(|_| "BIND_INVENTORY_INCOMPLETE")?,
+        );
+    }
+    crate::domain::validate_bind_plan(&target_sources, &existing)
+        .map_err(|error| error.public_code())
+}
+
 pub(crate) fn validate_runtime_paths_for_docker_root(
     services: &M3Services,
     metadata: &crate::domain::ConfigMetadata,
@@ -1275,7 +1452,7 @@ pub(crate) fn validate_runtime_paths_for_docker_root(
 ) -> Result<Vec<crate::domain::BindIdentity>, &'static str> {
     let allowed_bind_roots = services.store.allowed_bind_roots();
     let identities = crate::domain::validate_binds(&metadata.binds, &allowed_bind_roots)
-        .map_err(|_| "BIND_INVALID")?;
+        .map_err(|error| error.public_code())?;
     if let Some(root) = docker_root.map(PathBuf::from)
         && (allowed_bind_roots
             .iter()
@@ -1335,10 +1512,14 @@ async fn lifecycle(
             .await;
         }
     };
-    let verified = match load_verified_active(services, app_id) {
+    let verified = match if matches!(action, LifecycleAction::Stop) {
+        load_verified_active_for_stop(services, app_id)
+    } else {
+        load_verified_active(services, app_id)
+    } {
         Ok(value) => value,
         Err("APP_DEPLOY_REQUIRED") if matches!(action, LifecycleAction::Stop) => {
-            match load_verified_pending(services, app_id) {
+            match load_verified_pending_for_stop(services, app_id) {
                 Ok(value) => value,
                 Err(code) => {
                     return finish_error(
@@ -1381,7 +1562,23 @@ async fn lifecycle(
     let active_metadata = verified.loaded.metadata.clone();
     let operation_deadline = tokio::time::Instant::now()
         + Duration::from_secs((u64::from(active_metadata.stop_grace_period_seconds) + 30).max(60));
-    if let Err(code) = validate_runtime_paths(state, services, &active_metadata).await {
+    if !matches!(action, LifecycleAction::Stop)
+        && let Err(code) = validate_runtime_paths(state, services, &active_metadata).await
+    {
+        return finish_error(
+            services,
+            &route,
+            raw_key,
+            code,
+            mutation_status(code),
+            request_id,
+        )
+        .await;
+    }
+    if !matches!(action, LifecycleAction::Stop)
+        && let Err(code) =
+            validate_bind_plan_against_live_apps(state, services, app_id, &active_metadata).await
+    {
         return finish_error(
             services,
             &route,
@@ -1432,7 +1629,7 @@ async fn lifecycle(
             (None, "stopped")
         }
         (LifecycleAction::Stop, Ok(Some(_))) => (Some(ComposeAction::Stop), "stopped"),
-        (LifecycleAction::Restart, Ok(Some(_))) => (Some(ComposeAction::Restart), "running"),
+        (LifecycleAction::Restart, Ok(Some(_))) => (Some(ComposeAction::Stop), "running"),
         (LifecycleAction::Restart, Ok(None)) => {
             return finish_error(
                 services,
@@ -1623,7 +1820,9 @@ async fn lifecycle(
         // operation before spawning the CLI.
         let final_verified =
             if app.active_release_id.is_none() && matches!(action, LifecycleAction::Stop) {
-                load_verified_pending(services, app_id)
+                load_verified_pending_for_stop(services, app_id)
+            } else if matches!(action, LifecycleAction::Stop) {
+                load_verified_active_for_stop(services, app_id)
             } else {
                 load_verified_active(services, app_id)
             };
@@ -1656,6 +1855,18 @@ async fn lifecycle(
         {
             return interrupt_internal(services, &route, raw_key, request_id).await;
         }
+        if !matches!(action, LifecycleAction::Stop)
+            && validate_bind_plan_against_live_apps(
+                state,
+                services,
+                app_id,
+                &final_active.loaded.metadata,
+            )
+            .await
+            .is_err()
+        {
+            return interrupt_internal(services, &route, raw_key, request_id).await;
+        }
         for identity in &final_active.bind_identities {
             if crate::domain::revalidate_bind_identity(
                 identity,
@@ -1681,24 +1892,121 @@ async fn lifecycle(
                     .await;
                 }
             };
-        if let Err(error) = services
-            .compose
-            .run(
-                compose_action,
-                RunContext {
-                    project_name: final_active.app.project_name.clone(),
-                    project_directory: services.store.app_directory(app_id),
-                    compose_file: final_active.compose_file,
-                    timeout: compose_timeout,
-                    stop_grace_period_seconds: final_active
-                        .loaded
-                        .metadata
-                        .stop_grace_period_seconds,
-                    redaction_patterns: Vec::new(),
-                },
-            )
-            .await
-        {
+        let context = RunContext {
+            project_name: final_active.app.project_name.clone(),
+            project_directory: services.store.app_directory(app_id),
+            compose_file: final_active.compose_file,
+            timeout: compose_timeout,
+            stop_grace_period_seconds: final_active.loaded.metadata.stop_grace_period_seconds,
+            redaction_patterns: Vec::new(),
+        };
+        let effect = if matches!(action, LifecycleAction::Restart) {
+            match services
+                .compose
+                .run(ComposeAction::Stop, context.clone())
+                .await
+            {
+                Ok(_) => {
+                    let stopped = mutation_container_policy(state, &final_active.app, false).await;
+                    let stopped_matches = matches!(
+                        stopped,
+                        Ok(Some(ref container))
+                            if Some(container.id.as_str()) == expected_container_id.as_deref()
+                                && container.status == ContainerStatus::Exited
+                    );
+                    if !stopped_matches {
+                        return interrupt_internal(services, &route, raw_key, request_id).await;
+                    }
+                    if final_active.bind_identities.iter().any(|identity| {
+                        crate::domain::revalidate_bind_identity(
+                            identity,
+                            &services.store.allowed_bind_roots(),
+                        )
+                        .is_err()
+                    }) {
+                        return finish_error(
+                            services,
+                            &route,
+                            raw_key,
+                            "BIND_CHANGED",
+                            mutation_status("BIND_CHANGED"),
+                            request_id,
+                        )
+                        .await;
+                    }
+                    let fresh = match load_verified_active(services, app_id) {
+                        Ok(value) if value.release_id == active_release => value,
+                        Err(code) if post_stop_bind_error(code).is_some() => {
+                            let code = post_stop_bind_error(code).expect("matched bind error");
+                            return finish_error(
+                                services,
+                                &route,
+                                raw_key,
+                                code,
+                                mutation_status(code),
+                                request_id,
+                            )
+                            .await;
+                        }
+                        _ => {
+                            return interrupt_internal(services, &route, raw_key, request_id).await;
+                        }
+                    };
+                    if fresh.bind_identities != final_active.bind_identities {
+                        return finish_error(
+                            services,
+                            &route,
+                            raw_key,
+                            "BIND_CHANGED",
+                            mutation_status("BIND_CHANGED"),
+                            request_id,
+                        )
+                        .await;
+                    }
+                    for identity in &fresh.bind_identities {
+                        if crate::domain::revalidate_bind_identity(
+                            identity,
+                            &services.store.allowed_bind_roots(),
+                        )
+                        .is_err()
+                        {
+                            return finish_error(
+                                services,
+                                &route,
+                                raw_key,
+                                "BIND_CHANGED",
+                                mutation_status("BIND_CHANGED"),
+                                request_id,
+                            )
+                            .await;
+                        }
+                    }
+                    if let Err(code) = validate_bind_plan_against_live_apps(
+                        state,
+                        services,
+                        app_id,
+                        &fresh.loaded.metadata,
+                    )
+                    .await
+                    {
+                        return finish_error(
+                            services,
+                            &route,
+                            raw_key,
+                            code,
+                            mutation_status(code),
+                            request_id,
+                        )
+                        .await;
+                    }
+                    services.compose.run(ComposeAction::Start, context).await
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            services.compose.run(compose_action, context).await
+        };
+        if let Err(error) = effect {
             let _ = error;
             if expected_container_id.is_none()
                 && let Ok(Some(container)) =
@@ -1843,7 +2151,13 @@ fn partial_recreate_can_continue(
 fn mutation_status(code: &str) -> StatusCode {
     match code {
         "APP_NOT_FOUND" => StatusCode::NOT_FOUND,
-        "BIND_INVALID" | "BIND_ROOT_SENSITIVE" => StatusCode::UNPROCESSABLE_ENTITY,
+        "BIND_INVALID"
+        | "BIND_DISABLED"
+        | "BIND_OUTSIDE_ALLOWED_ROOT"
+        | "BIND_SYMLINK"
+        | "BIND_CHANGED"
+        | "BIND_ROOT_SENSITIVE"
+        | "BIND_SOURCE_ANCESTOR_CONFLICT" => StatusCode::UNPROCESSABLE_ENTITY,
         "DOCKER_UNAVAILABLE"
         | "DOCKER_PERMISSION_DENIED"
         | "DOCKER_API_INCOMPATIBLE"
@@ -1855,6 +2169,18 @@ fn mutation_status(code: &str) -> StatusCode {
         | "COMPOSE_TIMEOUT" => StatusCode::SERVICE_UNAVAILABLE,
         "FILESYSTEM_RESCAN_FAILED" => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::CONFLICT,
+    }
+}
+
+fn post_stop_bind_error(code: &'static str) -> Option<&'static str> {
+    match code {
+        "BIND_SOURCE_ANCESTOR_CONFLICT" => Some(code),
+        "BIND_INVALID"
+        | "BIND_DISABLED"
+        | "BIND_OUTSIDE_ALLOWED_ROOT"
+        | "BIND_SYMLINK"
+        | "BIND_CHANGED" => Some("BIND_CHANGED"),
+        _ => None,
     }
 }
 

@@ -71,7 +71,6 @@ pub enum ComposeAction {
     Recreate,
     DeployCandidate,
     Stop,
-    Restart,
     Remove,
 }
 
@@ -295,13 +294,6 @@ fn argv(action: ComposeAction, context: &RunContext) -> Vec<String> {
             context.stop_grace_period_seconds.to_string(),
             "app".to_owned(),
         ]),
-        ComposeAction::Restart => result.extend([
-            "restart".to_owned(),
-            "--no-deps".to_owned(),
-            "--timeout".to_owned(),
-            context.stop_grace_period_seconds.to_string(),
-            "app".to_owned(),
-        ]),
         ComposeAction::Remove => result.extend(["rm", "--force", "app"].map(str::to_owned)),
         ComposeAction::Version => unreachable!(),
     }
@@ -346,7 +338,6 @@ mod tests {
             ComposeAction::Recreate,
             ComposeAction::DeployCandidate,
             ComposeAction::Stop,
-            ComposeAction::Restart,
             ComposeAction::Remove,
         ] {
             let args = argv(action, &context);
@@ -368,11 +359,6 @@ mod tests {
         }
         assert!(
             argv(ComposeAction::Stop, &context)
-                .windows(2)
-                .any(|pair| pair == ["--timeout", "60"])
-        );
-        assert!(
-            argv(ComposeAction::Restart, &context)
                 .windows(2)
                 .any(|pair| pair == ["--timeout", "60"])
         );
