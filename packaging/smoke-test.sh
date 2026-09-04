@@ -833,7 +833,13 @@ if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID=0 SOLODOCK_TEST_GID="$re
 fi
 [[ ! -e $fixture/root-account-restore ]]
 
-if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID=1001 SOLODOCK_TEST_GID=1001 \
+unexpected_uid=1001
+unexpected_gid=1001
+if [[ $unexpected_uid == "$(id -u)" && $unexpected_gid == "$(id -g)" ]]; then
+  unexpected_uid=1002
+  unexpected_gid=1002
+fi
+if PATH="$restore_identity_bin:$PATH" SOLODOCK_TEST_UID="$unexpected_uid" SOLODOCK_TEST_GID="$unexpected_gid" \
   ./packaging/solodock-restore --archive "$fixture/backup.tar" --checksum "$fixture/backup.tar.sha256" --output "$fixture/non-system-account-restore" --validator "$validator" >"$fixture/non-system-account.stdout" 2>"$fixture/non-system-account.stderr"; then
   printf '%s\n' 'restore accepted an unexpected non-system service identity' >&2
   exit 1
