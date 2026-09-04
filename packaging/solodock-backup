@@ -18,6 +18,36 @@ validate_managed_links() {
   done < <(find "$state_root" -xdev -type l -print0)
 }
 
+open_safe_parent() {
+  local candidate=$1 component component_uid component_mode
+  parent_real=$(realpath -e -- "$candidate") || return 1
+  [[ $parent_real == "$candidate" && -d $parent_real && ! -L $parent_real ]] || return 1
+  component=$parent_real
+  while :; do
+    component_uid=$(stat -c '%u' -- "$component") || return 1
+    component_mode=$(stat -c '%a' -- "$component") || return 1
+    [[ $component_uid == 0 || $component_uid == "$(id -u)" ]] || return 1
+    if ((8#$component_mode & 8#022)); then
+      ((8#$component_mode & 8#1000)) || return 1
+    fi
+    [[ $component == / ]] && break
+    component=$(dirname -- "$component")
+  done
+  parent_uid=$(stat -c '%u' -- "$parent_real") || return 1
+  parent_mode=$(stat -c '%a' -- "$parent_real") || return 1
+  [[ $parent_uid == "$(id -u)" && $((8#$parent_mode & 8#022)) -eq 0 ]] || return 1
+  parent_path_identity=$(stat -Lc '%d:%i' -- "$parent_real") || return 1
+  exec {parent_fd}<"$parent_real" || return 1
+  parent_anchor="/proc/$$/fd/$parent_fd"
+  [[ $(stat -Lc '%d:%i' -- "$parent_anchor") == "$parent_path_identity" ]] || return 1
+}
+
+recheck_parent() {
+  [[ $(realpath -e -- "$parent") == "$parent_real" \
+    && $(stat -Lc '%d:%i' -- "$parent") == "$parent_path_identity" \
+    && $(stat -Lc '%d:%i' -- "$parent_anchor") == "$parent_path_identity" ]]
+}
+
 root=''
 output=''
 while (($#)); do
@@ -58,11 +88,22 @@ if [[ -z ${root} ]]; then
   [[ $(stat -c '%U:%G' "$state") == solodock:solodock && $(stat -c '%U:%G' "$config") == solodock:solodock ]] || { printf '%s\n' 'backup inputs have unsafe ownership' >&2; exit 1; }
 fi
 parent=$(dirname -- "$output")
-[[ -d $parent && ! -L $parent && $(realpath -e -- "$parent") == "$parent" ]] || { printf '%s\n' 'output parent is unsafe' >&2; exit 1; }
-tmp="$parent/.solodock-backup-$$.tmp"
-sumtmp="$parent/.solodock-backup-$$.sha256.tmp"
-trap 'rm -f -- "$tmp" "$sumtmp"' EXIT
+open_safe_parent "$parent" || { printf '%s\n' 'output parent or one of its ancestors is unsafe' >&2; exit 1; }
+output_name=$(basename -- "$output")
+anchored_output="$parent_anchor/$output_name"
+[[ ! -e $anchored_output && ! -L $anchored_output && ! -e $anchored_output.sha256 && ! -L $anchored_output.sha256 ]] || { printf '%s\n' 'output and checksum must remain new paths' >&2; exit 2; }
 umask 077
+tmp=$(mktemp "$parent_anchor/.solodock-backup.XXXXXX")
+sumtmp=$(mktemp "$parent_anchor/.solodock-backup-checksum.XXXXXX")
+archive_published=0
+checksum_published=0
+cleanup() {
+  if ((checksum_published)) && [[ $anchored_output.sha256 -ef $sumtmp ]]; then rm -f -- "$anchored_output.sha256"; fi
+  if ((archive_published)) && [[ $anchored_output -ef $tmp ]]; then rm -f -- "$anchored_output"; fi
+  rm -f -- "$tmp" "$sumtmp"
+}
+trap cleanup EXIT
+recheck_parent || { printf '%s\n' 'output parent identity changed before backup' >&2; exit 1; }
 tar --format=pax --numeric-owner --one-file-system -C "$root/" -cf "$tmp" var/lib/solodock etc/solodock/config.toml
 chmod 0600 "$tmp"
 sync -f "$tmp"
@@ -70,8 +111,14 @@ digest=$(sha256sum "$tmp" | awk '{print $1}')
 printf '%s  %s\n' "$digest" "$(basename -- "$output")" >"$sumtmp"
 chmod 0600 "$sumtmp"
 sync -f "$sumtmp"
-mv -- "$tmp" "$output"
-mv -- "$sumtmp" "$output.sha256"
-sync -f "$parent"
+recheck_parent || { printf '%s\n' 'output parent identity changed before publication' >&2; exit 1; }
+ln -- "$tmp" "$anchored_output"
+archive_published=1
+ln -- "$sumtmp" "$anchored_output.sha256"
+checksum_published=1
+sync -f "$parent_anchor"
+recheck_parent || { printf '%s\n' 'output parent identity changed during publication' >&2; exit 1; }
+rm -f -- "$tmp" "$sumtmp"
 trap - EXIT
+exec {parent_fd}<&-
 printf '%s\n' 'offline SoloDock control-plane backup completed'

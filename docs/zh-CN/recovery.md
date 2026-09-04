@@ -16,7 +16,7 @@ sudo /usr/local/bin/solodock-restore \
   --output /secure/solodock-restored
 ```
 
-helper 会拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层。唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`；它会在私有 staging 中把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，再调用版本绑定的同 package binary 严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。`0644`、owner drift、symlink 或特殊文件不会被自动修复。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
+helper 会在解包前拒绝绝对路径、`..`、hard link、特殊文件和非预期顶层，并在任何 owner/mode 修改前校验解出的全部 link：config 必须是非 symlink 的普通文件，整个 staging 中唯一允许的 symlink 是 SoloDock 自有的 canonical `apps/<app UUID>/{active,pending} -> releases/<release UUID>`。它会解析已安装的 `solodock` 系统账户，在不跟随 symlink 的前提下把整个私有 staging tree 映射到该精确 UID/GID，再以服务身份运行版本绑定的 validator。validator 会把 canonical managed leaf 的 legacy `0400`/`0600` 规范化为 `0444`，并严格复核 owner/mode、link boundary、HMAC、config revision 与 canonical Compose。archive 的 owner 字段不会被信任或保留；意外的 `0644` mode、symlink 或特殊文件不会被自动修复。发布会锚定到已检查的父目录身份，并采用原子 no-replace 操作。不要在线覆盖现有 state。将当前 `/var/lib/solodock` 原子改名为可恢复备份，再把验证后的完整 state/config 切入：目录与普通控制面文件分别保持 `0700/0600`，`files/{public,secret}` direct leaf 保持 `0444`，最后启动并检查 journal、`/healthz` 和认证 system health。
 
 binary、config 和 state 必须来自兼容的一组备份。SQLite migration 是 forward-only；迁移后仅回滚 binary 不安全。
 
