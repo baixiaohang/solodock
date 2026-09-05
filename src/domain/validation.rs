@@ -156,22 +156,21 @@ fn normalize_draft_with_options(
     allowed_bind_roots: &[PathBuf],
     enforce_bind_plan: bool,
 ) -> Result<NormalizedDraft, DraftValidationError> {
-    if let Some(profile) = &input.security_profile {
-        if profile.is_empty()
+    if let Some(profile) = &input.security_profile
+        && (profile.is_empty()
             || profile.len() > 48
             || !profile.as_bytes()[0].is_ascii_lowercase()
             || !profile
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-            || profile == "unconfined"
-        {
-            return Err(DraftValidationError::at(
-                DomainError::ConfigInvalid,
-                "security_profile",
-                "INVALID_VALUE",
-                "Use a preinstalled profile name: 1 to 48 lowercase letters, digits or hyphens, starting with a letter",
-            ));
-        }
+            || profile == "unconfined")
+    {
+        return Err(DraftValidationError::at(
+            DomainError::ConfigInvalid,
+            "security_profile",
+            "INVALID_VALUE",
+            "Use a preinstalled profile name: 1 to 48 lowercase letters, digits or hyphens, starting with a letter",
+        ));
     }
     validate_display_name(&input.display_name).map_err(|error| {
         DraftValidationError::at(

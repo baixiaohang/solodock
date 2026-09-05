@@ -62,7 +62,7 @@ impl LoadedRevision {
             allowed_bind_roots,
         )?;
         match self.metadata.schema_version {
-            1 | 2 | 3 if self.metadata.security_profile.is_none() => {
+            1..=3 if self.metadata.security_profile.is_none() => {
                 // Legacy schemas predate some current controls. Re-normalize
                 // all semantic fields, then preserve the signed legacy
                 // metadata and hash for artifact verification.
