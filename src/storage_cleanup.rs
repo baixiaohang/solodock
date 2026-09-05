@@ -109,7 +109,7 @@ pub async fn build_plan(
 ) -> Result<CleanupPlan, CleanupError> {
     match build_plan_inner(store, database, None).await {
         Err(CleanupError::Store(_)) => Err(CleanupError::InventoryIncomplete),
-        result => result,
+        result => result.map(|inventory| inventory.plan),
     }
 }
 
@@ -123,17 +123,31 @@ pub(crate) async fn resume_candidates(
 ) -> Result<HashSet<CleanupArtifact>, CleanupError> {
     Ok(build_plan_inner(store, database, Some(operation))
         .await?
+        .plan
         .candidates
         .into_iter()
         .map(|candidate| candidate.artifact)
         .collect())
 }
 
+pub(crate) struct ArtifactInventory {
+    pub plan: CleanupPlan,
+    pub app_ids: Vec<Uuid>,
+    pub releases: Vec<CleanedReleaseRecord>,
+}
+
+pub(crate) async fn image_protection_inventory(
+    store: &AppStore,
+    database: &Database,
+) -> Result<ArtifactInventory, CleanupError> {
+    build_plan_inner(store, database, None).await
+}
+
 async fn build_plan_inner(
     store: &AppStore,
     database: &Database,
     resuming_operation: Option<Uuid>,
-) -> Result<CleanupPlan, CleanupError> {
+) -> Result<ArtifactInventory, CleanupError> {
     let report = store.scan_read_only()?;
     crate::mutation::idempotency::IdempotencyService::validate_app_tombstones(database, store)
         .await
@@ -413,10 +427,23 @@ async fn build_plan_inner(
         .iter()
         .map(|candidate| candidate.estimated_logical_bytes)
         .sum();
-    Ok(CleanupPlan {
-        candidates,
-        protected,
-        estimated_logical_bytes,
+    Ok(ArtifactInventory {
+        app_ids: report.valid_apps.iter().map(|app| app.app_id).collect(),
+        releases: releases
+            .iter()
+            .map(|item| CleanedReleaseRecord {
+                manifest_digest: item.release.manifest_digest.clone(),
+                local_image_id: item.release.local_image_id.clone(),
+                platform_os: item.release.platform_os.clone(),
+                platform_architecture: item.release.platform_architecture.clone(),
+                platform_variant: item.release.platform_variant.clone(),
+            })
+            .collect(),
+        plan: CleanupPlan {
+            candidates,
+            protected,
+            estimated_logical_bytes,
+        },
     })
 }
 

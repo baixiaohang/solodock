@@ -1,6 +1,23 @@
 import type { Messages } from './en'
 
 export const zhCN = {
+  'Removed': '已删除',
+  'Retained': '已保留',
+  'Docker image cleanup': 'Docker 镜像清理',
+  'Only images from confirmed cleaned releases are considered. Every retained release and every running or stopped container protects its images, including containers outside SoloDock.': '仅考虑已确认清理的 release 对应镜像。所有保留 release 和所有运行或停止的容器均保护其镜像，包括 SoloDock 之外的容器。',
+  'Docker reported size is an upper estimate, not guaranteed reclaimed space or proof of ownership. Cleanup never removes containers, volumes, networks, or parent images and never forces deletion.': 'Docker 报告大小是上限估算，不保证实际释放空间，也不证明镜像归属。清理不删除容器、卷、网络或父镜像，绝不强制删除。',
+  'Protected images': '受保护镜像',
+  'No unused images are eligible for cleanup.': '没有符合清理条件的未使用镜像。',
+  'Docker reported bytes': 'Docker 报告字节数',
+  'I confirm removal of only the selected unused images. This is separate from artifact cleanup.': '我确认仅删除选中的未使用镜像，此操作独立于发布与配置清理。',
+  'Confirm the same image cleanup': '确认同一次镜像清理',
+  'Remove selected images': '删除选中镜像',
+  'Selected image cleanup confirmed.': '选中镜像的清理结果已确认。',
+  'Some images were retained. Scan again before any new cleanup.': '部分镜像已保留。再次清理前请重新扫描。',
+  'Scan unused Docker images': '扫描未使用的 Docker 镜像',
+  'Could not create a safe image cleanup preview.': '无法生成安全的镜像清理预览。',
+  'The image cleanup result is unknown. Retry only this exact operation; do not start another cleanup.': '镜像清理结果未知。仅可重试同一操作，不要开始其他清理。',
+  'The image cleanup was rejected. Scan again to review current references.': '镜像清理被拒绝。请重新扫描并核对当前引用。',
   'English': 'English',
   'Simplified Chinese': '简体中文',
   'Language': '语言',

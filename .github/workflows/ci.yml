@@ -122,6 +122,8 @@ jobs:
         run: cargo test --features embed-ui --all-targets -- --test-threads=2
       - name: Cleanup filesystem recovery gates
         run: cargo test --features docker-e2e --test m3_api storage_cleanup_ -- --test-threads=2
+      - name: Image cleanup Docker HTTP boundary (no host Docker)
+        run: cargo test --features docker-e2e --test image_cleanup_adapter -- --test-threads=2
 
   package-smoke:
     needs: classify

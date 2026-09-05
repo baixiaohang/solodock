@@ -1,3 +1,4 @@
+mod image_cleanup;
 mod support;
 
 use std::{

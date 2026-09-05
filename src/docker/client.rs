@@ -46,6 +46,9 @@ enum Endpoint {
 }
 
 impl BollardReadClient {
+    pub fn image_cleanup(&self) -> BollardImageCleanup {
+        BollardImageCleanup(self.clone())
+    }
     pub fn production() -> Self {
         Self {
             endpoint: Endpoint::Unix,
@@ -84,6 +87,106 @@ impl BollardReadClient {
 
     async fn reset_client(&self) {
         *self.client.lock().await = None;
+    }
+}
+
+#[derive(Clone)]
+pub struct BollardImageCleanup(BollardReadClient);
+
+#[async_trait]
+impl super::image_cleanup::ImageCleanup for BollardImageCleanup {
+    async fn all_containers(&self) -> Result<Vec<ContainerRecord>, DockerError> {
+        with_list_deadline(async {
+            let docker = self.0.client().await?;
+            // No label/status filter: unmanaged and stopped containers protect images too.
+            let options = ListContainersOptionsBuilder::default().all(true).build();
+            let summaries = docker
+                .list_containers(Some(options))
+                .await
+                .map_err(|error| classify(&error, false))?;
+            if summaries.len() > 4096 {
+                return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+            }
+            let mut result = Vec::new();
+            for summary in summaries {
+                let id = summary
+                    .id
+                    .filter(|id| valid_container_id(id))
+                    .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?;
+                // Unlike observation scans, disappearance/incomplete inspect is not skipped.
+                result.push(self.0.inspect_container(&id).await?);
+            }
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn inspect(
+        &self,
+        id: &super::image_cleanup::ExactImageId,
+    ) -> Result<Option<super::image_cleanup::CleanupImage>, DockerError> {
+        let docker = self.0.client().await?;
+        let raw = match tokio::time::timeout(REQUEST_TIMEOUT, docker.inspect_image(id.as_str()))
+            .await
+            .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
+        {
+            Ok(value) => value,
+            Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(error) => return Err(classify(&error, false)),
+        };
+        let size = raw
+            .size
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| DockerError::new(DockerErrorKind::ObservationFailed))?;
+        let mut tags = raw.repo_tags.clone().unwrap_or_default();
+        if tags.len() > 1024 {
+            return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+        }
+        tags.sort();
+        tags.dedup();
+        let mut image = project_image_inspect(raw)?;
+        if super::image_cleanup::ExactImageId::parse(&image.id).is_err()
+            || image.repo_digests.len() > 1024
+        {
+            return Err(DockerError::new(DockerErrorKind::ObservationFailed));
+        }
+        image.repo_digests.sort();
+        image.repo_digests.dedup();
+        Ok(Some(super::image_cleanup::CleanupImage {
+            image,
+            reported_size_bytes: size,
+            repo_tags: tags,
+        }))
+    }
+
+    async fn remove(
+        &self,
+        id: &super::image_cleanup::ExactImageId,
+    ) -> Result<super::image_cleanup::RemoveImageResult, DockerError> {
+        use super::image_cleanup::RemoveImageResult;
+        let docker = self.0.client().await?;
+        let options = bollard::query_parameters::RemoveImageOptionsBuilder::default()
+            .force(false)
+            .noprune(true)
+            .build();
+        match tokio::time::timeout(
+            REQUEST_TIMEOUT,
+            docker.remove_image(id.as_str(), Some(options), None),
+        )
+        .await
+        .map_err(|_| DockerError::new(DockerErrorKind::Unavailable))?
+        {
+            Ok(_)
+            | Err(BollardError::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(RemoveImageResult::Accepted),
+            Err(BollardError::DockerResponseServerError {
+                status_code: 409, ..
+            }) => Ok(RemoveImageResult::Retained),
+            Err(error) => Err(classify(&error, false)),
+        }
     }
 }
 
