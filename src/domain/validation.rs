@@ -52,6 +52,8 @@ impl DraftValidationError {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConfigMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_profile: Option<String>,
     pub schema_version: u32,
     #[serde(default = "default_stop_grace_period_seconds")]
     pub stop_grace_period_seconds: u16,
@@ -84,6 +86,7 @@ pub struct ExistingSecrets {
 }
 
 pub struct NormalizedDraft {
+    pub security_profile: Option<String>,
     pub display_name: String,
     pub discovery_image_ref: String,
     pub credential_ref: Option<uuid::Uuid>,
@@ -153,6 +156,23 @@ fn normalize_draft_with_options(
     allowed_bind_roots: &[PathBuf],
     enforce_bind_plan: bool,
 ) -> Result<NormalizedDraft, DraftValidationError> {
+    if let Some(profile) = &input.security_profile {
+        if profile.is_empty()
+            || profile.len() > 48
+            || !profile.as_bytes()[0].is_ascii_lowercase()
+            || !profile
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || profile == "unconfined"
+        {
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                "security_profile",
+                "INVALID_VALUE",
+                "Use a preinstalled profile name: 1 to 48 lowercase letters, digits or hyphens, starting with a letter",
+            ));
+        }
+    }
     validate_display_name(&input.display_name).map_err(|error| {
         DraftValidationError::at(
             error,
@@ -264,7 +284,8 @@ fn normalize_draft_with_options(
             )
         })?;
     let mut metadata = ConfigMetadata {
-        schema_version: 3,
+        security_profile: input.security_profile.clone(),
+        schema_version: 4,
         stop_grace_period_seconds: input.stop_grace_period_seconds,
         public_env_keys,
         secret_keys,
@@ -293,6 +314,7 @@ fn normalize_draft_with_options(
     let digest = Sha256::digest(canonical);
     metadata.config_sha256 = hex(&digest);
     Ok(NormalizedDraft {
+        security_profile: input.security_profile.clone(),
         display_name: input.display_name.trim().to_owned(),
         discovery_image_ref: input.discovery_image_ref,
         credential_ref: input.credential_ref,
@@ -1397,6 +1419,9 @@ fn canonical_non_secret(
     public_environment: &[PublicEnvInput],
     public_files: &BTreeMap<String, String>,
 ) -> Result<Vec<u8>, DomainError> {
+    if metadata.schema_version < 4 && metadata.security_profile.is_some() {
+        return Err(DomainError::ConfigInvalid);
+    }
     if metadata.schema_version == 1 {
         #[derive(Serialize)]
         struct LegacyConfigMetadata<'a> {
@@ -1649,8 +1674,45 @@ impl DomainError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn security_profile_is_optional_validated_and_integrity_protected() {
+        let base = normalize_draft(input(), &ExistingSecrets::default(), b"key", &[]).unwrap();
+        let mut selected = input();
+        selected.security_profile = Some("codex-v1".into());
+        let normalized =
+            normalize_draft(selected, &ExistingSecrets::default(), b"key", &[]).unwrap();
+        assert_eq!(
+            normalized.metadata.security_profile.as_deref(),
+            Some("codex-v1")
+        );
+        assert_ne!(
+            normalized.metadata.config_sha256,
+            base.metadata.config_sha256
+        );
+        for invalid in [
+            "",
+            "../codex",
+            "unconfined",
+            "a/b",
+            "a=b",
+            "a\nprivileged",
+            "-a",
+            "A",
+        ] {
+            let mut draft = input();
+            draft.security_profile = Some(invalid.into());
+            assert!(normalize_draft(draft, &ExistingSecrets::default(), b"key", &[]).is_err());
+        }
+        for version in 1..=3 {
+            let mut legacy = normalized.metadata.clone();
+            legacy.schema_version = version;
+            assert!(canonical_non_secret(&legacy, &[], &BTreeMap::new()).is_err());
+        }
+    }
+
     fn input() -> DraftInput {
         DraftInput {
+            security_profile: None,
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:latest".into(),
             credential_ref: None,
@@ -2171,6 +2233,7 @@ mod tests {
         assert!(normalized.secret_files.is_empty());
         assert_eq!(normalized.public_files["config"], "public-file");
         let response = serde_json::to_string(&crate::domain::dto::DraftResponse {
+            security_profile: None,
             discovery_image_ref: normalized.discovery_image_ref,
             credential_ref: None,
             auto_deploy_enabled: false,

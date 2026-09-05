@@ -7,6 +7,7 @@ use super::{
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DraftResponse {
+    pub security_profile: Option<String>,
     pub discovery_image_ref: String,
     pub credential_ref: Option<Uuid>,
     pub auto_deploy_enabled: bool,

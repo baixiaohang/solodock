@@ -188,6 +188,8 @@ export const en = {
   'Image HEALTHCHECK': 'Image HEALTHCHECK',
   'Complete successfully when the process exits': 'Complete successfully when the process exits',
   'Disabled (reduced safety)': 'Disabled (reduced safety)',
+  'Container security profile': 'Container security profile',
+  'Leave empty for Docker defaults. Use a versioned profile installed by the host operator.': 'Leave empty for Docker defaults. Use a versioned profile installed by the host operator.',
   'Stop grace period (seconds)': 'Stop grace period (seconds)',
   'Stable window (seconds)': 'Stable window (seconds)',
   'Client': 'Client',

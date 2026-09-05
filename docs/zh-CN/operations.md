@@ -158,3 +158,11 @@ Backup helper 会从自身不可变 package generation 解析 `solodock` binary�
 ## 手动存储清理
 
 SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。清理永远不会定时执行，也不会由磁盘阈值触发。除 active/pending/恢复事实外，每个应用还保留三个最近的回滚 release，且绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。
+
+## 按应用选择容器安全策略
+
+应用配置可选 `security_profile`，例如 `codex-v1`；空值/null 保持 Docker 默认策略。它是**宿主机预装的策略对名称**，并非任意 Compose 安全选项。SoloDock 只给该应用的单个服务生成 `seccomp=/etc/solodock/security-profiles/<name>/seccomp.json` 和 `apparmor=solodock-<name>`。名称以小写字母开头，长 1–48 个字符，仅含小写 ASCII 字母、数字或连字符；拒绝 `unconfined`。不会添加 capabilities、宿主机 namespace 或 privileged 模式。
+
+宿主机管理员须在部署前安装两份策略、加载 AppArmor，并配置开机加载。策略文件应归 root 所有且不能由业务容器写入。SoloDock 不上传、编辑、安装或放宽宿主机策略。缺失或无效的策略会通过已有部署失败路径导致容器创建失败，不回退为 unconfined。Compose 预览不能证明内核兼容性；部署提升前应在目标宿主机运行应用自己的沙箱冒烟检查。
+
+策略名是不可变的版本标识。改变内容时应安装新的版本名，不能覆盖已安装版本。配置 revision schema 4 通过已有完整性哈希保护所选名称；release、重试、恢复、回滚读取同一 revision。只要运行容器或保留的回滚 release 仍引用旧版本，就须保留对应 seccomp 文件与已加载的 AppArmor profile。宿主机策略内容由管理员管理，不复制到 release artifact，回滚依赖原名称对应的策略仍在。清空应用设置并重新部署会恢复 Docker 默认配置，不改变其他应用。

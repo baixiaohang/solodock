@@ -928,6 +928,7 @@ mod deployment_tests {
     fn configured_app(apps: &AppStore, key: &[u8], slug: &str) -> Uuid {
         let draft = normalize_draft(
             DraftInput {
+                security_profile: None,
                 display_name: slug.into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,

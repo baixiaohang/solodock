@@ -190,6 +190,8 @@ export const zhCN = {
   'Image HEALTHCHECK': '镜像 HEALTHCHECK',
   'Complete successfully when the process exits': '运行完成即成功',
   'Disabled (reduced safety)': '禁用（降低安全）',
+  'Container security profile': '容器安全策略',
+  'Leave empty for Docker defaults. Use a versioned profile installed by the host operator.': '留空使用 Docker 默认策略。填写宿主机管理员已安装的版本化策略名称。',
   'Stop grace period (seconds)': '停机宽限（秒）',
   'Stable window (seconds)': '稳定窗口（秒）',
   'Client': '客户端',

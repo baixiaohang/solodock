@@ -11,6 +11,8 @@ pub struct ComposeDocument {
 
 #[derive(Debug, Serialize)]
 pub struct Service {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub security_opt: Vec<String>,
     pub image: String,
     pub labels: BTreeMap<String, String>,
     pub env_file: Vec<EnvFile>,

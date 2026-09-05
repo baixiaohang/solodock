@@ -47,6 +47,7 @@
   let editImage = $state('')
   let editPoll = $state(300)
   let editStopGrace = $state(10)
+  let editSecurityProfile = $state('')
   let editAutoDeploy = $state(false)
   let editEnvironmentRows = $state<EnvironmentRow[]>([])
   let editFileRows = $state<ManagedFileRow[]>([])
@@ -238,6 +239,7 @@
     editName = app.display_name; editImage = app.draft?.discovery_image_ref ?? ''
     editPoll = app.draft?.poll_interval_seconds ?? 300
     editStopGrace = app.draft?.stop_grace_period_seconds ?? 10
+    editSecurityProfile = app.draft?.security_profile ?? ''
     editAutoDeploy = app.draft?.auto_deploy_enabled ?? false
     editEnvironmentRows = app.draft ? environmentRowsFromDraft(app.draft) : []
     editFileRows = app.draft ? managedFileRowsFromDraft(app.draft) : []
@@ -270,6 +272,7 @@
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
       auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !(app.draft?.auto_deploy_enabled ?? false), poll_interval_seconds: editPoll,
       stop_grace_period_seconds: editStopGrace,
+      security_profile: editSecurityProfile || null,
       environment: environmentProjection.environment,
       files: fileProjection.files,
       ports: editPorts,
@@ -417,6 +420,7 @@
           <PortEditor bind:ports={editPorts} issues={issuesUnder(formIssues, 'ports')} onStructureChange={clearFormIssuePath} />
           <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} issues={[...issuesUnder(formIssues, 'volumes'), ...issuesUnder(formIssues, 'binds')]} onStructureChange={clearFormIssuePath} />
           <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:serviceDiscoveryEnabled={editServiceDiscovery} bind:externalNetworks={editNetworks} issues={issuesUnder(formIssues, 'networks')} onStructureChange={clearFormIssuePath} />
+          <article class="panel"><label>{$t('Container security profile')}<input data-issue-path="security_profile" bind:value={editSecurityProfile} placeholder="codex-v1" /></label><p>{$t('Leave empty for Docker defaults. Use a versioned profile installed by the host operator.')}</p></article>
           <HealthLifecycleEditor bind:health={editHealth} bind:stopGrace={editStopGrace} limits={healthLimits} issues={[...issuesUnder(formIssues, 'health'), ...issuesUnder(formIssues, 'stop_grace_period_seconds')]} />
           <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError || !healthLimits} onclick={() => void validateDraft()}>{$t('Validate only')}</button><button disabled={actionBusy || !!editNetworkError || !healthLimits}>{$t('Save new revision')}</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; tab = 'overview' }}>{$t('Cancel')}</button></div>
           {#if validation}<article class="notice"><h3>{$t('Compose validation')}</h3><p>{validation.plan.runnable ? $t('Runnable') : $t('Preview only')} · {$t('{grace} second stop grace · {ports} ports · {mounts} mounts · {networks} networks · {mode}', { grace: validation.plan.stop_grace_period_seconds, ports: validation.plan.ports, mounts: validation.plan.mounts, networks: validation.plan.networks, mode: networkModeText(validation.plan.network_mode, $t) })}</p>{#if validation.plan.owned_default_network}<p>{$t('Owned network')}: <code>{validation.plan.owned_default_network.docker_name}</code> · {$t('Bridge')}: <code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{#if network.aliases.length} · {$t('Aliases')}: {network.aliases.join(', ')}{/if}</p>{/each}{#if validation.plan.external_networks.length}<p>{$t('External networks are not created, changed, or deleted by SoloDock.')}</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}

@@ -62,6 +62,7 @@ pub fn render(slug: &str, variables: Variables) -> Result<DraftInput, &'static s
         });
     }
     Ok(DraftInput {
+        security_profile: None,
         display_name: slug.to_owned(),
         discovery_image_ref: image.into(),
         credential_ref: None,

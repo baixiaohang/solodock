@@ -18,6 +18,8 @@ pub enum DesiredState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DraftInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_profile: Option<String>,
     pub display_name: String,
     pub discovery_image_ref: String,
     #[serde(default)]
