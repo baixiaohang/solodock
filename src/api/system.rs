@@ -19,6 +19,7 @@ pub struct SystemHealthResponse {
     disk: DiskHealth,
     streams: StreamHealth,
     projection: ProjectionHealth,
+    storage_cleanup: StorageCleanupHealth,
     deployments: DeploymentHealth,
     registry_credentials: CredentialHealth,
     polling: PollingHealth,
@@ -47,6 +48,11 @@ struct StreamHealth {
 #[derive(Serialize)]
 struct ProjectionHealth {
     status: &'static str,
+}
+#[derive(Serialize)]
+struct StorageCleanupHealth {
+    status: &'static str,
+    pending_operations: usize,
 }
 #[derive(Serialize)]
 struct DeploymentHealth {
@@ -118,6 +124,19 @@ pub async fn health(
             .projection_degraded
             .load(std::sync::atomic::Ordering::Acquire)
     });
+    let (storage_cleanup_status, storage_cleanup_pending) = match state.m3.as_ref() {
+        Some(services) => match crate::storage_cleanup::pending_operation_count(
+            &services.store,
+            &services.database,
+        )
+        .await
+        {
+            Ok(0) => ("ok", 0),
+            Ok(pending) => ("pending", pending),
+            Err(_) => ("degraded", 0),
+        },
+        None => ("unavailable", 0),
+    };
     let (credential_status, credential_count) =
         state.m4.as_ref().map_or(("unavailable", 0), |services| {
             services
@@ -155,6 +174,7 @@ pub async fn health(
         || memory_degraded
         || disk_degraded
         || projection_degraded
+        || matches!(storage_cleanup_status, "pending" | "degraded")
         || deployment_interrupted > 0
         || deployment_needs_attention > 0;
     let degraded = degraded || poll_snapshot.status == "degraded" || poll_store_degraded;
@@ -196,6 +216,10 @@ pub async fn health(
             } else {
                 "ok"
             },
+        },
+        storage_cleanup: StorageCleanupHealth {
+            status: storage_cleanup_status,
+            pending_operations: storage_cleanup_pending,
         },
         deployments: DeploymentHealth {
             active: deployment_active,

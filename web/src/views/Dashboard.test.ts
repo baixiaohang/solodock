@@ -36,7 +36,7 @@ const health = {
   memory: { total_bytes: 8589934592, available_bytes: 4294967296, used_percent: 50 },
   disk: { state: { status: 'normal', total_bytes: 4096, available_bytes: 2048, used_percent: 50 }, docker: null },
   streams: { active: 1, limit: 16 },
-  projection: { status: 'ok' }, deployments: { active: 0, interrupted: 0, needs_attention: 0, limit: 1 },
+  projection: { status: 'ok' }, storage_cleanup: { status: 'ok', pending_operations: 0 }, deployments: { active: 0, interrupted: 0, needs_attention: 0, limit: 1 },
   registry_credentials: { status: 'ok', count: 0 }, polling: { coordinator: { status: 'running', due: 0, inflight: 0 }, store_status: 'ok', enabled: 0, suppressed: 0, app_errors: 0 },
   webhooks: { status: 'ok', configured: 0, replay_records: 0 },
 }

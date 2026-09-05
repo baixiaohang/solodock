@@ -63,7 +63,7 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 - temp、rename、parent fsync 和 visible-effect failpoint；
 - runtime read-only scan不删除并发 writer artifact；
-- startup-only cleanup只处理 canonical、ledger-owned artifact；
+- startup 与 runtime filesystem scan 都保留 cleanup candidate；只有 exact ledger-owned finalizer 可以移除已认证的 recovery payload；
 - active/pending canonical symlink、mode/owner、HMAC、config/release/Compose验证；
 - public/secret managed leaf 精确 `0444`、ancestor 保持 `0700`，restrictive umask 下发布 mode 不收窄；startup 仅迁移 canonical legacy `0400`/`0600`，runtime scan 不改权限，unsafe drift fail closed；
 - SQLite 丢失后的可重建事实和不可伪造的认证/audit历史；
@@ -146,3 +146,14 @@ rg -n "proposals/" README.md README.zh-CN.md docs --glob '!testing.md' --glob '!
 - diff 只包含本任务授权的文档。
 
 日常开发命令和默认验证边界见仓库根 `AGENTS.md`；运维验收与恢复演练分别见 [运维](operations.md) 和 [恢复](recovery.md)。
+
+## 手动存储清理门禁
+
+- Protection inventory 覆盖 active、pending、当前 draft、三个 distinct 最近回滚 candidate、`queued`、`running`、`interrupted` 与 `needs_attention` deployment 的全部 release/revision 字段，以及 cleanup recovery proof。
+- 损坏的 filesystem/ledger/trash 输入、stale preview 与 busy 有序 app guard 都证明零 token consumption、零 rename。
+- 既有 application tombstone 复用删除恢复 validator：pending/interrupted/succeeded proof 可与清理共存；unknown entry、marker 损坏及 proof 缺失或不匹配会阻止 preview，并在消费 token 或 rename 前拒绝先前已签发的计划。
+- 最后一份退休 marker unlink 后故障仍保留 durable retirement intent、pending health 与超期 terminal proof，GC 不得回收。Restart 分别覆盖 marker 缺失和模拟崩溃后合法签名 marker 再出现；只有确认目录同步后才能释放 proof。
+- 真实 router 测试注入 plan audit transaction 回滚、marker publication 失败、rename 后两个父目录各自的同步失败、item progress 与 response 写入失败。payload 移除、marker 退休和空目录移除后的部分失败均接续新 store/startup scan、proof-aware GC 与统一 finalizer。CI 显式运行 feature-gated filesystem fault 测试，不调用宿主 Docker。
+- 真实 rollback scheduler/puller 交错在清理中断时建立新 recovery 引用，exact resume 保留它；busy 与 session 不匹配的重试保留原 operation 的恢复身份。public/secret managed leaf 在 preview、detach 与 finalization 中保持按类型判定的 `0444` 权限规则。
+- Release detach 会保留 shared/draft/失败 release 的 config revision；cleaned deployment detail 以 `ROLLBACK_ARTIFACT_CLEANED` 失去 rollback，普通损坏不会被误标。
+- Web 测试覆盖 mount 时零请求、acknowledgement、partial result、unknown outcome exact replay、generation disposal 与 token/path 不泄漏。意外 204/202 或格式不符的 200 成功响应会保留精确 retry identity，直到收到已验证的终态结果。

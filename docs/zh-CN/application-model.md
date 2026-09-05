@@ -111,3 +111,9 @@ preview 合并 active、pending 与 draft 中的文件、volume、bind、network
 默认 deletion 只 unregister。显式 remove 也只移除 token 绑定的精确 owned container；所有 volume、bind 内容和 network 继续保留。删除与 stream producer 之间使用可回滚 barrier，只有 filesystem tombstone commit 后才永久阻止该 app 的新流。
 
 部署、active/pending 和 rollback 语义见 [部署与回滚](deployments.md)，恢复时的文件权限与链接约束见 [恢复](recovery.md)。
+
+## 手动 artifact 清理
+
+存储清理是显式的“预览并确认”操作。它始终保护 active/pending release、当前 draft revision、`queued`、`running`、`interrupted` 与 `needs_attention` deployment 的恢复引用、清理恢复 artifact，以及每个应用额外三个最近的回滚 release。每次预览最多选择全局最旧的 100 个已验证且无引用 release；config revision 只有在没有任何保留 release 或 draft 引用时才成为候选。已知私有临时 artifact 复用同一 typed store inventory。未知名称、链接、类型、owner、mode、签名或 ledger 事实都会让整个 inventory fail closed。
+
+清理绝不删除应用 metadata、deployment、audit 历史、credential、container、volume、bind 数据、network、backup 或 operator 管理的 Docker 资源。逻辑大小估算不承诺实际释放的磁盘空间。

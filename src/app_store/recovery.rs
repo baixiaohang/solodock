@@ -185,6 +185,33 @@ fn scan_with_mode(
             check_private(&entry.path(), true)?;
             continue;
         }
+        if entry.file_name() == std::ffi::OsStr::new(super::cleanup::CLEANUP_TRASH_DIRECTORY) {
+            // Cleanup tombstones are recovery artifacts, not applications.
+            // Validate every operation before allowing the rest of the catalog
+            // to load, but never finalize one from a filesystem scan.
+            let store = super::AppStore {
+                apps_directory: apps_directory.to_owned(),
+                canonical_apps_directory: canonical_apps_directory
+                    .unwrap_or(apps_directory)
+                    .to_owned(),
+                integrity_key: integrity_key.map(|key| std::sync::Arc::new(key.to_vec())),
+                allowed_bind_roots: std::sync::Arc::new(std::sync::RwLock::new(
+                    allowed_bind_roots.to_vec(),
+                )),
+                #[cfg(any(test, feature = "docker-e2e"))]
+                cleanup_fault: std::sync::Arc::new(std::sync::Mutex::new(None)),
+                #[cfg(test)]
+                cleanup_fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+                #[cfg(test)]
+                cleanup_fail_next_finalize: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
+            };
+            store.cleanup_tombstones()?;
+            continue;
+        }
         if is_app_temp_name(&entry.file_name()) {
             let file_type = entry.file_type()?;
             if file_type.is_symlink() || !file_type.is_dir() {
@@ -196,16 +223,8 @@ fn scan_with_mode(
                 &entry.path(),
                 ManagedTreePolicy::DisposableAppTemp,
             )?;
-            if mode == ScanMode::StartupCleanup {
-                fs::remove_dir_all(entry.path())?;
-                super::sync_directory(apps_directory)?;
-            }
             report.issues.push(RecoveryIssue {
-                code: if mode == ScanMode::StartupCleanup {
-                    "TEMP_APP_REMOVED"
-                } else {
-                    "TEMP_ARTIFACT_IGNORED"
-                },
+                code: "TEMP_ARTIFACT_IGNORED",
                 app_id: None,
             });
             continue;
@@ -271,9 +290,6 @@ fn scan_with_mode(
                 code: "TEMP_ARTIFACT_IGNORED",
                 app_id: Some(directory_id),
             });
-        }
-        if mode == ScanMode::StartupCleanup {
-            cleanup_revision_temps(&entry.path())?;
         }
         let active = validate_release_link_path(&entry.path(), "active")?;
         let pending = validate_release_link_path(&entry.path(), "pending")?;
@@ -389,41 +405,6 @@ fn is_app_temp_name(name: &std::ffi::OsStr) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn is_revision_temp_name(name: &std::ffi::OsStr) -> bool {
-    let Some(value) = name.to_str() else {
-        return false;
-    };
-    let Some(suffix) = value.strip_prefix(".solodock-config-tmp-") else {
-        return false;
-    };
-    suffix.len() == 32
-        && suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn cleanup_revision_temps(app_directory: &Path) -> Result<(), StoreError> {
-    let revisions = app_directory.join("config-revisions");
-    let entries = match fs::read_dir(&revisions) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        if !is_revision_temp_name(&entry.file_name()) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() || !file_type.is_dir() {
-            return Err(StoreError::SymlinkBoundary);
-        }
-        check_private(&entry.path(), true)?;
-        fs::remove_dir_all(entry.path())?;
-    }
-    super::sync_directory(&revisions)
-}
-
 fn validate_managed_tree(
     tree_root: &Path,
     app_directory: &Path,
@@ -459,26 +440,12 @@ fn validate_managed_tree(
                 check_private(&path, true)?;
                 pending.push(path);
             } else if file_type.is_file() {
-                match (
-                    policy,
-                    super::config_revision::managed_file_path_kind(app_directory, &path),
-                ) {
-                    (ManagedTreePolicy::DisposableAppTemp, Some(_)) => {
-                        check_allowed_managed_file_modes(
-                            &path,
-                            &[MANAGED_FILE_MODE, 0o400, 0o600],
-                        )?;
-                    }
-                    (
-                        ManagedTreePolicy::Strict,
-                        Some(super::config_revision::ManagedFilePathKind::Canonical),
-                    ) => check_allowed_managed_file_modes(&path, &[MANAGED_FILE_MODE])?,
-                    (
-                        ManagedTreePolicy::Strict,
-                        Some(super::config_revision::ManagedFilePathKind::Temporary),
-                    ) => check_allowed_managed_file_modes(&path, &[MANAGED_FILE_MODE, 0o600])?,
-                    (_, None) => check_private(&path, false)?,
-                }
+                check_managed_tree_file(
+                    &path,
+                    app_directory,
+                    &path,
+                    policy == ManagedTreePolicy::DisposableAppTemp,
+                )?;
             } else {
                 return Err(StoreError::SymlinkBoundary);
             }
@@ -488,6 +455,32 @@ fn validate_managed_tree(
         }
     }
     Ok(temporary_artifacts)
+}
+
+/// The logical path preserves the original typed artifact identity after a
+/// cleanup rename or backup relocation; permissions are checked on `path`.
+pub(crate) fn check_managed_tree_file(
+    path: &Path,
+    app_directory: &Path,
+    logical_path: &Path,
+    disposable_app_temp: bool,
+) -> Result<(), StoreError> {
+    use super::config_revision::ManagedFilePathKind;
+    match (
+        disposable_app_temp,
+        super::config_revision::managed_file_path_kind(app_directory, logical_path),
+    ) {
+        (true, Some(_)) => {
+            check_allowed_managed_file_modes(path, &[MANAGED_FILE_MODE, 0o400, 0o600])
+        }
+        (false, Some(ManagedFilePathKind::Canonical)) => {
+            check_allowed_managed_file_modes(path, &[MANAGED_FILE_MODE])
+        }
+        (false, Some(ManagedFilePathKind::Temporary)) => {
+            check_allowed_managed_file_modes(path, &[MANAGED_FILE_MODE, 0o600])
+        }
+        (_, None) => check_private(path, false).map_err(StoreError::from),
+    }
 }
 
 fn check_allowed_managed_file_modes(path: &Path, allowed: &[u32]) -> Result<(), StoreError> {
@@ -736,9 +729,7 @@ fn scan_app(
     if let Some(revision) = header.draft_revision {
         referenced.insert(revision);
     }
-    if mode == ScanMode::StartupCleanup {
-        cleanup_unreferenced_revisions(path, &referenced)?;
-    }
+    let _ = (mode, referenced);
     Ok(Ok(RecoveredApp {
         app_id: header.id,
         project_name: header.resource_names().project_name,
@@ -864,9 +855,6 @@ fn collect_release_revisions(
             }
             check_private(&entry.path(), true)?;
             validate_managed_tree(&entry.path(), app_directory, ManagedTreePolicy::Strict)?;
-            if mode == ScanMode::StartupCleanup {
-                fs::remove_dir_all(entry.path())?;
-            }
             continue;
         }
         if file_type.is_symlink() {
@@ -918,9 +906,7 @@ fn collect_release_revisions(
             _ => return Ok(Err("RELEASE_HEADER_INVALID")),
         }
     }
-    if mode == ScanMode::StartupCleanup {
-        super::sync_directory(&releases)?;
-    }
+    let _ = mode;
     Ok(Ok(references))
 }
 
@@ -1026,40 +1012,6 @@ fn is_release_temp_name(name: &std::ffi::OsStr) -> bool {
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn cleanup_unreferenced_revisions(
-    app_directory: &Path,
-    referenced: &HashSet<Uuid>,
-) -> Result<(), StoreError> {
-    let revisions = app_directory.join("config-revisions");
-    for entry in fs::read_dir(&revisions)? {
-        let entry = entry?;
-        if is_revision_temp_name(&entry.file_name()) {
-            continue;
-        }
-        let file_type = entry.file_type()?;
-        if file_type.is_symlink() {
-            return Err(StoreError::SymlinkBoundary);
-        }
-        if !file_type.is_dir() {
-            return Err(StoreError::ContentInvalid);
-        }
-        let name = entry.file_name();
-        let revision = name
-            .to_str()
-            .and_then(|value| value.parse::<Uuid>().ok())
-            .ok_or(StoreError::ContentInvalid)?;
-        if name.as_os_str() != std::ffi::OsStr::new(&revision.to_string()) {
-            return Err(StoreError::ContentInvalid);
-        }
-        if !referenced.contains(&revision) {
-            check_private(&entry.path(), true)?;
-            validate_managed_tree(&entry.path(), app_directory, ManagedTreePolicy::Strict)?;
-            fs::remove_dir_all(entry.path())?;
-        }
-    }
-    super::sync_directory(&revisions)
 }
 
 fn load_revision(
@@ -1691,12 +1643,12 @@ mod tests {
         );
 
         let report = scan_with_options(root.path(), None, &[]).unwrap();
-        assert!(!temporary.exists());
+        assert!(temporary.exists());
         assert!(
             report
                 .issues
                 .iter()
-                .any(|issue| issue.code == "TEMP_APP_REMOVED")
+                .any(|issue| issue.code == "TEMP_ARTIFACT_IGNORED")
         );
     }
 
@@ -1757,7 +1709,7 @@ mod tests {
         store.scan_read_only().unwrap();
         assert!(path.exists());
         store.scan().unwrap();
-        assert!(!path.exists());
+        assert!(path.exists());
     }
 
     #[test]
@@ -1815,7 +1767,7 @@ mod tests {
         let app_id = Uuid::new_v4();
         empty_fixture(root.path(), app_id, "example");
         let app = root.path().join(app_id.to_string());
-        let temporary = app.join(".solodock-tmp-interrupted");
+        let temporary = app.join(format!(".solodock-tmp-{}", Uuid::new_v4().simple()));
         fs::write(&temporary, "partial").unwrap();
         fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600)).unwrap();
         let report = scan(root.path()).unwrap();

@@ -13,6 +13,7 @@ pub mod presets;
 pub mod registry;
 pub mod security;
 pub mod settings;
+pub mod storage_cleanup;
 pub mod system;
 pub mod telemetry;
 pub mod webhook;

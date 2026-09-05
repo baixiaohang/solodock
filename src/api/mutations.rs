@@ -883,6 +883,13 @@ pub fn start_projection_reconciler(
             // coordinator guard through inventory, candidate selection, and
             // the bounded DELETE commit.
             let _catalog = services.coordinator.catalog_lock().await;
+            if let Err(error) =
+                crate::storage_cleanup::finalize_succeeded(&services.store, &services.database)
+                    .await
+            {
+                tracing::warn!(error = %error, "storage cleanup finalization remains pending");
+                services.projection_degraded.store(true, Ordering::Release);
+            }
             if services.projection_degraded.load(Ordering::Acquire) {
                 let outcome = refresh_outcome(&state, services).await;
                 if outcome.catalog_published {
@@ -2515,6 +2522,27 @@ pub async fn delete_app(
             .await;
         }
     };
+    let cleanup_in_progress: i64 = match sqlx::query_scalar(
+        "SELECT COUNT(*) FROM storage_cleanup_items i JOIN storage_cleanup_operations o ON o.operation_id=i.operation_id WHERE i.app_id=? AND o.status IN ('planned','running')",
+    )
+    .bind(app_id.to_string())
+    .fetch_one(services.database.pool())
+    .await
+    {
+        Ok(count) => count,
+        Err(_) => return interrupt_internal(services, &route, raw_key, request_id).await,
+    };
+    if cleanup_in_progress != 0 {
+        return finish_error(
+            services,
+            &route,
+            raw_key,
+            "APP_BUSY",
+            StatusCode::CONFLICT,
+            request_id,
+        )
+        .await;
+    }
     let token_hash = payload.confirmation_token.sha256().to_vec();
     let row = match sqlx::query("SELECT session_id,slug,revision_id,preview_hash,preview_json,remove_container,container_ids_json,expires_at,consumed_at FROM deletion_previews WHERE token_hash=? AND app_id=?")
         .bind(&token_hash)

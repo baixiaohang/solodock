@@ -124,3 +124,9 @@ logs 支持有限 tail/since cursor，不接受任意 Docker 参数。framer 先
 stats 只在有 subscriber 时创建 Docker producer，并只保留最新 sample，不累计无界历史。最后一个 subscriber 离开后取消 producer；独立 producer registry保证 deletion/shutdown 能 cancel并 join 所有 generation。
 
 静态资源、SPA fallback 和安全 header 由 embedded asset handler提供；`/api/**` 和 `/hooks/**` 不进入 SPA fallback。公开 webhook 的独立 Host 与签名协议见 [Webhook](webhooks.md)。
+
+## 存储清理
+
+`POST /api/v1/system/storage-cleanup/preview` 接受 `{}`，返回绑定 session、有效期五分钟的确认 token 与精确 artifact plan。`POST /api/v1/system/storage-cleanup/apply` 只接受该 write-only token 和 `acknowledge_rollback_loss: true`，并要求 `Idempotency-Key`。两者都是 management authority mutation，受 exact Origin、CSRF、session、16 KiB body limit、no-store response 和标准安全错误 envelope 保护。
+
+Apply 会取得 catalog 与按序的 application guard、重建 fresh facts；inventory 无效、过期、stale、busy 或不完整时都不会 rename。已确认的 partial result 要求重新 preview。无法确定的 5xx/transport 结果只能以完全相同的 body 与 key 查询；raw token 和 filesystem path 永远不会进入 ledger 或 response item。

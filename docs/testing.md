@@ -63,7 +63,7 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 
 - Temporary files, rename, parent fsync, and visible-effect failpoints.
 - Runtime read-only scans never delete a concurrent writer's artifact.
-- Startup-only cleanup handles only canonical ledger-owned artifacts.
+- Startup and runtime filesystem scans preserve cleanup candidates; only exact ledger-owned finalizers may remove authenticated recovery payloads.
 - Canonical active/pending symlinks, modes/owners, HMACs, and config/release/Compose validation.
 - Exact `0444` public/secret managed leaves with `0700` ancestors and publication modes that do not narrow under restrictive umask. Startup migrates only canonical legacy `0400`/`0600`; runtime scans do not change permissions and unsafe drift fails closed.
 - Rebuildable facts and non-fabricated authentication/audit history after SQLite loss.
@@ -146,3 +146,14 @@ Also verify manually:
 - the diff contains only documentation and collaboration files authorized by the task.
 
 See repository-root `AGENTS.md` for routine development commands and default validation scope, [operations](operations.md) for operational acceptance, and [recovery](recovery.md) for restoration exercises.
+
+## Manual storage cleanup gates
+
+- Protection inventory covers active, pending, current draft, three distinct recent rollback candidates, every release/revision field from `queued`, `running`, `interrupted`, and `needs_attention` deployments, and cleanup recovery proofs.
+- Corrupt filesystem/ledger/trash inputs, stale previews, and busy ordered app guards prove zero token consumption and zero rename.
+- Existing application tombstones reuse the deletion recovery validator: pending/interrupted/succeeded proofs coexist with cleanup, while unknown entries, damaged markers, and missing/mismatched proofs prevent preview and invalidate an already-issued token before consumption or rename.
+- A fault after the last retired-marker unlink keeps the durable retirement intent, pending health, and an aged terminal proof through GC. Restart converges both with the marker absent and with a simulated crash-restored signed marker; only confirmed directory sync releases the proof.
+- Real router tests inject plan-audit transaction rollback, marker publication failure, both post-rename directory sync failures, item-progress and response-write failures. Partial payload removal, marker retirement, and empty-directory removal are followed by a new store/startup scan, proof-aware GC, and the shared finalizer. CI explicitly runs the feature-gated filesystem fault tests without invoking host Docker.
+- A real rollback scheduler/puller interleaving establishes a new recovery reference while cleanup is interrupted; exact resume retains it. Busy and mismatched-session retries preserve the original operation's recovery identity. Public and secret managed leaves retain their typed `0444` policy through preview, detach, and finalization.
+- Release detachment retains shared/draft/failed-release config revisions; cleaned deployment details lose rollback with `ROLLBACK_ARTIFACT_CLEANED` while ordinary damage is not mislabeled.
+- Web tests cover no mount request, acknowledgement, partial results, exact unknown-outcome replay, generation disposal, and token/path non-disclosure. Unexpected 204/202 or malformed 200 success envelopes retain the exact retry identity until a validated terminal result arrives.

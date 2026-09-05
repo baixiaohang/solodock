@@ -185,13 +185,21 @@ impl IdempotencyService {
         &self,
         store: &crate::app_store::AppStore,
     ) -> Result<Vec<(Uuid, Uuid)>, IdempotencyError> {
+        Self::validate_app_tombstones(&self.database, store).await
+    }
+
+    /// Read-only shared recovery inventory; never finalizes a deletion.
+    pub async fn validate_app_tombstones(
+        database: &Database,
+        store: &crate::app_store::AppStore,
+    ) -> Result<Vec<(Uuid, Uuid)>, IdempotencyError> {
         let mut succeeded = Vec::new();
         for (app_id, operation_id) in store.tombstones()? {
             let route = format!("/api/v1/apps/{app_id}");
             let row = sqlx::query("SELECT status,response_status,response_body FROM idempotency_records WHERE actor='admin' AND route=? AND operation_id=?")
                 .bind(route)
                 .bind(operation_id.to_string())
-                .fetch_optional(self.database.pool())
+                .fetch_optional(database.pool())
                 .await?;
             let Some(row) = row else {
                 return Err(IdempotencyError::RecordInvalid);
@@ -467,6 +475,7 @@ impl IdempotencyService {
                 .into_iter()
                 .map(|(_, operation_id)| operation_id),
         );
+        protected.extend(apps.cleanup_tombstones()?);
         protected.extend(
             credentials
                 .tombstones()?
@@ -531,7 +540,7 @@ impl IdempotencyService {
         let mut tx = self.database.pool().begin().await?;
         let mut deleted = 0;
         for (rowid, operation_id) in rows {
-            deleted += sqlx::query("DELETE FROM idempotency_records WHERE rowid=? AND operation_id=? AND status IN ('succeeded','failed') AND updated_at < ?")
+            deleted += sqlx::query("DELETE FROM idempotency_records WHERE rowid=? AND operation_id=? AND status IN ('succeeded','failed') AND updated_at < ? AND NOT EXISTS (SELECT 1 FROM storage_cleanup_operations c WHERE c.operation_id=idempotency_records.operation_id AND c.retirement_pending=1)")
                 .bind(rowid)
                 .bind(operation_id.to_string())
                 .bind(&retention_cutoff)
@@ -549,7 +558,19 @@ impl IdempotencyService {
         credentials: &CredentialStore,
         webhooks: &crate::webhook::WebhookStore,
     ) -> Result<u64, IdempotencyError> {
-        let protected = self.protected_operation_ids(apps, credentials, webhooks)?;
+        let mut protected = self.protected_operation_ids(apps, credentials, webhooks)?;
+        for operation in sqlx::query_scalar::<_, String>(
+            "SELECT operation_id FROM storage_cleanup_operations WHERE retirement_pending=1",
+        )
+        .fetch_all(self.database.pool())
+        .await?
+        {
+            protected.insert(
+                operation
+                    .parse()
+                    .map_err(|_| IdempotencyError::RecordInvalid)?,
+            );
+        }
         self.gc_terminal_records(&protected).await
     }
 

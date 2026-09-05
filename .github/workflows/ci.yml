@@ -120,6 +120,8 @@ jobs:
         working-directory: web
       - name: Test all non-Docker targets
         run: cargo test --features embed-ui --all-targets -- --test-threads=2
+      - name: Cleanup filesystem recovery gates
+        run: cargo test --features docker-e2e --test m3_api storage_cleanup_ -- --test-threads=2
 
   package-smoke:
     needs: classify

@@ -99,7 +99,7 @@ config revision和release先在同一父目录内写入operation-owned temp，�
 
 filesystem commit之后才发布内存catalog/redactor和SQLite投影。投影失败不能把已经提交的事实误报为回滚；系统标记degraded并由shutdown-aware reconciler重试。redactor只有在完整读取所有app、active/pending/draft、Registry credential和webhook secret后才允许destructive replace，不完整时保留旧pattern或拒绝冷启动。
 
-破坏性recovery cleanup只在HTTP listen前运行。运行期verified loader、catalog refresh和reconciler使用read-only scan，不能删除另一个writer正在发布的temp或尚未被旧metadata引用的新revision。
+startup 与 runtime 的 filesystem scan 都是非破坏性的：verified loader、catalog refresh 和 reconciler 不能删除并发 writer 的 temp、未引用 revision 或其他 cleanup candidate。破坏性 recovery 仅限 ledger-owned exact finalizer，且必须同时验证 authenticated artifact 与 durable proof。管理员存储清理使用独立确认的 plan，把每个选中 artifact 原子 detach 到 authenticated tombstone 后，finalizer 才能移除 payload。
 
 replay retention 与 recovery proof retention 是两个不同生命周期。terminal idempotency response 通常在 24 小时后过期；只要 application/credential tombstone、webhook revision 或 webhook operation 临时目录仍依赖某条 exact proof，该 proof 就继续受保护。Webhook inventory 会认证所有 canonical revision，包括 current revision。stale revision cleanup 由当前签名 `webhook.toml` 指定的成功 transition 授权，并把已记录 response 与当前 metadata identity 精确匹配。全局 mutation coordinator 会将 artifact publication/finalization 与 fresh inventory 到有界 SQLite deletion commit 串行化。inventory 不完整或历史 proof 无法验证时零删除。
 
