@@ -1,4 +1,5 @@
 pub mod atomic;
+pub mod cleanup;
 pub mod config_revision;
 pub mod recovery;
 pub mod releases;
@@ -26,6 +27,12 @@ pub struct AppStore {
     canonical_apps_directory: PathBuf,
     integrity_key: Option<Arc<Vec<u8>>>,
     allowed_bind_roots: Arc<RwLock<Vec<PathBuf>>>,
+    #[cfg(any(test, feature = "docker-e2e"))]
+    cleanup_fault: Arc<std::sync::Mutex<Option<cleanup::CleanupFault>>>,
+    #[cfg(test)]
+    cleanup_fail_next_rename: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    cleanup_fail_next_finalize: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppStore {
@@ -36,6 +43,12 @@ impl AppStore {
             apps_directory,
             integrity_key: None,
             allowed_bind_roots: Arc::new(RwLock::new(Vec::new())),
+            #[cfg(any(test, feature = "docker-e2e"))]
+            cleanup_fault: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            cleanup_fail_next_rename: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            cleanup_fail_next_finalize: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -79,26 +92,14 @@ impl AppStore {
 
     pub fn scan(&self) -> Result<recovery::RecoveryReport, StoreError> {
         config_revision::normalize_managed_file_permissions(&self.apps_directory)?;
-        let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_relocated_with_options(
-            &self.apps_directory,
-            &self.canonical_apps_directory,
-            self.integrity_key.as_deref().map(Vec::as_slice),
-            &allowed_bind_roots,
-        )
+        recovery::scan_store(self, recovery::ScanMode::StartupCleanup)
     }
 
     /// Validate and project the current filesystem facts without performing
     /// startup-only cleanup. Runtime readers must never remove a writer's
     /// temporary or newly published-but-not-yet-referenced artifacts.
     pub fn scan_read_only(&self) -> Result<recovery::RecoveryReport, StoreError> {
-        let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_read_only_relocated(
-            &self.apps_directory,
-            &self.canonical_apps_directory,
-            self.integrity_key.as_deref().map(Vec::as_slice),
-            &allowed_bind_roots,
-        )
+        recovery::scan_store(self, recovery::ScanMode::ReadOnly)
     }
 
     pub fn apps_directory(&self) -> &std::path::Path {

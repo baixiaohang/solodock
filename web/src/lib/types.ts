@@ -28,6 +28,32 @@ export interface SettingsResponse {
   idempotency_replayed?: boolean
 }
 
+export type CleanupProtectionReason = 'active' | 'pending' | 'current_draft' | 'recent_rollback' | 'deployment_recovery' | 'cleanup_in_progress'
+
+export interface CleanupCandidate {
+  artifact_kind: 'release' | 'config_revision' | 'temporary'
+  artifact_id: string
+  app_id?: string
+  estimated_logical_bytes: number
+  release_created_at: string | null
+}
+
+export interface CleanupPreview {
+  candidates: CleanupCandidate[]
+  protected: Array<{ reason: CleanupProtectionReason; count: number }>
+  estimated_logical_bytes: number
+  confirmation_token: string
+  expires_at: string
+}
+
+export interface CleanupApplyResult {
+  operation_id: string
+  plan_hash: string
+  status: 'completed' | 'completed_with_failures'
+  items: Array<{ app_id?: string; artifact_kind: string; artifact_id: string; status: 'deleted' | 'retained'; error_code?: string }>
+  idempotency_replayed: boolean
+}
+
 export interface NumericLimit { min: number; max: number; default: number }
 export interface HealthConfigurationLimits {
   running_stable_window_seconds: NumericLimit
@@ -63,6 +89,7 @@ export interface SystemHealth {
   disk: { state: DiskSnapshot; docker: DiskSnapshot | null }
   streams: { active: number; limit: number }
   projection: { status: 'ok' | 'degraded' }
+  storage_cleanup: { status: 'ok' | 'pending' | 'degraded' | 'unavailable'; pending_operations: number }
   deployments: { active: number; interrupted: number; needs_attention: number; limit: number }
   registry_credentials: { status: 'ok' | 'degraded' | 'unavailable'; count: number }
   polling: { coordinator: { status: 'running' | 'degraded' | 'stopped'; due: number; inflight: number }; store_status: 'ok' | 'degraded'; enabled: number; suppressed: number; app_errors: number }

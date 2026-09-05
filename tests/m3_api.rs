@@ -478,6 +478,44 @@ struct Harness {
 }
 
 impl Harness {
+    async fn restart_cleanup_router(&mut self) {
+        let old = self.state.m3.as_ref().unwrap();
+        let database = Database::open(&self.state.state_directory.join("state.sqlite3"))
+            .await
+            .unwrap();
+        let idempotency =
+            IdempotencyService::initialize(database.clone(), &self.state.state_directory).unwrap();
+        idempotency.interrupt_pending().await.unwrap();
+        let store = AppStore::initialize_managed(
+            self.apps.clone(),
+            idempotency.integrity_key(),
+            self.store.allowed_bind_roots(),
+        )
+        .unwrap();
+        solodock::storage_cleanup::finalize_succeeded(&store, &database)
+            .await
+            .unwrap();
+        let report = store.scan().unwrap();
+        database.refresh_app_index(&report).await.unwrap();
+        self.state.m3 = Some(Arc::new(M3Services {
+            store: store.clone(),
+            database: database.clone(),
+            allowed_bind_roots: old.allowed_bind_roots.clone(),
+            runtime_directory: old.runtime_directory.clone(),
+            idempotency: idempotency.clone(),
+            coordinator: AppMutationCoordinator::new(old.runtime_directory.clone()).unwrap(),
+            compose: old.compose.clone(),
+            compose_capability: old.compose_capability.clone(),
+            projection_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            reconcile_notify: Arc::new(tokio::sync::Notify::new()),
+            publication_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }));
+        self.database = database;
+        self.idempotency = idempotency;
+        self.store = store;
+        self.app = router(self.state.clone());
+    }
+
     async fn new() -> Self {
         Self::new_with_docker(Arc::new(MissingDocker)).await
     }
@@ -957,6 +995,1696 @@ async fn body(response: axum::response::Response) -> (StatusCode, String) {
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+async fn storage_cleanup_fixture(harness: &Harness) -> (Uuid, Uuid, Vec<Uuid>, Uuid) {
+    let mut input = draft("cleanup-secret-canary");
+    input["files"] = json!([
+        {"logical_name":"public-config","target_path":"/app/config","sensitive":false,"readonly":true,"content":"cleanup-public-canary"},
+        {"logical_name":"secret-config","target_path":"/app/secret","sensitive":true,"readonly":true,"operation":"replace","value":"cleanup-file-secret-canary"}
+    ]);
+    let (status, created) =
+        body(harness.create(Some("storage-cleanup-create"), &input).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let metadata = harness.store.read_metadata(app_id).unwrap();
+    let mut releases = Vec::new();
+    for index in 0..12 {
+        let release_id = Uuid::new_v4();
+        let digest = format!("sha256:{}", format!("{index:x}").repeat(64));
+        harness
+            .store
+            .publish_v2_release(
+                &metadata,
+                release_id,
+                &solodock::registry::ResolvedImage {
+                    source_image_ref: metadata.discovery_image_ref.clone().unwrap(),
+                    logical_registry: "registry.example".into(),
+                    repository: "app".into(),
+                    source_tag: "stable".into(),
+                    source_descriptor_digest: digest.clone(),
+                    index_digest: None,
+                    manifest_digest: digest.clone(),
+                    runnable_image_ref: format!("registry.example/app@{digest}"),
+                    platform: solodock::registry::Platform::canonical("linux", "amd64", None)
+                        .unwrap(),
+                    local_image_id: digest,
+                },
+                solodock::app_store::releases::ReleaseTrigger::Manual,
+                None,
+            )
+            .unwrap();
+        releases.push(release_id);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    solodock::app_store::atomic::AtomicWriter::switch_release_link(
+        &harness.store.app_directory(app_id),
+        "active",
+        releases[11],
+    )
+    .unwrap();
+    solodock::app_store::atomic::AtomicWriter::switch_release_link(
+        &harness.store.app_directory(app_id),
+        "pending",
+        releases[10],
+    )
+    .unwrap();
+    let base = time::OffsetDateTime::now_utc();
+    let mut source_deployment = Uuid::nil();
+    for (order, index) in [0usize, 7, 8, 9].into_iter().enumerate() {
+        let release_id = releases[index];
+        let deployment_id = Uuid::new_v4();
+        if index == 0 {
+            source_deployment = deployment_id;
+        }
+        let created =
+            solodock::db::format_time(base + time::Duration::seconds(order as i64)).unwrap();
+        sqlx::query("INSERT INTO deployments (id,app_id,trigger,requested_revision,candidate_release_id,status,phase,request_id,created_at,updated_at) VALUES (?,?,'manual',?,?,'succeeded','terminal',?,?,?)")
+            .bind(deployment_id.to_string())
+            .bind(app_id.to_string())
+            .bind(revision.to_string())
+            .bind(release_id.to_string())
+            .bind(Uuid::new_v4().to_string())
+            .bind(&created)
+            .bind(&created)
+            .execute(harness.database.pool())
+            .await
+            .unwrap();
+    }
+    let created = solodock::db::format_time(base + time::Duration::seconds(100)).unwrap();
+    sqlx::query("INSERT INTO deployments (id,app_id,trigger,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,predecessor_runtime_release_id,candidate_release_id,rollback_target_release_id,status,phase,request_id,created_at,updated_at) VALUES (?,?,'manual',?,?,?,?,?,?,?,'queued','queued',?,?,?)")
+        .bind(Uuid::new_v4().to_string())
+        .bind(app_id.to_string())
+        .bind(revision.to_string())
+        .bind(releases[1].to_string())
+        .bind(releases[2].to_string())
+        .bind(releases[3].to_string())
+        .bind(releases[4].to_string())
+        .bind(releases[5].to_string())
+        .bind(releases[6].to_string())
+        .bind(Uuid::new_v4().to_string())
+        .bind(&created)
+        .bind(&created)
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    (app_id, revision, releases, source_deployment)
+}
+
+async fn cleanup_request(harness: &Harness) -> Value {
+    let (status, response) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/preview",
+                None,
+                &json!({}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let preview: Value = serde_json::from_str(&response).unwrap();
+    json!({"confirmation_token": preview["confirmation_token"], "acknowledge_rollback_loss": true})
+}
+
+#[cfg(feature = "docker-e2e")]
+async fn cleanup_exclusive_revision_fixture(harness: &Harness) -> (Uuid, Uuid, Uuid) {
+    let mut input = draft("cleanup-exclusive-secret");
+    input["files"] = json!([
+        {"logical_name":"public-config","target_path":"/app/config","sensitive":false,"readonly":true,"content":"cleanup-public-canary"},
+        {"logical_name":"secret-config","target_path":"/app/secret","sensitive":true,"readonly":true,"operation":"replace","value":"cleanup-file-secret-canary"}
+    ]);
+    let (status, response) = body(
+        harness
+            .create(Some("cleanup-exclusive-create"), &input)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    let created: Value = serde_json::from_str(&response).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let old_revision: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let old_release = Uuid::new_v4();
+    harness.publish_active(
+        app_id,
+        old_release,
+        &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+    );
+    let mut updated = mutable(input);
+    updated["environment"] = mutable_draft("cleanup-new-secret")["environment"].clone();
+    let (status, response) = body(
+        harness
+            .mutate(
+                "PUT",
+                &format!("/api/v1/apps/{app_id}/draft"),
+                Some("cleanup-exclusive-update"),
+                &json!({"expected_revision":old_revision, "draft": updated}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    harness.publish_active(
+        app_id,
+        Uuid::new_v4(),
+        &format!("registry.example/app@sha256:{}", "b".repeat(64)),
+    );
+    (app_id, old_revision, old_release)
+}
+
+#[cfg(feature = "docker-e2e")]
+struct CleanupPausedPuller {
+    reached: tokio::sync::Semaphore,
+    resume: tokio::sync::Semaphore,
+}
+
+#[cfg(feature = "docker-e2e")]
+#[async_trait]
+impl ImagePuller for CleanupPausedPuller {
+    async fn pull(
+        &self,
+        _deployment_id: Uuid,
+        _resolved: &solodock::registry::ResolvedImage,
+        _credential: Option<&solodock::registry::LoadedCredential>,
+        _redaction: Vec<Vec<u8>>,
+    ) -> Result<(), PullError> {
+        self.reached.add_permits(1);
+        self.resume.acquire().await.unwrap().forget();
+        Err(PullError::Interrupted)
+    }
+}
+
+#[cfg(feature = "docker-e2e")]
+#[tokio::test]
+async fn storage_cleanup_resume_preserves_a_new_rollback_scheduler_reference() {
+    use solodock::app_store::cleanup::CleanupFault;
+    let docker = Arc::new(ScriptedDocker::default());
+    let puller = Arc::new(CleanupPausedPuller {
+        reached: tokio::sync::Semaphore::new(0),
+        resume: tokio::sync::Semaphore::new(0),
+    });
+    let harness = Harness::new_with_components(docker.clone(), None, Some(puller.clone())).await;
+    let (app_id, _, releases, source_deployment) = storage_cleanup_fixture(&harness).await;
+    sqlx::query(
+        "UPDATE deployments SET status='interrupted',phase='terminal' WHERE status='queued'",
+    )
+    .execute(harness.database.pool())
+    .await
+    .unwrap();
+    harness
+        .catalog
+        .replace(&harness.store.scan_read_only().unwrap());
+    let request = cleanup_request(&harness).await;
+    let route = "/api/v1/system/storage-cleanup/apply";
+    let key = "cleanup-rollback-interleaving";
+    harness
+        .store
+        .fail_cleanup_once(CleanupFault::MarkerPublished);
+    assert_eq!(
+        harness
+            .mutate("POST", route, Some(key), &request)
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    docker.set(vec![Vec::new()]);
+    let (status, scheduled) = body(harness.mutate("POST", &format!("/api/v1/deployments/{source_deployment}/rollback"), Some("rollback-after-cleanup-interruption"), &json!({
+        "expected_active_release_id": releases[11], "expected_pending_release_id": releases[10],
+        "expected_actual_release_id": null, "expected_actual_container_id": null,
+        "acknowledge_non_rollbackable_data": true
+    })).await).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{scheduled}");
+    tokio::time::timeout(Duration::from_secs(5), puller.reached.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    assert_eq!(
+        harness.store.read_release_link(app_id, "pending").unwrap(),
+        Some(releases[0])
+    );
+    assert_eq!(
+        harness
+            .mutate("POST", route, Some(key), &request)
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    puller.resume.add_permits(1);
+    harness.state.stream_tasks.close();
+    tokio::time::timeout(Duration::from_secs(5), harness.state.stream_tasks.wait())
+        .await
+        .unwrap();
+    let (status, result) = body(harness.mutate("POST", route, Some(key), &request).await).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let result: Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(result["status"], "completed_with_failures");
+    assert_eq!(result["items"][0]["error_code"], "CLEANUP_ITEM_PROTECTED");
+    assert!(harness.store.load_v2_release(app_id, releases[0]).is_ok());
+    assert_eq!(
+        harness.store.read_release_link(app_id, "pending").unwrap(),
+        Some(releases[0])
+    );
+    assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+}
+
+#[cfg(feature = "docker-e2e")]
+#[tokio::test]
+async fn storage_cleanup_managed_leaves_and_partial_response_resume_use_durable_item_codes() {
+    use solodock::app_store::cleanup::CleanupFault;
+    for fail_rename in [true, false] {
+        let mut harness = Harness::new().await;
+        let (app_id, old_revision, old_release) =
+            cleanup_exclusive_revision_fixture(&harness).await;
+        let request = cleanup_request(&harness).await;
+        if fail_rename {
+            harness.store.fail_cleanup_once(CleanupFault::Rename);
+        }
+        sqlx::query("CREATE TRIGGER reject_cleanup_response BEFORE UPDATE ON idempotency_records WHEN NEW.route='/api/v1/system/storage-cleanup/apply' AND NEW.status='succeeded' BEGIN SELECT RAISE(ABORT,'injected response commit failure'); END").execute(harness.database.pool()).await.unwrap();
+        let route = "/api/v1/system/storage-cleanup/apply";
+        let key = "cleanup-durable-item-codes";
+        assert_eq!(
+            harness
+                .mutate("POST", route, Some(key), &request)
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let directory = harness
+            .store
+            .app_directory(app_id)
+            .join("config-revisions")
+            .join(old_revision.to_string());
+        assert_eq!(directory.exists(), fail_rename);
+        assert_eq!(
+            harness.store.load_v2_release(app_id, old_release).is_ok(),
+            fail_rename
+        );
+        let operation: String =
+            sqlx::query_scalar("SELECT operation_id FROM storage_cleanup_operations")
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        if fail_rename {
+            let codes: Vec<String> =
+                sqlx::query_scalar("SELECT error_code FROM storage_cleanup_items ORDER BY ordinal")
+                    .fetch_all(harness.database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(codes, ["CLEANUP_ITEM_RETAINED", "RELEASE_RETAINED"]);
+        } else {
+            let payload = harness
+                .store
+                .cleanup_tombstone_path(operation.parse().unwrap())
+                .join("payload/1");
+            assert_eq!(
+                fs::read_to_string(payload.join("files/secret/secret-config")).unwrap(),
+                "cleanup-file-secret-canary"
+            );
+            assert_eq!(
+                fs::metadata(payload.join("files/public/public-config"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+        }
+        assert!(
+            harness
+                .store
+                .scan()
+                .unwrap()
+                .valid_apps
+                .iter()
+                .any(|app| app.app_id == app_id)
+        );
+        assert_eq!(
+            solodock::storage_cleanup::pending_operation_count(&harness.store, &harness.database)
+                .await
+                .unwrap(),
+            1
+        );
+        solodock::storage_cleanup::finalize_succeeded(&harness.store, &harness.database)
+            .await
+            .unwrap();
+        assert_eq!(harness.store.cleanup_tombstones().unwrap().len(), 1);
+        harness.restart_cleanup_router().await;
+        sqlx::query("DROP TRIGGER reject_cleanup_response")
+            .execute(harness.database.pool())
+            .await
+            .unwrap();
+        let (status, response) =
+            body(harness.mutate("POST", route, Some(key), &request).await).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(!response.contains("cleanup-file-secret-canary"));
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["status"],
+            if fail_rename {
+                "completed_with_failures"
+            } else {
+                "completed"
+            }
+        );
+        if fail_rename {
+            assert_eq!(response["items"][1]["error_code"], "RELEASE_RETAINED");
+        }
+        assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+        assert!(
+            harness
+                .store
+                .scan()
+                .unwrap()
+                .valid_apps
+                .iter()
+                .any(|app| app.app_id == app_id)
+        );
+    }
+}
+
+#[cfg(feature = "docker-e2e")]
+#[tokio::test]
+async fn storage_cleanup_real_filesystem_interruptions_repeat_barriers_and_preserve_retry() {
+    use solodock::app_store::cleanup::CleanupFault;
+    for fault in [
+        CleanupFault::MarkerPublished,
+        CleanupFault::SourceSync,
+        CleanupFault::DestinationSync,
+    ] {
+        let mut harness = Harness::new().await;
+        let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+        let request = cleanup_request(&harness).await;
+        let route = "/api/v1/system/storage-cleanup/apply";
+        let key = "cleanup-real-filesystem-failure";
+        harness.store.fail_cleanup_once(fault);
+        assert_eq!(
+            harness
+                .mutate("POST", route, Some(key), &request)
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let operation: String =
+            sqlx::query_scalar("SELECT operation_id FROM storage_cleanup_operations")
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        let canonical = harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[0].to_string());
+        assert_eq!(canonical.exists(), fault == CleanupFault::MarkerPublished);
+        harness.restart_cleanup_router().await;
+        let guard = harness
+            .state
+            .m3
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .try_app(app_id)
+            .unwrap();
+        assert_eq!(
+            harness
+                .mutate("POST", route, Some(key), &request)
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        drop(guard);
+        // The same authenticated cookie resolves to a different valid session ID.
+        let original_session: String = sqlx::query_scalar("SELECT id FROM sessions")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE sessions SET id=?")
+            .bind(Uuid::new_v4().to_string())
+            .execute(harness.database.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            harness
+                .mutate("POST", route, Some(key), &request)
+                .await
+                .status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        sqlx::query("UPDATE sessions SET id=?")
+            .bind(original_session)
+            .execute(harness.database.pool())
+            .await
+            .unwrap();
+        let proof: String =
+            sqlx::query_scalar("SELECT status FROM idempotency_records WHERE operation_id=?")
+                .bind(&operation)
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(proof, "interrupted");
+        if fault != CleanupFault::MarkerPublished {
+            // This second injected failure can only fire if AlreadyDetached
+            // repeats the durability barrier before recording progress.
+            harness.store.fail_cleanup_once(fault);
+            assert_eq!(
+                harness
+                    .mutate("POST", route, Some(key), &request)
+                    .await
+                    .status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let item: String =
+                sqlx::query_scalar("SELECT status FROM storage_cleanup_items WHERE operation_id=?")
+                    .bind(&operation)
+                    .fetch_one(harness.database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(item, "planned");
+        }
+        let (status, response) =
+            body(harness.mutate("POST", route, Some(key), &request).await).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["status"],
+            "completed"
+        );
+        assert!(!canonical.exists());
+        assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+    }
+}
+
+#[cfg(feature = "docker-e2e")]
+#[tokio::test]
+async fn storage_cleanup_partial_finalization_restarts_with_exact_proof_and_catalog() {
+    use solodock::app_store::cleanup::CleanupFault;
+    for fault in [
+        CleanupFault::PayloadRemoved,
+        CleanupFault::MarkerRetired,
+        CleanupFault::DirectoryRemoved,
+    ] {
+        let harness = Harness::new().await;
+        let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+        let request = cleanup_request(&harness).await;
+        harness.store.fail_cleanup_once(fault);
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/system/storage-cleanup/apply",
+                    Some("cleanup-finalizer-real-partial"),
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        let operation: Uuid = response["operation_id"].as_str().unwrap().parse().unwrap();
+        assert!(
+            !harness
+                .store
+                .cleanup_tombstone_path(operation)
+                .join("payload")
+                .exists()
+        );
+        let restarted = AppStore::initialize_verified(
+            harness.apps.clone(),
+            harness.idempotency.integrity_key(),
+        )
+        .unwrap();
+        assert_eq!(restarted.cleanup_tombstones().unwrap(), vec![operation]);
+        assert!(
+            restarted
+                .scan()
+                .unwrap()
+                .valid_apps
+                .iter()
+                .any(|app| app.app_id == app_id)
+        );
+        assert_eq!(
+            restarted.read_release_link(app_id, "active").unwrap(),
+            Some(releases[11])
+        );
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(operation.to_string())
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+        harness
+            .idempotency
+            .gc_with_artifact_inventory(
+                &restarted,
+                &harness.state.m4.as_ref().unwrap().credentials,
+                &harness.state.webhooks.as_ref().unwrap().store,
+            )
+            .await
+            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+                .bind(operation.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        solodock::storage_cleanup::finalize_succeeded(&restarted, &harness.database)
+            .await
+            .unwrap();
+        assert!(restarted.cleanup_tombstones().unwrap().is_empty());
+        assert!(
+            restarted
+                .scan()
+                .unwrap()
+                .valid_apps
+                .iter()
+                .any(|app| app.app_id == app_id)
+        );
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_plan_audit_failure_rolls_back_consumption_and_publication() {
+    let harness = Harness::new().await;
+    let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+    let request = cleanup_request(&harness).await;
+    sqlx::query("CREATE TRIGGER reject_cleanup_audit BEFORE INSERT ON audit_events WHEN NEW.action='storage_cleanup_apply' BEGIN SELECT RAISE(ABORT,'injected cleanup audit failure'); END").execute(harness.database.pool()).await.unwrap();
+    let response = harness
+        .mutate(
+            "POST",
+            "/api/v1/system/storage-cleanup/apply",
+            Some("cleanup-plan-audit-failure"),
+            &request,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM storage_cleanup_previews WHERE consumed_at IS NOT NULL",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
+    let operations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_cleanup_operations")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(operations, 0);
+    assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+    assert!(harness.store.load_v2_release(app_id, releases[0]).is_ok());
+    sqlx::query("DROP TRIGGER reject_cleanup_audit")
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/apply",
+                Some("cleanup-plan-audit-failure"),
+                &request
+            )
+            .await
+            .status(),
+        StatusCode::OK
+    );
+}
+
+#[cfg(feature = "docker-e2e")]
+#[tokio::test]
+async fn storage_cleanup_last_unlink_failure_retains_proof_until_sync_even_after_marker_resurrection()
+ {
+    use solodock::app_store::cleanup::CleanupFault;
+    for resurrect in [false, true] {
+        let harness = Harness::new().await;
+        let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+        let request = cleanup_request(&harness).await;
+        harness
+            .store
+            .fail_cleanup_once(CleanupFault::DirectoryRemoved);
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/system/storage-cleanup/apply",
+                    Some("cleanup-last-unlink"),
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        let operation: Uuid = response["operation_id"].as_str().unwrap().parse().unwrap();
+        let retired = harness
+            .apps
+            .join(".cleanup-trash")
+            .join(format!("{operation}.retired.toml"));
+        let signed_marker = fs::read(&retired).unwrap();
+        harness
+            .store
+            .fail_cleanup_once(CleanupFault::RetiredMarkerRemoved);
+        assert!(
+            solodock::storage_cleanup::finalize_succeeded(&harness.store, &harness.database)
+                .await
+                .is_err()
+        );
+        assert!(!retired.exists());
+        assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+        assert_eq!(
+            solodock::storage_cleanup::pending_operation_count(&harness.store, &harness.database)
+                .await
+                .unwrap(),
+            1
+        );
+        sqlx::query(
+            "UPDATE idempotency_records SET updated_at='2020-01-01T00:00:00Z' WHERE operation_id=?",
+        )
+        .bind(operation.to_string())
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+        harness
+            .idempotency
+            .gc_with_artifact_inventory(
+                &harness.store,
+                &harness.state.m4.as_ref().unwrap().credentials,
+                &harness.state.webhooks.as_ref().unwrap().store,
+            )
+            .await
+            .unwrap();
+        let proofs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+                .bind(operation.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(proofs, 1);
+        // A crash may roll back an unlink whose parent fsync never succeeded.
+        if resurrect {
+            fs::write(&retired, signed_marker).unwrap();
+            fs::set_permissions(&retired, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let restarted = AppStore::initialize_verified(
+            harness.apps.clone(),
+            harness.idempotency.integrity_key(),
+        )
+        .unwrap();
+        assert_eq!(
+            solodock::storage_cleanup::pending_operation_count(&restarted, &harness.database)
+                .await
+                .unwrap(),
+            1
+        );
+        solodock::storage_cleanup::finalize_succeeded(&restarted, &harness.database)
+            .await
+            .unwrap();
+        assert_eq!(
+            solodock::storage_cleanup::pending_operation_count(&restarted, &harness.database)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(restarted.cleanup_tombstones().unwrap().is_empty());
+        assert_eq!(
+            restarted.read_release_link(app_id, "active").unwrap(),
+            Some(releases[11])
+        );
+        assert!(
+            restarted
+                .scan()
+                .unwrap()
+                .valid_apps
+                .iter()
+                .any(|app| app.app_id == app_id)
+        );
+        harness
+            .idempotency
+            .gc_with_artifact_inventory(
+                &restarted,
+                &harness.state.m4.as_ref().unwrap().credentials,
+                &harness.state.webhooks.as_ref().unwrap().store,
+            )
+            .await
+            .unwrap();
+        let proofs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM idempotency_records WHERE operation_id=?")
+                .bind(operation.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(proofs, 0);
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_application_trash_uses_exact_read_only_deletion_inventory() {
+    for scenario in [
+        "pending",
+        "interrupted",
+        "succeeded",
+        "unknown",
+        "marker",
+        "missing-proof",
+        "wrong-proof",
+    ] {
+        let harness = Harness::new().await;
+        let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+        let mut input = draft("trash-canary");
+        input["slug"] = json!("old-trash-app");
+        let (status, created) = body(harness.create(Some("old-trash-create"), &input).await).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let old: Uuid = serde_json::from_str::<Value>(&created).unwrap()["app"]["id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let route = format!("/api/v1/apps/{old}");
+        let operation = match harness
+            .idempotency
+            .claim(&route, "old-trash-delete", &[1; 32], Uuid::new_v4())
+            .await
+            .unwrap()
+        {
+            solodock::mutation::ClaimResult::New(id) => id,
+            _ => panic!("expected new deletion"),
+        };
+        harness.store.tombstone(old, operation).unwrap();
+        if scenario == "interrupted" {
+            harness
+                .idempotency
+                .mark_interrupted(&route, "old-trash-delete", Uuid::new_v4())
+                .await
+                .unwrap();
+        } else if scenario == "succeeded" || scenario == "wrong-proof" {
+            harness
+                .idempotency
+                .finish(
+                    &route,
+                    "old-trash-delete",
+                    200,
+                    &json!({"app_id":old,"unregistered":true}).to_string(),
+                    None,
+                    Uuid::new_v4(),
+                )
+                .await
+                .unwrap();
+        }
+        // The legal pre-existing tombstone is compatible with preview, without
+        // executing its deletion finalizer. Corruption arrives after this token.
+        let request = cleanup_request(&harness).await;
+        let path = harness.store.tombstone_path(old, operation);
+        match scenario {
+            "unknown" => {
+                fs::create_dir(harness.apps.join(".trash/unknown")).unwrap();
+            }
+            "marker" => {
+                fs::write(path.join("deletion.toml"), "invalid").unwrap();
+            }
+            "missing-proof" => {
+                sqlx::query("DELETE FROM idempotency_records WHERE operation_id=?")
+                    .bind(operation.to_string())
+                    .execute(harness.database.pool())
+                    .await
+                    .unwrap();
+            }
+            "wrong-proof" => {
+                sqlx::query(
+                    "UPDATE idempotency_records SET response_body='{}' WHERE operation_id=?",
+                )
+                .bind(operation.to_string())
+                .execute(harness.database.pool())
+                .await
+                .unwrap();
+            }
+            _ => {}
+        }
+        let valid = matches!(scenario, "pending" | "interrupted" | "succeeded");
+        if !valid {
+            let (status, error) = body(
+                harness
+                    .mutate(
+                        "POST",
+                        "/api/v1/system/storage-cleanup/preview",
+                        None,
+                        &json!({}),
+                    )
+                    .await,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{scenario}: {error}");
+            assert_eq!(
+                serde_json::from_str::<Value>(&error).unwrap()["code"],
+                "CLEANUP_INVENTORY_INCOMPLETE"
+            );
+            let previews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_cleanup_previews")
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+            assert_eq!(previews, 1);
+        }
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/system/storage-cleanup/apply",
+                    Some("cleanup-old-trash"),
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(
+            status,
+            if valid {
+                StatusCode::OK
+            } else {
+                StatusCode::CONFLICT
+            },
+            "{scenario}: {response}"
+        );
+        assert!(path.exists(), "cleanup must not finalize app deletion");
+        if !valid {
+            let consumed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM storage_cleanup_previews WHERE consumed_at IS NOT NULL",
+            )
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+            assert_eq!(consumed, 0);
+            let operations: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM storage_cleanup_operations")
+                    .fetch_one(harness.database.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(operations, 0);
+            assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+            assert!(harness.store.load_v2_release(app_id, releases[0]).is_ok());
+        }
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_progress_write_failure_resumes_a_real_rename() {
+    let mut harness = Harness::new().await;
+    let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+    let request = cleanup_request(&harness).await;
+    sqlx::query("CREATE TRIGGER reject_cleanup_progress BEFORE UPDATE ON storage_cleanup_items WHEN NEW.status='detached' BEGIN SELECT RAISE(ABORT,'injected item progress failure'); END").execute(harness.database.pool()).await.unwrap();
+    let route = "/api/v1/system/storage-cleanup/apply";
+    let key = "cleanup-progress-failure";
+    assert_eq!(
+        harness
+            .mutate("POST", route, Some(key), &request)
+            .await
+            .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert!(
+        !harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[0].to_string())
+            .exists()
+    );
+    let item: String = sqlx::query_scalar("SELECT status FROM storage_cleanup_items")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(item, "planned");
+    let cleaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cleaned_releases")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(cleaned, 0);
+    let proof: String = sqlx::query_scalar("SELECT status FROM idempotency_records WHERE route=?")
+        .bind(route)
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(proof, "interrupted");
+    harness.restart_cleanup_router().await;
+    sqlx::query("DROP TRIGGER reject_cleanup_progress")
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    let (status, response) = body(harness.mutate("POST", route, Some(key), &request).await).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let cleaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cleaned_releases")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(cleaned, 1);
+    assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn storage_cleanup_each_current_fact_change_rejects_before_consumption() {
+    for fact in ["active", "pending", "draft", "recovery"] {
+        let harness = Harness::new().await;
+        let (app_id, revision, releases, _) = storage_cleanup_fixture(&harness).await;
+        let request = cleanup_request(&harness).await;
+        match fact {
+            "active" | "pending" => solodock::app_store::atomic::AtomicWriter::switch_release_link(
+                &harness.store.app_directory(app_id),
+                fact,
+                releases[0],
+            )
+            .unwrap(),
+            "draft" => {
+                let metadata = harness.store.read_metadata(app_id).unwrap();
+                let loaded = solodock::app_store::config_revision::load_verified(
+                    &harness.store.app_directory(app_id),
+                    revision,
+                    harness.store.integrity_key().unwrap(),
+                )
+                .unwrap();
+                let normalized = loaded
+                    .normalize_verified(
+                        metadata.display_name,
+                        metadata.discovery_image_ref.unwrap(),
+                        metadata.credential_ref,
+                        metadata.auto_deploy_enabled,
+                        metadata.poll_interval_seconds,
+                        harness.store.integrity_key().unwrap(),
+                        &[],
+                    )
+                    .unwrap();
+                harness
+                    .store
+                    .update_draft(
+                        app_id,
+                        Some(revision),
+                        Uuid::new_v4(),
+                        Uuid::new_v4(),
+                        &normalized,
+                        time::OffsetDateTime::now_utc(),
+                    )
+                    .unwrap();
+            }
+            "recovery" => {
+                sqlx::query("UPDATE deployments SET from_release_id=? WHERE status='queued'")
+                    .bind(releases[0].to_string())
+                    .execute(harness.database.pool())
+                    .await
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/system/storage-cleanup/apply",
+                    Some("cleanup-fresh-facts"),
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{fact}: {response}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["code"],
+            "CLEANUP_PREVIEW_STALE"
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM storage_cleanup_previews WHERE consumed_at IS NOT NULL",
+        )
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
+        assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+        assert!(harness.store.load_v2_release(app_id, releases[0]).is_ok());
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_invalid_artifact_or_ledger_never_issues_a_token() {
+    for damage in [
+        "hmac",
+        "missing",
+        "mode",
+        "managed-mode",
+        "symlink",
+        "type",
+        "ledger",
+        "owner",
+    ] {
+        if damage == "owner" && unsafe { libc::geteuid() } != 0 {
+            continue;
+        }
+        let harness = Harness::new().await;
+        let (app_id, revision, releases, _) = storage_cleanup_fixture(&harness).await;
+        let app = harness.store.app_directory(app_id);
+        let header = app
+            .join("releases")
+            .join(releases[0].to_string())
+            .join("release.toml");
+        let original = fs::read(&header).unwrap();
+        match damage {
+            "hmac" => {
+                let mut value: toml::Value =
+                    toml::from_str(std::str::from_utf8(&original).unwrap()).unwrap();
+                value["integrity_hmac"] = toml::Value::String("0".repeat(64));
+                fs::write(&header, toml::to_string(&value).unwrap()).unwrap();
+            }
+            "missing" => fs::remove_file(&header).unwrap(),
+            "mode" => fs::set_permissions(&header, fs::Permissions::from_mode(0o444)).unwrap(),
+            "managed-mode" => fs::set_permissions(
+                app.join("config-revisions")
+                    .join(revision.to_string())
+                    .join("files/public/public-config"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap(),
+            "symlink" => {
+                fs::remove_file(&header).unwrap();
+                std::os::unix::fs::symlink("/etc/passwd", &header).unwrap();
+            }
+            "type" => {
+                fs::remove_file(&header).unwrap();
+                fs::create_dir(&header).unwrap();
+            }
+            "ledger" => {
+                sqlx::query("UPDATE deployments SET requested_revision='invalid-uuid' WHERE status='queued'").execute(harness.database.pool()).await.unwrap();
+            }
+            "owner" => {
+                let path = std::ffi::CString::new(header.as_os_str().as_encoded_bytes()).unwrap();
+                assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
+            }
+            _ => unreachable!(),
+        }
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/system/storage-cleanup/preview",
+                    None,
+                    &json!({}),
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{damage}: {response}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["code"],
+            "CLEANUP_INVENTORY_INCOMPLETE"
+        );
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_cleanup_previews")
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+        assert!(app.join("releases").join(releases[0].to_string()).is_dir());
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_protects_every_recoverable_deployment_status() {
+    let harness = Harness::new().await;
+    let (app_id, revision, releases, _) = storage_cleanup_fixture(&harness).await;
+    for (status, phase) in [
+        ("queued", "queued"),
+        ("running", "pulling"),
+        ("interrupted", "terminal"),
+        ("needs_attention", "terminal"),
+    ] {
+        sqlx::query("UPDATE deployments SET status=?,phase=? WHERE app_id=? AND status IN ('queued','running','interrupted','needs_attention')")
+            .bind(status)
+            .bind(phase)
+            .bind(app_id.to_string())
+            .execute(harness.database.pool())
+            .await
+            .unwrap();
+        let plan = solodock::storage_cleanup::build_plan(&harness.store, &harness.database)
+            .await
+            .unwrap();
+        assert!(plan.protected.iter().any(|item| {
+            item.artifact_id == revision.to_string()
+                && item.reason == solodock::storage_cleanup::ProtectionReason::DeploymentRecovery
+        }));
+        for release in &releases[1..=6] {
+            assert!(plan.protected.iter().any(|item| {
+                item.artifact_id == release.to_string()
+                    && item.reason
+                        == solodock::storage_cleanup::ProtectionReason::DeploymentRecovery
+            }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn storage_cleanup_protects_current_and_three_rollbacks_then_applies_exact_plan() {
+    let harness = Harness::new().await;
+    let (app_id, revision, releases, source_deployment) = storage_cleanup_fixture(&harness).await;
+    let plan = solodock::storage_cleanup::build_plan(&harness.store, &harness.database)
+        .await
+        .unwrap();
+    assert!(plan.protected.iter().any(|item| {
+        item.artifact_id == releases[11].to_string()
+            && item.reason == solodock::storage_cleanup::ProtectionReason::Active
+    }));
+    assert!(plan.protected.iter().any(|item| {
+        item.artifact_id == releases[10].to_string()
+            && item.reason == solodock::storage_cleanup::ProtectionReason::Pending
+    }));
+    assert_eq!(
+        plan.protected
+            .iter()
+            .filter(|item| {
+                item.reason == solodock::storage_cleanup::ProtectionReason::RecentRollback
+            })
+            .count(),
+        3
+    );
+    for release in &releases[1..=6] {
+        assert!(plan.protected.iter().any(|item| {
+            item.artifact_id == release.to_string()
+                && item.reason == solodock::storage_cleanup::ProtectionReason::DeploymentRecovery
+        }));
+    }
+    assert!(plan.protected.iter().any(|item| {
+        item.artifact_id == revision.to_string()
+            && item.reason == solodock::storage_cleanup::ProtectionReason::CurrentDraft
+    }));
+    harness.compose_actions.lock().unwrap().clear();
+    let (status, preview) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/preview",
+                None,
+                &json!({}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+    let release_candidates = preview["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["artifact_kind"] == "release")
+        .collect::<Vec<_>>();
+    assert_eq!(release_candidates.len(), 1, "{preview:#}");
+    assert_eq!(
+        release_candidates[0]["artifact_id"],
+        releases[0].to_string()
+    );
+    assert_eq!(
+        preview["protected"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["reason"] == "recent_rollback")
+            .unwrap()["count"],
+        3
+    );
+    assert!(
+        preview["protected"].as_array().unwrap().iter().any(|item| {
+            item["reason"] == "current_draft" && item["count"].as_u64().unwrap() >= 1
+        })
+    );
+
+    let request = json!({
+        "confirmation_token": preview["confirmation_token"],
+        "acknowledge_rollback_loss": true,
+    });
+    let audit_before = harness.database.audit_count().await.unwrap();
+    let (status, applied) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/apply",
+                Some("storage-cleanup-apply-0001"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert!(!applied.contains("cleanup-secret-canary"));
+    let applied: Value = serde_json::from_str(&applied).unwrap();
+    assert_eq!(applied["status"], "completed");
+    assert!(
+        !harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[0].to_string())
+            .exists()
+    );
+    assert!(
+        harness
+            .store
+            .app_directory(app_id)
+            .join("config-revisions")
+            .join(revision.to_string())
+            .exists()
+    );
+    let retained_config = solodock::app_store::config_revision::load_verified(
+        &harness.store.app_directory(app_id),
+        revision,
+        harness.store.integrity_key().unwrap(),
+    )
+    .unwrap();
+    assert!(
+        retained_config
+            .known_secrets()
+            .iter()
+            .any(|secret| secret == b"cleanup-secret-canary")
+    );
+    assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+    assert_eq!(
+        harness.database.audit_count().await.unwrap(),
+        audit_before + 3
+    );
+    let cleanup_audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE action='storage_cleanup_apply' AND result='planned'",
+    )
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    assert_eq!(cleanup_audits, 1);
+    assert!(harness.compose_actions.lock().unwrap().is_empty());
+
+    let replay = harness
+        .mutate(
+            "POST",
+            "/api/v1/system/storage-cleanup/apply",
+            Some("storage-cleanup-apply-0001"),
+            &request,
+        )
+        .await;
+    let (status, replay) = body(replay).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_str::<Value>(&replay).unwrap()["idempotency_replayed"],
+        true
+    );
+
+    let detail = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/deployments/{source_deployment}"))
+                .header(header::HOST, "solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, detail) = body(detail).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let detail: Value = serde_json::from_str(&detail).unwrap();
+    assert!(detail["safe_release_id"].is_null());
+    assert_eq!(detail["available_actions"], json!([]));
+    assert!(
+        detail["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ROLLBACK_ARTIFACT_CLEANED"))
+    );
+
+    let health = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/health")
+                .header(header::HOST, "solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, health) = body(health).await;
+    assert_eq!(status, StatusCode::OK, "{health}");
+    let health: Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(health["storage_cleanup"]["status"], "ok");
+    assert_eq!(health["storage_cleanup"]["pending_operations"], 0);
+
+    let ordinarily_missing_deployment: String =
+        sqlx::query_scalar("SELECT id FROM deployments WHERE app_id=? AND candidate_release_id=?")
+            .bind(app_id.to_string())
+            .bind(releases[7].to_string())
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    fs::remove_dir_all(
+        harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[7].to_string()),
+    )
+    .unwrap();
+    let ordinary = harness
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/v1/deployments/{ordinarily_missing_deployment}"
+                ))
+                .header(header::HOST, "solodock.example.com")
+                .header(header::COOKIE, &harness.cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, ordinary) = body(ordinary).await;
+    assert_eq!(status, StatusCode::OK, "{ordinary}");
+    let ordinary: Value = serde_json::from_str(&ordinary).unwrap();
+    assert!(ordinary["safe_release_id"].is_null());
+    assert!(
+        !ordinary["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("ROLLBACK_ARTIFACT_CLEANED"))
+    );
+}
+
+#[tokio::test]
+async fn storage_cleanup_exact_retry_resumes_after_plan_marker_and_rename() {
+    let harness = Harness::new().await;
+    let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+    let (_, preview_body) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/preview",
+                None,
+                &json!({}),
+            )
+            .await,
+    )
+    .await;
+    let preview: Value = serde_json::from_str(&preview_body).unwrap();
+    let token = preview["confirmation_token"].as_str().unwrap();
+    let token_hmac = harness.idempotency.fingerprint(token.as_bytes());
+    let (plan_hash, plan_json): (Vec<u8>, String) = sqlx::query_as(
+        "SELECT facts_hash,preview_json FROM storage_cleanup_previews WHERE token_hmac=?",
+    )
+    .bind(&token_hmac)
+    .fetch_one(harness.database.pool())
+    .await
+    .unwrap();
+    let plan: solodock::storage_cleanup::CleanupPlan = serde_json::from_str(&plan_json).unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    let request = json!({
+        "confirmation_token": token,
+        "acknowledge_rollback_loss": true,
+    });
+    let route = "/api/v1/system/storage-cleanup/apply";
+    let canonical = serde_json::to_vec(&json!({
+        "actor": "admin",
+        "method": "POST",
+        "route": route,
+        "token_hmac": token_hmac,
+        "acknowledge_rollback_loss": true,
+    }))
+    .unwrap();
+    let request_hmac = harness.idempotency.fingerprint(&canonical);
+    let key = "storage-cleanup-resume-0001";
+    let operation = match harness
+        .idempotency
+        .claim(route, key, &request_hmac, Uuid::new_v4())
+        .await
+        .unwrap()
+    {
+        solodock::mutation::ClaimResult::New(operation) => operation,
+        _ => panic!("new cleanup claim expected"),
+    };
+    let now = solodock::db::format_time(time::OffsetDateTime::now_utc()).unwrap();
+    let candidate = &plan.candidates[0];
+    let config_revision = match candidate.artifact {
+        solodock::app_store::cleanup::CleanupArtifact::Release {
+            config_revision_id, ..
+        }
+        | solodock::app_store::cleanup::CleanupArtifact::ConfigRevision {
+            revision_id: config_revision_id,
+            ..
+        } => Some(config_revision_id.to_string()),
+        solodock::app_store::cleanup::CleanupArtifact::Temporary { .. } => None,
+    };
+    let mut transaction = harness.database.pool().begin().await.unwrap();
+    sqlx::query("UPDATE storage_cleanup_previews SET consumed_at=? WHERE token_hmac=?")
+        .bind(&now)
+        .bind(&token_hmac)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_operations (operation_id,cleanup_kind,plan_hash,plan_json,status,created_at) VALUES (?,'artifacts',?,?,'planned',?)")
+        .bind(operation.to_string())
+        .bind(&plan_hash)
+        .bind(&plan_json)
+        .bind(&now)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_items (operation_id,ordinal,app_id,artifact_kind,artifact_id,config_revision_id,status) VALUES (?,0,?,?,?,?,'planned')")
+        .bind(operation.to_string())
+        .bind(candidate.artifact.app_id().map(|id| id.to_string()))
+        .bind(candidate.artifact.kind_name())
+        .bind(candidate.artifact.public_id())
+        .bind(config_revision)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    harness
+        .store
+        .prepare_cleanup_tombstone(
+            operation,
+            &plan_hash,
+            std::slice::from_ref(&candidate.artifact),
+        )
+        .unwrap();
+    assert_eq!(
+        harness
+            .store
+            .detach_cleanup_artifact(operation, 0, &candidate.artifact)
+            .unwrap(),
+        solodock::app_store::cleanup::DetachResult::Detached
+    );
+    harness
+        .idempotency
+        .mark_interrupted(route, key, Uuid::new_v4())
+        .await
+        .unwrap();
+
+    let (status, response) = body(harness.mutate("POST", route, Some(key), &request).await).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["status"],
+        "completed"
+    );
+    assert!(
+        !harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[0].to_string())
+            .exists()
+    );
+    assert!(harness.store.cleanup_tombstones().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn storage_cleanup_stale_and_busy_fail_before_consuming_or_renaming() {
+    let harness = Harness::new().await;
+    let (app_id, _, releases, _) = storage_cleanup_fixture(&harness).await;
+    let (_, preview_body) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/system/storage-cleanup/preview",
+                None,
+                &json!({}),
+            )
+            .await,
+    )
+    .await;
+    let preview: Value = serde_json::from_str(&preview_body).unwrap();
+    let request = json!({
+        "confirmation_token": preview["confirmation_token"],
+        "acknowledge_rollback_loss": true,
+    });
+    let guard = harness
+        .state
+        .m3
+        .as_ref()
+        .unwrap()
+        .coordinator
+        .try_app(app_id)
+        .unwrap();
+    let busy = harness
+        .mutate(
+            "POST",
+            "/api/v1/system/storage-cleanup/apply",
+            Some("storage-cleanup-busy-0001"),
+            &request,
+        )
+        .await;
+    assert_eq!(busy.status(), StatusCode::CONFLICT);
+    drop(guard);
+    let token_hmac = harness
+        .idempotency
+        .fingerprint(preview["confirmation_token"].as_str().unwrap().as_bytes());
+    let consumed: Option<String> =
+        sqlx::query_scalar("SELECT consumed_at FROM storage_cleanup_previews WHERE token_hmac=?")
+            .bind(&token_hmac)
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    assert!(consumed.is_none());
+
+    solodock::app_store::atomic::AtomicWriter::switch_release_link(
+        &harness.store.app_directory(app_id),
+        "pending",
+        releases[0],
+    )
+    .unwrap();
+    let stale = harness
+        .mutate(
+            "POST",
+            "/api/v1/system/storage-cleanup/apply",
+            Some("storage-cleanup-stale-0001"),
+            &request,
+        )
+        .await;
+    let (status, stale) = body(stale).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(
+        serde_json::from_str::<Value>(&stale).unwrap()["code"],
+        "CLEANUP_PREVIEW_STALE"
+    );
+    assert!(
+        harness
+            .store
+            .app_directory(app_id)
+            .join("releases")
+            .join(releases[0].to_string())
+            .exists()
+    );
+    let consumed_after_stale: Option<String> =
+        sqlx::query_scalar("SELECT consumed_at FROM storage_cleanup_previews WHERE token_hmac=?")
+            .bind(token_hmac)
+            .fetch_one(harness.database.pool())
+            .await
+            .unwrap();
+    assert!(consumed_after_stale.is_none());
+}
+
+#[tokio::test]
+async fn storage_cleanup_unknown_trash_fails_closed_without_issuing_a_preview() {
+    let harness = Harness::new().await;
+    let trash = harness.store.apps_directory().join(".cleanup-trash");
+    fs::create_dir(&trash).unwrap();
+    fs::set_permissions(&trash, fs::Permissions::from_mode(0o700)).unwrap();
+    let unknown = trash.join("unexpected-entry");
+    fs::create_dir(&unknown).unwrap();
+    fs::set_permissions(&unknown, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let response = harness
+        .mutate(
+            "POST",
+            "/api/v1/system/storage-cleanup/preview",
+            None,
+            &json!({}),
+        )
+        .await;
+    let (status, response) = body(response).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["code"],
+        "CLEANUP_INVENTORY_INCOMPLETE"
+    );
+    let previews: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM storage_cleanup_previews")
+        .fetch_one(harness.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(previews, 0);
+    assert!(unknown.exists());
+}
+
+#[tokio::test]
+async fn application_deletion_is_blocked_by_a_published_cleanup_plan() {
+    let docker = Arc::new(ScriptedDocker::default());
+    let harness = Harness::new_with_docker(docker.clone()).await;
+    let (app_id, revision, _, _) = storage_cleanup_fixture(&harness).await;
+    docker.set(vec![Vec::new()]);
+    let (status, preview) = body(
+        harness
+            .mutate(
+                "POST",
+                &format!("/api/v1/apps/{app_id}/deletion-preview"),
+                None,
+                &json!({"remove_container":false}),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    let preview: Value = serde_json::from_str(&preview).unwrap();
+
+    let operation = Uuid::new_v4();
+    let now = solodock::db::format_time(time::OffsetDateTime::now_utc()).unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_operations (operation_id,cleanup_kind,plan_hash,plan_json,status,created_at) VALUES (?,'artifacts',x'01','{}','planned',?)")
+        .bind(operation.to_string())
+        .bind(&now)
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_items (operation_id,ordinal,app_id,artifact_kind,artifact_id,status) VALUES (?,0,?,'temporary','temporary-1','planned')")
+        .bind(operation.to_string())
+        .bind(app_id.to_string())
+        .execute(harness.database.pool())
+        .await
+        .unwrap();
+
+    let request = json!({
+        "confirmation_token":preview["confirmation_token"],
+        "slug":"example",
+        "expected_revision":revision,
+        "remove_container":false
+    });
+    let (status, response) = body(
+        harness
+            .mutate(
+                "DELETE",
+                &format!("/api/v1/apps/{app_id}"),
+                Some("cleanup-plan-blocks-app-delete"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{response}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["code"],
+        "APP_BUSY"
+    );
+    assert!(harness.store.app_directory(app_id).exists());
 }
 
 #[tokio::test]
@@ -1451,7 +3179,7 @@ async fn postgresql_preset_is_versioned_idempotent_and_never_echoes_password() {
 }
 
 #[tokio::test]
-async fn interrupted_update_resumes_after_startup_only_old_revision_cleanup() {
+async fn interrupted_update_resumes_while_old_revision_awaits_manual_cleanup() {
     let harness = Harness::new().await;
     let (_, created) = body(
         harness
@@ -1479,8 +3207,8 @@ async fn interrupted_update_resumes_after_startup_only_old_revision_cleanup() {
     assert!(old_path.exists(), "runtime refresh must be read-only");
     harness.store.scan().unwrap();
     assert!(
-        !old_path.exists(),
-        "startup recovery collects old revisions"
+        old_path.exists(),
+        "startup recovery must not bypass manual cleanup confirmation"
     );
     sqlx::query("UPDATE idempotency_records SET status='interrupted',response_status=NULL,response_body=NULL WHERE route=?")
         .bind(&route)

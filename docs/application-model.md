@@ -111,3 +111,9 @@ Preview merges files, volumes, binds, and networks from active, pending, and dra
 Deletion unregisters by default. Explicit removal still removes only the exact owned container bound to the token; all volumes, bind contents, and networks remain. A rollback-capable barrier coordinates deletion with stream producers, and new streams become permanently unavailable only after the filesystem tombstone commits.
 
 See [deployments and rollback](deployments.md) for active/pending and rollback semantics, and [recovery](recovery.md) for file-permission and link requirements.
+
+## Manual artifact cleanup
+
+Storage cleanup is an explicit preview-and-confirm operation. It always protects active and pending releases, the current draft revision, recovery references from `queued`, `running`, `interrupted`, and `needs_attention` deployments, cleanup recovery artifacts, and three additional recent rollback releases per application. A preview selects at most 100 of the globally oldest verified, unreferenced releases; config revisions become candidates only when no retained release or draft references them. Known private temporary artifacts use the same typed store inventory. Unknown names, links, types, ownership, modes, signatures, or ledger facts make the entire inventory fail closed.
+
+Cleanup never removes application metadata, deployments, audit history, credentials, containers, volumes, bind data, networks, backups, or operator-managed Docker resources. Logical-size estimates are not a promise of reclaimed disk space.

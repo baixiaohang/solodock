@@ -6,6 +6,7 @@
   import type { SettingsResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   import PasswordChange from '../components/PasswordChange.svelte'
+  import StorageCleanup from '../components/StorageCleanup.svelte'
 
   let settings = $state<SettingsResponse | null>(null)
   let selected = $state('UTC')
@@ -84,5 +85,6 @@
       <p class="muted">{$t('Change the single administrator password and revoke every active session atomically.')}</p>
       <PasswordChange />
     </section>
+    <StorageCleanup />
   </div>
 </main>

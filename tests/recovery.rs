@@ -5,7 +5,11 @@ use std::{
 };
 
 use solodock::{
-    app_store::{AppStore, releases::ReleaseTrigger},
+    app_store::{
+        AppStore,
+        cleanup::{CleanupArtifact, CleanupTempLocation, DetachResult},
+        releases::ReleaseTrigger,
+    },
     db::Database,
     domain::{
         BindMountInput, DesiredState, DraftInput, EnvironmentInput, ExistingSecrets, HealthPolicy,
@@ -14,6 +18,7 @@ use solodock::{
     mutation::{ClaimResult, IdempotencyService},
     registry::{CredentialStore, Platform, ResolvedImage},
     security::secret::SecretValue,
+    storage_cleanup::{CleanupCandidate, CleanupPlan, canonical_plan_json, plan_hash},
     webhook::WebhookStore,
 };
 use tempfile::tempdir;
@@ -293,8 +298,8 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
     assert!(!rebuilt.has_admin().await.unwrap());
 }
 
-#[test]
-fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
+#[tokio::test]
+async fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     let fixture = tempdir().unwrap();
     fs::set_permissions(fixture.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let package_root = fixture.path().join("root");
@@ -440,6 +445,91 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
     webhook_store
         .configure(app_id, None, Uuid::new_v4(), &webhook_secret)
         .unwrap();
+    let cleanup_operation = Uuid::new_v4();
+    let cleanup_temp_name = format!(".solodock-tmp-{}", Uuid::new_v4().simple());
+    fs::write(
+        store.apps_directory().join(&cleanup_temp_name),
+        b"cleanup recovery payload",
+    )
+    .unwrap();
+    fs::set_permissions(
+        store.apps_directory().join(&cleanup_temp_name),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let cleanup_artifact = CleanupArtifact::Temporary {
+        app_id: None,
+        location: CleanupTempLocation::AppsRoot,
+        name: cleanup_temp_name,
+    };
+    let cleanup_plan = CleanupPlan {
+        candidates: vec![CleanupCandidate {
+            artifact: cleanup_artifact.clone(),
+            estimated_logical_bytes: b"cleanup recovery payload".len() as u64,
+            release_created_at: None,
+            release_record: None,
+        }],
+        protected: Vec::new(),
+        estimated_logical_bytes: b"cleanup recovery payload".len() as u64,
+    };
+    let cleanup_plan_json = canonical_plan_json(&cleanup_plan).unwrap();
+    let cleanup_plan_hash = plan_hash(&cleanup_plan_json);
+    let encoded_cleanup_plan_hash = cleanup_plan_hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    store
+        .prepare_cleanup_tombstone(
+            cleanup_operation,
+            &cleanup_plan_hash,
+            std::slice::from_ref(&cleanup_artifact),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .detach_cleanup_artifact(cleanup_operation, 0, &cleanup_artifact)
+            .unwrap(),
+        DetachResult::Detached
+    );
+    let database = Database::open(&state.join("state.sqlite3")).await.unwrap();
+    let cleanup_time = solodock::db::format_time(time::OffsetDateTime::now_utc()).unwrap();
+    let cleanup_response = serde_json::json!({
+        "operation_id": cleanup_operation,
+        "plan_hash": encoded_cleanup_plan_hash,
+        "status": "completed",
+        "items": [{
+            "app_id": null,
+            "artifact_kind": "temporary",
+            "artifact_id": "temporary-1",
+            "status": "deleted"
+        }],
+        "idempotency_replayed": false
+    })
+    .to_string();
+    sqlx::query("INSERT INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,response_status,response_body,created_at,updated_at) VALUES ('admin','/api/v1/system/storage-cleanup/apply',x'31',x'32',?,'succeeded',200,?,?,?)")
+        .bind(cleanup_operation.to_string())
+        .bind(cleanup_response)
+        .bind(&cleanup_time)
+        .bind(&cleanup_time)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_operations (operation_id,cleanup_kind,plan_hash,plan_json,status,created_at,completed_at) VALUES (?,'artifacts',?,?,'completed',?,?)")
+        .bind(cleanup_operation.to_string())
+        .bind(&cleanup_plan_hash)
+        .bind(&cleanup_plan_json)
+        .bind(&cleanup_time)
+        .bind(&cleanup_time)
+        .execute(database.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO storage_cleanup_items (operation_id,ordinal,artifact_kind,artifact_id,status) VALUES (?,0,'temporary',?,'detached')")
+        .bind(cleanup_operation.to_string())
+        .bind(cleanup_artifact.public_id())
+        .execute(database.pool())
+        .await
+        .unwrap();
+    database.close().await;
 
     let config = config_directory.join("config.toml");
     fs::write(
@@ -555,13 +645,49 @@ fn offline_backup_and_restore_preserve_verified_active_and_pending_links() {
         fs::read_link(restored_app.join("pending")).unwrap(),
         std::path::PathBuf::from(format!("releases/{pending}"))
     );
+    let restored_cleanup = restored
+        .join("var/lib/solodock/apps/.cleanup-trash")
+        .join(cleanup_operation.to_string());
+    assert!(restored_cleanup.join("marker.toml").is_file());
+    assert!(restored_cleanup.join("payload/0").is_file());
     if invoking_uid != 0 {
-        let restored_store = AppStore::initialize_managed(
+        let restored_database = Database::open(&restored.join("var/lib/solodock/state.sqlite3"))
+            .await
+            .unwrap();
+        let restored_store = AppStore::initialize_managed_relocated(
             restored.join("var/lib/solodock/apps"),
+            std::path::PathBuf::from("/var/lib/solodock/apps"),
             key.clone(),
             vec![bind_root],
         )
         .unwrap();
+        assert_eq!(
+            restored_store.cleanup_tombstones().unwrap(),
+            vec![cleanup_operation]
+        );
+        assert_eq!(
+            solodock::storage_cleanup::pending_operation_count(
+                &restored_store,
+                &restored_database,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        solodock::storage_cleanup::finalize_succeeded(&restored_store, &restored_database)
+            .await
+            .unwrap();
+        assert!(restored_store.cleanup_tombstones().unwrap().is_empty());
+        assert_eq!(restored_store.scan().unwrap().valid_apps.len(), 1);
+        assert_eq!(
+            restored_store.read_release_link(app_id, "active").unwrap(),
+            Some(active)
+        );
+        assert_eq!(
+            restored_store.read_release_link(app_id, "pending").unwrap(),
+            Some(pending)
+        );
+        restored_database.close().await;
         let restored_webhook = WebhookStore::new(restored_store, key);
         assert!(
             restored_webhook

@@ -108,6 +108,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         idempotency.integrity_key(),
         settings.allowed_bind_roots.clone(),
     )?;
+    let cleanup_degraded =
+        match solodock::storage_cleanup::finalize_succeeded(&app_store, &database).await {
+            Ok(()) => false,
+            Err(error) => {
+                warn!(error = %error, "storage cleanup finalization remains pending");
+                true
+            }
+        };
     let webhook_store = WebhookStore::new(app_store.clone(), idempotency.integrity_key());
     idempotency
         .cleanup_webhook_operation_temps(&webhook_store)
@@ -192,7 +200,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let compose_capability = ComposeCapability::default();
     compose_capability.probe(compose.as_ref()).await;
     let compose_capability_task = compose_capability.start(compose.clone(), shutdown.clone());
-    let recovery_degraded = !recovery.issues.is_empty();
+    let recovery_degraded = cleanup_degraded || !recovery.issues.is_empty();
     let m3 = Arc::new(M3Services {
         store: app_store,
         database: database.clone(),
@@ -429,6 +437,7 @@ async fn validate_restore(
     if !report.issues.is_empty() {
         return Err("restored application state is degraded".into());
     }
+    solodock::storage_cleanup::pending_operation_count(&store, &database).await?;
     let webhooks = WebhookStore::new(store.clone(), key.clone());
     for app in &report.valid_apps {
         if webhooks.status(app.app_id)?.configured {

@@ -44,3 +44,9 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 旧 naming/config/release schema 保持可读和可回滚：旧应用继续使用原 bridge 且不会自动加入平台网络。旧 Compose schema 仍先验证 release HMAC 和它签名覆盖的精确文件 hash，再按对应 schema 校验 canonical 文档；serializer 引号表示变化不会把合法旧 release 误判为损坏，也不会放宽内容或结构校验。不要手工向历史 artifact 注入新字段；reader 会忽略旧签名域之外的控制值。SQLite global settings 备份必须与 filesystem state 同一恢复点，否则 bind roots revision 可能与应用引用不一致并使恢复 fail closed。
 
 日常安装、备份和 health 检查入口见 [运维](operations.md)；资源保留与删除语义见 [应用模型](application-model.md)。
+
+## 清理恢复
+
+`.cleanup-trash/<operation UUID>` 保存已持久化计划的签名 marker 及原子移出的 artifact。不要手工删除、重命名或编辑。Startup/background finalizer 只有在 integrity marker、已存 plan/items 与精确成功 idempotency response 全部一致时才删除 payload。payload 部分删除后 marker 仍保留；payload 完全移除并同步父目录后，marker 才转移到精确的同级 `<operation UUID>.retired.toml`，直到空 operation 目录也完成持久删除。退休开始前先在数据库持久化退休意图，即使最后一份 marker 已可见地 unlink，精确终态 proof 仍受保护。只有最后的父目录同步成功后才能清除退休意图和 pending 健康状态。恢复时 marker 缺失会重新同步；若崩溃使 marker 再次出现，则重新验证并完成退休。没有退休意图的任意缺 marker 或未知 trash 仍然 fail closed。
+
+中断的 operation 仍使用原 request/key 重放。resume 在同一组 guard 内复核当前保护集合，只排除自身已验证的 reservation；新获得引用的 artifact 在原计划中标为保留。busy 或 session 不匹配的重试不能终结已经发布计划的 operation。此前已可见的 rename 必须重新同步两个父目录后才记录进度。完整或部分失败响应均从精确 durable item state 重建。backup/restore 降权为服务身份后校验 cleanup ledger 与签名 tombstone。

@@ -440,7 +440,18 @@ pub async fn rollback(
     let target = source
         .candidate_release_id
         .ok_or_else(|| ApiError::conflict("ROLLBACK_TARGET_INVALID", request_id))?;
-    let metadata = m3(&state, request_id)?
+    let m3 = m3(&state, request_id)?;
+    let cleaned: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cleaned_releases WHERE app_id=? AND release_id=?")
+            .bind(source.app_id.to_string())
+            .bind(target.to_string())
+            .fetch_one(m3.database.pool())
+            .await
+            .map_err(|_| ApiError::internal(request_id))?;
+    if cleaned != 0 {
+        return Err(ApiError::conflict("ROLLBACK_ARTIFACT_CLEANED", request_id));
+    }
+    let metadata = m3
         .store
         .read_metadata(source.app_id)
         .map_err(|_| ApiError::app_not_found(request_id))?;
@@ -636,7 +647,8 @@ pub async fn detail(
         .into_iter()
         .next()
         .is_some_and(|value| !value.status.is_terminal());
-    let safe_release = deployment.candidate_release_id.and_then(|release_id| {
+    let candidate_release_id = deployment.candidate_release_id;
+    let safe_release = candidate_release_id.and_then(|release_id| {
         state
             .m3
             .as_ref()
@@ -650,6 +662,21 @@ pub async fn detail(
         && safe_release_id.is_some()
         && safe_release_id != active;
     let mut warnings = Vec::new();
+    if let Some(release_id) = candidate_release_id
+        && safe_release.is_none()
+    {
+        let cleaned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM cleaned_releases WHERE app_id=? AND release_id=?",
+        )
+        .bind(deployment.app_id.to_string())
+        .bind(release_id.to_string())
+        .fetch_one(m3.database.pool())
+        .await
+        .map_err(|_| ApiError::internal(request_id))?;
+        if cleaned == 1 {
+            warnings.push("ROLLBACK_ARTIFACT_CLEANED");
+        }
+    }
     if pending.is_some() {
         warnings.push("DEPLOYMENT_PENDING");
     }

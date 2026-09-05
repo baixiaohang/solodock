@@ -114,7 +114,7 @@ curl --fail http://127.0.0.1:8080/healthz
 
 当 loopback listen authority 与 `public_origin` 不同时，它永久只暴露精确的 `GET /healthz` 与 `GET /favicon.svg`，让已安装 updater 能探测 strict-Host binary；它不暴露登录页、其他 asset、management API、SSE 或 webhook route。直接诊断时应在 request URL 使用已配置 loopback authority，不能用 forwarding header 替代。
 
-认证后的 `/api/v1/system/health` 分开展示 Docker、恢复、projection、deployment、poll coordinator、磁盘与 credential 状态。`interrupted`、`needs_attention` 或 ownership collision 需要先按 deployment detail 与精确 `docker inspect` 处理，不能 prune、宽泛删除或猜测性重跑。
+认证后的 `/api/v1/system/health` 分开展示 Docker、恢复、projection、存储清理恢复、deployment、poll coordinator、磁盘与 credential 状态。cleanup 状态为 `pending` 表示仍有 exact plan 或 tombstone 需要 replay/finalize；`degraded` 表示其 recovery ledger 无法验证。`interrupted`、`needs_attention` 或 ownership collision 需要先按 deployment detail 与精确 `docker inspect` 处理，不能 prune、宽泛删除或猜测性重跑。
 
 任何引用 external network 的应用都必须先由管理员创建目标 Docker network。SoloDock 不改变该网络的 driver、IPAM、labels 或生命周期；升级、部署与删除也不会移除它。新服务默认使用的 `solodock-services` 不是用户 external network：SoloDock 会在首次需要时创建 internal bridge，并严格校验 `sd-services` 与 platform labels；`PLATFORM_NETWORK_IDENTITY_CONFLICT` 时应先识别同名资源来源，不能让 SoloDock 接管或自动删除。应用可用 slug 和容器端口进行内部访问。
 
@@ -154,3 +154,7 @@ archive 含应用、Registry credential 和 webhook secret，必须按高敏数�
 Backup helper 会从自身不可变 package generation 解析 `solodock` binary，并在创建 archive 或临时输出前验证固定 packaged layout。Restore 会在修改 owner/mode 或发布目标前对解出的 config 执行同一检查。自定义路径 config 会被拒绝，不会被部分归档或静默跟随。
 
 恢复 archive 或处理 degraded/interrupted 状态前，按 [恢复](recovery.md) 的 fail-closed 流程操作；安全前提见 [威胁模型](threat-model.md)。
+
+## 手动存储清理
+
+SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。清理永远不会定时执行，也不会由磁盘阈值触发。除 active/pending/恢复事实外，每个应用还保留三个最近的回滚 release，且绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。

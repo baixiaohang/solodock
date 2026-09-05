@@ -112,7 +112,7 @@ curl --fail http://127.0.0.1:8080/healthz
 
 The loopback listen authority permanently exposes only exact `GET /healthz` and `GET /favicon.svg` when it differs from `public_origin`, so installed updaters can probe a strict-Host binary. It does not expose the sign-in page, other assets, management API, SSE, or webhook routes. For direct diagnostics, keep the configured loopback authority in the request URL; do not substitute forwarding headers.
 
-Authenticated `/api/v1/system/health` reports Docker, recovery, projection, deployment, poll coordinator, disk, and credential states separately. For `interrupted`, `needs_attention`, or an ownership collision, inspect deployment details and the exact `docker inspect` facts first. Do not prune, delete broadly, or retry speculatively.
+Authenticated `/api/v1/system/health` reports Docker, recovery, projection, storage-cleanup recovery, deployment, poll coordinator, disk, and credential states separately. A cleanup status of `pending` means an exact plan or tombstone still needs replay/finalization; `degraded` means its recovery ledger could not be verified. For `interrupted`, `needs_attention`, or an ownership collision, inspect deployment details and the exact `docker inspect` facts first. Do not prune, delete broadly, or retry speculatively.
 
 Administrators must create every referenced external network before use. SoloDock never changes its driver, IPAM, labels, or lifecycle, and upgrades, deployments, and deletion never remove it. The default `solodock-services` network for new services is not a user external network: SoloDock creates it on first use as an internal bridge and strictly validates `sd-services` and platform labels. On `PLATFORM_NETWORK_IDENTITY_CONFLICT`, identify the same-named resource's owner rather than letting SoloDock adopt or delete it. Applications can use the slug and container port for internal access.
 
@@ -152,3 +152,7 @@ The archive contains application, Registry credential, and webhook secrets. Rest
 The backup helper resolves the `solodock` binary from its own immutable package generation and validates the fixed packaged layout before creating an archive or temporary output. Restore applies the same check to the extracted config before changing ownership/modes or publishing a target. A custom-path config is refused rather than partially archived or silently followed.
 
 Before restoring an archive or resolving a degraded/interrupted state, follow the fail-closed process in [recovery](recovery.md). See the [threat model](threat-model.md) for security prerequisites.
+
+## Manual storage cleanup
+
+Use **System settings → Storage cleanup** for SoloDock-owned immutable artifacts. Scan first, inspect the exact release/config/temp list and rollback loss, then acknowledge and apply. A preview is not a lock: apply rechecks all protected facts and refuses a changed plan without deleting anything. Cleanup is never scheduled or triggered by a disk threshold. It retains three recent rollback releases per application in addition to active/pending/recovery facts, and never touches workload data or Docker resources. The displayed logical size is an estimate, not guaranteed reclaimed space.

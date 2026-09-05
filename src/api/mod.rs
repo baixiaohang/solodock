@@ -7,6 +7,7 @@ pub mod middleware;
 pub mod mutations;
 pub mod presets;
 pub mod settings;
+pub mod storage_cleanup;
 pub mod streams;
 pub mod system;
 pub mod webhooks;
@@ -158,6 +159,16 @@ pub fn router(state: AppState) -> Router {
             post(image_inspection::inspect),
         )
         .layer(DefaultBodyLimit::max(16 * 1024));
+    let storage_cleanup = Router::new()
+        .route(
+            "/api/v1/system/storage-cleanup/preview",
+            post(storage_cleanup::preview),
+        )
+        .route(
+            "/api/v1/system/storage-cleanup/apply",
+            post(storage_cleanup::apply),
+        )
+        .layer(DefaultBodyLimit::max(16 * 1024));
     let public_webhook = Router::new()
         .route(
             "/hooks/v1/apps/{id}/registry",
@@ -193,6 +204,7 @@ pub fn router(state: AppState) -> Router {
         .merge(settings)
         .merge(presets)
         .merge(image_inspection)
+        .merge(storage_cleanup)
         .merge(public_webhook)
         .fallback(assets::serve)
         .with_state(state.clone())

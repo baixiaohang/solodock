@@ -124,3 +124,9 @@ Application-generated secrets the control plane has never held cannot be identif
 Stats creates a Docker producer only while subscribers exist and retains only the latest sample, never an unbounded history. The final subscriber cancels the producer. A separate producer registry ensures deletion and shutdown can cancel and join every generation.
 
 The embedded asset handler serves static files, SPA fallback, and security headers. `/api/**` and `/hooks/**` never enter SPA fallback. See [webhooks](webhooks.md) for the public webhook's separate Host and signature protocol.
+
+## Storage cleanup
+
+`POST /api/v1/system/storage-cleanup/preview` accepts `{}` and returns a five-minute, session-bound confirmation token plus an exact artifact plan. `POST /api/v1/system/storage-cleanup/apply` accepts only that write-only token and `acknowledge_rollback_loss: true`, and requires an `Idempotency-Key`. Both are management-authority mutations protected by exact Origin, CSRF, session, the 16 KiB body limit, no-store responses, and the standard safe error envelope.
+
+Apply obtains the catalog and ordered application guards, rebuilds fresh facts, and performs zero renames for invalid, expired, stale, busy, or incomplete inventories. Confirmed partial results require a new preview. An uncertain 5xx/transport result may only be checked by replaying the exact body and key; raw tokens and filesystem paths never enter the ledger or response items.

@@ -14,7 +14,7 @@ use crate::security::permissions::check_private;
 const TEMP_PREFIX: &str = ".solodock-tmp-";
 
 pub fn is_internal_temp_name(name: &std::ffi::OsStr) -> bool {
-    name.to_string_lossy().starts_with(TEMP_PREFIX)
+    super::cleanup::exact_internal_temp_name(name)
 }
 
 pub struct AtomicWriter;

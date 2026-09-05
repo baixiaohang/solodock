@@ -122,6 +122,7 @@ describe('Settings', () => {
 
     expect(await screen.findByText('管理员安全')).toBeTruthy()
     expect(screen.getByLabelText('当前密码')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '扫描可清理存储' })).toBeTruthy()
     expect(await screen.findByText('无法加载全局设置。')).toBeTruthy()
   })
 })

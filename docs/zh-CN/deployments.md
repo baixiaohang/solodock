@@ -100,3 +100,5 @@ candidate 达到 health policy 后才把 `active` 原子切向该 release，并�
 Webhook secret revision 在被精确删除前始终是 recovery artifact。其创建 proof、operation temp，以及存在 stale revision 时由签名 metadata 指定的最新 configure/rotate/revoke transition proof，不参与普通 24 小时 replay cleanup。startup/background finalizer 只有在该 transition 是成功 response，且其中 configured 状态、metadata revision、secret revision 与当前签名 metadata 精确一致时，才可删除 stale revision。这也兼容旧 current revision 的创建 proof 在升级前已过期的实例；transition proof 缺失或不匹配时继续 fail closed。
 
 协议、Host 隔离和 WAF 约束见 [Webhook](webhooks.md)。应用资源模型见 [应用模型](application-model.md)，人工处置见 [运维](operations.md) 和 [恢复](recovery.md)。
+
+管理员确认的存储清理可以移除旧 release，同时永久保留其 deployment 历史。该详情返回 `safe_release_id: null`、不提供 rollback action，并带有 `ROLLBACK_ARTIFACT_CLEANED` warning。持久化的 cleaned-release 记录会把这种明确清理与普通 release 缺失或损坏区分开；直接回滚请求也会被拒绝。
