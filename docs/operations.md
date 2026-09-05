@@ -6,7 +6,7 @@ Start with the [product scope](product-scope.md). See the [application model](ap
 
 ## Installation and upgrade
 
-The production target is Ubuntu 24.04 x86_64 with Docker Engine, the `docker` group/socket, systemd, and Docker Compose v2.24+. Stable GitHub Releases provide a long-lived package and require GitHub CLI authentication plus the `gh attestation verify` capability; they do not require Rust, Node.js, npm, or Git on the host. Distribution packages can lag behind GitHub CLI capabilities. Install or upgrade `gh` with GitHub's [official Linux instructions](https://github.com/cli/cli/blob/trunk/docs/install_linux.md), and treat this capability check—not a permanently documented version number—as authoritative:
+The production target is Ubuntu 24.04 x86_64 with a currently supported Docker Engine release no older than 28.3.3, the `docker` group/socket, systemd, and Docker Compose v2.24+. Stable GitHub Releases provide a long-lived package and require GitHub CLI authentication plus the `gh attestation verify` capability; they do not require Rust, Node.js, npm, or Git on the host. Distribution packages can lag behind GitHub CLI capabilities. Install or upgrade `gh` with GitHub's [official Linux instructions](https://github.com/cli/cli/blob/trunk/docs/install_linux.md), and treat this capability check—not a permanently documented version number—as authoritative:
 
 ```bash
 gh attestation verify --help
@@ -82,6 +82,21 @@ GitHub **Release assets** are the long-lived stable distribution. **Actions arti
 ## Security prerequisites
 
 The service listens only on loopback and `public_origin` must use HTTPS. An external tunnel or reverse proxy, access control, and TLS are deployment prerequisites that SoloDock does not configure. Configure the proxy to preserve the exact external `Host` from `public_origin`; rewriting it to the loopback upstream authority causes management requests to fail closed with `404`. `Forwarded`, `X-Forwarded-Host`, `X-Original-Host`, and similar headers are intentionally ignored for routing authority. The `solodock` user belongs to the `docker` group, which is effectively host root access; restrict host administrators, configuration files, and the Web login surface accordingly.
+
+Production requires a currently supported Docker Engine release and never one older than 28.3.3. Docker documents that releases before 28.0.0 may expose ports published to a loopback address to hosts on the same layer-2 segment; 28.3.3 also fixed CVE-2025-54388, which could expose loopback-published ports after a firewalld reload. See Docker's [port-publishing security warning](https://docs.docker.com/engine/network/port-publishing/) and [28.3.3 release notes](https://docs.docker.com/engine/release-notes/28/#2833). SoloDock cannot repair daemon or host-firewall behavior, so satisfying the version floor does not replace the following host acceptance checks.
+
+Before production use, after every relevant upgrade or firewall reload, and after changing tunnel/proxy rules:
+
+1. Run `docker version --format '{{.Server.Version}}'` and `docker compose version`; confirm the daemon is currently supported, at least 28.3.3, and Compose is at least v2.24.
+2. Use `ss -ltnp` (or the host's equivalent) to confirm the SoloDock process listens only on its configured loopback socket.
+3. Review `docker ps --all --format '{{.Names}}\t{{.Ports}}'` and the `HostIp`/`HostPort` values in `docker inspect` for every application that publishes a port. Every binding must match the intended interface; an empty or `0.0.0.0`/`::` host address is externally reachable unless the host network policy proves otherwise. Repeat this check after adding or changing an application port and after redeployment.
+4. Inspect the host firewall independently of Docker's generated rules—for example with `nft list ruleset` and, when applicable, `firewall-cmd --state` plus `firewall-cmd --list-all-zones`. Confirm the default policy and explicit ingress rules, then repeat this check after daemon or firewall reloads.
+5. From a separate host on the same layer-2 network, attempt connections to every management/application port that is intended to remain loopback-only. The connection must fail; a successful local-host test is not sufficient evidence.
+6. Route the management hostname only to the management ingress, preserve the exact `public_origin` authority, and protect it with the deployment's access-control policy. Cloudflare deployments should enable Access MFA in addition to restrictive WAF rules.
+7. Give `webhook_public_origin` a separate hostname and allow only exact `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`. Reject its UI/API routes, every GET, and noncanonical paths at the external ingress. Keep the 1 KiB body limit and bounded rate/concurrency controls at least as strict as SoloDock's documented endpoint limits.
+8. Do not treat source IP, `Forwarded`, or `X-Forwarded-*` values as webhook authentication. The signed body/path/timestamp/nonce protocol remains authoritative.
+
+Record the Docker version, inspected bindings, firewall result, external layer-2 probes, and ingress policy revision with the deployment acceptance evidence. Re-run the entire checklist after Docker, firewalld/nftables, kernel networking, Cloudflare Tunnel, WAF, or reverse-proxy changes.
 
 The packaged unit has only `After=`/`Wants=` ordering for Docker. An absent socket or stopped daemon is a supported degraded state: SoloDock remains running so `/healthz`, authentication, filesystem catalog, and recovery information stay available, while Docker-dependent operations retain their specific degraded failures. If `/var/run/docker.sock` exists, the installer still requires a Unix socket owned by the configured `docker` group; a regular file, symlink, or wrong-group socket is never treated as degraded. Initial import of non-empty legacy TOML bind roots may still require an observable Docker data root to prove non-overlap and remains fail closed.
 

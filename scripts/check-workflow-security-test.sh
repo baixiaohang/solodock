@@ -13,6 +13,12 @@ fixture_dir() {
   cat >"$directory/ci.yml" <<EOF
 on: [push]
 jobs:
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      docker:
+        image: docker:28.5.2-dind
+    steps: []
   attest-package:
     needs: package-smoke
     if: github.event_name == 'push'
@@ -31,6 +37,16 @@ jobs:
         uses: $pinned_attest
         with:
           subject-path: \${{ runner.temp }}/attested-package/solodock-package/SHA256SUMS
+EOF
+  cat >"$directory/extended-ci.yml" <<'EOF'
+on: [workflow_dispatch]
+jobs:
+  docker-resources:
+    runs-on: ubuntu-24.04
+    services:
+      docker:
+        image: docker:28.5.2-dind
+    steps: []
 EOF
   write_safe_release "$directory/release.yml"
   printf '%s\n' "$directory"
@@ -150,6 +166,26 @@ jobs:
 EOF
 "$checker" "$fixture_root/safe-codeql" >/dev/null
 
+directory=$(fixture_dir classic-dind-downgrade)
+sed -i 's/docker:28.5.2-dind/docker:27-dind/' "$directory/ci.yml"
+expect_failure classic-dind-downgrade
+
+directory=$(fixture_dir extended-classic-dind-downgrade)
+sed -i 's/docker:28.5.2-dind/docker:28.3.2-dind/' "$directory/extended-ci.yml"
+expect_failure extended-classic-dind-downgrade
+
+directory=$(fixture_dir renamed-classic-dind-job)
+sed -i 's/^  docker-e2e:/  classic-e2e:/' "$directory/ci.yml"
+expect_failure renamed-classic-dind-job
+
+directory=$(fixture_dir renamed-extended-classic-dind-job)
+sed -i 's/^  docker-resources:/  classic-resources:/' "$directory/extended-ci.yml"
+expect_failure renamed-extended-classic-dind-job
+
+directory=$(fixture_dir missing-extended-classic-dind-workflow)
+rm -- "$directory/extended-ci.yml"
+expect_failure missing-extended-classic-dind-workflow
+
 directory=$(fixture_dir safe-attestation)
 cat >"$directory/ci.yml" <<EOF
 name: Safe attestation
@@ -157,6 +193,12 @@ on: [push]
 permissions:
   contents: read
 jobs:
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      docker:
+        image: docker:28.5.2-dind
+    steps: []
   attest-package:
     needs: package-smoke
     if: github.event_name == 'push'

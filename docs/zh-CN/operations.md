@@ -6,7 +6,7 @@
 
 ## 安装与升级
 
-生产目标为 Ubuntu 24.04 x86_64，并需要 Docker Engine、`docker` group/socket、systemd 与 Docker Compose v2.24+。稳定 GitHub Release 提供长期保留的 package，需要已登录且具备 `gh attestation verify` 能力的 GitHub CLI；宿主机不需要 Rust、Node.js、npm 或 Git。发行版自带 package 可能滞后于 GitHub CLI 的能力。安装或升级 `gh` 时应使用 GitHub 的[官方 Linux 说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)，并以以下能力检查而不是文档中永久写死的版本号作为判断依据：
+生产目标为 Ubuntu 24.04 x86_64，并需要当前受支持且不低于 28.3.3 的 Docker Engine、`docker` group/socket、systemd 与 Docker Compose v2.24+。稳定 GitHub Release 提供长期保留的 package，需要已登录且具备 `gh attestation verify` 能力的 GitHub CLI；宿主机不需要 Rust、Node.js、npm 或 Git。发行版自带 package 可能滞后于 GitHub CLI 的能力。安装或升级 `gh` 时应使用 GitHub 的[官方 Linux 说明](https://github.com/cli/cli/blob/trunk/docs/install_linux.md)，并以以下能力检查而不是文档中永久写死的版本号作为判断依据：
 
 ```bash
 gh attestation verify --help
@@ -84,6 +84,21 @@ GitHub **Release asset** 是长期保留的稳定分发；**Actions artifact** �
 ## 安全前置条件
 
 服务只监听 loopback，`public_origin` 必须是 HTTPS。外部 tunnel 或 reverse proxy、访问控制和 TLS 是部署前置条件，不由 SoloDock 配置。Proxy 必须保留 `public_origin` 的精确外部 `Host`；若改写为 loopback upstream authority，management request 会以 `404` fail closed。`Forwarded`、`X-Forwarded-Host`、`X-Original-Host` 等 header 会被有意忽略，不能提供路由 authority。`solodock` 用户属于 `docker` group；这等同宿主 root 权限，必须限制主机管理员、配置文件和 Web 登录面。
+
+生产环境必须使用当前受支持且不低于 28.3.3 的 Docker Engine。Docker 文档说明，28.0.0 以前的版本可能让同一二层网络中的其他主机访问仅发布到 loopback 的端口；28.3.3 还修复了 CVE-2025-54388，即 firewalld reload 后可能暴露 loopback-published port。参见 Docker 的 [port publishing 安全说明](https://docs.docker.com/engine/network/port-publishing/)和 [28.3.3 release notes](https://docs.docker.com/engine/release-notes/28/#2833)。SoloDock 无法修复 daemon 或宿主 firewall 行为，因此达到版本下限不能替代下面的宿主验收。
+
+生产启用前、每次相关升级或 firewall reload 后，以及 tunnel/proxy 规则变更后，执行以下检查：
+
+1. 运行 `docker version --format '{{.Server.Version}}'` 与 `docker compose version`；确认 daemon 当前仍受支持、版本不低于 28.3.3，且 Compose 不低于 v2.24。
+2. 使用 `ss -ltnp`（或宿主等价工具）确认 SoloDock 进程只监听配置的 loopback socket。
+3. 检查 `docker ps --all --format '{{.Names}}\t{{.Ports}}'`，并对每个发布端口的应用核对 `docker inspect` 中的 `HostIp`/`HostPort`。每个 bind 必须符合预期 interface；空地址或 `0.0.0.0`/`::` 会对外可达，除非宿主网络策略已明确证明阻断。新增或修改应用端口以及重新部署后，都要重复该检查。
+4. 独立于 Docker 自动生成的规则检查宿主 firewall，例如运行 `nft list ruleset`，使用 firewalld 时同时运行 `firewall-cmd --state` 和 `firewall-cmd --list-all-zones`。核对 default policy 与显式 ingress rule，并在 daemon 或 firewall reload 后重新检查。
+5. 从同一二层网络中的另一台主机连接所有应保持 loopback-only 的 management/application port；连接必须失败，只在本机测试成功不能证明外部隔离。
+6. Management hostname 只路由到 management ingress，保留精确 `public_origin` authority，并用部署侧访问控制保护。Cloudflare 部署还应在严格 WAF 规则之外启用 Access MFA。
+7. 为 `webhook_public_origin` 使用独立 hostname，外部 ingress 只允许精确的 `POST /hooks/v1/apps/<canonical-lowercase-UUID>/registry`；拒绝该 hostname 上的 UI/API、所有 GET 与非 canonical path。外部 1 KiB body limit、rate limit 与 concurrency limit 至少应与 SoloDock 文档中的 endpoint 上限同样严格。
+8. 不得把来源 IP、`Forwarded` 或 `X-Forwarded-*` 当作 webhook 认证；签名的 body/path/timestamp/nonce 协议才是权威边界。
+
+把 Docker 版本、实际 bind、firewall 结果、外部二层探测与 ingress policy revision 记录到部署验收证据中。Docker、firewalld/nftables、kernel networking、Cloudflare Tunnel、WAF 或 reverse proxy 变更后应重新执行完整清单。
 
 官方 unit 对 Docker 只有 `After=`/`Wants=` 顺序。socket 缺失或 daemon 停止属于受支持的 degraded 状态：SoloDock 继续运行，`/healthz`、认证、filesystem catalog 和 recovery 信息仍可用，需要 Docker 的操作继续返回具体 degraded 错误。若 `/var/run/docker.sock` 已存在，installer 仍要求它是由配置的 `docker` group 拥有的 Unix socket；普通文件、symlink 或错误 group 的 socket 绝不会按 degraded 放行。首次导入非空 legacy TOML bind roots 时，如必须观察 Docker data root 才能证明无重叠，仍保持 fail closed。
 

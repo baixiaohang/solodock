@@ -247,7 +247,7 @@ jobs:
     runs-on: ubuntu-24.04
     services:
       docker:
-        image: docker:27-dind
+        image: docker:28.5.2-dind
         env:
           DOCKER_TLS_CERTDIR: ""
         ports:
@@ -276,7 +276,7 @@ jobs:
           save-if: false
       - name: Lint Docker E2E target
         run: cargo clippy --features docker-e2e --test docker_e2e -- -D warnings
-      - name: Assert Docker 27 classic image store
+      - name: Assert Docker 28 classic image store
         run: |
           driver_status=$(docker info --format '{{json .DriverStatus}}')
           if [[ $driver_status == *io.containerd.snapshotter.v1* ]]; then
