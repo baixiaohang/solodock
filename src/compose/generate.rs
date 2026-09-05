@@ -223,6 +223,17 @@ pub fn generate(
         .collect::<Vec<_>>();
     let (restart, healthcheck) = health(&input.draft.health);
     let service = Service {
+        security_opt: input
+            .draft
+            .security_profile
+            .as_ref()
+            .map(|profile| {
+                vec![
+                    format!("seccomp=/etc/solodock/security-profiles/{profile}/seccomp.json"),
+                    format!("apparmor=solodock-{profile}"),
+                ]
+            })
+            .unwrap_or_default(),
         image: literal(input.image_ref),
         labels: ownership,
         env_file: vec![
@@ -435,6 +446,7 @@ mod tests {
     ) -> crate::domain::NormalizedDraft {
         crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -463,6 +475,7 @@ mod tests {
     fn generated_yaml_is_single_service_and_never_contains_secret_material() {
         let draft = crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:latest".into(),
                 credential_ref: None,
@@ -514,6 +527,35 @@ mod tests {
     }
 
     #[test]
+    fn security_profile_only_adds_the_preinstalled_pair_to_its_service() {
+        let mut draft = network_draft(true, vec![]);
+        for selected in [None, Some("codex-v1".to_owned())] {
+            draft.security_profile = selected.clone();
+            let (yaml, _) = generate(
+                ComposeInput {
+                    resource_identity: identity(Uuid::nil(), "example"),
+                    release_id: Uuid::nil(),
+                    image_ref: &draft.discovery_image_ref,
+                    revision_directory: Path::new("/var/lib/solodock/revision"),
+                    draft: &draft,
+                    include_stop_grace_period: true,
+                },
+                false,
+            )
+            .unwrap();
+            assert_eq!(yaml.contains("security_opt:"), selected.is_some());
+            if selected.is_some() {
+                assert!(
+                    yaml.contains("seccomp=/etc/solodock/security-profiles/codex-v1/seccomp.json")
+                );
+                assert!(yaml.contains("apparmor=solodock-codex-v1"));
+            }
+            assert!(!yaml.contains("privileged"));
+            assert!(!yaml.contains("unconfined"));
+        }
+    }
+
+    #[test]
     fn compose_interpolation_metacharacters_are_emitted_as_literals() {
         assert_eq!(literal("/srv/${APP}/$VALUE"), "/srv/$${APP}/$$VALUE");
     }
@@ -521,6 +563,7 @@ mod tests {
     #[test]
     fn user_volume_names_cannot_collide_with_internal_resource_keys() {
         let input = crate::domain::DraftInput {
+            security_profile: None,
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,

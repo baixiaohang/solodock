@@ -1148,6 +1148,7 @@ mod tests {
         let draft = |stop_grace_period_seconds| {
             crate::domain::normalize_draft(
                 crate::domain::DraftInput {
+                    security_profile: None,
                     display_name: "Example".into(),
                     discovery_image_ref: "registry.example/app:stable".into(),
                     credential_ref: None,

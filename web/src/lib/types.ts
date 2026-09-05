@@ -167,6 +167,7 @@ export interface HttpHealthcheck {
 }
 
 export interface DraftInput {
+  security_profile?: string | null
   display_name: string
   discovery_image_ref: string
   credential_ref: string | null
@@ -246,6 +247,7 @@ export interface WebhookStatus {
 export type ConfiguredScope = 'active' | 'pending' | 'draft' | 'active_and_pending' | 'active_and_draft' | 'pending_and_draft' | 'active_pending_and_draft'
 
 export interface DraftResponse {
+  security_profile?: string | null
   discovery_image_ref: string
   credential_ref: string | null
   auto_deploy_enabled: boolean

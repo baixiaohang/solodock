@@ -1168,6 +1168,7 @@ mod tests {
     fn managed_file_draft(key: &[u8], public_value: &str) -> crate::domain::NormalizedDraft {
         crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Managed files".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -1338,6 +1339,7 @@ mod tests {
         let release_id = Uuid::new_v4();
         let draft = crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Canonical".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -1453,6 +1455,7 @@ mod tests {
         let store = crate::app_store::AppStore::initialize(root.to_path_buf()).unwrap();
         let draft = crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -1661,6 +1664,7 @@ mod tests {
         .unwrap();
         let draft = crate::domain::normalize_draft(
             crate::domain::DraftInput {
+                security_profile: None,
                 display_name: "Read only".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,

@@ -566,6 +566,7 @@ mod tests {
         let revision_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
         let mut draft = normalize_draft(
             DraftInput {
+                security_profile: None,
                 display_name: "Legacy".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,
@@ -790,6 +791,7 @@ mod tests {
         let store = AppStore::initialize_verified(root.path().join("apps"), key.clone()).unwrap();
         let draft = normalize_draft(
             DraftInput {
+                security_profile: None,
                 display_name: "Example".into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,

@@ -1674,6 +1674,7 @@ async fn production_compose_actions_preserve_volume_bind_and_network_data() {
     let compose_file = project.path().join("compose.yaml");
     let draft = solodock::domain::normalize_draft(
         solodock::domain::DraftInput {
+            security_profile: None,
             display_name: "E2E".into(),
             discovery_image_ref: "alpine:3.20".into(),
             credential_ref: None,

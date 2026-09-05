@@ -62,7 +62,7 @@ impl LoadedRevision {
             allowed_bind_roots,
         )?;
         match self.metadata.schema_version {
-            1 | 2 => {
+            1 | 2 | 3 if self.metadata.security_profile.is_none() => {
                 // Legacy schemas predate some current controls. Re-normalize
                 // all semantic fields, then preserve the signed legacy
                 // metadata and hash for artifact verification.
@@ -76,7 +76,7 @@ impl LoadedRevision {
                 }
                 normalized.metadata = self.metadata.clone();
             }
-            3 if normalized.metadata == self.metadata => {}
+            4 if normalized.metadata == self.metadata => {}
             _ => return Err(DomainError::ConfigInvalid),
         }
         Ok(normalized)
@@ -90,6 +90,7 @@ impl LoadedRevision {
         poll_interval_seconds: u32,
     ) -> DraftResponse {
         DraftResponse {
+            security_profile: self.metadata.security_profile.clone(),
             discovery_image_ref,
             credential_ref,
             auto_deploy_enabled,
@@ -140,6 +141,7 @@ impl LoadedRevision {
         poll_interval_seconds: u32,
     ) -> DraftInput {
         DraftInput {
+            security_profile: self.metadata.security_profile.clone(),
             display_name,
             discovery_image_ref,
             credential_ref,
@@ -282,7 +284,7 @@ pub fn load(app_directory: &Path, revision_id: Uuid) -> Result<LoadedRevision, S
     })?;
     let mut metadata: ConfigMetadata =
         toml::from_str(&config).map_err(|_| StoreError::ContentInvalid)?;
-    if !matches!(metadata.schema_version, 1..=3)
+    if !matches!(metadata.schema_version, 1..=4)
         || metadata.files.iter().any(|file| {
             crate::domain::validation::validate_logical_name(&file.logical_name).is_err()
         })
@@ -580,6 +582,7 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let key = b"managed-file-integrity-key";
         let input = DraftInput {
+            security_profile: None,
             display_name: "Managed files".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -663,6 +666,7 @@ mod tests {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let key = b"managed-file-integrity-key";
         let input = DraftInput {
+            security_profile: None,
             display_name: "Managed files".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -707,10 +711,55 @@ mod tests {
     }
 
     #[test]
+    fn security_profile_survives_revision_reload_and_cannot_be_tampered() {
+        let root = tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let input: DraftInput = serde_json::from_value(serde_json::json!({
+            "display_name": "Sandbox", "discovery_image_ref": "example/app:stable",
+            "security_profile": "codex-v1"
+        }))
+        .unwrap();
+        let key = b"security-profile-integrity";
+        let draft =
+            crate::domain::normalize_draft(input, &ExistingSecrets::default(), key, &[]).unwrap();
+        let revision = Uuid::new_v4();
+        publish(root.path(), revision, &draft).unwrap();
+        let loaded = load_verified(root.path(), revision, key).unwrap();
+        let normalized = loaded
+            .normalize_verified(
+                "Sandbox".into(),
+                "example/app:stable".into(),
+                None,
+                false,
+                300,
+                key,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(normalized.security_profile.as_deref(), Some("codex-v1"));
+        assert_eq!(
+            loaded
+                .response("example/app:stable".into(), None, false, 300)
+                .security_profile,
+            normalized.security_profile
+        );
+        let config_path = root
+            .path()
+            .join("config-revisions")
+            .join(revision.to_string())
+            .join("config.toml");
+        let mut metadata = loaded.metadata;
+        metadata.security_profile = Some("codex-v2".into());
+        fs::write(config_path, toml::to_string(&metadata).unwrap()).unwrap();
+        assert!(load_verified(root.path(), revision, key).is_err());
+    }
+
+    #[test]
     fn immutable_revision_detects_secret_corruption() {
         let root = tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let input = DraftInput {
+            security_profile: None,
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -765,6 +814,7 @@ mod tests {
         let root = tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let input = DraftInput {
+            security_profile: None,
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
