@@ -6,6 +6,11 @@ require "yaml"
 PINNED_ACTION = %r{\A[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}\z}
 DANGEROUS_TRIGGERS = %w[pull_request_target workflow_run].freeze
 ATTEST_JOB = "attest-package"
+CLASSIC_DIND_IMAGE = "docker:28.5.2-dind"
+CLASSIC_DIND_LANES = {
+  "ci.yml" => "docker-e2e",
+  "extended-ci.yml" => "docker-resources"
+}.freeze
 RELEASE_ATTEST_JOB = "attest-release"
 RELEASE_PUBLISH_JOB = "publish-release"
 DOWNLOAD_ARTIFACT_ACTION = "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
@@ -32,6 +37,12 @@ end
 required_release_file = File.join(workflow_dir, "release.yml")
 unless File.file?(required_release_file) && !File.symlink?(required_release_file)
   errors << "#{required_release_file}: required workflow must exist as a regular file"
+end
+CLASSIC_DIND_LANES.each_key do |workflow_name|
+  file = File.join(workflow_dir, workflow_name)
+  unless File.file?(file) && !File.symlink?(file)
+    errors << "#{file}: classic DinD workflow must exist as a regular file"
+  end
 end
 
 scalar_strings = lambda do |value, &block|
@@ -127,6 +138,17 @@ workflow_files.each do |file|
   unless jobs.is_a?(Hash)
     errors << "#{file}: jobs must be a mapping"
     next
+  end
+  if (classic_job_id = CLASSIC_DIND_LANES[File.basename(file)])
+    classic_job = jobs[classic_job_id]
+    unless classic_job.is_a?(Hash)
+      errors << "#{file}: required classic DinD job #{classic_job_id} is missing"
+    else
+      docker_image = classic_job.dig("services", "docker", "image")
+      unless docker_image == CLASSIC_DIND_IMAGE
+        errors << "#{file}: #{classic_job_id} must pin the patched classic DinD image #{CLASSIC_DIND_IMAGE}"
+      end
+    end
   end
   if File.basename(file) == "ci.yml" && !jobs.key?(ATTEST_JOB)
     errors << "#{file}: required #{ATTEST_JOB} job is missing"

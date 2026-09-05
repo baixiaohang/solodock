@@ -12,6 +12,8 @@ Reverse proxy 提供的 authority 输入不可信。SoloDock 将 management 路�
 
 官方 package state 仅允许固定的 config/state/runtime 布局。Runtime、installer、updater、backup 与 restore 都会在各自 durable boundary 之前调用同一个 Rust layout validator；shell 不跟随任意 TOML 路径。Docker socket 缺失是允许的 degraded availability 状态，但已存在却类型或 group 错误的路径会被拒绝。Systemd soft dependency 可避免 Docker outage/restart 停止与 Docker 无关的控制面访问，但不会降低可用 Docker socket 实际等同 host root 的权限。
 
+宿主 Docker daemon 与 firewall 是独立的生产安全边界。生产支持要求使用当前仍受维护且不低于 28.3.3 的 Docker Engine，因为更早版本存在 Docker 已记录的 loopback port 暴露路径。SoloDock 的 loopback listener、typed port bind 与严格 HTTP authority 不能证明 Docker NAT/firewall rule 或外部 tunnel 在 daemon、firewall、proxy 变更后仍保持私有。管理员必须按[运维文档](operations.md)核验实际宿主 listener、发布 bind、firewall policy、二层网络可达性与外部 ingress。
+
 secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入 API response、SQLite、release、audit、argv、tracing 或错误；日志使用完整、fail-closed 的动态已知 secret 集脱敏。内核、allocator、Docker daemon、Registry 服务端和管理员业务备份不在“内存中从未出现明文”的保证范围。备份含 secret，必须高敏保护。
 
 仅持有合法管理员 session 不能轮换 credential：该 route 还要求当前密码、精确 Origin 与 CSRF proof。无效 current-password 尝试与 login 共用 throttle，但使用独立的脱敏 audit action 和 HTTP 403 结果，因此不会伪装成 session 过期，也不泄露密码材料。轮换与 login 串行化，并在原子替换 hash 时撤销全部 session。这让密码泄露后的止损依赖一次成功轮换；本次不增加 MFA、account recovery、password history，也不增加用于取消 commit 前已获准 request 的 authentication epoch。
