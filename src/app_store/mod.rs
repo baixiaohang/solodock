@@ -92,26 +92,14 @@ impl AppStore {
 
     pub fn scan(&self) -> Result<recovery::RecoveryReport, StoreError> {
         config_revision::normalize_managed_file_permissions(&self.apps_directory)?;
-        let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_relocated_with_options(
-            &self.apps_directory,
-            &self.canonical_apps_directory,
-            self.integrity_key.as_deref().map(Vec::as_slice),
-            &allowed_bind_roots,
-        )
+        recovery::scan_store(self, recovery::ScanMode::StartupCleanup)
     }
 
     /// Validate and project the current filesystem facts without performing
     /// startup-only cleanup. Runtime readers must never remove a writer's
     /// temporary or newly published-but-not-yet-referenced artifacts.
     pub fn scan_read_only(&self) -> Result<recovery::RecoveryReport, StoreError> {
-        let allowed_bind_roots = self.allowed_bind_roots();
-        recovery::scan_read_only_relocated(
-            &self.apps_directory,
-            &self.canonical_apps_directory,
-            self.integrity_key.as_deref().map(Vec::as_slice),
-            &allowed_bind_roots,
-        )
+        recovery::scan_store(self, recovery::ScanMode::ReadOnly)
     }
 
     pub fn apps_directory(&self) -> &std::path::Path {

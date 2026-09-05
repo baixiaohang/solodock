@@ -113,21 +113,6 @@ pub fn scan_with_options(
     )
 }
 
-pub(crate) fn scan_relocated_with_options(
-    apps_directory: &Path,
-    canonical_apps_directory: &Path,
-    integrity_key: Option<&[u8]>,
-    allowed_bind_roots: &[PathBuf],
-) -> Result<RecoveryReport, StoreError> {
-    scan_with_mode(
-        apps_directory,
-        integrity_key,
-        allowed_bind_roots,
-        ScanMode::StartupCleanup,
-        Some(canonical_apps_directory),
-    )
-}
-
 pub fn scan_read_only_with_options(
     apps_directory: &Path,
     integrity_key: Option<&[u8]>,
@@ -158,7 +143,7 @@ pub fn scan_read_only_relocated(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ScanMode {
+pub(crate) enum ScanMode {
     StartupCleanup,
     ReadOnly,
 }
@@ -176,6 +161,37 @@ fn scan_with_mode(
     mode: ScanMode,
     canonical_apps_directory: Option<&Path>,
 ) -> Result<RecoveryReport, StoreError> {
+    // Standalone startup/restore callers have explicit physical/canonical roots.
+    // Runtime scans reuse their initialized store instead of reconstructing it
+    // from paths derived from an HTTP handler's injected application state.
+    let store = super::AppStore {
+        apps_directory: apps_directory.to_owned(),
+        canonical_apps_directory: canonical_apps_directory
+            .unwrap_or(apps_directory)
+            .to_owned(),
+        integrity_key: integrity_key.map(|key| std::sync::Arc::new(key.to_vec())),
+        allowed_bind_roots: std::sync::Arc::new(std::sync::RwLock::new(
+            allowed_bind_roots.to_vec(),
+        )),
+        #[cfg(any(test, feature = "docker-e2e"))]
+        cleanup_fault: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        #[cfg(test)]
+        cleanup_fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(test)]
+        cleanup_fail_next_finalize: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    scan_store(&store, mode)
+}
+
+pub(crate) fn scan_store(
+    store: &super::AppStore,
+    mode: ScanMode,
+) -> Result<RecoveryReport, StoreError> {
+    let apps_directory = store.apps_directory();
+    let canonical_apps_directory = Some(store.canonical_apps_directory.as_path());
+    let integrity_key = store.integrity_key.as_deref().map(Vec::as_slice);
+    let allowed_bind_roots = store.allowed_bind_roots();
+    let allowed_bind_roots = allowed_bind_roots.as_slice();
     check_private(apps_directory, true)?;
     let mut report = RecoveryReport::default();
     let mut candidates = Vec::new();
@@ -189,26 +205,6 @@ fn scan_with_mode(
             // Cleanup tombstones are recovery artifacts, not applications.
             // Validate every operation before allowing the rest of the catalog
             // to load, but never finalize one from a filesystem scan.
-            let store = super::AppStore {
-                apps_directory: apps_directory.to_owned(),
-                canonical_apps_directory: canonical_apps_directory
-                    .unwrap_or(apps_directory)
-                    .to_owned(),
-                integrity_key: integrity_key.map(|key| std::sync::Arc::new(key.to_vec())),
-                allowed_bind_roots: std::sync::Arc::new(std::sync::RwLock::new(
-                    allowed_bind_roots.to_vec(),
-                )),
-                #[cfg(any(test, feature = "docker-e2e"))]
-                cleanup_fault: std::sync::Arc::new(std::sync::Mutex::new(None)),
-                #[cfg(test)]
-                cleanup_fail_next_rename: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
-                    false,
-                )),
-                #[cfg(test)]
-                cleanup_fail_next_finalize: std::sync::Arc::new(
-                    std::sync::atomic::AtomicBool::new(false),
-                ),
-            };
             store.cleanup_tombstones()?;
             continue;
         }
