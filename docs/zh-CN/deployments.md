@@ -102,3 +102,7 @@ Webhook secret revision 在被精确删除前始终是 recovery artifact。其�
 协议、Host 隔离和 WAF 约束见 [Webhook](webhooks.md)。应用资源模型见 [应用模型](application-model.md)，人工处置见 [运维](operations.md) 和 [恢复](recovery.md)。
 
 管理员确认的存储清理可以移除旧 release，同时永久保留其 deployment 历史。该详情返回 `safe_release_id: null`、不提供 rollback action，并带有 `ROLLBACK_ARTIFACT_CLEANED` warning。持久化的 cleaned-release 记录会把这种明确清理与普通 release 缺失或损坏区分开；直接回滚请求也会被拒绝。
+
+## Artifact 清理后的镜像
+
+清理 release 不会删除 Docker 镜像。独立镜像预览从已验证 artifact plan 与 detached item ledger 推导来源，仅在 artifact finalize 完成后才允许作为候选。新增的保留 release 或 container 引用会阻止镜像删除。Image apply 先取得 catalog guard、按 UUID 顺序取得全部当前 app guard 和共享 Compose guard，再 fresh recheck。回滚与部署历史语义不变：额外三个回滚 release 始终保留；已明确清理的 artifact 即使镜像仍存在，也不能回滚。

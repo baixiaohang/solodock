@@ -158,3 +158,9 @@ Backup helper 会从自身不可变 package generation 解析 `solodock` binary�
 ## 手动存储清理
 
 SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。清理永远不会定时执行，也不会由磁盘阈值触发。除 active/pending/恢复事实外，每个应用还保留三个最近的回滚 release，且绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。
+
+## 手动 Docker 镜像清理
+
+Artifact 清理后使用独立的 **系统设置 → Docker 镜像清理**。扫描、逐项选择、确认，再应用。不会自动选择，不设定时或磁盘阈值自动清理。Preview 不是锁；执行前重新检查全部 release 及运行/停止 container 引用，daemon 还会阻止 non-force 冲突。Docker 报告字节数只是上限估算，不保证实际释放空间或证明归属，共享 layer 可能继续保留。
+
+只按 fresh exact image ID 删除，使用 `force=false`、`noprune=true`。In-use 或 multiple-reference 冲突保留镜像，SoloDock 不会升级 force/prune 或删除父镜像。Container、volume、network、业务数据、credential、backup、deployment 和 audit 不在范围内。来源/container inventory 不完整或超限会 fail closed（cleaned record 或 container 上限 4,096；每次预览最多选择 100 个镜像）。应先解决 inventory 问题再扫描，不可宽泛删除绕过。
