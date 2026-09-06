@@ -43,6 +43,7 @@ async fn webhook_transition_proof_survives_gc_until_restart_recovery_converges()
     .unwrap();
     let draft = normalize_draft(
         DraftInput {
+            security_profile: None,
             display_name: "Webhook recovery".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,
@@ -214,6 +215,7 @@ async fn deleted_database_rebuilds_index_without_fabricating_audit() {
     let store = AppStore::initialize_verified(apps, key.clone()).unwrap();
     let draft = normalize_draft(
         DraftInput {
+            security_profile: None,
             display_name: "Example".into(),
             discovery_image_ref: "registry.example/image:stable".into(),
             credential_ref: None,
@@ -332,6 +334,7 @@ async fn offline_backup_and_restore_preserve_verified_active_and_pending_links()
     .unwrap();
     let draft = normalize_draft(
         DraftInput {
+            security_profile: None,
             display_name: "Backup fixture".into(),
             discovery_image_ref: "registry.example/app:stable".into(),
             credential_ref: None,

@@ -911,6 +911,7 @@ mod tests {
     fn create_managed_app(app_store: &AppStore, key: &[u8], slug: &str) -> Uuid {
         let draft = normalize_draft(
             DraftInput {
+                security_profile: None,
                 display_name: slug.into(),
                 discovery_image_ref: "registry.example/app:stable".into(),
                 credential_ref: None,

@@ -131,6 +131,10 @@ The embedded asset handler serves static files, SPA fallback, and security heade
 
 Apply obtains the catalog and ordered application guards, rebuilds fresh facts, and performs zero renames for invalid, expired, stale, busy, or incomplete inventories. Confirmed partial results require a new preview. An uncertain 5xx/transport result may only be checked by replaying the exact body and key; raw tokens and filesystem paths never enter the ledger or response items.
 
+### Container security profile selection
+
+Draft input and response include optional `security_profile: string | null`. Omission/null selects Docker defaults; a nonempty name selects the preinstalled pair described in [operations](operations.md#per-application-container-security-profiles). It is part of configuration identity, Compose preview and immutable revisions. Invalid names return a field issue at `security_profile`. Clients editing existing drafts must preserve this field unless intentionally clearing it. Existing schema 1–3 revisions remain readable and select Docker defaults; injected security profile values in historical unsigned schemas are rejected.
+
 ## Docker image cleanup
 
 `POST /api/v1/system/image-cleanup/preview` accepts only `{}`. It returns canonical image IDs, manifest/platform, Docker-reported bytes, a protected count, and a session-bound write-only confirmation token expiring in five minutes. `POST /api/v1/system/image-cleanup/apply` requires `Idempotency-Key` and only `confirmation_token`, a nonempty sorted unique `image_ids` subset of that preview (at most 100), and `acknowledge_image_removal: true`. Both routes retain management authority, session, exact Origin, CSRF, 16 KiB body, safe error and no-store boundaries. Tags, paths, prune options, and arbitrary Docker arguments are not accepted.

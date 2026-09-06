@@ -4224,6 +4224,7 @@ mod tests {
 
     fn external_only_metadata() -> crate::domain::ConfigMetadata {
         crate::domain::ConfigMetadata {
+            security_profile: None,
             schema_version: 1,
             stop_grace_period_seconds: 10,
             public_env_keys: vec![],
@@ -4402,6 +4403,7 @@ mod tests {
             DockerSupervisor::new(),
         );
         let metadata = crate::domain::ConfigMetadata {
+            security_profile: None,
             schema_version: 1,
             stop_grace_period_seconds: 10,
             public_env_keys: vec![],

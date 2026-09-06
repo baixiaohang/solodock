@@ -61,9 +61,11 @@ describe('app detail resource identity', () => {
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: '配置' }))
     await user.type(screen.getByLabelText('发现镜像 tag'), 'ghcr.io/example/app:stable')
+    await user.type(screen.getByLabelText('容器安全策略'), 'codex-v1')
     await user.click(screen.getByRole('button', { name: '保存新 revision' }))
     await waitFor(() => expect(saved).toBeDefined())
     expect(saved?.expected_revision).toBeNull()
+    expect(saved?.draft).toMatchObject({ security_profile: 'codex-v1' })
   })
 
   it('does not display an owned network or bridge for an external-only app', async () => {
