@@ -159,6 +159,8 @@ Use **System settings → Storage cleanup** for SoloDock-owned immutable artifac
 
 ## Manual Docker image cleanup
 
+Known conservative limitation: some normally running multi-architecture containers have a selected child that Docker cannot inspect independently by digest. This blocks the **entire image cleanup preview**, including unrelated eligible images; it does not stop or impair those applications. SoloDock does not ignore such containers or automatically pull images to repair the inventory. This version does not support every otherwise-valid containerd inventory. The E2E fixture's explicit child preparation is test setup, not a runtime recovery feature.
+
 On containerd, a tag-created container may reference an image index while its descriptor identifies the platform-selected manifest. Cleanup verifies the exact index and separately inspects that child, preserving both identities and the child's config ID. Missing or inconsistent child identity/platform still blocks the entire inventory; index objects are not treated as eligible release manifests.
 
 Use the separate **System settings → Docker image cleanup** panel after artifact cleanup. Scan, select individual images, acknowledge, then apply. Nothing is selected automatically, and there is no scheduled or disk-threshold cleanup. The preview is not a lock. All release and running/stopped container references are rechecked before effects; the daemon additionally enforces non-force conflicts. Docker-reported bytes are an upper estimate, not guaranteed reclaimed space or ownership: shared layers may remain.

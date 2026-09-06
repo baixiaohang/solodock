@@ -161,6 +161,8 @@ SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。
 
 ## 手动 Docker 镜像清理
 
+已知保守限制：某些正常运行的多架构容器，其选中子镜像无法由 Docker 按 digest 独立 inspect。这会拒绝**整次镜像清理预览**，包括无关的合格镜像；不会停止或影响这些应用运行。SoloDock 不会忽略这些容器，也不会自动拉取镜像修复 inventory。本版本并非兼容所有原本合法的 containerd inventory。E2E 显式准备子镜像只是测试准备，不是运行时恢复功能。
+
 Containerd 上通过 tag 创建的容器可能引用 image index，而 descriptor 指向平台选中的 manifest。清理会验证精确 index 并独立 inspect 子 manifest，保护两种 identity 以及子镜像 config ID。子 identity/platform 缺失或冲突仍会阻断整个 inventory；不会把 index 当成可清理的 release manifest。
 
 Artifact 清理后使用独立的 **系统设置 → Docker 镜像清理**。扫描、逐项选择、确认，再应用。不会自动选择，不设定时或磁盘阈值自动清理。Preview 不是锁；执行前重新检查全部 release 及运行/停止 container 引用，daemon 还会阻止 non-force 冲突。Docker 报告字节数只是上限估算，不保证实际释放空间或证明归属，共享 layer 可能继续保留。

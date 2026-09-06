@@ -42,6 +42,7 @@ async fn run() {
     let network = format!("image-cleanup-network-{token}");
     let outcome=tokio::time::timeout(Duration::from_secs(240),AssertUnwindSafe(async {
         docker_cli(&endpoint,&["pull","registry:2"]).await;
+        docker_cli(&endpoint,&["pull","alpine:3.20"]).await;
         let registry=docker.create_container(Some(CreateContainerOptionsBuilder::default().name(&format!("image-cleanup-registry-{token}")).build()),ContainerCreateBody {
             image:Some("registry:2".into()),labels:Some(labels.clone()),
             exposed_ports:Some(vec!["5000/tcp".into()]),
@@ -81,6 +82,46 @@ async fn run() {
         let preview=MutationHarness::json(harness.request("POST","/api/v1/system/storage-cleanup/preview",None,Some(&json!({}))).await).await;
         let apply=harness.request("POST","/api/v1/system/storage-cleanup/apply",Some("image-cleanup-e2e-artifacts"),Some(&json!({"confirmation_token":preview["confirmation_token"],"acknowledge_rollback_loss":true}))).await;
         assert_eq!(apply.status(),StatusCode::OK,"{}",MutationHarness::json(apply).await);
+        if std::env::var("SOLODOCK_EXPECT_CONTAINERD").as_deref()==Ok("1") {
+            // Keep the real tag-created index container. A missing independent
+            // child is an inventory failure even when candidates are unrelated.
+            let raw=docker.inspect_container(&registry,None).await.unwrap();
+            let parent=raw.image.clone().unwrap();
+            let child=raw.image_manifest_descriptor.as_ref().unwrap().digest.clone().unwrap();
+            assert_ne!(parent,child);
+            let observed=docker.inspect_image(&parent).await.unwrap();
+            assert_eq!(observed.id.as_deref(),Some(parent.as_str()));
+            assert!(matches!(observed.descriptor.as_ref().and_then(|d|d.media_type.as_deref()),Some("application/vnd.oci.image.index.v1+json"|"application/vnd.docker.distribution.manifest.list.v2+json")));
+            // An isolated daemon must start this phase without a separately
+            // pulled registry child. Never skip it or remove a preexisting image.
+            assert!(matches!(docker.inspect_image(&child).await,Err(bollard::errors::Error::DockerResponseServerError{status_code:404,..})),"registry child must initially be independently absent");
+            let pool=harness.state.m3.as_ref().unwrap().database.pool();
+            let before: (i64,i64)=sqlx::query_as("SELECT (SELECT COUNT(*) FROM image_cleanup_previews), (SELECT COUNT(*) FROM image_cleanup_operations)").fetch_one(pool).await.unwrap();
+            let denied=harness.request("POST","/api/v1/system/image-cleanup/preview",None,Some(&json!({}))).await;
+            assert_eq!(denied.status(),StatusCode::CONFLICT);
+            let after: (i64,i64)=sqlx::query_as("SELECT (SELECT COUNT(*) FROM image_cleanup_previews), (SELECT COUNT(*) FROM image_cleanup_operations)").fetch_one(pool).await.unwrap();
+            assert_eq!(before,after);
+            for record in &records {assert!(docker.inspect_image(&record.0).await.is_ok());}
+            for id in &containers {assert!(docker.inspect_container(id,None).await.is_ok());}
+            assert!(docker.inspect_volume(&volume).await.is_ok());
+            assert!(docker.inspect_network(&network,None).await.is_ok());
+
+            // Explicit fixture preparation, never a runtime cleanup action.
+            // Prepare both children, independent of other E2Es' previous pulls.
+            for (container,repository) in [(&registry,"docker.io/library/registry"),(&base,"docker.io/library/alpine")] {
+                let before=docker.inspect_container(container,None).await.unwrap();
+                let child=before.image_manifest_descriptor.as_ref().unwrap().digest.as_deref().unwrap();
+                let reference=format!("{repository}@{child}");
+                docker_cli(&endpoint,&["pull",&reference]).await;
+                let observed=docker.inspect_image(child).await.expect("explicit fixture child must be independently inspectable");
+                assert_eq!(observed.descriptor.as_ref().and_then(|d|d.digest.as_deref()),Some(child));
+                assert!(observed.os.as_ref().is_some_and(|s|!s.is_empty()));
+                assert!(observed.architecture.as_ref().is_some_and(|s|!s.is_empty()));
+                let after=docker.inspect_container(container,None).await.unwrap();
+                assert_eq!(after.image,before.image);
+                assert_eq!(descriptor_identity(after.image_manifest_descriptor.as_ref()),descriptor_identity(before.image_manifest_descriptor.as_ref()));
+            }
+        }
         let response=harness.request("POST","/api/v1/system/image-cleanup/preview",None,Some(&json!({}))).await;
         let status=response.status();
         let preview=MutationHarness::json(response).await;

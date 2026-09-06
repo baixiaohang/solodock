@@ -160,6 +160,8 @@ rg -n "proposals/" README.md README.zh-CN.md docs --glob '!testing.md' --glob '!
 
 ## 手动镜像清理门禁
 
+真实 containerd cleanup E2E 在隔离 daemon 上有两个必经阶段。保留通过 tag 创建、引用 index parent 的 registry 容器，先要求选中 child 无法独立 inspect：preview 必须返回 409、不新增 token/operation，所有候选镜像和资源 canary 保留。随后仅由 fixture 按精确 repository@digest 显式拉取 registry 和 Alpine 的选中 child，验证 fresh child inspect 与容器 identity 不变，再执行原成功 preview/删除断言。不依赖其他 E2E 预先准备 child、不跳过负向阶段，也不把 registry 改为单 manifest 容器；显式准备失败就是测试失败。这证明完整与不完整 inventory 的不同结果，不代表运行时自动修复或所有 containerd 配置均兼容。
+
 Containerd index 回归保护 tag 创建容器的 index、选中子 manifest 及 config ID。子 inspect 缺失、子 platform/descriptor 错误、父 identity 错误或替换为嵌套 index 都会在 token consume/remove 前拒绝 preview/apply。HTTP adapter 还独立门禁 index media type 投影，不混同 manifest identity。
 
 定向 `m3_api image_cleanup::` 用例走 production router 和真实 artifact cleanup 来源：running/stopped × managed/unmanaged 四类容器、普通保留 release、fresh race、app/Compose guard、非法选择、不完整 identity/inventory 和持久 ledger 损坏。真实有副作用的 daemon mock 与 SQLite trigger 覆盖 remove 前失败、remove 响应丢失、删除后 inspect 失败、progress/response commit 失败、audit 回滚及显式 restart/retry，只能删除精确选中镜像。
