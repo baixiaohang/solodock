@@ -1,6 +1,18 @@
 use super::*;
 use bollard::query_parameters::{CommitContainerOptionsBuilder, RemoveImageOptionsBuilder};
 
+fn descriptor_identity(value: Option<&bollard::models::OciDescriptor>) -> Value {
+    value.map_or(Value::Null, |value| {
+        let platform = value.platform.as_ref();
+        json!({
+            "digest": value.digest, "media_type": value.media_type, "size": value.size,
+            "os": platform.and_then(|p| p.os.as_ref()),
+            "architecture": platform.and_then(|p| p.architecture.as_ref()),
+            "variant": platform.and_then(|p| p.variant.as_ref())
+        })
+    })
+}
+
 #[tokio::test]
 #[ignore = "requires an isolated classic Docker daemon"]
 async fn classic_manual_image_cleanup_preserves_unselected_and_container_resources() {
@@ -69,7 +81,26 @@ async fn run() {
         let preview=MutationHarness::json(harness.request("POST","/api/v1/system/storage-cleanup/preview",None,Some(&json!({}))).await).await;
         let apply=harness.request("POST","/api/v1/system/storage-cleanup/apply",Some("image-cleanup-e2e-artifacts"),Some(&json!({"confirmation_token":preview["confirmation_token"],"acknowledge_rollback_loss":true}))).await;
         assert_eq!(apply.status(),StatusCode::OK,"{}",MutationHarness::json(apply).await);
-        let preview=MutationHarness::json(harness.request("POST","/api/v1/system/image-cleanup/preview",None,Some(&json!({}))).await).await;
+        let response=harness.request("POST","/api/v1/system/image-cleanup/preview",None,Some(&json!({}))).await;
+        let status=response.status();
+        let preview=MutationHarness::json(response).await;
+        if status!=StatusCode::OK {
+            // Test-owned daemon only: print identity fields, never Config/Env,
+            // mounts, registry credentials, response tokens, or production paths.
+            for container_id in &containers {
+                let raw=docker.inspect_container(container_id,None).await.unwrap();
+                eprintln!("cleanup container identity: id={container_id}, image={:?}, descriptor={}",raw.image,descriptor_identity(raw.image_manifest_descriptor.as_ref()));
+                if let Some(id)=raw.image {
+                    let observed=docker.inspect_image(&id).await.unwrap();
+                    eprintln!("cleanup container image: requested={id}, id={:?}, descriptor={}, os={:?}, arch={:?}, variant={:?}, size={:?}",observed.id,descriptor_identity(observed.descriptor.as_ref()),observed.os,observed.architecture,observed.variant,observed.size);
+                }
+            }
+            for (id,manifest,_,_,_) in &records {
+                let observed=docker.inspect_image(id).await.unwrap();
+                eprintln!("cleanup candidate image: requested={id}, manifest={manifest}, id={:?}, descriptor={}, os={:?}, arch={:?}, variant={:?}, size={:?}",observed.id,descriptor_identity(observed.descriptor.as_ref()),observed.os,observed.architecture,observed.variant,observed.size);
+            }
+        }
+        assert_eq!(status,StatusCode::OK,"image preview must succeed before reading candidates");
         let eligible:Vec<_>=preview["candidates"].as_array().expect("complete image preview").iter().map(|item|item["image_id"].as_str().unwrap()).collect();
         assert_eq!(eligible.len(),2);assert!(eligible.contains(&records[0].0.as_str()));assert!(eligible.contains(&records[1].0.as_str()));
         let apply=harness.request("POST","/api/v1/system/image-cleanup/apply",Some("image-cleanup-e2e-selected"),Some(&json!({"confirmation_token":preview["confirmation_token"],"image_ids":[records[0].0],"acknowledge_image_removal":true}))).await;
