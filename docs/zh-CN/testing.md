@@ -13,6 +13,8 @@ SoloDock 的测试目标不是只证明 happy path，而是证明 Docker root �
 - Registry + Docker E2E：独立 private Bearer Registry 和 Docker-in-Docker daemon，穿过 production HTTP、poll/webhook、scheduler、pull、Compose、health、rollback 和 cleanup 边界；
 - resource harness：production embedded binary、60 秒 idle sample、60 秒 authenticated SSE 和独立 dockerd采样。
 
+updater fixture 还模拟管理员无法进入私有配置目录的场景：普通配置文件必须通过，缺失文件、符号链接（含悬空链接）和目录必须在配置校验或服务变更前失败。只有模拟的 `sudo` 命令会在隔离 fixture 内临时允许目录访问；生产配置权限保持不变。
+
 测试数量会随实现演进，文档只固定场景和护栏，不把某次运行的计数作为长期契约。
 
 非认证 integration/API 与 Docker E2E fixture 直接写入格式有效、期限受控的测试管理员与 session，不重复执行生产参数 Argon2。认证 API 仍完整覆盖 bootstrap、密码 hash/verify/rotation、login、cookie、CSRF、logout、revoke 和 audit；AuthService 的生产参数 bootstrap/login/password-rotation 路径也保留。测试 session helper 不进入 production binary，且保留 bootstrap/login 两条 fixture audit，使业务用例的审计计数语义不变。
