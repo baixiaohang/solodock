@@ -125,10 +125,15 @@ pub async fn health(
             .load(std::sync::atomic::Ordering::Acquire)
     });
     let (storage_cleanup_status, storage_cleanup_pending) = match state.m3.as_ref() {
-        Some(services) => match crate::storage_cleanup::pending_operation_count(
-            &services.store,
-            &services.database,
-        )
+        Some(services) => match async {
+            let artifacts = crate::storage_cleanup::pending_operation_count(
+                &services.store,
+                &services.database,
+            )
+            .await?;
+            let images = crate::image_cleanup::pending_operation_count(&services.database).await?;
+            Ok::<_, crate::storage_cleanup::CleanupError>(artifacts + images)
+        }
         .await
         {
             Ok(0) => ("ok", 0),

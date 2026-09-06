@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let idempotency = IdempotencyService::initialize(database.clone(), &config.state_directory)?;
     idempotency.interrupt_pending().await?;
+    solodock::image_cleanup::validate_operations(&database).await?;
     let app_store = AppStore::initialize_managed(
         config.apps_directory(),
         idempotency.integrity_key(),
@@ -152,6 +153,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let event_hub = DockerEventHub::new();
     let event_task = event_hub.start(docker_api.clone(), catalog.clone(), shutdown.clone());
     let observer = DockerObserver::new(docker_api.clone(), catalog, supervisor);
+    let image_cleanup = Arc::new(docker_api.image_cleanup());
     let stats = StatsHub::new(docker_api, shutdown.clone(), stream_tasks.clone());
     let redactor = SecretRedactor::new(&EmptySecretProvider);
     let mut known_secrets = Vec::new();
@@ -291,6 +293,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         webhook_authority: config.webhook_authority,
         local_probe_authority: config.local_probe_authority,
         observer,
+        image_cleanup,
         events: event_hub,
         stats,
         stream_gate: solodock::api::streams::StreamGate::default(),
@@ -438,6 +441,7 @@ async fn validate_restore(
         return Err("restored application state is degraded".into());
     }
     solodock::storage_cleanup::pending_operation_count(&store, &database).await?;
+    solodock::image_cleanup::validate_operations(&database).await?;
     let webhooks = WebhookStore::new(store.clone(), key.clone());
     for app in &report.valid_apps {
         if webhooks.status(app.app_id)?.configured {

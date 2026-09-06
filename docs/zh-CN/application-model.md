@@ -117,3 +117,7 @@ preview 合并 active、pending 与 draft 中的文件、volume、bind、network
 存储清理是显式的“预览并确认”操作。它始终保护 active/pending release、当前 draft revision、`queued`、`running`、`interrupted` 与 `needs_attention` deployment 的恢复引用、清理恢复 artifact，以及每个应用额外三个最近的回滚 release。每次预览最多选择全局最旧的 100 个已验证且无引用 release；config revision 只有在没有任何保留 release 或 draft 引用时才成为候选。已知私有临时 artifact 复用同一 typed store inventory。未知名称、链接、类型、owner、mode、签名或 ledger 事实都会让整个 inventory fail closed。
 
 清理绝不删除应用 metadata、deployment、audit 历史、credential、container、volume、bind 数据、network、backup 或 operator 管理的 Docker 资源。逻辑大小估算不承诺实际释放的磁盘空间。
+
+## 手动 Docker 镜像清理
+
+镜像清理独立于 artifact 清理，要求逐项选择（初始为空）和独立确认。仅已确认的 `cleaned_releases` 身份可成为来源。所有仍保留的 release、应用删除 tombstone 内 release 和未完成 artifact 清理恢复引用都保护镜像，包括不属于三个回滚点的普通历史 release。无论是否受管，运行和停止容器均保护其 config/manifest 身份。digest、platform、descriptor、恢复 proof 或完整 inventory 任一校验失败都不会生成可执行预览。不删除 container、volume、bind、network、credential、deployment、audit 或 backup。

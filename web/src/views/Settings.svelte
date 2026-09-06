@@ -7,6 +7,7 @@
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   import PasswordChange from '../components/PasswordChange.svelte'
   import StorageCleanup from '../components/StorageCleanup.svelte'
+  import ImageCleanup from '../components/ImageCleanup.svelte'
 
   let settings = $state<SettingsResponse | null>(null)
   let selected = $state('UTC')
@@ -86,5 +87,6 @@
       <PasswordChange />
     </section>
     <StorageCleanup />
+    <ImageCleanup />
   </div>
 </main>

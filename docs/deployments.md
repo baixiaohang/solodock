@@ -102,3 +102,7 @@ Webhook secret revisions remain recovery artifacts until they are deleted exactl
 See [webhooks](webhooks.md) for the protocol, Host isolation, and WAF constraints; [application model](application-model.md) for resources; and [operations](operations.md) and [recovery](recovery.md) for manual intervention.
 
 An administrator-confirmed storage cleanup may remove an old release while retaining its deployment history. Such a detail has `safe_release_id: null`, no rollback action, and warning `ROLLBACK_ARTIFACT_CLEANED`. The durable cleaned-release record distinguishes this deliberate loss from ordinary missing or corrupt release state; direct rollback requests are rejected as well.
+
+## Images after artifact cleanup
+
+Cleaning a release does not remove its Docker image. The independent image preview derives provenance from the verified artifact plan and detached item ledger, only after artifact finalization has completed. A newly retained release or container reference vetoes image deletion. Image apply takes the catalog guard, every current application guard in UUID order, and the shared Compose guard before its fresh recheck. Rollback and deployment history remain unchanged: three additional rollback releases stay protected, and an explicitly cleaned artifact remains unavailable for rollback even if its image is still present.

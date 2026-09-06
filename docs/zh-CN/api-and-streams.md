@@ -134,3 +134,9 @@ Apply 会取得 catalog 与按序的 application guard、重建 fresh facts；in
 ### 容器安全策略选择
 
 Draft 输入和响应增加可选 `security_profile: string | null`。省略/null 使用 Docker 默认策略；非空名称选择[运维文档](operations.md#按应用选择容器安全策略)中的预装策略对。该字段属于配置身份、Compose 预览及不可变 revision。名称无效时返回 `security_profile` 字段错误。客户端编辑现有 draft 时应保留该字段，除非有意清空。历史 schema 1–3 revision 仍可读取并采用 Docker 默认配置；向未签入该字段的历史 schema 注入安全策略值会被拒绝。
+
+## Docker 镜像清理
+
+`POST /api/v1/system/image-cleanup/preview` 只接受 `{}`，返回 canonical image ID、manifest/platform、Docker 报告字节数、受保护数量，以及绑定 session、五分钟过期的 write-only 确认 token。`POST /api/v1/system/image-cleanup/apply` 要求 `Idempotency-Key`，且只接受 `confirmation_token`、预览内非空且排序去重的 `image_ids` 子集（最多 100 个）及 `acknowledge_image_removal: true`。两条 route 保持 management authority、session、exact Origin、CSRF、16 KiB body、安全错误和 no-store 边界。不接受 tag、path、prune option 或任意 Docker 参数。
+
+Fresh facts 与预览不同会在 token consume 或任何 remove 前返回 `CLEANUP_PREVIEW_STALE`。发布前的 invalid/expired preview、app/Compose busy 和 inventory 不完整同样零副作用。Token consume、精确选择的 plan/items 和安全 audit 在一个 SQLite transaction 中发布。只有 exact HTTP 200 且 per-image 终态响应校验通过才确认完成。`completed_with_failures` 报告保留项并要求重新预览。transport/daemon/SQLite 结果未知时保留同 body/key；已发布操作不会因 busy 或其他 session 重试被错误终结为已知拒绝。

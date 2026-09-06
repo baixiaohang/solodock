@@ -1,5 +1,6 @@
 pub mod client;
 pub mod events;
+pub mod image_cleanup;
 pub mod logs;
 pub mod models;
 pub mod ownership;

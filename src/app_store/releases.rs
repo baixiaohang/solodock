@@ -165,15 +165,52 @@ impl AppStore {
     }
 
     pub fn load_v2_release(&self, app_id: Uuid, release_id: Uuid) -> Result<ReleaseV2, StoreError> {
-        let app = self.read_metadata(app_id)?;
-        let directory = self
-            .app_directory(app_id)
-            .join("releases")
-            .join(release_id.to_string());
+        self.load_v2_release_at(app_id, release_id, &self.app_directory(app_id))
+    }
+
+    pub(crate) fn tombstone_releases(&self) -> Result<Vec<ReleaseV2>, StoreError> {
+        let mut result = Vec::new();
+        for (app_id, operation) in self.tombstones()? {
+            let app_directory = self.tombstone_path(app_id, operation);
+            let mut release_ids = std::collections::HashSet::new();
+            for entry in fs::read_dir(app_directory.join("releases"))? {
+                let entry = entry?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| StoreError::ContentInvalid)?;
+                let id = name
+                    .parse::<Uuid>()
+                    .map_err(|_| StoreError::ContentInvalid)?;
+                if id.to_string() != name {
+                    return Err(StoreError::ContentInvalid);
+                }
+                result.push(self.load_v2_release_at(app_id, id, &app_directory)?);
+                release_ids.insert(id);
+            }
+            for name in ["active", "pending"] {
+                if Self::read_release_link_at(&app_directory, name)?
+                    .is_some_and(|id| !release_ids.contains(&id))
+                {
+                    return Err(StoreError::ContentInvalid);
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    fn load_v2_release_at(
+        &self,
+        app_id: Uuid,
+        release_id: Uuid,
+        app_directory: &std::path::Path,
+    ) -> Result<ReleaseV2, StoreError> {
+        let app = super::read_metadata(app_directory)?;
+        let directory = app_directory.join("releases").join(release_id.to_string());
         let header_path = directory.join("release.toml");
         let compose_path = directory.join("compose.yaml");
-        check_private_tree(&self.app_directory(app_id), &header_path, false)?;
-        check_private_tree(&self.app_directory(app_id), &compose_path, false)?;
+        check_private_tree(app_directory, &header_path, false)?;
+        check_private_tree(app_directory, &compose_path, false)?;
         let mut release: ReleaseV2 = toml::from_str(&fs::read_to_string(header_path)?)
             .map_err(|_| StoreError::ContentInvalid)?;
         release.apply_schema_defaults();
@@ -190,7 +227,7 @@ impl AppStore {
             .map_err(|_| StoreError::ContentInvalid)?;
         let compose = fs::read(&compose_path)?;
         let loaded = config_revision::load_verified(
-            &self.app_directory(app_id),
+            app_directory,
             release.config_revision,
             self.integrity_key()?,
         )?;
@@ -333,7 +370,11 @@ impl AppStore {
     }
 
     pub fn read_release_link(&self, app_id: Uuid, name: &str) -> Result<Option<Uuid>, StoreError> {
-        let path = self.app_directory(app_id).join(name);
+        Self::read_release_link_at(&self.app_directory(app_id), name)
+    }
+
+    fn read_release_link_at(directory: &Path, name: &str) -> Result<Option<Uuid>, StoreError> {
+        let path = directory.join(name);
         match fs::read_link(path) {
             Ok(target) => {
                 let text = target.to_str().ok_or(StoreError::ContentInvalid)?;

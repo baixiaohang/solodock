@@ -8,6 +8,7 @@ pub mod deploy;
 pub mod docker;
 pub mod domain;
 pub mod error;
+pub mod image_cleanup;
 pub mod mutation;
 pub mod presets;
 pub mod registry;

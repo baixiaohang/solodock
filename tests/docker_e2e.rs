@@ -1,5 +1,7 @@
 #![cfg(feature = "docker-e2e")]
 
+#[path = "image_cleanup/e2e.rs"]
+mod image_cleanup_e2e;
 mod support;
 
 use std::{
@@ -526,6 +528,7 @@ impl MutationHarness {
             DockerSupervisor::from_snapshot(probe),
         );
         let mut state = AppState {
+            image_cleanup: Arc::new(docker_api.image_cleanup()),
             auth,
             public_origin: "https://solodock.example.com".into(),
             management_authority: solodock::config::CanonicalAuthority::parse_http(
