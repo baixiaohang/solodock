@@ -90,6 +90,13 @@ async fn run() {
             for container_id in &containers {
                 let raw=docker.inspect_container(container_id,None).await.unwrap();
                 eprintln!("cleanup container identity: id={container_id}, image={:?}, descriptor={}",raw.image,descriptor_identity(raw.image_manifest_descriptor.as_ref()));
+                if let Some(child)=raw.image_manifest_descriptor.as_ref().and_then(|value|value.digest.as_deref()) {
+                    match docker.inspect_image(child).await {
+                        Ok(value)=>eprintln!("cleanup selected child: requested={child}, id={:?}, descriptor={}, os={:?}, arch={:?}, variant={:?}, size={:?}",value.id,descriptor_identity(value.descriptor.as_ref()),value.os,value.architecture,value.variant,value.size),
+                        Err(bollard::errors::Error::DockerResponseServerError{status_code,..})=>eprintln!("cleanup selected child: requested={child}, HTTP status={status_code}"),
+                        Err(_)=>eprintln!("cleanup selected child: requested={child}, transport failure"),
+                    }
+                }
                 if let Some(id)=raw.image {
                     let observed=docker.inspect_image(&id).await.unwrap();
                     eprintln!("cleanup container image: requested={id}, id={:?}, descriptor={}, os={:?}, arch={:?}, variant={:?}, size={:?}",observed.id,descriptor_identity(observed.descriptor.as_ref()),observed.os,observed.architecture,observed.variant,observed.size);
