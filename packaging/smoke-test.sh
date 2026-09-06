@@ -416,6 +416,12 @@ printf '%s\n' \
   'set -euo pipefail' \
   '[[ -z ${SOLODOCK_SMOKE_SUDO_LOG:-} ]] || printf "%s\n" "$*" >>"$SOLODOCK_SMOKE_SUDO_LOG"' \
   'if [[ ${1-} == -n && ${2-} == true ]]; then exit 0; fi' \
+  'if [[ -n ${SOLODOCK_SMOKE_PRIVATE_CONFIG_DIR:-} ]]; then' \
+  '  chmod 0700 -- "$SOLODOCK_SMOKE_PRIVATE_CONFIG_DIR"' \
+  '  trap '\''chmod 0000 -- "$SOLODOCK_SMOKE_PRIVATE_CONFIG_DIR"'\'' EXIT' \
+  '  "$@"' \
+  '  exit 0' \
+  'fi' \
   'exec "$@"' >"$fake_bin/sudo"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
@@ -511,6 +517,63 @@ run_successful_update() {
     ./packaging/solodock-update "${channel_args[@]}" --backup-dir "$backups" >"$output"
   printf '%s\n' "$root" "$backups" "$systemctl_log" "$output" "$gh_trace" "$curl_log"
 }
+
+# Model the administrator's lack of directory traversal without requiring root:
+# only the sudo fixture temporarily opens the private config directory.
+for config_kind in regular missing symlink dangling-symlink directory; do
+  private_root="$fixture/private-config-$config_kind-root"
+  "$main_package/install.sh" --version "main-${trusted_sha:0:12}" --destdir "$private_root" >/dev/null
+  private_config_dir="$private_root/etc/solodock"
+  private_config="$private_config_dir/config.toml"
+  case "$config_kind" in
+    missing) rm -- "$private_config" ;;
+    symlink) mv -- "$private_config" "$private_config_dir/real.toml"; ln -s real.toml "$private_config" ;;
+    dangling-symlink) rm -- "$private_config"; ln -s missing.toml "$private_config" ;;
+    directory) rm -- "$private_config"; mkdir -- "$private_config" ;;
+  esac
+  capture_install_snapshot "$private_root" >"$fixture/private-config-before"
+  : >"$fixture/private-config-systemctl.log"
+  : >"$fixture/private-config-sudo.log"
+  chmod 0000 -- "$private_config_dir"
+  [[ ! -f $private_config ]]
+  private_status=0
+  PATH="$fake_bin:$PATH" \
+    SOLODOCK_UPDATE_TEST_MODE=1 \
+    SOLODOCK_UPDATE_TEST_ROOT="$private_root" \
+    SOLODOCK_SMOKE_PACKAGE="$main_package" \
+    SOLODOCK_SMOKE_ATTESTATION_ARGS="$attestation_args" \
+    SOLODOCK_SMOKE_SYSTEMCTL_LOG="$fixture/private-config-systemctl.log" \
+    SOLODOCK_SMOKE_SUDO_LOG="$fixture/private-config-sudo.log" \
+    SOLODOCK_SMOKE_PRIVATE_CONFIG_DIR="$private_config_dir" \
+    ./packaging/solodock-update --backup-dir "$fixture/private-config-backups" \
+      >"$fixture/private-config.stdout" 2>"$fixture/private-config.stderr" || private_status=$?
+  private_mode=$(stat -c '%a' "$private_config_dir")
+  chmod 0700 -- "$private_config_dir"
+  [[ $private_mode == 0 ]]
+  if [[ $config_kind == regular ]]; then
+    if ((private_status != 0)); then
+      cat "$fixture/private-config.stderr" >&2
+      printf '%s\n' 'updater rejected a regular config behind a private directory' >&2
+      exit 1
+    fi
+    grep -Fq 'SoloDock is already current' "$fixture/private-config.stdout"
+    [[ $(stat -c '%a' "$private_config") == 600 ]]
+  else
+    [[ $private_status == 1 ]]
+    grep -Fxq 'installed SoloDock configuration is missing or unsafe' "$fixture/private-config.stderr"
+    if grep -Fq 'inspect-packaged-config' "$fixture/private-config-sudo.log"; then
+      printf '%s\n' 'unsafe config reached the downloaded inspector' >&2
+      exit 1
+    fi
+  fi
+  capture_install_snapshot "$private_root" >"$fixture/private-config-after"
+  cmp "$fixture/private-config-before" "$fixture/private-config-after"
+  if grep -Eq '^(stop|start) ' "$fixture/private-config-systemctl.log"; then
+    printf '%s\n' 'private config preflight changed service state' >&2
+    exit 1
+  fi
+  [[ ! -e $fixture/private-config-backups ]]
+done
 
 mapfile -t main_result < <(run_successful_update main-success "$old_main_package" '' 1)
 main_root=${main_result[0]}

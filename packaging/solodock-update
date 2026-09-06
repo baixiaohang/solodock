@@ -289,7 +289,8 @@ IFS=$'\t' read -r package_channel package_version source_sha package_identity <<
 [[ $source_sha == "$head_sha" ]] || fail 'package source SHA does not match its trusted source'
 [[ $package_version == "$version" ]] || fail 'package version does not match its trusted source'
 config_path="$root/etc/solodock/config.toml"
-[[ -f $config_path && ! -L $config_path ]] || fail 'installed SoloDock configuration is missing or unsafe'
+# The service-owned 0700 config directory is not traversable by the administrator.
+sudo test -f "$config_path" && sudo test ! -L "$config_path" || fail 'installed SoloDock configuration is missing or unsafe'
 inspect_packaged_config "$package/solodock" "$config_path" || fail 'downloaded package rejected the installed packaged configuration'
 
 new_digest=$(sha256sum "$package/solodock" | awk '{print $1}')

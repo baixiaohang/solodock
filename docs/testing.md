@@ -13,6 +13,8 @@ Testing must prove more than the happy path. It must show that a Docker-root con
 - Registry + Docker E2E: a private Bearer Registry and Docker-in-Docker daemon through production HTTP, polling/webhooks, scheduler, pull, Compose, health, rollback, and cleanup boundaries.
 - Resource harness: production embedded binary, 60-second idle sample, 60-second authenticated SSE, and independent dockerd sampling.
 
+The updater fixture also models an administrator unable to traverse the private config directory: a regular config must pass, while missing files, symlinks (including dangling links), and directories must fail before config inspection or service changes. Only the mocked `sudo` command temporarily grants traversal inside the isolated fixture; production config permissions remain unchanged.
+
 Test counts will change with the implementation. This document fixes scenarios and guardrails, not a one-run count.
 
 Unauthenticated integration/API and Docker E2E fixtures directly insert valid, time-bounded test administrators and sessions instead of repeating production-cost Argon2. Authentication APIs still fully cover bootstrap, password hash/verify and rotation, login, cookies, CSRF, logout, revoke, and audit. Production-parameter bootstrap/login/password-rotation paths in `AuthService` also remain. Test session helpers are excluded from production binaries, and fixture bootstrap/login audit entries remain so business-case audit counts keep their meaning.

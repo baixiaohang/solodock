@@ -65,6 +65,8 @@ gh auth status
 solodock-update
 ```
 
+使用管理员账号运行 `solodock-update`，不要使用 `sudo solodock-update`。updater 内部通过 `sudo` 执行配置文件安全检查和配置校验，因为 `/etc/solodock` 的属主是 `solodock:solodock`、权限是 `0700`，而 `config.toml` 的权限是 `0600`。保留这些权限；管理员不需要直接访问配置目录。配置缺失、符号链接和非普通文件会在修改服务前被拒绝。
+
 不传 `--channel` 时，updater 读取当前带版本的 `INSTALL_MANIFEST`：Release 安装继续使用 `stable`，CI 安装继续使用 `main`。显式传入一次 `--channel stable|main` 可主动换轨；成功安装的新 package 会记录新 channel，之后无参数运行会继续沿用。对没有 manifest 的旧安装，只能从精确的受管 `main-<12 位十六进制>` 或 canonical SemVer 目录推断；其他格式 fail closed，并要求显式 channel。`--branch` 与 `--workflow` 只适用于 main，非法组合会在认证、下载、`sudo` 或服务变更前被拒绝。
 
 `stable` channel 读取 GitHub 的实际 Latest Release，并要求其已正式发布、非 draft、非 prerelease。Release workflow 让 GitHub 使用其版本感知默认规则确定 Latest，不会强制每个后来创建的旧版本线 Release 成为 Latest。如果 GitHub 返回的 stable 版本低于当前已安装 stable manifest，updater 会在下载或 mutation 前拒绝降级。
