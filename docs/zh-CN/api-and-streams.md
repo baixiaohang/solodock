@@ -130,3 +130,9 @@ stats 只在有 subscriber 时创建 Docker producer，并只保留最新 sample
 `POST /api/v1/system/storage-cleanup/preview` 接受 `{}`，返回绑定 session、有效期五分钟的确认 token 与精确 artifact plan。`POST /api/v1/system/storage-cleanup/apply` 只接受该 write-only token 和 `acknowledge_rollback_loss: true`，并要求 `Idempotency-Key`。两者都是 management authority mutation，受 exact Origin、CSRF、session、16 KiB body limit、no-store response 和标准安全错误 envelope 保护。
 
 Apply 会取得 catalog 与按序的 application guard、重建 fresh facts；inventory 无效、过期、stale、busy 或不完整时都不会 rename。已确认的 partial result 要求重新 preview。无法确定的 5xx/transport 结果只能以完全相同的 body 与 key 查询；raw token 和 filesystem path 永远不会进入 ledger 或 response item。
+
+## Docker 镜像清理
+
+`POST /api/v1/system/image-cleanup/preview` 只接受 `{}`，返回 canonical image ID、manifest/platform、Docker 报告字节数、受保护数量，以及绑定 session、五分钟过期的 write-only 确认 token。`POST /api/v1/system/image-cleanup/apply` 要求 `Idempotency-Key`，且只接受 `confirmation_token`、预览内非空且排序去重的 `image_ids` 子集（最多 100 个）及 `acknowledge_image_removal: true`。两条 route 保持 management authority、session、exact Origin、CSRF、16 KiB body、安全错误和 no-store 边界。不接受 tag、path、prune option 或任意 Docker 参数。
+
+Fresh facts 与预览不同会在 token consume 或任何 remove 前返回 `CLEANUP_PREVIEW_STALE`。发布前的 invalid/expired preview、app/Compose busy 和 inventory 不完整同样零副作用。Token consume、精确选择的 plan/items 和安全 audit 在一个 SQLite transaction 中发布。只有 exact HTTP 200 且 per-image 终态响应校验通过才确认完成。`completed_with_failures` 报告保留项并要求重新预览。transport/daemon/SQLite 结果未知时保留同 body/key；已发布操作不会因 busy 或其他 session 重试被错误终结为已知拒绝。

@@ -50,3 +50,9 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 `.cleanup-trash/<operation UUID>` 保存已持久化计划的签名 marker 及原子移出的 artifact。不要手工删除、重命名或编辑。Startup/background finalizer 只有在 integrity marker、已存 plan/items 与精确成功 idempotency response 全部一致时才删除 payload。payload 部分删除后 marker 仍保留；payload 完全移除并同步父目录后，marker 才转移到精确的同级 `<operation UUID>.retired.toml`，直到空 operation 目录也完成持久删除。退休开始前先在数据库持久化退休意图，即使最后一份 marker 已可见地 unlink，精确终态 proof 仍受保护。只有最后的父目录同步成功后才能清除退休意图和 pending 健康状态。恢复时 marker 缺失会重新同步；若崩溃使 marker 再次出现，则重新验证并完成退休。没有退休意图的任意缺 marker 或未知 trash 仍然 fail closed。
 
 中断的 operation 仍使用原 request/key 重放。resume 在同一组 guard 内复核当前保护集合，只排除自身已验证的 reservation；新获得引用的 artifact 在原计划中标为保留。busy 或 session 不匹配的重试不能终结已经发布计划的 operation。此前已可见的 rename 必须重新同步两个父目录后才记录进度。完整或部分失败响应均从精确 durable item state 重建。backup/restore 降权为服务身份后校验 cleanup ledger 与签名 tombstone。
+
+## 中断的镜像清理
+
+镜像删除使用独立持久 plan，item 状态为 `planned`、`started`、`removed` 和 `retained`。Startup 和后台任务不删除镜像。必须显式重试原 request/key；继续前服务端重新验证 plan、preview 绑定、item ledger、当前 artifact 恢复 inventory 和 Docker 引用。`started` item 的 exact ID 已不存在时，无须重复 remove 即可确认；新增引用或冲突的镜像保留。Remove 响应丢失、删除后 inspect 失败、item/response commit 失败在重新核验完成前仍是结果未知。
+
+Pending/interrupted idempotency record 不过期。终态 item ledger 可超出普通 24 小时 terminal replay 保留期，但不能用新 key 授权再次删除。公共只读 operation validator 用于 runtime startup、`validate-restore` 及新的清理 inventory；它不初始化 Docker 连接或执行恢复副作用。Backup helper 在归档前验证 packaged config，而非此 ledger。未完成镜像操作计入现有 storage-cleanup health 状态。不要编辑记录绕过验证。中断的浏览器重试继续使用原认证 session，其他 session 不能接管已发布操作。

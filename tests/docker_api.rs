@@ -239,6 +239,7 @@ impl Harness {
         let shutdown = CancellationToken::new();
         let stream_tasks = TaskTracker::new();
         let state = AppState {
+            image_cleanup: Arc::new(solodock::docker::image_cleanup::UnavailableImageCleanup),
             auth: auth.clone(),
             public_origin: "https://solodock.example.com".into(),
             management_authority: solodock::config::CanonicalAuthority::parse_http(

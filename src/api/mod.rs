@@ -2,6 +2,7 @@ pub mod apps;
 pub mod assets;
 pub mod auth;
 pub mod deployments;
+pub mod image_cleanup;
 pub mod image_inspection;
 pub mod middleware;
 pub mod mutations;
@@ -44,6 +45,7 @@ pub struct AppState {
     pub webhook_authority: Option<CanonicalAuthority>,
     pub local_probe_authority: CanonicalAuthority,
     pub observer: DockerObserver,
+    pub image_cleanup: Arc<dyn crate::docker::image_cleanup::ImageCleanup>,
     pub events: DockerEventHub,
     pub stats: StatsHub,
     pub stream_gate: streams::StreamGate,
@@ -77,6 +79,7 @@ impl AppState {
             management_authority,
             webhook_authority: None,
             observer: DockerObserver::new(api.clone(), AppCatalog::default(), supervisor),
+            image_cleanup: Arc::new(crate::docker::image_cleanup::UnavailableImageCleanup),
             events: DockerEventHub::new(),
             stats: StatsHub::new(api, shutdown.clone(), stream_tasks.clone()),
             stream_gate: streams::StreamGate::default(),
@@ -160,6 +163,14 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(16 * 1024));
     let storage_cleanup = Router::new()
+        .route(
+            "/api/v1/system/image-cleanup/preview",
+            post(image_cleanup::preview),
+        )
+        .route(
+            "/api/v1/system/image-cleanup/apply",
+            post(image_cleanup::apply),
+        )
         .route(
             "/api/v1/system/storage-cleanup/preview",
             post(storage_cleanup::preview),
