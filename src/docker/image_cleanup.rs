@@ -29,6 +29,8 @@ impl<'de> Deserialize<'de> for ExactImageId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CleanupImage {
     pub image: ImageRecord,
+    /// An index is not the platform-selected manifest in ContainerInspect.
+    pub is_index: bool,
     pub reported_size_bytes: u64,
     pub repo_tags: Vec<String>,
 }

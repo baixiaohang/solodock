@@ -160,6 +160,8 @@ rg -n "proposals/" README.md README.zh-CN.md docs --glob '!testing.md' --glob '!
 
 ## 手动镜像清理门禁
 
+Containerd index 回归保护 tag 创建容器的 index、选中子 manifest 及 config ID。子 inspect 缺失、子 platform/descriptor 错误、父 identity 错误或替换为嵌套 index 都会在 token consume/remove 前拒绝 preview/apply。HTTP adapter 还独立门禁 index media type 投影，不混同 manifest identity。
+
 定向 `m3_api image_cleanup::` 用例走 production router 和真实 artifact cleanup 来源：running/stopped × managed/unmanaged 四类容器、普通保留 release、fresh race、app/Compose guard、非法选择、不完整 identity/inventory 和持久 ledger 损坏。真实有副作用的 daemon mock 与 SQLite trigger 覆盖 remove 前失败、remove 响应丢失、删除后 inspect 失败、progress/response commit 失败、audit 回滚及显式 restart/retry，只能删除精确选中镜像。
 
 `image_cleanup_adapter` 使用 loopback HTTP daemon fixture，不调用宿主 Docker，检查完整无过滤 container 枚举、inspect 缺失失败、exact full ID、`force=false`、`noprune=true`、冲突保留和 absence 确认。CI 显式以 `docker-e2e` feature 运行。隔离 classic/containerd 的 `manual_image_cleanup` E2E 在私有 fixture registry 创建独有 commit 镜像、发布签名 release、通过 artifact API 清理，再通过 image API 仅删除选中的合格镜像。未选镜像、running/stopped unmanaged container、volume/network canary 保留；teardown 只处理记录的精确 fixture 资源。这些宿主 Docker 测试由 CI 执行，不属于默认本地定向验证。

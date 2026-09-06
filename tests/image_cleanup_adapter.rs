@@ -19,6 +19,7 @@ struct Daemon {
     conflict: bool,
     absent: bool,
     incomplete: bool,
+    index: bool,
 }
 async fn endpoint(State(state): State<Arc<Mutex<Daemon>>>, request: Request) -> Response {
     let mut daemon = state.lock().unwrap();
@@ -54,7 +55,11 @@ async fn endpoint(State(state): State<Arc<Mutex<Daemon>>>, request: Request) -> 
     if daemon.absent {
         return (StatusCode::NOT_FOUND, Json(json!({"message":"absent"}))).into_response();
     }
-    Json(json!({"Id":format!("sha256:{}","c".repeat(64)),"RepoDigests":[format!("example/image@sha256:{}","d".repeat(64))],"RepoTags":[],"Size":1024,"Os":"linux","Architecture":"amd64"})).into_response()
+    let mut value = json!({"Id":format!("sha256:{}","c".repeat(64)),"RepoDigests":[format!("example/image@sha256:{}","d".repeat(64))],"RepoTags":[],"Size":1024,"Os":"linux","Architecture":"amd64"});
+    if daemon.index {
+        value["Descriptor"] = json!({"digest":format!("sha256:{}","c".repeat(64)),"mediaType":"application/vnd.oci.image.index.v1+json"});
+    }
+    Json(value).into_response()
 }
 
 #[tokio::test]
@@ -84,6 +89,10 @@ async fn image_cleanup_adapter_is_all_container_exact_nonforce_noprune_and_fail_
             .reported_size_bytes,
         1024
     );
+    assert!(!client.inspect(&id).await.unwrap().unwrap().is_index);
+    state.lock().unwrap().index = true;
+    assert!(client.inspect(&id).await.unwrap().unwrap().is_index);
+    state.lock().unwrap().index = false;
     state.lock().unwrap().conflict = true;
     assert_eq!(
         client.remove(&id).await.unwrap(),

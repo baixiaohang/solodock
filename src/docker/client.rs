@@ -146,6 +146,16 @@ impl super::image_cleanup::ImageCleanup for BollardImageCleanup {
         }
         tags.sort();
         tags.dedup();
+        let is_index = raw
+            .descriptor
+            .as_ref()
+            .and_then(|value| value.media_type.as_deref())
+            .is_some_and(|value| {
+                matches!(
+                    value,
+                    crate::registry::manifest::OCI_INDEX | crate::registry::manifest::DOCKER_LIST
+                )
+            });
         let mut image = project_image_inspect(raw)?;
         if super::image_cleanup::ExactImageId::parse(&image.id).is_err()
             || image.repo_digests.len() > 1024
@@ -156,6 +166,7 @@ impl super::image_cleanup::ImageCleanup for BollardImageCleanup {
         image.repo_digests.dedup();
         Ok(Some(super::image_cleanup::CleanupImage {
             image,
+            is_index,
             reported_size_bytes: size,
             repo_tags: tags,
         }))

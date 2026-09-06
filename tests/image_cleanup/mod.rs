@@ -75,6 +75,7 @@ impl ImageCleanup for Images {
 }
 fn image(index: usize) -> CleanupImage {
     CleanupImage {
+        is_index: false,
         image: ImageRecord {
             id: digest(index),
             manifest_descriptor: None,
@@ -516,6 +517,119 @@ async fn multiple_selected_images_resume_real_progress_and_retain_new_references
             "unselected eligible image survives"
         );
         assert_eq!(state.images.contains_key(&digest(14)), new_reference);
+    }
+}
+
+#[tokio::test]
+async fn containerd_index_and_selected_child_are_both_verified_and_protected() {
+    let (h, images, _, _) = fixture().await;
+    let descriptor = |index| solodock::registry::ManifestDescriptor {
+        digest: Some(digest(index)),
+        os: Some("linux".into()),
+        architecture: Some("amd64".into()),
+        variant: None,
+    };
+    let setup = |child_index| {
+        let mut state = images.state.lock().unwrap();
+        let mut parent = image(12);
+        parent.is_index = true;
+        parent.image.manifest_descriptor = Some(descriptor(12));
+        let mut child = image(child_index);
+        child.image.manifest_descriptor = Some(descriptor(child_index));
+        state.images.insert(digest(12), parent);
+        state.images.insert(digest(child_index), child);
+        let mut c = container(false, false);
+        c.image_id = Some(digest(12));
+        c.manifest_descriptor = Some(descriptor(child_index));
+        state.containers = vec![c];
+    };
+    setup(13);
+    let p = preview(&h).await;
+    assert_eq!(
+        p["candidates"][0]["image_id"],
+        digest(0),
+        "unrelated tag-created container is not a conflict"
+    );
+    setup(0);
+    assert!(
+        preview(&h).await["candidates"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "selected child is protected even though container Image names the index"
+    );
+    for case in 0..7 {
+        setup(13);
+        {
+            let mut state = images.state.lock().unwrap();
+            match case {
+                0 => state.containers[0].manifest_descriptor = None,
+                1 => {
+                    state.images.remove(&digest(13));
+                }
+                2 => {
+                    state
+                        .images
+                        .get_mut(&digest(13))
+                        .unwrap()
+                        .image
+                        .architecture = "arm64".into()
+                }
+                3 => {
+                    state
+                        .images
+                        .get_mut(&digest(13))
+                        .unwrap()
+                        .image
+                        .manifest_descriptor = Some(descriptor(14))
+                }
+                4 => state.images.get_mut(&digest(12)).unwrap().image.id = digest(15),
+                5 => state.images.get_mut(&digest(13)).unwrap().is_index = true,
+                _ => {
+                    state
+                        .images
+                        .get_mut(&digest(12))
+                        .unwrap()
+                        .image
+                        .manifest_descriptor = Some(descriptor(14))
+                }
+            }
+        }
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM image_cleanup_previews")
+            .fetch_one(h.database.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            h.image_mutate("POST", PREVIEW, None, &json!({}))
+                .await
+                .status(),
+            StatusCode::CONFLICT,
+            "case {case}"
+        );
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM image_cleanup_previews")
+            .fetch_one(h.database.pool())
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(
+            h.image_mutate(
+                "POST",
+                APPLY,
+                Some(&format!("index-conflict-{case}")),
+                &request(&p)
+            )
+            .await
+            .status(),
+            StatusCode::CONFLICT
+        );
+        let consumed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM image_cleanup_previews WHERE consumed_at IS NOT NULL",
+        )
+        .fetch_one(h.database.pool())
+        .await
+        .unwrap();
+        assert_eq!(consumed, 0);
+        assert!(images.state.lock().unwrap().removes.is_empty());
     }
 }
 

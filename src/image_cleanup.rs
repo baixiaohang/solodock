@@ -101,6 +101,9 @@ pub(crate) fn matches_inspect(
     record: &CleanedReleaseRecord,
     observed: &CleanupImage,
 ) -> Result<bool, CleanupError> {
+    if observed.is_index {
+        return Ok(false);
+    }
     let image = &observed.image;
     ExactImageId::parse(&image.id).map_err(|_| CleanupError::InventoryIncomplete)?;
     let platform = Platform::canonical(&image.os, &image.architecture, image.variant.as_deref())
@@ -241,6 +244,62 @@ pub(crate) async fn build_plan_for_operation(
         )
         .map_err(|_| CleanupError::InventoryIncomplete)?;
         references.insert(image_id.as_str().to_owned());
+        if observed.is_index {
+            // Docker's container Image can name a multi-platform index, while
+            // ImageManifestDescriptor binds that container to its selected child.
+            // Verify both distinct objects; never compare the index descriptor
+            // as though it were the child's manifest or ignore the container.
+            if image_id != requested
+                || observed
+                    .image
+                    .manifest_descriptor
+                    .as_ref()
+                    .and_then(|value| value.digest.as_deref())
+                    != Some(requested.as_str())
+            {
+                return Err(CleanupError::InventoryIncomplete);
+            }
+            let descriptor = container
+                .manifest_descriptor
+                .as_ref()
+                .ok_or(CleanupError::InventoryIncomplete)?;
+            let selected = ExactImageId::parse(
+                descriptor
+                    .digest
+                    .as_deref()
+                    .ok_or(CleanupError::InventoryIncomplete)?,
+            )
+            .map_err(|_| CleanupError::InventoryIncomplete)?;
+            if selected == requested {
+                return Err(CleanupError::InventoryIncomplete);
+            }
+            let child = docker
+                .inspect(&selected)
+                .await
+                .map_err(|_| CleanupError::InventoryIncomplete)?
+                .ok_or(CleanupError::InventoryIncomplete)?;
+            let record = CleanedReleaseRecord {
+                manifest_digest: selected.as_str().to_owned(),
+                local_image_id: child.image.id.clone(),
+                platform_os: descriptor
+                    .os
+                    .clone()
+                    .ok_or(CleanupError::InventoryIncomplete)?,
+                platform_architecture: descriptor
+                    .architecture
+                    .clone()
+                    .ok_or(CleanupError::InventoryIncomplete)?,
+                platform_variant: descriptor.variant.clone(),
+            };
+            if !matches_inspect(&record, &child)?
+                || !identity(&record)?.matches_manifest_descriptor(descriptor)
+            {
+                return Err(CleanupError::InventoryIncomplete);
+            }
+            references.insert(child.image.id);
+            references.insert(selected.as_str().to_owned());
+            continue;
+        }
         if let Some(descriptor) = &observed.image.manifest_descriptor {
             let digest = descriptor
                 .digest
@@ -518,6 +577,7 @@ mod tests {
             platform_variant: None,
         };
         let mut observed = CleanupImage {
+            is_index: false,
             image: ImageRecord {
                 id: config.clone(),
                 manifest_descriptor: None,
