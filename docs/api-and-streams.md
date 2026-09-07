@@ -86,6 +86,10 @@ DELETE submits the token, slug, and container-removal choice. The service recomp
 
 A successful tombstone must first publish catalog removal, then finalize exactly. If projection or fsync is uncertain, the tombstone remains for reconciler/startup convergence. Application deletion permanently removes its managed config/secrets and webhook secret, so the locked preview must state that clearly.
 
+Application details refresh application facts and deployment history about every 10 seconds while visible, and immediately on becoming visible. Stats keep their SSE subscription. Reads are cancelled and superseded responses ignored when a newer refresh starts, a mutation begins, or the page unmounts. A failed refresh preserves the last successful data and offers retry; initial loading, missing applications, and retryable failures are explicit. Credentials, settings, webhook, and history failures are independent of the application body, and unavailable configuration capabilities block saving.
+
+Background refresh preserves the editing form and its original revision. A changed remote draft shows a conflict notice and an explicit reload action that discards local edits. Saves use the original form revision; Deploy uses fresh observed facts. Known conflicts refresh facts for another user action; an unknown deployment outcome retains its original body and idempotency key across refreshes.
+
 ## Common SSE boundary
 
 Events, logs, and stats are server-to-client SSE only. There is no WebSocket, terminal, shell, or exec capability.

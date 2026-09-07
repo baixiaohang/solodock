@@ -1,6 +1,17 @@
 import type { Messages } from './en'
 
 export const zhCN = {
+  "Application not found.": "应用不存在。",
+  "Could not refresh the application. Showing the last loaded state.": "无法刷新应用，当前显示上次加载的状态。",
+  "Could not load the application.": "无法加载应用。",
+  "Could not load registry credentials. Retry before saving.": "无法加载 Registry 凭据，请重试后再保存。",
+  "The draft changed elsewhere. Your inputs and original revision are preserved. Reload the draft to discard these edits.": "Draft 已在其他位置更新，当前输入和原 revision 已保留。重新载入 draft 会丢弃这些编辑。",
+  "Reload draft": "重新载入 draft",
+  "Loading application\u2026": "正在加载应用…",
+  "Retry loading": "重试加载",
+  "Could not load deployment history. Previously loaded entries are preserved.": "无法加载部署历史，已保留此前加载的记录。",
+  "Could not load webhook settings.": "无法加载 Webhook 设置。",
+
   'Removed': '已删除',
   'Retained': '已保留',
   'Docker image cleanup': 'Docker 镜像清理',

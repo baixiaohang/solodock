@@ -1,4 +1,15 @@
 export const en = {
+  "Application not found.": "Application not found.",
+  "Could not refresh the application. Showing the last loaded state.": "Could not refresh the application. Showing the last loaded state.",
+  "Could not load the application.": "Could not load the application.",
+  "Could not load registry credentials. Retry before saving.": "Could not load registry credentials. Retry before saving.",
+  "The draft changed elsewhere. Your inputs and original revision are preserved. Reload the draft to discard these edits.": "The draft changed elsewhere. Your inputs and original revision are preserved. Reload the draft to discard these edits.",
+  "Reload draft": "Reload draft",
+  "Loading application\u2026": "Loading application…",
+  "Retry loading": "Retry loading",
+  "Could not load deployment history. Previously loaded entries are preserved.": "Could not load deployment history. Previously loaded entries are preserved.",
+  "Could not load webhook settings.": "Could not load webhook settings.",
+
   'Removed': 'Removed',
   'Retained': 'Retained',
   'Docker image cleanup': 'Docker image cleanup',

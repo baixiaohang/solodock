@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte'
-  import { api, mutation } from '../lib/api'
+  import { ApiError, api, mutation } from '../lib/api'
   import { openSse } from '../lib/sse'
   import { configuredScopeText, driftText, formatBytes, mountKindText, networkKindText, networkModeText, shortRef, stateText } from '../lib/presentation'
   import { locale, localized, messageText, t, type MessageKey, type UserMessage } from '../lib/i18n'
@@ -41,6 +41,24 @@
   let lifecycleName = $state('')
   let deletionKey = $state('')
   let editing = $state(false)
+  let editSession = $state(0)
+  let editChanges = 0
+  let editRevision = $state<string | null>(null)
+  let editOriginallyAutoDeploy = false
+  let draftConflict = $derived(editing && app !== null && app.draft_revision !== editRevision)
+  let loading = $state(true)
+  let loadError = $state<MessageKey | null>(null)
+  let credentialsReady = false
+  let settingsReady = false
+  let webhookReady = false
+  let deploymentError = $state(false)
+  let credentialsError = $state(false)
+  let settingsError = $state(false)
+  let webhookError = $state(false)
+  let loadGeneration = 0
+  let loadController: AbortController | undefined
+  let loadTimeout: ReturnType<typeof setTimeout> | undefined
+  let refreshTimer: ReturnType<typeof setTimeout> | undefined
   let editRetry = $state<RetryIdentity | undefined>()
   let validation = $state<{ plan: ComposePlan; compose_yaml: string } | null>(null)
   let editName = $state('')
@@ -77,16 +95,22 @@
   let disposed = false
   let matchingCredentials = $derived(credentialsForReference(credentials, editImage))
   let editNetworkError = $derived(networkEditorError({ ownedDefaultNetwork: editOwnedDefaultNetwork, serviceDiscoveryEnabled: editServiceDiscovery, externalNetworks: editNetworks }))
-  $effect(() => {
-    if (editCredential && credentials.length > 0 && !matchingCredentials.some((value) => value.id === editCredential)) editCredential = null
-  })
 
   onMount(() => {
     disposed = false
-    void load().catch(() => {})
+    void refresh(true)
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible' && !actionBusy) void refresh(false)
+    }
+    document.addEventListener('visibilitychange', onVisibility)
     const source = openSse(`/api/v1/apps/${appId}/stats`, { stats: (event) => { if (!disposed) stats = JSON.parse(event.data) as StatsSample } })
     return () => {
       disposed = true
+      loadGeneration++
+      loadController?.abort()
+      clearTimeout(loadTimeout)
+      clearTimeout(refreshTimer)
+      document.removeEventListener('visibilitychange', onVisibility)
       source.close()
       webhookSecret = ''; webhookSaved = false; webhookRetry = undefined
       lifecycleKey = ''; lifecycleName = ''; deletionKey = ''; confirmationSlug = ''
@@ -95,19 +119,83 @@
     }
   })
 
-  async function load() {
+  function scheduleRefresh() {
+    clearTimeout(refreshTimer)
+    if (!disposed) refreshTimer = setTimeout(() => {
+      if (!actionBusy && document.visibilityState === 'visible') void refresh(false)
+      else scheduleRefresh()
+    }, 10_000)
+  }
+
+  async function refresh(auxiliary = true) {
+    try { await load(auxiliary) } catch { /* load exposes a retryable page error. */ }
+  }
+
+  function invalidateLoad() {
+    loadGeneration++
+    loadController?.abort()
+    clearTimeout(loadTimeout)
+    clearTimeout(refreshTimer)
+  }
+
+  async function load(auxiliary = true) {
     if (disposed) return
-    const [loadedApp, page, loadedCredentials, loadedWebhook, loadedSettings] = await Promise.all([
-      api<AppDetailResponse>(`/api/v1/apps/${appId}`),
-      api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`),
-      api<RegistryCredential[]>('/api/v1/registry-credentials'),
-      api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`).catch(() => null),
-      api<SettingsResponse>('/api/v1/settings').catch(() => null),
-    ])
-    if (disposed) return
-    app = loadedApp; deployments = page.items; credentials = loadedCredentials; webhook = loadedWebhook
-    allowedBindRoots = loadedSettings?.allowed_bind_roots ?? []
-    healthLimits = loadedSettings?.configuration_limits?.health ?? null
+    invalidateLoad()
+    const generation = loadGeneration
+    const controller = new AbortController()
+    loadController = controller
+    const current = () => !disposed && generation === loadGeneration
+    const timeout = setTimeout(() => controller.abort(), 15_000)
+    loadTimeout = timeout
+    loading = !app
+    const application = api<AppDetailResponse>(`/api/v1/apps/${appId}`, { signal: controller.signal }).then((value) => {
+      if (current()) { app = value; loadError = null; loading = false }
+    }).catch((cause) => {
+      if (current()) {
+        loading = false
+        loadError = cause instanceof ApiError && (cause.status === 404 || cause.body.code === 'APP_NOT_FOUND')
+          ? 'Application not found.' : app ? 'Could not refresh the application. Showing the last loaded state.' : 'Could not load the application.'
+      }
+      throw cause
+    })
+    const history = api<DeploymentPage>(`/api/v1/apps/${appId}/deployments?limit=20`, { signal: controller.signal }).then((page) => {
+      if (current()) { deployments = page.items; deploymentError = false }
+    }).catch(() => { if (current()) deploymentError = true })
+    const requests: Promise<unknown>[] = [application, history]
+    if (auxiliary || !credentialsReady) requests.push(
+        api<RegistryCredential[]>('/api/v1/registry-credentials', { signal: controller.signal }).then((value) => {
+          if (current()) { credentials = value; credentialsError = false; credentialsReady = true }
+        }).catch(() => { if (current()) credentialsError = true }),
+    )
+    if (auxiliary || !webhookReady) requests.push(
+        api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, { signal: controller.signal }).then((value) => {
+          if (current()) { webhook = value; webhookError = false; webhookReady = true }
+        }).catch(() => { if (current()) webhookError = true }),
+    )
+    if (auxiliary || !settingsReady) requests.push(
+        api<SettingsResponse>('/api/v1/settings', { signal: controller.signal }).then((value) => {
+          if (current()) {
+            allowedBindRoots = value.allowed_bind_roots
+            healthLimits = value.configuration_limits?.health ?? null
+            settingsError = !healthLimits
+            settingsReady = !!healthLimits
+          }
+        }).catch(() => { if (current()) settingsError = true }),
+    )
+    try {
+      const results = await Promise.allSettled(requests)
+      if (!current()) return false
+      if (results[0].status === 'rejected') throw results[0].reason
+      return true
+    } finally {
+      clearTimeout(timeout)
+      if (current()) { loading = false; loadController = undefined; scheduleRefresh() }
+    }
+  }
+
+  function factsConflict(cause: unknown): boolean {
+    return cause instanceof ApiError && cause.mutationOutcome === 'known_not_applied'
+      && cause.status === 409
   }
 
   function prepareWebhookSecret() {
@@ -119,6 +207,7 @@
   async function saveWebhook() {
     if (disposed || !webhook || !webhookSecret || !webhookSaved) return
     const request = { expected_metadata_revision: webhook.configured ? webhook.metadata_revision : null, secret: webhookSecret }
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
     try {
       const nextRetry = await writeOnlyRetryIdentity(
@@ -140,13 +229,14 @@
           ? 'The secret mutation outcome could not be confirmed. Re-entering the same secret with unchanged fields will reuse its request identity.'
           : 'The secret mutation was not applied. Review the current state before re-entering it; the next attempt will use a new request identity.')
       }
-    } finally { if (!disposed) actionBusy = false }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
 
   async function revokeWebhook() {
     if (disposed || !webhook?.configured || !webhook.metadata_revision || !window.confirm($t('Revoking makes the old webhook secret invalid immediately. Periodic polling and already-claimed deployments are unaffected. Continue?'))) return
     const request = { expected_metadata_revision: webhook.metadata_revision }
     webhookRetry = retryIdentity(webhookRetry, request)
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
     try {
       const revoked = await mutation<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, request, { method: 'DELETE', idempotencyKey: webhookRetry.key })
@@ -161,11 +251,12 @@
           ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
           : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
       }
-    } finally { if (!disposed) actionBusy = false }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
 
   async function lifecycle(action: 'start' | 'stop' | 'restart') {
     if (disposed) return
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
     if (lifecycleName !== action || !lifecycleKey) { lifecycleName = action; lifecycleKey = crypto.randomUUID() }
     try {
@@ -185,11 +276,12 @@
           : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
       }
     }
-    finally { if (!disposed) actionBusy = false }
+    finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
 
   async function previewDeletion() {
     if (disposed) return
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
     try {
       const preview = await mutation<DeletionPreviewResponse>(`/api/v1/apps/${appId}/deletion-preview`, { remove_container: removeContainer })
@@ -197,7 +289,7 @@
       deletion = preview
       deletionKey = crypto.randomUUID()
       confirmationSlug = ''
-    } catch { if (!disposed) error = localized('Could not generate the deletion preview.') } finally { if (!disposed) actionBusy = false }
+    } catch { if (!disposed) error = localized('Could not generate the deletion preview.') } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
 
   async function confirmDeletion() {
@@ -205,6 +297,7 @@
     const confirmed = deletion
     if (!confirmed) return
     if (!deletionKey) deletionKey = crypto.randomUUID()
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
     try {
       await mutation(`/api/v1/apps/${appId}`, {
@@ -225,7 +318,7 @@
           ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
           : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
       }
-    } finally { if (!disposed) actionBusy = false }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
 
   function pretty(value: unknown): string { return JSON.stringify(value, null, 2) }
@@ -237,6 +330,10 @@
   }
   function startEditing() {
     if (!app) return
+    editSession++
+    editChanges = 0
+    editRevision = app.draft_revision
+    editOriginallyAutoDeploy = app.draft?.auto_deploy_enabled ?? false
     editName = app.display_name; editImage = app.draft?.discovery_image_ref ?? ''
     editPoll = app.draft?.poll_interval_seconds ?? 300
     editStopGrace = app.draft?.stop_grace_period_seconds ?? 10
@@ -257,7 +354,8 @@
   }
   function buildDraft(): DraftInput {
     if (!app) throw new Error('missing app')
-    if (!healthLimits) throw new FormValidationError([{ path: 'health', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load backend health-check limits. Refresh and try again.') }])
+    if (!healthLimits || settingsError) throw new FormValidationError([{ path: 'health', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load backend health-check limits. Refresh and try again.') }])
+    if (credentialsError) throw new FormValidationError([{ path: 'credential_ref', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load registry credentials. Retry before saving.') }])
     const environmentRows = environmentEditor?.prepare() ?? editEnvironmentRows
     const unacknowledgedBind = editBinds.findIndex((bind) => !bind.readonly && !bind.acknowledge_non_rollbackable)
     if (unacknowledgedBind >= 0) throw new FormValidationError([{
@@ -271,7 +369,7 @@
     secretRequestRowIndexes = environmentProjection.secretRequestRowIndexes
     return {
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
-      auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !(app.draft?.auto_deploy_enabled ?? false), poll_interval_seconds: editPoll,
+      auto_deploy_enabled: editAutoDeploy, auto_deploy_acknowledged: editAutoDeploy && !editOriginallyAutoDeploy, poll_interval_seconds: editPoll,
       stop_grace_period_seconds: editStopGrace,
       security_profile: editSecurityProfile || null,
       environment: environmentProjection.environment,
@@ -298,6 +396,7 @@
     error = null
   }
   function clearFormIssuePath(path: string) {
+    editChanges++
     if (!formIssues.length) return
     formIssues = formIssues.filter((issue) => !(
       issue.path === path
@@ -310,6 +409,7 @@
     if (!formIssues.length) { formIssueRequestId = undefined; formPresentation = null }
   }
   function handleFormInput(event: Event) {
+    editChanges++
     const path = (event.target as HTMLElement).dataset.issuePath
     if (path) clearFormIssuePath(path)
   }
@@ -317,8 +417,9 @@
     if (disposed || !app) return
     const nonRollbackable = (app.draft?.volumes.length ?? 0) > 0 || (app.draft?.binds.length ?? 0) > 0
     if (nonRollbackable && !window.confirm($t('Deployments and rollbacks do not revert named volume or bind contents. Continue?'))) return
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null
-    const request = {
+    const request = deployRetry ? JSON.parse(deployRetry.fingerprint) : {
       expected_draft_revision: app.draft_revision,
       expected_active_release_id: app.active_release?.id ?? null,
       expected_pending_release_id: app.pending_release_id,
@@ -336,14 +437,16 @@
       if (!disposed) {
         const failure = mutationFailure(deployRetry, cause)
         deployRetry = failure.retry
+        if (factsConflict(cause)) { await refresh(false); if (disposed) return }
         error = localized(failure.outcome === 'outcome_unknown'
           ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
           : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
       }
-    } finally { if (!disposed) actionBusy = false }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
   async function validateDraft() {
     if (disposed) return
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null; formIssues = []
     try {
       const result = await mutation<{ plan: ComposePlan; compose_yaml: string }>(`/api/v1/apps/${appId}/validate`, { draft: buildDraft() })
@@ -352,42 +455,75 @@
     }
     catch (cause) {
       if (!disposed) setFormError(cause, 'Configuration validation failed. Check Docker/Compose status and try again.')
-    } finally { if (!disposed) actionBusy = false }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
   async function saveDraft() {
     if (disposed || !app) return
+    invalidateLoad()
     actionBusy = true; error = null; formPresentation = null; formIssues = []
     try {
-      const request = { expected_revision: app.draft_revision, draft: buildDraft() }
+      const request = { expected_revision: editRevision, draft: buildDraft() }
+      const session = editSession
+      const changes = editChanges
+      const submittedSecrets = editEnvironmentRows.filter((row) => !row.removed && row.sensitive)
+        .map((row) => ({ id: row.id, key: row.key, value: row.value }))
+      const submittedFiles = editFileRows.filter((row) => !row.removed && row.sensitive)
+        .map((row) => ({ row, name: row.logicalName, target: row.targetPath, value: row.value }))
       editRetry = retryIdentity(editRetry, request)
       await mutation(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
       if (disposed) return
-      clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = editFileRows.map((row) => ({ ...row, value: row.sensitive ? '' : row.value })); editRetry = undefined
+      editRetry = undefined
+      if (session === editSession) {
+        for (const submitted of submittedSecrets) {
+          const row = editEnvironmentRows.find((row) => row.id === submitted.id)
+          if (row && !row.removed && row.sensitive && row.key === submitted.key && row.value === submitted.value) row.value = ''
+        }
+        for (const submitted of submittedFiles) {
+          const row = submitted.row
+          if (editFileRows.includes(row) && !row.removed && row.sensitive && row.logicalName === submitted.name
+            && row.targetPath === submitted.target && row.value === submitted.value) row.value = ''
+        }
+      }
+      try {
+        const loaded = await load()
+        if (loaded && !disposed && session === editSession && changes === editChanges) startEditing()
+      } catch {
+        if (!disposed) error = localized('The configuration was saved but refresh failed. Reopen the application page to load the latest revision.')
+      }
     } catch (cause) {
       if (!disposed) {
         const failure = mutationFailure(editRetry, cause)
         editRetry = failure.retry
+        if (factsConflict(cause)) { await refresh(false); if (disposed) return }
         setFormError(cause, failure.outcome === 'outcome_unknown'
           ? 'The request outcome could not be confirmed. Retrying the same unchanged request will reuse its idempotency key.'
           : 'The request was not applied. Review the current state before trying again; the next attempt will use a new idempotency key.')
       }
-    } finally { if (!disposed) actionBusy = false }
-    if (disposed) return
-    if (error || formPresentation) return
-    try { await load(); if (!disposed) startEditing() }
-    catch { if (!disposed) error = localized('The configuration was saved but refresh failed. Reopen the application page to load the latest revision.') }
+    } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
+
   }
 </script>
 
 <main class="page-shell">
   <a class="back" href="#/">← {$t('Back to console')}</a>
   {#if visibleError}<p class="notice danger">{visibleError}</p>{/if}
+  {#if loading}<p role="status">{$t('Loading application…')}</p>{/if}
+  {#if loadError}<p class="notice danger" role="alert">{$t(loadError)} <button type="button" disabled={loading || actionBusy} onclick={() => void refresh(true)}>{$t('Retry loading')}</button></p>{/if}
+  {#if deploymentError || credentialsError || settingsError || webhookError}
+    <div class="notice warning" role="alert">
+      {#if deploymentError}<p>{$t('Could not load deployment history. Previously loaded entries are preserved.')}</p>{/if}
+      {#if credentialsError}<p>{$t('Could not load registry credentials. Retry before saving.')}</p>{/if}
+      {#if settingsError}<p>{$t('Could not load backend health-check limits. Refresh and try again.')}</p>{/if}
+      {#if webhookError}<p>{$t('Could not load webhook settings.')}</p>{/if}
+      <button type="button" disabled={loading || actionBusy} onclick={() => void refresh(true)}>{$t('Retry loading')}</button>
+    </div>
+  {/if}
   {#if app}
     <div class="detail-heading"><div><p class="eyebrow">{$t('APPLICATION')}</p><h1>{app.display_name}</h1><code>{app.id}</code></div><span class:healthy={app.actual?.health === 'healthy'} class="state-pill large">{app.deployment_status === 'UNCONFIGURED' ? $t('Not configured') : app.deployment_status === 'DEPLOY_REQUIRED' ? $t('Waiting for first deployment') : `${stateText(app.actual?.status, $t)} · ${stateText(app.actual?.health ?? 'unknown', $t)}`}</span></div>
     <p class="notice"><strong>{$t('Immutable slug')}: </strong><code>{app.slug}</code> · <strong>{$t('Compose project')}: </strong><code>{app.resource_names.project_name}</code> · <strong>{$t('Default container')}: </strong><code>{app.resource_names.project_name}-app-1</code></p>
     {#if app.expected_owned_default_network}<p class="notice"><strong>{$t('Owned network')}: </strong><code>{app.expected_owned_default_network.docker_name}</code> · <strong>{$t('Host bridge')}: </strong><code>{app.expected_owned_default_network.bridge_name}</code></p>{:else if !app.active_release && !app.pending_release_id && app.draft?.owned_default_network}<p class="notice"><strong>{$t('Draft owned network')}: </strong><code>{app.resource_names.owned_default_network_name}</code> · <strong>{$t('Host bridge')}: </strong><code>{app.resource_names.bridge_name}</code></p>{/if}
-    <div class="actions"><button disabled={actionBusy || !app.available_actions.includes('deploy')} onclick={() => void deploy()}>{$t('Deploy draft')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('start')} onclick={() => void lifecycle('start')}>{$t('Start')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('stop')} onclick={() => void lifecycle('stop')}>{$t('Stop')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('restart')} onclick={() => void lifecycle('restart')}>{$t('Restart')}</button><button class="danger danger-action" disabled={actionBusy} onclick={() => { deletionDialog = true; deletion = null; removeContainer = false }}>{$t('Unregister…')}</button></div>
-    <div class="tabs"><button class:active={tab === 'overview'} onclick={() => { tab = 'overview' }}>{$t('Overview')}</button><button class:active={tab === 'configuration'} onclick={() => { tab = 'configuration'; startEditing() }}>{$t('Configuration')}</button><button class:active={tab === 'deployments'} onclick={() => { tab = 'deployments' }}>{$t('Deployment history')}</button><button class:active={tab === 'logs'} onclick={() => { tab = 'logs' }}>{$t('Live logs')}</button></div>
+    <div class="actions"><button disabled={actionBusy || (!app.available_actions.includes('deploy') && !deployRetry)} onclick={() => void deploy()}>{$t('Deploy draft')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('start')} onclick={() => void lifecycle('start')}>{$t('Start')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('stop')} onclick={() => void lifecycle('stop')}>{$t('Stop')}</button><button class="ghost" disabled={actionBusy || !app.available_actions.includes('restart')} onclick={() => void lifecycle('restart')}>{$t('Restart')}</button><button class="danger danger-action" disabled={actionBusy} onclick={() => { deletionDialog = true; deletion = null; removeContainer = false }}>{$t('Unregister…')}</button></div>
+    <div class="tabs"><button class:active={tab === 'overview'} onclick={() => { tab = 'overview' }}>{$t('Overview')}</button><button class:active={tab === 'configuration'} onclick={() => { tab = 'configuration'; if (!editing) startEditing() }}>{$t('Configuration')}</button><button class:active={tab === 'deployments'} onclick={() => { tab = 'deployments' }}>{$t('Deployment history')}</button><button class:active={tab === 'logs'} onclick={() => { tab = 'logs' }}>{$t('Live logs')}</button></div>
     {#if tab === 'logs'}
       <LogsPane {appId} />
     {:else if tab === 'deployments'}
@@ -404,26 +540,27 @@
               <a href={`#/deployments/${deployment.id}`}>{$t('View details')}</a>
             </article>
           {/each}
-        {:else}<p class="muted">{$t('No deployment history.')}</p>{/if}
+        {:else if !deploymentError}<p class="muted">{$t('No deployment history.')}</p>{/if}
       </section>
     {:else if tab === 'configuration'}
       {#if editing}
         <form class="panel configuration-stack" oninput={handleFormInput} onchange={handleFormInput} onsubmit={(event) => { event.preventDefault(); void saveDraft() }}>
-          <header><h2>{$t('Draft configuration')}</h2><p class="muted">{$t('Revision {revision}. Saving atomically creates a new immutable revision.', { revision: app.draft_revision ?? $t('Not created') })}</p></header>
+          <header><h2>{$t('Draft configuration')}</h2><p class="muted">{$t('Revision {revision}. Saving atomically creates a new immutable revision.', { revision: editRevision ?? $t('Not created') })}</p></header>
+          {#if draftConflict}<p class="notice warning" role="alert">{$t('The draft changed elsewhere. Your inputs and original revision are preserved. Reload the draft to discard these edits.')} <button type="button" class="ghost" disabled={actionBusy} onclick={startEditing}>{$t('Reload draft')}</button></p>{/if}
           <label>{$t('Slug (immutable)')}<input value={app.slug} readonly /></label><label>{$t('Display name')}<input data-issue-path="display_name" bind:value={editName} required /></label>
           <label>{$t('Discovery image tag')}<input data-issue-path="discovery_image_ref" bind:value={editImage} aria-invalid={formIssues.some((issue) => issue.path === 'discovery_image_ref') ? 'true' : undefined} required /></label><label>{$t('Poll interval (seconds)')}<input data-issue-path="poll_interval_seconds" type="number" min="60" max="86400" bind:value={editPoll} aria-invalid={formIssues.some((issue) => issue.path === 'poll_interval_seconds') ? 'true' : undefined} /></label>
           <label class="checkbox"><input data-issue-path="auto_deploy_enabled" type="checkbox" bind:checked={editAutoDeploy} /> {$t('Automatically deploy new digests for the tag')}</label>
           {#if editAutoDeploy}<p class="notice warning">{$t('When enabled, a new digest automatically replaces the container and restores the old release if health checks fail. Volume and bind data do not roll back. Disabling does not cancel deployments that are already durably claimed.')}</p>{/if}
-          <label>{$t('Registry credential')}<select data-issue-path="credential_ref" bind:value={editCredential}><option value={null}>{$t('Anonymous')}</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
+          <label>{$t('Registry credential')}<select data-issue-path="credential_ref" bind:value={editCredential} disabled={credentialsError}>{#if editCredential && !matchingCredentials.some((credential) => credential.id === editCredential)}<option disabled value={editCredential}>{editCredential}</option>{/if}<option value={null}>{$t('Anonymous')}</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
           <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} onStructureChange={clearFormIssuePath} />
-          <EnvironmentEditor bind:this={environmentEditor} bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />
+          {#key editSession}<EnvironmentEditor bind:this={environmentEditor} bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />{/key}
           <ManagedFileEditor bind:rows={editFileRows} issues={issuesUnder(formIssues, 'files')} onStructureChange={clearFormIssuePath} />
           <PortEditor bind:ports={editPorts} issues={issuesUnder(formIssues, 'ports')} onStructureChange={clearFormIssuePath} />
           <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} issues={[...issuesUnder(formIssues, 'volumes'), ...issuesUnder(formIssues, 'binds')]} onStructureChange={clearFormIssuePath} />
           <NetworkEditor bind:ownedDefaultNetwork={editOwnedDefaultNetwork} bind:serviceDiscoveryEnabled={editServiceDiscovery} bind:externalNetworks={editNetworks} issues={issuesUnder(formIssues, 'networks')} onStructureChange={clearFormIssuePath} />
           <article class="panel"><label>{$t('Container security profile')}<input data-issue-path="security_profile" bind:value={editSecurityProfile} placeholder="codex-v1" /></label><p>{$t('Leave empty for Docker defaults. Use a versioned profile installed by the host operator.')}</p></article>
           <HealthLifecycleEditor bind:health={editHealth} bind:stopGrace={editStopGrace} limits={healthLimits} issues={[...issuesUnder(formIssues, 'health'), ...issuesUnder(formIssues, 'stop_grace_period_seconds')]} />
-          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError || !healthLimits} onclick={() => void validateDraft()}>{$t('Validate only')}</button><button disabled={actionBusy || !!editNetworkError || !healthLimits}>{$t('Save new revision')}</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; tab = 'overview' }}>{$t('Cancel')}</button></div>
+          <div class="actions"><button type="button" class="ghost" disabled={actionBusy || !!editNetworkError || !healthLimits || settingsError || credentialsError} onclick={() => void validateDraft()}>{$t('Validate only')}</button><button disabled={actionBusy || !!editNetworkError || !healthLimits || settingsError || credentialsError}>{$t('Save new revision')}</button><button type="button" class="ghost" onclick={() => { clearSensitiveEnvironmentValues(editEnvironmentRows); editFileRows = []; editRetry = undefined; editing = false; editSession++; tab = 'overview' }}>{$t('Cancel')}</button></div>
           {#if validation}<article class="notice"><h3>{$t('Compose validation')}</h3><p>{validation.plan.runnable ? $t('Runnable') : $t('Preview only')} · {$t('{grace} second stop grace · {ports} ports · {mounts} mounts · {networks} networks · {mode}', { grace: validation.plan.stop_grace_period_seconds, ports: validation.plan.ports, mounts: validation.plan.mounts, networks: validation.plan.networks, mode: networkModeText(validation.plan.network_mode, $t) })}</p>{#if validation.plan.owned_default_network}<p>{$t('Owned network')}: <code>{validation.plan.owned_default_network.docker_name}</code> · {$t('Bridge')}: <code>{validation.plan.owned_default_network.bridge_name}</code></p>{/if}{#each validation.plan.external_networks as network}<p><code>{network.name}</code>{#if network.aliases.length} · {$t('Aliases')}: {network.aliases.join(', ')}{/if}</p>{/each}{#if validation.plan.external_networks.length}<p>{$t('External networks are not created, changed, or deleted by SoloDock.')}</p>{/if}{#each validation.plan.warnings as warning}<span class="tag">{warning}</span>{/each}<pre>{validation.compose_yaml}</pre></article>{/if}
         </form>
         {#if app.draft && webhook}<article class="panel webhook-panel"><h2>{$t('Registry recheck webhook')}</h2><p><span class="tag">{webhook.degraded ? $t('Configuration damaged; generate a new secret to repair it') : webhook.configured ? $t('Configured') : $t('Not configured')}</span> · {webhook.algorithm}</p><p><code>{webhook.public_origin}{webhook.public_path}</code></p><p class="muted">{$t('The webhook triggers one durable Registry recheck. It does not trust image information in the payload or bypass automatic deployment, backoff, drift checks, or health gates.')}</p>{#if webhookSecret}<p class="notice warning">{$t('This is the only time the secret is displayed. Save it in your CI secret store:')} <code>{webhookSecret}</code></p><label class="checkbox"><input type="checkbox" bind:checked={webhookSaved} /> {$t('I saved this secret securely')}</label><div class="actions"><button disabled={actionBusy || !webhookSaved} onclick={() => void saveWebhook()}>{webhook.configured ? $t('Confirm rotation') : $t('Confirm configuration')}</button><button class="ghost" onclick={() => { webhookSecret = ''; webhookSaved = false; webhookRetry = undefined }}>{$t('Cancel')}</button></div>{:else}<div class="actions"><button disabled={actionBusy} onclick={prepareWebhookSecret}>{webhook.configured ? $t('Generate rotation secret') : $t('Generate webhook secret')}</button>{#if webhook.configured}<button class="danger" disabled={actionBusy} onclick={() => void revokeWebhook()}>{$t('Revoke webhook')}</button>{/if}</div>{/if}</article>{/if}
