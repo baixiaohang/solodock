@@ -63,6 +63,7 @@
   let formIssueRequestId = $state<string | undefined>()
   let fileRequestRowIndexes = $state<number[]>([])
   let secretRequestRowIndexes = $state<number[]>([])
+  let environmentEditor = $state<ReturnType<typeof EnvironmentEditor>>()
   let environmentClientIssue = $state<FormIssue | null>(null)
   let allowedBindRoots = $state<string[]>([])
   let credentials = $state<RegistryCredential[]>([])
@@ -257,7 +258,7 @@
   function buildDraft(): DraftInput {
     if (!app) throw new Error('missing app')
     if (!healthLimits) throw new FormValidationError([{ path: 'health', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load backend health-check limits. Refresh and try again.') }])
-    if (environmentClientIssue) throw new FormValidationError([environmentClientIssue])
+    const environmentRows = environmentEditor?.prepare() ?? editEnvironmentRows
     const unacknowledgedBind = editBinds.findIndex((bind) => !bind.readonly && !bind.acknowledge_non_rollbackable)
     if (unacknowledgedBind >= 0) throw new FormValidationError([{
       path: `binds[${unacknowledgedBind}].acknowledge_non_rollbackable`,
@@ -266,7 +267,7 @@
     }])
     const fileProjection = buildManagedFileProjection(editFileRows)
     fileRequestRowIndexes = fileProjection.requestRowIndexes
-    const environmentProjection = buildEnvironmentProjection(editEnvironmentRows)
+    const environmentProjection = buildEnvironmentProjection(environmentRows)
     secretRequestRowIndexes = environmentProjection.secretRequestRowIndexes
     return {
       display_name: editName, discovery_image_ref: editImage, credential_ref: editCredential,
@@ -415,7 +416,7 @@
           {#if editAutoDeploy}<p class="notice warning">{$t('When enabled, a new digest automatically replaces the container and restores the old release if health checks fail. Volume and bind data do not roll back. Disabling does not cancel deployments that are already durably claimed.')}</p>{/if}
           <label>{$t('Registry credential')}<select data-issue-path="credential_ref" bind:value={editCredential}><option value={null}>{$t('Anonymous')}</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
           <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} onStructureChange={clearFormIssuePath} />
-          <EnvironmentEditor bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />
+          <EnvironmentEditor bind:this={environmentEditor} bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />
           <ManagedFileEditor bind:rows={editFileRows} issues={issuesUnder(formIssues, 'files')} onStructureChange={clearFormIssuePath} />
           <PortEditor bind:ports={editPorts} issues={issuesUnder(formIssues, 'ports')} onStructureChange={clearFormIssuePath} />
           <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} issues={[...issuesUnder(formIssues, 'volumes'), ...issuesUnder(formIssues, 'binds')]} onStructureChange={clearFormIssuePath} />

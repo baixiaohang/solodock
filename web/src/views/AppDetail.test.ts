@@ -266,3 +266,72 @@ describe('app detail resource identity', () => {
     expect(screen.queryByText(/新 Secret 值无效/)).toBeNull()
   })
 })
+
+
+describe('current configuration input submission', () => {
+  it('blocks stale bulk values after Secret edits and preserves multiline file request content', async () => {
+    const app = {
+      id: '00000000-0000-4000-8000-000000000051', slug: 'input-test', display_name: 'Input test',
+      resource_names: { project_name: 'solodock-input-test' }, active_release: null, actual_release_id: null,
+      actual: null, expected_network_plan: null, expected_owned_default_network: null,
+      actual_owned_default_network: null, drift_codes: [], draft_revision: 'revision-one',
+      draft_config_sha256: 'a'.repeat(64), active_config_revision: null, pending_release_id: null,
+      pending_image_ref: null, desired_state: 'stopped', deployment_status: 'DEPLOY_REQUIRED',
+      available_actions: ['deploy'], compose_available: true, polling: null,
+      draft: { discovery_image_ref: 'registry.example/app:stable', credential_ref: null,
+        auto_deploy_enabled: false, poll_interval_seconds: 300, stop_grace_period_seconds: 10,
+        public_environment: [{ key: 'PUBLIC', value: 'old' }], secret_keys: ['TOKEN'],
+        files: [ { logical_name: 'config', target_path: '/config.yaml', sensitive: false, content: 'old' },
+          { logical_name: 'key', target_path: '/key.pem', sensitive: true } ],
+        ports: [], volumes: [], binds: [], owned_default_network: true, service_discovery_enabled: false,
+        networks: [], health: { policy: 'running', stable_window_seconds: 15 } },
+    }
+    const requests: { url: string; body: any }[] = []
+    vi.stubGlobal('EventSource', MockEventSource)
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/deployments?limit=20')) return new Response('{"items":[]}')
+      if (url.endsWith('/registry-credentials')) return new Response('[]')
+      if (url.endsWith('/settings')) return new Response(JSON.stringify(settings))
+      if (url.endsWith('/webhook')) return new Response('{}', { status: 404 })
+      if (url.endsWith('/validate') || url.endsWith('/draft')) {
+        requests.push({ url, body: JSON.parse(String(init?.body)) })
+        // Keep the editor open so both request paths can be inspected.
+        return new Response('{"code":"CONFIG_INVALID","message":"Test rejection"}', { status: 422 })
+      }
+      return new Response(JSON.stringify(app))
+    }))
+    render(AppDetail, { appId: app.id })
+    await screen.findByRole('heading', { name: 'Input test' })
+    const user = userEvent.setup()
+    await user.click(screen.getByRole('button', { name: '配置' }))
+    await user.click(screen.getByRole('button', { name: '批量文本' }))
+    const text = screen.getByLabelText('批量普通环境变量')
+    await user.clear(text); await user.click(text); await user.paste('PUBLIC=new\nINVALID')
+    await user.type(screen.getByLabelText('Secret 值'), 'replacement')
+    for (const name of ['保存新 revision', '仅预检']) await user.click(screen.getByRole('button', { name }))
+    expect(requests).toHaveLength(0)
+    expect(text).toHaveProperty('value', 'PUBLIC=new\nINVALID')
+    await user.clear(text); await user.paste('PUBLIC=new')
+    const secretKey = screen.getByDisplayValue('TOKEN')
+    await user.clear(secretKey); await user.type(secretKey, 'PUBLIC')
+    await user.click(screen.getByRole('button', { name: '仅预检' }))
+    expect(requests).toHaveLength(0)
+    await user.clear(secretKey); await user.type(secretKey, 'TOKEN')
+    const yaml = 'server:\n  port: 8080\n\n  enabled: true\n'
+    const pem = '-----BEGIN PRIVATE KEY-----\n  test-line\n\n-----END PRIVATE KEY-----\n'
+    const contents = screen.getAllByLabelText('内容')
+    for (const [index, value] of [yaml, pem].entries()) {
+      expect(contents[index].tagName).toBe('TEXTAREA')
+      await user.clear(contents[index]); await user.click(contents[index]); await user.paste(value)
+    }
+    for (const name of ['仅预检', '保存新 revision']) await user.click(screen.getByRole('button', { name }))
+    expect(requests).toHaveLength(2)
+    for (const { body } of requests) {
+      expect(body.draft.environment.public).toEqual([{ key: 'PUBLIC', value: 'new' }])
+      expect(body.draft.environment.secrets).toContainEqual({ key: 'TOKEN', operation: 'replace', value: 'replacement' })
+      expect(body.draft.files[0].content).toBe(yaml)
+      expect(body.draft.files[1]).toMatchObject({ operation: 'replace', value: pem })
+    }
+  })
+})
