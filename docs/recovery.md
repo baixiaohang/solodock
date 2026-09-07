@@ -45,6 +45,8 @@ Legacy naming/config/release schemas remain readable and rollback-capable. Old a
 
 See [operations](operations.md) for routine installation, backup, and health checks, and [application model](application-model.md) for resource-retention and deletion semantics.
 
+When retrying an existing pending deployment, an ordinary image-pull failure retains pending and active and records `needs_attention` with the pull error. This also applies to an interrupted first deployment with no active release: the earlier attempt may already have created the candidate. A pull failure for a newly published candidate with no container effects can still clear pending and finish as failed. Never remove a retained pending link merely because the latest attempt failed before Compose.
+
 ## Completed application unregistrations
 
 `app_unregistrations` preserves the application ID, operation ID, source, completion timestamp, and finalization state after terminal replay GC. API retries, startup, and background recovery share the same exact-proof finalizer. A receipt-write failure retains the tombstone. A final unlink/sync failure keeps the receipt pending and protects its replay proof; recovery repeats the missing barrier before allowing cleanup. `validate-restore` validates these lifecycle facts and pending proofs. A completed receipt never permits skipping a malformed or reappeared application/tombstone.

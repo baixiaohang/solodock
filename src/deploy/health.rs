@@ -5,7 +5,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     docker::{
-        models::{ContainerStatus, DockerReadApi, HealthStatus},
+        models::{ContainerRecord, ContainerStatus, DockerReadApi, HealthStatus},
         ownership::RELEASE_ID_LABEL,
     },
     domain::HealthPolicy,
@@ -19,6 +19,79 @@ pub struct HealthResult {
     pub elapsed_seconds: u64,
     pub restart_count: Option<i64>,
     pub exit_code: Option<i64>,
+    #[serde(skip)]
+    verified_container: ContainerRecord,
+}
+
+impl HealthResult {
+    pub(crate) fn recheck(
+        &self,
+        container: &ContainerRecord,
+        policy: &HealthPolicy,
+    ) -> Result<(), HealthError> {
+        if container.id != self.verified_container.id {
+            return Err(HealthError::Changed);
+        }
+        if container.started_at != self.verified_container.started_at
+            || container.restart_count != self.verified_container.restart_count
+        {
+            return Err(HealthError::Restarted);
+        }
+        if policy_ready(container, policy)? {
+            Ok(())
+        } else {
+            Err(HealthError::NotReady)
+        }
+    }
+}
+
+// Preserve the existing startup allowance and budget the full configured observation.
+pub(crate) fn health_deadline(policy: &HealthPolicy) -> Duration {
+    const STARTUP_SECONDS: u64 = 300;
+    const OBSERVATION_MARGIN_SECONDS: u64 = 10;
+    let seconds = match policy {
+        HealthPolicy::Running {
+            stable_window_seconds,
+        } => STARTUP_SECONDS + u64::from(*stable_window_seconds) + OBSERVATION_MARGIN_SECONDS,
+        HealthPolicy::Healthy { http: Some(http) } => STARTUP_SECONDS.max(
+            u64::from(http.start_period_seconds)
+                + u64::from(http.retries)
+                    * (u64::from(http.interval_seconds) + u64::from(http.timeout_seconds))
+                + OBSERVATION_MARGIN_SECONDS,
+        ),
+        _ => STARTUP_SECONDS,
+    };
+    Duration::from_secs(seconds)
+}
+
+pub(crate) fn policy_ready(
+    container: &ContainerRecord,
+    policy: &HealthPolicy,
+) -> Result<bool, HealthError> {
+    if matches!(policy, HealthPolicy::Completed) {
+        return match container.status {
+            ContainerStatus::Exited if container.exit_code == Some(0) => Ok(true),
+            ContainerStatus::Exited => Err(HealthError::CompletedNonzero),
+            ContainerStatus::Dead => Err(HealthError::Exited),
+            _ => Ok(false),
+        };
+    }
+    match container.status {
+        ContainerStatus::Exited | ContainerStatus::Dead => return Err(HealthError::Exited),
+        ContainerStatus::Paused | ContainerStatus::Removing => return Err(HealthError::NotReady),
+        ContainerStatus::Running => {}
+        _ => return Ok(false),
+    }
+    if matches!(policy, HealthPolicy::Healthy { .. }) {
+        match container.health {
+            HealthStatus::Healthy => Ok(true),
+            HealthStatus::Starting => Ok(false),
+            HealthStatus::Unhealthy => Err(HealthError::Unhealthy),
+            HealthStatus::None | HealthStatus::Unknown => Err(HealthError::Missing),
+        }
+    } else {
+        Ok(true)
+    }
 }
 
 #[derive(Clone)]
@@ -52,7 +125,10 @@ impl HealthVerifier {
                 deadline,
             )
             .await?;
-        let baseline_started = first.started_at.clone();
+        let mut baseline_started = first.started_at.clone();
+        let mut awaiting_first_start = first.status == ContainerStatus::Created
+            && first.started_at.is_none()
+            && first.restart_count == Some(0);
         let baseline_restarts = first.restart_count;
         let mut running_since = None;
         let stable_required = match policy {
@@ -73,42 +149,29 @@ impl HealthVerifier {
                     deadline,
                 )
                 .await?;
+            if awaiting_first_start
+                && container.started_at.is_some()
+                && matches!(
+                    container.status,
+                    ContainerStatus::Running | ContainerStatus::Exited
+                )
+                && container.restart_count == Some(0)
+            {
+                baseline_started = container.started_at.clone();
+                awaiting_first_start = false;
+            }
             if container.started_at != baseline_started
                 || container.restart_count != baseline_restarts
             {
                 return Err(HealthError::Restarted);
             }
-            let success = match policy {
-                HealthPolicy::Healthy { .. } => match container.health {
-                    HealthStatus::Healthy => true,
-                    HealthStatus::Starting => false,
-                    HealthStatus::Unhealthy => return Err(HealthError::Unhealthy),
-                    HealthStatus::None | HealthStatus::Unknown => return Err(HealthError::Missing),
-                },
-                HealthPolicy::Running { .. } | HealthPolicy::Disabled { .. } => {
-                    match container.status {
-                        ContainerStatus::Running => {
-                            let since = running_since.get_or_insert_with(tokio::time::Instant::now);
-                            since.elapsed().as_secs() >= stable_required
-                        }
-                        ContainerStatus::Exited | ContainerStatus::Dead => {
-                            return Err(HealthError::Exited);
-                        }
-                        ContainerStatus::Paused | ContainerStatus::Removing => {
-                            return Err(HealthError::Changed);
-                        }
-                        _ => {
-                            running_since = None;
-                            false
-                        }
-                    }
-                }
-                HealthPolicy::Completed => match container.status {
-                    ContainerStatus::Exited if container.exit_code == Some(0) => true,
-                    ContainerStatus::Exited => return Err(HealthError::CompletedNonzero),
-                    ContainerStatus::Dead => return Err(HealthError::Exited),
-                    _ => false,
-                },
+            let ready = policy_ready(&container, policy)?;
+            let success = if ready {
+                let since = running_since.get_or_insert_with(tokio::time::Instant::now);
+                since.elapsed().as_secs() >= stable_required
+            } else {
+                running_since = None;
+                false
             };
             if success {
                 return Ok(HealthResult {
@@ -117,6 +180,7 @@ impl HealthVerifier {
                     elapsed_seconds: started.elapsed().as_secs(),
                     restart_count: container.restart_count,
                     exit_code: container.exit_code,
+                    verified_container: container,
                 });
             }
             let sleep = tokio::time::sleep(Duration::from_secs(1));
@@ -196,6 +260,8 @@ pub enum HealthError {
     Restarted,
     #[error("completed container returned nonzero")]
     CompletedNonzero,
+    #[error("container is not ready")]
+    NotReady,
     #[error("container identity changed")]
     Changed,
     #[error("container image identity mismatched")]
@@ -208,6 +274,7 @@ pub enum HealthError {
 impl HealthError {
     pub const fn public_code(self) -> &'static str {
         match self {
+            Self::NotReady => "CONTAINER_NOT_READY",
             Self::Missing => "HEALTHCHECK_MISSING",
             Self::Unhealthy => "HEALTH_UNHEALTHY",
             Self::Timeout => "HEALTH_TIMEOUT",
@@ -301,6 +368,196 @@ mod tests {
             &crate::registry::Platform::canonical("linux", "amd64", None).unwrap(),
         )
         .unwrap()
+    }
+
+    fn verifier(records: Vec<ContainerRecord>) -> HealthVerifier {
+        HealthVerifier::new(
+            Arc::new(ScriptedDocker {
+                records: Mutex::new(records.into()),
+                last: Mutex::new(None),
+            }),
+            CancellationToken::new(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maximum_running_window_includes_delayed_start_and_times_out_when_never_ready() {
+        let release = uuid::Uuid::new_v4();
+        let policy = HealthPolicy::Running {
+            stable_window_seconds: 300,
+        };
+        let mut created = record(release, ContainerStatus::Created);
+        created.started_at = None;
+        let mut records = vec![created; 250];
+        records.push(record(release, ContainerStatus::Running));
+        let result = verifier(records)
+            .verify(
+                "container",
+                release,
+                &record(release, ContainerStatus::Running)
+                    .configured_image_ref
+                    .unwrap(),
+                &image_identity(),
+                &policy,
+                health_deadline(&policy),
+            )
+            .await
+            .unwrap();
+        assert!(result.elapsed_seconds >= 548);
+        let result = verifier(vec![record(release, ContainerStatus::Created)])
+            .verify(
+                "container",
+                release,
+                &record(release, ContainerStatus::Running)
+                    .configured_image_ref
+                    .unwrap(),
+                &image_identity(),
+                &policy,
+                health_deadline(&policy),
+            )
+            .await;
+        assert!(matches!(result, Err(HealthError::Timeout)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn first_start_does_not_allow_real_restarts_to_reset_the_window() {
+        let release = uuid::Uuid::new_v4();
+        let mut created = record(release, ContainerStatus::Created);
+        created.started_at = None;
+        let running = record(release, ContainerStatus::Running);
+        for changed_count in [false, true] {
+            let mut restarted = running.clone();
+            if changed_count {
+                restarted.restart_count = Some(1);
+            } else {
+                restarted.started_at = Some("second-start".into());
+            }
+            let policy = HealthPolicy::Running {
+                stable_window_seconds: 300,
+            };
+            assert!(matches!(
+                verifier(vec![created.clone(), running.clone(), restarted])
+                    .verify(
+                        "container",
+                        release,
+                        running.configured_image_ref.as_ref().unwrap(),
+                        &image_identity(),
+                        &policy,
+                        health_deadline(&policy)
+                    )
+                    .await,
+                Err(HealthError::Restarted)
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn healthy_budget_covers_custom_probes_and_cancellation() {
+        let release = uuid::Uuid::new_v4();
+        let policy: HealthPolicy = serde_json::from_value(serde_json::json!({
+            "policy": "healthy", "http": {"client": "curl", "scheme": "http",
+            "host": "127.0.0.1", "port": 80, "path": "/", "interval_seconds": 300,
+            "timeout_seconds": 60, "retries": 10, "start_period_seconds": 300}
+        }))
+        .unwrap();
+        assert_eq!(health_deadline(&policy), Duration::from_secs(3910));
+        let mut starting = record(release, ContainerStatus::Running);
+        starting.health = HealthStatus::Starting;
+        let mut ready = starting.clone();
+        ready.health = HealthStatus::Healthy;
+        let mut records = vec![starting.clone(); 400];
+        records.push(ready);
+        let result = verifier(records)
+            .verify(
+                "container",
+                release,
+                starting.configured_image_ref.as_ref().unwrap(),
+                &image_identity(),
+                &policy,
+                health_deadline(&policy),
+            )
+            .await
+            .unwrap();
+        assert!(result.elapsed_seconds > 300);
+        let verifier = verifier(vec![starting.clone()]);
+        verifier.shutdown.cancel();
+        assert!(matches!(
+            verifier
+                .verify(
+                    "container",
+                    release,
+                    starting.configured_image_ref.as_ref().unwrap(),
+                    &image_identity(),
+                    &policy,
+                    health_deadline(&policy)
+                )
+                .await,
+            Err(HealthError::Interrupted)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn final_recheck_preserves_policy_and_successful_restart_baseline() {
+        let release = uuid::Uuid::new_v4();
+        for policy in [
+            HealthPolicy::Healthy { http: None },
+            HealthPolicy::Running {
+                stable_window_seconds: 5,
+            },
+            HealthPolicy::Disabled {
+                acknowledge_reduced_safety: true,
+            },
+            HealthPolicy::Completed,
+        ] {
+            let mut ready = record(release, ContainerStatus::Running);
+            ready.health = HealthStatus::Healthy;
+            if matches!(policy, HealthPolicy::Completed) {
+                ready.status = ContainerStatus::Exited;
+                ready.exit_code = Some(0);
+            }
+            let result = verifier(vec![ready.clone()])
+                .verify(
+                    "container",
+                    release,
+                    ready.configured_image_ref.as_ref().unwrap(),
+                    &image_identity(),
+                    &policy,
+                    health_deadline(&policy),
+                )
+                .await
+                .unwrap();
+            assert!(result.recheck(&ready, &policy).is_ok());
+            for change in 0..5 {
+                let mut changed = ready.clone();
+                match change {
+                    0 => changed.restart_count = Some(1),
+                    1 => changed.started_at = Some("new-start".into()),
+                    2 => changed.status = ContainerStatus::Restarting,
+                    3 => {
+                        changed.status = ContainerStatus::Exited;
+                        changed.exit_code = Some(1);
+                    }
+                    _ => changed.id = "other".into(),
+                }
+                assert!(result.recheck(&changed, &policy).is_err());
+            }
+            if matches!(policy, HealthPolicy::Healthy { .. }) {
+                let mut changed = ready.clone();
+                changed.health = HealthStatus::Unhealthy;
+                assert!(matches!(
+                    result.recheck(&changed, &policy),
+                    Err(HealthError::Unhealthy)
+                ));
+                changed.status = ContainerStatus::Exited;
+                changed.health = HealthStatus::Healthy;
+                assert!(matches!(
+                    policy_ready(&changed, &policy),
+                    Err(HealthError::Exited)
+                ));
+            }
+        }
+        let ready = record(release, ContainerStatus::Running);
+        assert!(policy_ready(&ready, &HealthPolicy::default()).unwrap());
     }
 
     #[tokio::test(start_paused = true)]

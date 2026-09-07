@@ -45,6 +45,8 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 
 日常安装、备份和 health 检查入口见 [运维](operations.md)；资源保留与删除语义见 [应用模型](application-model.md)。
 
+重试已有 pending 的部署时，普通镜像拉取失败会保留 pending 与 active，并以原拉取错误记录 `needs_attention`。首次部署中断、尚无 active 时也适用：先前尝试可能已经创建候选容器。新发布且尚无容器副作用的候选在拉取失败后仍可清除 pending 并记为 failed。不能仅因最近一次尝试在 Compose 前失败就删除保留的 pending 引用。
+
 ## 已完成的应用注销
 
 `app_unregistrations` 在终态 replay GC 后继续保存应用 ID、操作 ID、来源、完成时间和 finalization 状态。API 重试、启动与后台恢复共用精确证明 finalizer。注销记录写入失败时保留 tombstone；最终 unlink/sync 失败时记录保持 pending 并保护重放证明，恢复补齐屏障后才能解除清理保护。`validate-restore` 校验这些生命周期事实和 pending proof。完成记录不能绕过异常或重新出现的应用目录/tombstone。

@@ -66,6 +66,10 @@ After `post_container_id` is durable, that exact full ID is the source of truth 
 
 Only after the candidate reaches its health policy does SoloDock atomically point `active` to the release and clear the corresponding `pending`. A replayable finalizer converges active rename, pending unlink, parent fsync, and desired-state publication. Later metadata failure cannot reverse an already visible active release.
 
+Health verification and automatic rollback share a policy-derived deadline. Running allows 300 seconds for startup plus the complete configured stable window and 10 seconds of observation margin. Custom HTTP health checks allow at least 300 seconds, or the start period plus retries multiplied by interval plus timeout, with 10 seconds of margin, whichever is larger. Other policies retain a bounded 300-second wait. Each inspect is bounded by the remaining deadline and can be cancelled.
+
+Immediately before committing active or clearing pending after automatic rollback, SoloDock rechecks the verified container ID, start time, restart count, and policy: Healthy requires Running and Healthy, Running/Disabled require Running, and Completed requires Exited with exit code zero. A known unhealthy candidate enters compensation; uncertain identity or observation retains recovery facts. This final check does not repeat the stable window or guarantee future container health.
+
 ## Failure recovery and rollback
 
 When candidate identity, apply, or health fails deterministically and the scene is proven to belong to that candidate, SoloDock enters one compensation path. With an old active release, it stops the failed candidate using the candidate release's grace period, then reapplies and re-verifies the old release. Without an old active release, it first stops with the candidate grace period, executes an exact `rm --force`, and confirms the container is absent. Rollback repeats the old release's digest pull, resource/bind/data-root/candidate preflight, fixed Compose action, post-observation, and health gate rather than trusting historical YAML or an old container.
