@@ -91,7 +91,7 @@
   }
 </script>
 
-<section class="panel">
+<section class="panel cleanup-panel">
   <h2>{$t('Docker image cleanup')}</h2>
   <p class="muted">{$t('Only images from confirmed cleaned releases are considered. Every retained release and every running or stopped container protects its images, including containers outside SoloDock.')}</p>
   <p class="security-note">{$t('Docker reported size is an upper estimate, not guaranteed reclaimed space or proof of ownership. Cleanup never removes containers, volumes, networks, or parent images and never forces deletion.')}</p>
@@ -99,15 +99,33 @@
   {#if preview}
     <p>{$t('Protected images')}: {preview.protected_count}</p>
     {#if !preview.candidates.length}<p>{$t('No unused images are eligible for cleanup.')}</p>{/if}
-    {#each preview.candidates as item}
-      <label class="checkbox-row"><input type="checkbox" bind:group={selected} value={item.image_id} disabled={busy || !!retry} /><span><code>{item.image_id}</code> · {item.platform_os}/{item.platform_architecture}{item.platform_variant ? `/${item.platform_variant}` : ''} · {$t('Docker reported bytes')}: {item.reported_size_bytes}</span></label>
-    {/each}
-    <label class="checkbox-row"><input type="checkbox" bind:checked={acknowledge} disabled={busy || !!retry} />{$t('I confirm removal of only the selected unused images. This is separate from artifact cleanup.')}</label>
-    <button class="button danger" disabled={busy || !acknowledge || !selected.length} onclick={apply}>{retry ? $t('Confirm the same image cleanup') : $t('Remove selected images')}</button>
+    {#if preview.candidates.length}
+      <ul class="cleanup-candidates">
+        {#each preview.candidates as item}
+          <li>
+            <label class="checkbox">
+              <input type="checkbox" bind:group={selected} value={item.image_id} disabled={busy || !!retry} />
+              <span class="cleanup-item">
+                <code>{item.image_id}</code>
+                <span class="muted">{item.platform_os}/{item.platform_architecture}{item.platform_variant ? `/${item.platform_variant}` : ''} · {$t('Docker reported bytes')}: {item.reported_size_bytes}</span>
+              </span>
+            </label>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+    <label class="checkbox"><input type="checkbox" bind:checked={acknowledge} disabled={busy || !!retry} /><span>{$t('I confirm removal of only the selected unused images. This is separate from artifact cleanup.')}</span></label>
   {/if}
   {#if result}
-    <p role="status">{result.status === 'completed' ? $t('Selected image cleanup confirmed.') : $t('Some images were retained. Scan again before any new cleanup.')}</p>
-    <ul>{#each result.items as item}<li><code>{item.image_id}</code> · {item.status === 'removed' ? $t('Removed') : $t('Retained')}</li>{/each}</ul>
+    <div class="notice cleanup-result">
+      <p role="status">{result.status === 'completed' ? $t('Selected image cleanup confirmed.') : $t('Some images were retained. Scan again before any new cleanup.')}</p>
+      <ul>{#each result.items as item}<li><code>{item.image_id}</code> · {item.status === 'removed' ? $t('Removed') : $t('Retained')}</li>{/each}</ul>
+    </div>
   {/if}
-  <button class="button secondary" disabled={busy || !!retry} onclick={scan}>{$t('Scan unused Docker images')}</button>
+  <div class="actions">
+    {#if preview}
+      <button class="danger" disabled={busy || !acknowledge || !selected.length} onclick={apply}>{retry ? $t('Confirm the same image cleanup') : $t('Remove selected images')}</button>
+    {/if}
+    <button class:ghost={preview !== null} disabled={busy || !!retry} onclick={scan}>{$t('Scan unused Docker images')}</button>
+  </div>
 </section>
