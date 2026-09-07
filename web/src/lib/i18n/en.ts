@@ -382,7 +382,7 @@ export const en = {
   'Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.': 'Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.',
   'Configuration validation failed. Check Docker/Compose status and try again.': 'Configuration validation failed. Check Docker/Compose status and try again.',
   'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.': 'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.',
-  'The configuration was saved but refresh failed. Reopen the application page to load the latest revision.': 'The configuration was saved but refresh failed. Reopen the application page to load the latest revision.',
+  'The configuration was saved, but refreshing the application failed. Your edits and saved revision are retained; retry loading the latest application state.': 'The configuration was saved, but refreshing the application failed. Your edits and saved revision are retained; retry loading the latest application state.',
   'The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.': 'The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.',
   'The lifecycle operation succeeded, but refreshing the application failed. Reload the page to see the latest state.': 'The lifecycle operation succeeded, but refreshing the application failed. Reload the page to see the latest state.',
   'Back to console': 'Back to console',

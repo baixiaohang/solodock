@@ -60,6 +60,8 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 - proof-aware idempotency cleanup：current webhook proof retention、旧创建 proof 已过期后的 rotate/revoke recovery、确定性的 inventory/transition 串行化、finalizer 失败超过 24 小时后的 restart 收敛、canonical pre-metadata crash 保留、metadata/revision/route/operation/status/response identity 异常时 fail closed，以及 100 条 terminal batch 上限；
 - secret canary 不进入 API、SSE、audit、tracing、error、Compose、release、SQLite 或 argv；
 - degraded inventory保留旧 redactor，冷启动不完整 inventory fail closed。
+- 草稿保存回归通过延迟响应并继续编辑，验证后续请求使用已确认 revision，刷新失败时也如此；真实外部 revision 仍产生冲突。敏感行测试覆盖并发 keep/replace/delete、重命名、类型转换以及仅清空已提交值。无效批量原文和模式在切页签重挂载后保留，覆盖保存等待期间的组合场景；修正前保存和预检均被阻止。
+- tombstone 临时目录测试验证：`.trash` 为符号链接、权限不安全或 marker 身份不符时，在读取 metadata 或删除目标前拒绝，外部哨兵文件保持完整；正常删除和 rename/fsync 恢复仍有覆盖。
 
 ### Filesystem 与恢复
 

@@ -66,6 +66,8 @@ terminal replay record 通常在 24 小时后过期，但清理是低频 service
 
 `POST /api/v1/apps` 只接受 1–20 字符的不可变 `slug` 并返回 `UNCONFIGURED` 应用。首次 draft mutation 接受 `expected_revision: null`，以后必须提交精确 UUID；两种路径共享 revision/idempotency guard。Draft 输入包含 `1..=600` 的 `stop_grace_period_seconds`（缺失默认 `10`）、新 revision 默认启用的 `owned_default_network`/`service_discovery_enabled` 和结构化 external attachment。Compose 预检返回最终停机宽限、network mode、attachment、platform DNS alias、warning 与版本化资源 identity。
 
+草稿编辑器在保存期间继续允许输入。确认成功后，当前编辑会话使用响应中的 `app.config_revision` 推进基准，并同步已保存 Secret/文件基准，保留等待期间新增的输入。只有仍与提交值匹配的敏感输入才会清空，后续保存相对已确认 revision 生成 keep/replace/delete。后续读取失败时仍保留 revision 和输入，并标明应用事实尚未刷新；读取到外部修改产生的其他 revision 仍需处理冲突，结果未知的请求不会推进基准。普通环境变量批量原文（包括非法行）、编辑模式和校验错误在同一编辑会话内切换页签后保留。预检成功与错误响应仅作用于发起该请求且输入未变化的编辑会话。保存和预检校验当前原文；显式重新载入草稿或开始新编辑会话会重置原文。
+
 `GET /api/v1/app-presets` 只返回版本化公开 descriptor；`POST /api/v1/apps/from-preset` 以 write-only 变量生成正常 revision。PostgreSQL v1 支持 major 18/17，分别挂载 `/var/lib/postgresql` 与 `/var/lib/postgresql/data`，不使用 `latest`，且 response 不回显密码。Web 随后以独立稳定幂等键调用现有 deployment mutation；创建成功而部署失败时保留可恢复应用。
 
 `POST /api/v1/images/inspect-config` 复用 Registry credential 与 manifest resolver，验证 config blob digest/大小/media type，只投影 exposed ports、volume targets、healthcheck presence、user 和 stop signal。Web 通过统一的 JSON/CSRF mutation helper 发起这个只读 POST，并原样提交当前选择的 credential reference；它不需要 durable idempotency ledger。API 不返回 image Env、labels、entrypoint/command，不写 revision；用户明确采用建议后仍走正常 draft mutation。

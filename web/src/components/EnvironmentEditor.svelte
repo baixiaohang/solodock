@@ -14,10 +14,10 @@
     rows = $bindable(),
     issues = [],
     clientIssue = $bindable<FormIssue | null>(null),
+    mode = $bindable<'rows' | 'text'>('rows'),
+    batchText = $bindable(''),
     onStructureChange,
-  }: { rows: EnvironmentRow[]; issues?: FormIssue[]; clientIssue?: FormIssue | null; onStructureChange?: (path: string) => void } = $props()
-  let mode = $state<'rows' | 'text'>('rows')
-  let batchText = $state('')
+  }: { rows: EnvironmentRow[]; issues?: FormIssue[]; clientIssue?: FormIssue | null; mode?: 'rows' | 'text'; batchText?: string; onStructureChange?: (path: string) => void } = $props()
 
   function remove(row: EnvironmentRow) {
     if (row.originalKey !== null) row.removed = true

@@ -50,7 +50,7 @@ describe('app detail resource identity', () => {
       if (url.endsWith('/webhook')) return new Response('{}', { status: 404 })
       if (url.endsWith(`/apps/${app.id}/draft`) && init?.method === 'PUT') {
         saved = JSON.parse(String(init.body)) as Record<string, unknown>
-        return new Response('{}', { status: 200 })
+        return new Response(JSON.stringify({ app: { config_revision: 'revision-two' } }), { status: 200 })
       }
       if (url.endsWith(`/apps/${app.id}`)) return new Response(JSON.stringify(app), { status: 200 })
       throw new Error(`unexpected request: ${url}`)
@@ -306,8 +306,13 @@ describe('current configuration input submission', () => {
     const user = userEvent.setup()
     await user.click(screen.getByRole('button', { name: '配置' }))
     await user.click(screen.getByRole('button', { name: '批量文本' }))
-    const text = screen.getByLabelText('批量普通环境变量')
+    let text = screen.getByLabelText('批量普通环境变量')
     await user.clear(text); await user.click(text); await user.paste('PUBLIC=new\nINVALID')
+    await user.click(screen.getByRole('button', { name: '概览' }))
+    await user.click(screen.getByRole('button', { name: '配置' }))
+    text = screen.getByLabelText('批量普通环境变量')
+    expect(text).toHaveProperty('value', 'PUBLIC=new\nINVALID')
+    expect(text.getAttribute('aria-invalid')).toBe('true')
     await user.type(screen.getByLabelText('Secret 值'), 'replacement')
     for (const name of ['保存新 revision', '仅预检']) await user.click(screen.getByRole('button', { name }))
     expect(requests).toHaveLength(0)
