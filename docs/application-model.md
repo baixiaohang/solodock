@@ -48,7 +48,7 @@ On the host, the state root, application directory, config revision, and `files/
 
 Compose still mounts every managed file with `read_only: true`, so the container cannot write to the host inode. Persistent writable content must use a volume or an explicitly confirmed read-write bind, not managed files that bypass secret, quota, or immutable-release semantics. Publication writes into a private temporary revision, applies the final mode, and fsyncs before the revision becomes atomically visible. Before deployment, the strict loader rejects mode, owner, file-type, or symlink drift and returns the configuration- or release-invalid error appropriate to that deployment phase.
 
-Managed file contentuses multiline text fields and preserves indentation, blank lines, and trailing newlines. Newly entered secret file text is visible while editing; stored secrets are never returned, empty stored-secret input keeps its value, and successful saving clears replacement inputs.
+Managed file content uses multiline text fields and preserves indentation, blank lines, and trailing newlines. Newly entered secret file text is visible while editing; stored secrets are never returned, empty stored-secret input keeps its value, and successful saving clears replacement inputs.
 
 ## Ports, volumes, binds, and networks
 
