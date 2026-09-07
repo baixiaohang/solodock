@@ -22,6 +22,8 @@ secret 为 write-only：本项目拥有的 buffer 会 zeroize，secret 不进入
 
 受管 state reader 在拼接或读取 leaf 前先验证来自 metadata 的文件名；root-relative 路径只接受普通组件，拒绝 `.`、`..`、absolute/prefix 和 symlink boundary。HMAC 负责内容完整性，不被当作延迟执行的路径消毒器；路径不合法时必须在读取目标内容前 fail closed。
 
+应用 tombstone 位于配置的 apps 根目录下，目录名由已解析的应用 UUID 和操作 UUID 按规范格式生成。读取 marker/metadata 前，以及递归删除前，SoloDock 都会检查从 apps 根目录经 `.trash` 到指定 tombstone 的私有目录链。符号链接、异常节点类型、不安全的属主或权限均被拒绝，marker 和 metadata 身份仍必须一致。此检查补充现有 durable 操作证明和 fsync 顺序，不承诺隔离服务用户或 host root 持续并发修改文件系统的行为。共享 Axum `State<AppState>` 提供服务端配置的存储根目录，不是 HTTP 提交的路径。
+
 部署只信任严格解析并校验 digest/header/body/platform 的 Registry 结果，不验证 Cosign/Sigstore 签名。tag race 不能改变已调度 candidate，但 Registry/镜像供应链仍可能提供恶意内容。容器 capabilities、mount 和 Compose 由 typed generator 限制；bind allowlist 和 Docker data-root overlap 每次 effect 前 fail closed。
 
 拥有 read-write bind 的受管容器在该 source 范围内属于不可信宿主文件系统 writer。因此，SoloDock 会拒绝这个 source 成为另一 bind source 严格祖先的任何计划。同一应用替换时，系统先停止并确认 exact writer，再 fresh 解析和复核 bind；另一应用中的冲突 writer 会阻止 start-like action，且绝不会被自动停止。这关闭了受管 SIGTERM path-swap 窗口，但不承诺抵御 host root 或能并发修改 allowed path 的独立进程。

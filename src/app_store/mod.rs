@@ -19,7 +19,9 @@ use crate::domain::{
     APP_METADATA_SCHEMA_VERSION, AppMetadata, DesiredState, NormalizedDraft,
     RESOURCE_NAME_SCHEMA_CURRENT, RESOURCE_NAME_SCHEMA_LEGACY, validate_slug_for_resource_schema,
 };
-use crate::security::permissions::{PermissionError, check_private, ensure_private_directory};
+use crate::security::permissions::{
+    PermissionError, check_private, check_private_tree, ensure_private_directory,
+};
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -345,7 +347,7 @@ impl AppStore {
         operation_id: Uuid,
     ) -> Result<AppMetadata, StoreError> {
         let path = self.tombstone_path(app_id, operation_id);
-        crate::security::permissions::check_private(&path, true)?;
+        check_private_tree(&self.apps_directory, &path, true)?;
         let marker_path = path.join("deletion.toml");
         crate::security::permissions::check_private(&marker_path, false)?;
         let marker: DeletionMarker = toml::from_str(&fs::read_to_string(marker_path)?)
@@ -367,6 +369,7 @@ impl AppStore {
         let path = self.tombstone_path(app_id, operation_id);
         self.read_tombstone_metadata(app_id, operation_id)?;
         self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneFinalize)?;
+        check_private_tree(&self.apps_directory, &path, true)?;
         fs::remove_dir_all(path)?;
         self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneRemoved)?;
         sync_directory(&self.apps_directory.join(".trash"))?;
@@ -558,8 +561,7 @@ mod tests {
         assert_eq!(identity.resource_names().bridge_name, "sd-legacy");
     }
 
-    #[test]
-    fn tombstone_records_the_delete_operation_and_only_finalizes_that_entry() {
+    fn tombstone_fixture() -> (tempfile::TempDir, AppStore, Uuid, Uuid, PathBuf) {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let store = AppStore::initialize(root.path().join("apps")).unwrap();
@@ -591,6 +593,12 @@ mod tests {
         .unwrap();
         let delete_operation = Uuid::new_v4();
         let path = store.tombstone(app_id, delete_operation).unwrap();
+        (root, store, app_id, delete_operation, path)
+    }
+
+    #[test]
+    fn tombstone_records_the_delete_operation_and_only_finalizes_that_entry() {
+        let (_root, store, app_id, delete_operation, path) = tombstone_fixture();
         assert_eq!(
             store
                 .read_tombstone_metadata(app_id, delete_operation)
@@ -598,6 +606,67 @@ mod tests {
                 .last_operation_id,
             delete_operation
         );
+        store.finalize_tombstone(app_id, delete_operation).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tombstone_rejects_symlinked_trash() {
+        let (root, store, app_id, delete_operation, path) = tombstone_fixture();
+        let trash = store.apps_directory.join(".trash");
+        let outside = root.path().join("outside");
+        fs::rename(&trash, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &trash).unwrap();
+        let sentinel = outside.join(path.file_name().unwrap()).join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        assert!(
+            store
+                .read_tombstone_metadata(app_id, delete_operation)
+                .is_err()
+        );
+        assert!(store.finalize_tombstone(app_id, delete_operation).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        fs::remove_file(&trash).unwrap();
+        fs::rename(&outside, &trash).unwrap();
+        store.finalize_tombstone(app_id, delete_operation).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tombstone_rejects_unsafe_trash_permissions() {
+        let (_root, store, app_id, delete_operation, path) = tombstone_fixture();
+        let trash = store.apps_directory.join(".trash");
+        fs::set_permissions(&trash, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            store
+                .read_tombstone_metadata(app_id, delete_operation)
+                .is_err()
+        );
+        assert!(store.finalize_tombstone(app_id, delete_operation).is_err());
+        assert!(path.exists());
+        fs::set_permissions(&trash, fs::Permissions::from_mode(0o700)).unwrap();
+        store.finalize_tombstone(app_id, delete_operation).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn tombstone_rejects_mismatched_marker_identity() {
+        let (_root, store, app_id, delete_operation, path) = tombstone_fixture();
+        let marker = path.join("deletion.toml");
+        let original = fs::read(&marker).unwrap();
+        let wrong = format!(
+            "schema_version=1\napp_id='{}'\noperation_id='{delete_operation}'\n",
+            Uuid::new_v4()
+        );
+        fs::write(&marker, wrong).unwrap();
+        assert!(
+            store
+                .read_tombstone_metadata(app_id, delete_operation)
+                .is_err()
+        );
+        assert!(store.finalize_tombstone(app_id, delete_operation).is_err());
+        assert!(path.exists());
+        fs::write(&marker, original).unwrap();
         store.finalize_tombstone(app_id, delete_operation).unwrap();
         assert!(!path.exists());
     }

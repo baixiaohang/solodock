@@ -12,7 +12,7 @@
   import { encodeWebhookSecret } from '../lib/webhookSecret'
   import { networkDraft, networkEditorError, networkEditorState } from '../lib/networks'
   import { formatTimestamp, timeSettings } from '../lib/time'
-  import type { AppDetailResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, HealthConfigurationLimits, RegistryCredential, SettingsResponse, StatsSample, WebhookStatus } from '../lib/types'
+  import type { AppDetailResponse, AppMutationResponse, ComposePlan, DeletionPreviewResponse, Deployment, DeploymentPage, DraftInput, ExternalNetworkAttachment, HealthConfigurationLimits, RegistryCredential, SettingsResponse, StatsSample, WebhookStatus } from '../lib/types'
   import LogsPane from '../components/LogsPane.svelte'
   import DeletionWebhookNotice from '../components/DeletionWebhookNotice.svelte'
   import NetworkEditor from '../components/NetworkEditor.svelte'
@@ -23,6 +23,7 @@
   import ManagedFileEditor from '../components/ManagedFileEditor.svelte'
   import ImageSuggestions from '../components/ImageSuggestions.svelte'
   import { buildEnvironmentProjection, clearSensitiveEnvironmentValues, environmentRowsFromDraft, type EnvironmentRow } from '../lib/environmentRows'
+  import { acceptEnvironmentSave, acceptManagedFileSave, submittedDraftRows } from '../lib/draftSaveState'
   import { buildManagedFileProjection, managedFileRowsFromDraft, type ManagedFileRow } from '../lib/managedFileRows'
   import { errorPresentation, errorPresentationText, FormValidationError, issuesUnder, remapIndexedIssues, type ErrorPresentation, type FormIssue } from '../lib/formErrors'
   let { appId }: { appId: string } = $props()
@@ -44,8 +45,11 @@
   let editSession = $state(0)
   let editChanges = 0
   let editRevision = $state<string | null>(null)
+  let observedDraftRevision = $state<string | null>(null)
+  let editEnvironmentMode = $state<'rows' | 'text'>('rows')
+  let editEnvironmentText = $state('')
   let editOriginallyAutoDeploy = false
-  let draftConflict = $derived(editing && app !== null && app.draft_revision !== editRevision)
+  let draftConflict = $derived(editing && app !== null && observedDraftRevision !== editRevision)
   let loading = $state(true)
   let loadError = $state<MessageKey | null>(null)
   let credentialsReady = false
@@ -149,7 +153,7 @@
     loadTimeout = timeout
     loading = !app
     const application = api<AppDetailResponse>(`/api/v1/apps/${appId}`, { signal: controller.signal }).then((value) => {
-      if (current()) { app = value; loadError = null; loading = false }
+      if (current()) { app = value; observedDraftRevision = value.draft_revision; loadError = null; loading = false }
     }).catch((cause) => {
       if (current()) {
         loading = false
@@ -330,6 +334,7 @@
   }
   function startEditing() {
     if (!app) return
+    editEnvironmentMode = 'rows'; editEnvironmentText = ''
     editSession++
     editChanges = 0
     editRevision = app.draft_revision
@@ -356,6 +361,7 @@
     if (!app) throw new Error('missing app')
     if (!healthLimits || settingsError) throw new FormValidationError([{ path: 'health', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load backend health-check limits. Refresh and try again.') }])
     if (credentialsError) throw new FormValidationError([{ path: 'credential_ref', code: 'CAPABILITIES_UNAVAILABLE', message: localized('Could not load registry credentials. Retry before saving.') }])
+    if (environmentClientIssue) throw new FormValidationError([environmentClientIssue])
     const environmentRows = environmentEditor?.prepare() ?? editEnvironmentRows
     const unacknowledgedBind = editBinds.findIndex((bind) => !bind.readonly && !bind.acknowledge_non_rollbackable)
     if (unacknowledgedBind >= 0) throw new FormValidationError([{
@@ -396,6 +402,7 @@
     error = null
   }
   function clearFormIssuePath(path: string) {
+    validation = null
     editChanges++
     if (!formIssues.length) return
     formIssues = formIssues.filter((issue) => !(
@@ -409,6 +416,7 @@
     if (!formIssues.length) { formIssueRequestId = undefined; formPresentation = null }
   }
   function handleFormInput(event: Event) {
+    validation = null
     editChanges++
     const path = (event.target as HTMLElement).dataset.issuePath
     if (path) clearFormIssuePath(path)
@@ -448,13 +456,19 @@
     if (disposed) return
     invalidateLoad()
     actionBusy = true; error = null; formPresentation = null; formIssues = []
+    const session = editSession
+    let changes: number | undefined
     try {
-      const result = await mutation<{ plan: ComposePlan; compose_yaml: string }>(`/api/v1/apps/${appId}/validate`, { draft: buildDraft() })
-      if (disposed) return
+      const draft = buildDraft()
+      changes = editChanges
+      const result = await mutation<{ plan: ComposePlan; compose_yaml: string }>(`/api/v1/apps/${appId}/validate`, { draft })
+      if (disposed || session !== editSession || changes !== editChanges) return
       validation = result; error = null
     }
     catch (cause) {
-      if (!disposed) setFormError(cause, 'Configuration validation failed. Check Docker/Compose status and try again.')
+      if (!disposed && session === editSession && (changes === undefined || changes === editChanges)) {
+        setFormError(cause, 'Configuration validation failed. Check Docker/Compose status and try again.')
+      }
     } finally { if (!disposed) { actionBusy = false; scheduleRefresh() } }
   }
   async function saveDraft() {
@@ -464,31 +478,23 @@
     try {
       const request = { expected_revision: editRevision, draft: buildDraft() }
       const session = editSession
-      const changes = editChanges
-      const submittedSecrets = editEnvironmentRows.filter((row) => !row.removed && row.sensitive)
-        .map((row) => ({ id: row.id, key: row.key, value: row.value }))
-      const submittedFiles = editFileRows.filter((row) => !row.removed && row.sensitive)
-        .map((row) => ({ row, name: row.logicalName, target: row.targetPath, value: row.value }))
+      const submitted = submittedDraftRows(editEnvironmentRows, editFileRows)
       editRetry = retryIdentity(editRetry, request)
-      await mutation(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
+      const saved = await mutation<AppMutationResponse>(`/api/v1/apps/${appId}/draft`, request, { method: 'PUT', idempotencyKey: editRetry.key })
       if (disposed) return
       editRetry = undefined
       if (session === editSession) {
-        for (const submitted of submittedSecrets) {
-          const row = editEnvironmentRows.find((row) => row.id === submitted.id)
-          if (row && !row.removed && row.sensitive && row.key === submitted.key && row.value === submitted.value) row.value = ''
-        }
-        for (const submitted of submittedFiles) {
-          const row = submitted.row
-          if (editFileRows.includes(row) && !row.removed && row.sensitive && row.logicalName === submitted.name
-            && row.targetPath === submitted.target && row.value === submitted.value) row.value = ''
-        }
+        editRevision = saved.app.config_revision
+        observedDraftRevision = editRevision
+        editOriginallyAutoDeploy = request.draft.auto_deploy_enabled
+        editEnvironmentRows = acceptEnvironmentSave(editEnvironmentRows, submitted.environment)
+        editFileRows = acceptManagedFileSave(editFileRows, submitted.files)
+        validation = null
       }
       try {
-        const loaded = await load()
-        if (loaded && !disposed && session === editSession && changes === editChanges) startEditing()
+        await load()
       } catch {
-        if (!disposed) error = localized('The configuration was saved but refresh failed. Reopen the application page to load the latest revision.')
+        if (!disposed) error = localized('The configuration was saved, but refreshing the application failed. Your edits and saved revision are retained; retry loading the latest application state.')
       }
     } catch (cause) {
       if (!disposed) {
@@ -553,7 +559,7 @@
           {#if editAutoDeploy}<p class="notice warning">{$t('When enabled, a new digest automatically replaces the container and restores the old release if health checks fail. Volume and bind data do not roll back. Disabling does not cancel deployments that are already durably claimed.')}</p>{/if}
           <label>{$t('Registry credential')}<select data-issue-path="credential_ref" bind:value={editCredential} disabled={credentialsError}>{#if editCredential && !matchingCredentials.some((credential) => credential.id === editCredential)}<option disabled value={editCredential}>{editCredential}</option>{/if}<option value={null}>{$t('Anonymous')}</option>{#each matchingCredentials as credential}<option value={credential.id}>{credential.registry} · {credential.username}</option>{/each}</select></label>
           <ImageSuggestions image={editImage} credentialRef={editCredential} bind:ports={editPorts} bind:volumes={editVolumes} onStructureChange={clearFormIssuePath} />
-          {#key editSession}<EnvironmentEditor bind:this={environmentEditor} bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />{/key}
+          {#key editSession}<EnvironmentEditor bind:this={environmentEditor} bind:mode={editEnvironmentMode} bind:batchText={editEnvironmentText} bind:rows={editEnvironmentRows} bind:clientIssue={environmentClientIssue} issues={issuesUnder(formIssues, 'environment')} onStructureChange={clearFormIssuePath} />{/key}
           <ManagedFileEditor bind:rows={editFileRows} issues={issuesUnder(formIssues, 'files')} onStructureChange={clearFormIssuePath} />
           <PortEditor bind:ports={editPorts} issues={issuesUnder(formIssues, 'ports')} onStructureChange={clearFormIssuePath} />
           <StorageEditor bind:volumes={editVolumes} bind:binds={editBinds} {allowedBindRoots} issues={[...issuesUnder(formIssues, 'volumes'), ...issuesUnder(formIssues, 'binds')]} onStructureChange={clearFormIssuePath} />

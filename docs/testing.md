@@ -60,6 +60,8 @@ Bind fixtures must be within the run's private temporary root. Cleanup must not 
 - Proof-aware idempotency cleanup: current webhook proof retention; rotate/revoke recovery after the old creation proof has expired; deterministic inventory-versus-transition serialization; more than 24 hours of finalizer failure followed by restart convergence; canonical pre-metadata crash retention; malformed metadata/revision/route/operation/status/response identity failing closed; and the 100-record terminal batch bound.
 - A secret canary never enters API, SSE, audit, tracing, errors, Compose, releases, SQLite, or argv.
 - Degraded inventory preserves the old redactor; incomplete cold-start inventory fails closed.
+- Draft-save regressions delay the response while editing, then verify the next request uses the confirmed revision even when refresh fails; a real external revision remains a conflict. Sensitive row tests cover concurrent keep/replace/delete, rename and type conversion, and clearing only submitted values. Invalid bulk text and its mode survive tab remounts, including during saving, and block both save and preflight until corrected.
+- Tombstone temporary-directory tests reject a symlinked or non-private `.trash` and mismatched marker identity before reading metadata or deleting the target; an external sentinel remains intact, and normal deletion and rename/fsync recovery remain covered.
 
 ### Filesystem and recovery
 

@@ -384,7 +384,7 @@ export const zhCN = {
   'Deployment facts changed, Registry or Docker is unavailable, or another deployment is already running.': '部署 facts 已变化、Registry/Docker 不可用或已有部署正在运行。',
   'Configuration validation failed. Check Docker/Compose status and try again.': '配置预检失败；请检查 Docker/Compose 状态后重试。',
   'Save failed. If the network result is uncertain, the same request will reuse its idempotency key.': '保存失败；网络结果不明确时，同一请求会复用幂等键。',
-  'The configuration was saved but refresh failed. Reopen the application page to load the latest revision.': '配置已保存，但刷新失败；请重新打开应用页面获取最新 revision。',
+  'The configuration was saved, but refreshing the application failed. Your edits and saved revision are retained; retry loading the latest application state.': '配置已保存，但应用刷新失败。编辑内容和已保存 revision 均已保留；请重试加载最新应用状态。',
   'The credential change succeeded, but refreshing the credential list failed. Reload the page to see the latest state.': 'Credential 变更已成功，但刷新 credential 列表失败；请重新加载页面查看最新状态。',
   'The lifecycle operation succeeded, but refreshing the application failed. Reload the page to see the latest state.': '生命周期操作已成功，但刷新应用失败；请重新加载页面查看最新状态。',
   'Back to console': '返回观察台',

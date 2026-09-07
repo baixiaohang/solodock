@@ -53,7 +53,7 @@ beforeEach(() => {
   current = application(); history = []; failures = new Map()
   read.mockReset(); write.mockReset()
   read.mockImplementation(async (path) => response(path) as never)
-  write.mockResolvedValue({} as never)
+  write.mockResolvedValue({ app: { config_revision: 'revision-two' } } as never)
   vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
 })
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks() })
@@ -230,7 +230,7 @@ describe('editing session and auxiliary cancellation boundaries', () => {
     expect(screen.getByLabelText('显示名称')).toHaveProperty('value', 'Next unsaved input')
     expect(screen.getByLabelText('批量普通环境变量')).toHaveProperty('value', 'PUBLIC=next\nINVALID')
     expect(screen.getByRole('button', { name: '保存新 revision' })).toHaveProperty('disabled', false)
-    expect(screen.getByRole('button', { name: '重新载入 draft' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: '重新载入 draft' })).toBeNull()
   })
 })
 
@@ -251,9 +251,99 @@ it.each([false, true])('clears only confirmed submitted sensitive values while p
     await fireEvent.input(file, { target: { value: 'unsubmitted\nfile\n' } })
   }
   current.draft_revision = 'revision-two'
-  await act(async () => { finish?.({}) }); await settle()
+  await act(async () => { finish?.({ app: { config_revision: 'revision-two' } }) }); await settle()
   expect(screen.getByLabelText('显示名称')).toHaveProperty('value', 'Unsaved next name')
   expect(secret).toHaveProperty('value', replaceDuringSave ? 'unsubmitted-token' : '')
   expect(file).toHaveProperty('value', replaceDuringSave ? 'unsubmitted\nfile\n' : '')
+  expect(screen.queryByRole('button', { name: '重新载入 draft' })).toBeNull()
+  write.mockResolvedValue({ app: { config_revision: 'revision-three' } } as never)
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  expect(write.mock.calls[1][1]).toMatchObject({ expected_revision: 'revision-two', draft: {
+    environment: { secrets: [{ key: 'TOKEN', operation: replaceDuringSave ? 'replace' : 'keep' }] },
+    files: [{ logical_name: 'key', operation: replaceDuringSave ? 'replace' : 'keep' }],
+  } })
+})
+
+it.each(['success', 'refresh failure', 'external revision'])('advances the confirmed save baseline with concurrent edits (%s)', async (outcome) => {
+  await mount(); await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  let finish: ((value: unknown) => void) | undefined
+  write.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }) as never)
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  await fireEvent.input(screen.getByLabelText('显示名称'), { target: { value: 'Next name' } })
+  current.draft_revision = outcome === 'external revision' ? 'revision-three' : 'revision-two'
+  if (outcome === 'refresh failure') failures.set('/api/v1/apps/app-id', new Error('offline'))
+  await act(async () => { finish?.({ app: { config_revision: 'revision-two' } }) }); await settle()
+  expect(screen.getByLabelText('显示名称')).toHaveProperty('value', 'Next name')
+  expect(screen.queryByRole('button', { name: '重新载入 draft' }) !== null).toBe(outcome === 'external revision')
+  if (outcome === 'external revision') write.mockRejectedValueOnce(conflict())
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  expect(write.mock.calls[1][1]).toMatchObject({ expected_revision: 'revision-two', draft: { display_name: 'Next name' } })
+  if (outcome === 'external revision') expect(screen.getByRole('button', { name: '重新载入 draft' })).toBeTruthy()
+})
+
+it('preserves invalid bulk text entered during saving across tab remounts and blocks stale submission', async () => {
+  await mount(); await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  let finish: ((value: unknown) => void) | undefined
+  write.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }) as never)
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  await fireEvent.click(screen.getByRole('button', { name: '批量文本' }))
+  await fireEvent.input(screen.getByLabelText('批量普通环境变量'), { target: { value: 'PUBLIC=new\nINVALID' } })
+  await fireEvent.click(screen.getByRole('button', { name: '概览' }))
+  current.draft_revision = 'revision-two'
+  await act(async () => { finish?.({ app: { config_revision: 'revision-two' } }) }); await settle()
+  await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  expect(screen.getByLabelText('批量普通环境变量')).toHaveProperty('value', 'PUBLIC=new\nINVALID')
+  for (const name of ['保存新 revision', '仅预检']) { await fireEvent.click(screen.getByRole('button', { name })); await settle() }
+  expect(write).toHaveBeenCalledTimes(1)
+  await fireEvent.input(screen.getByLabelText('批量普通环境变量'), { target: { value: 'PUBLIC=new' } })
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  expect(write.mock.calls[1][1]).toMatchObject({ expected_revision: 'revision-two', draft: { environment: { public: [{ key: 'PUBLIC', value: 'new' }] } } })
+})
+
+it('does not adopt a revision from refresh after an unknown save and reuses the unchanged retry identity', async () => {
+  await mount(); await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  write.mockRejectedValue(new TypeError('offline'))
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  current.draft_revision = 'revision-two'
+  await poll()
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  expect(write.mock.calls[1][1]).toMatchObject({ expected_revision: 'revision-one' })
+  expect(write.mock.calls[1][2]).toEqual(write.mock.calls[0][2])
   expect(screen.getByRole('button', { name: '重新载入 draft' })).toBeTruthy()
+})
+
+it('does not overwrite a new editing session when a cancelled session finishes saving', async () => {
+  await mount(); await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  let finish: ((value: unknown) => void) | undefined
+  write.mockImplementationOnce(() => new Promise((resolve) => { finish = resolve }) as never)
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  await fireEvent.click(screen.getByRole('button', { name: '取消' }))
+  await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  await fireEvent.input(screen.getByLabelText('显示名称'), { target: { value: 'New session' } })
+  current.draft_revision = 'revision-two'
+  await act(async () => { finish?.({ app: { config_revision: 'revision-two' } }) }); await settle()
+  expect(screen.getByLabelText('显示名称')).toHaveProperty('value', 'New session')
+  expect(screen.getByRole('button', { name: '重新载入 draft' })).toBeTruthy()
+  await fireEvent.click(screen.getByRole('button', { name: '保存新 revision' })); await settle()
+  expect(write.mock.calls[1][1]).toMatchObject({ expected_revision: 'revision-one' })
+})
+
+it.each([false, true])('ignores a late preflight rejection after editing or starting a new session (new session: %s)', async (newSession) => {
+  await mount(); await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  let reject: ((cause: unknown) => void) | undefined
+  write.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail }) as never)
+  await fireEvent.click(screen.getByRole('button', { name: '仅预检' })); await settle()
+  if (newSession) {
+    await fireEvent.click(screen.getByRole('button', { name: '取消' }))
+    await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+  } else {
+    await fireEvent.input(screen.getByLabelText('显示名称'), { target: { value: 'New input' } })
+  }
+  await act(async () => { reject?.(new ApiError(422, {
+    code: 'CONFIG_INVALID', message: 'Old preflight error', request_id: 'old-preflight',
+    issues: [{ path: 'display_name', code: 'INVALID_NAME', message: 'Old preflight error' }],
+  }, 'known_not_applied')) }); await settle()
+  expect(screen.queryByText(/Old preflight error/)).toBeNull()
+  expect(screen.getByLabelText('显示名称').getAttribute('aria-invalid')).toBeNull()
+  expect(screen.getByRole('button', { name: '仅预检' })).toHaveProperty('disabled', false)
 })
