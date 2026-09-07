@@ -487,3 +487,81 @@ async fn terminal_interrupted_deployment_is_history_after_successful_unregistrat
         .unwrap();
     assert_eq!(status, "interrupted");
 }
+
+#[tokio::test]
+#[cfg(feature = "docker-e2e")]
+async fn replay_with_damaged_tombstone_keeps_background_recovery_pending() {
+    use solodock::app_store::cleanup::CleanupFault;
+    let (h, app, request, _) = fixture().await;
+    h.store
+        .fail_cleanup_once(CleanupFault::AppTombstoneFinalize);
+    let route = format!("/api/v1/apps/{app}");
+    let key = "unregistration-damaged-replay";
+    assert_eq!(
+        h.mutate("DELETE", &route, Some(key), &request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let tombstones = h.store.tombstones().unwrap();
+    assert_eq!(tombstones.len(), 1);
+    let (app_id, operation_id) = tombstones[0];
+    let marker = h
+        .store
+        .tombstone_path(app_id, operation_id)
+        .join("deletion.toml");
+    let original = std::fs::read(&marker).unwrap();
+    std::fs::write(&marker, "invalid marker").unwrap();
+    let services = h.state.m3.as_ref().unwrap();
+    assert_eq!(
+        h.mutate("DELETE", &route, Some(key), &request)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(services.projection_degraded.load(Ordering::Acquire));
+    assert_eq!(std::fs::read(&marker).unwrap(), b"invalid marker");
+    let finalized: bool = sqlx::query_scalar(
+        "SELECT finalized FROM app_unregistrations WHERE app_id=? AND operation_id=?",
+    )
+    .bind(app_id.to_string())
+    .bind(operation_id.to_string())
+    .fetch_one(h.database.pool())
+    .await
+    .unwrap();
+    assert!(!finalized);
+    previews(
+        &h,
+        StatusCode::CONFLICT,
+        Some("CLEANUP_INVENTORY_INCOMPLETE"),
+    )
+    .await;
+    std::fs::write(&marker, original).unwrap();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let worker =
+        solodock::api::mutations::start_projection_reconciler(h.state.clone(), cancel.clone());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let finalized: bool = sqlx::query_scalar(
+                "SELECT finalized FROM app_unregistrations WHERE app_id=? AND operation_id=?",
+            )
+            .bind(app_id.to_string())
+            .bind(operation_id.to_string())
+            .fetch_one(h.database.pool())
+            .await
+            .unwrap();
+            if finalized {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    cancel.cancel();
+    worker.await.unwrap();
+    assert!(!services.projection_degraded.load(Ordering::Acquire));
+    assert!(h.store.tombstones().unwrap().is_empty());
+    assert_eq!(receipt_count(&h).await, 1);
+    previews(&h, StatusCode::OK, None).await;
+}

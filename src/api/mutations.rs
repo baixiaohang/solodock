@@ -2494,18 +2494,25 @@ pub async fn delete_app(
     } = claim
     {
         let _catalog = services.coordinator.catalog_lock().await;
-        let tombstone = services.store.tombstone_path(app_id, operation_id);
-        if std::fs::symlink_metadata(&tombstone).is_ok()
-            || services
-                .idempotency
-                .succeeded_app_tombstones(&services.store)
-                .await
-                .is_ok_and(|pending| pending.contains(&(app_id, operation_id)))
+        match services
+            .idempotency
+            .succeeded_app_tombstones(&services.store)
+            .await
         {
-            let publication = publish_deletion(&state, services, app_id).await;
-            finalize_deletion_or_reconcile(services, app_id, operation_id, &publication).await;
-        } else {
-            let _ = refresh(&state, services).await;
+            Ok(pending) if pending.contains(&(app_id, operation_id)) => {
+                let publication = publish_deletion(&state, services, app_id).await;
+                finalize_deletion_or_reconcile(services, app_id, operation_id, &publication).await;
+            }
+            Ok(_) => {
+                let _ = refresh(&state, services).await;
+            }
+            Err(_) => {
+                let _ = refresh(&state, services).await;
+                // Catalog refresh does not inspect trash. Preserve recovery
+                // work when its separate proof inventory remains unreadable.
+                services.projection_degraded.store(true, Ordering::Release);
+                services.reconcile_notify.notify_one();
+            }
         }
         return replay_recorded(status, body);
     }
