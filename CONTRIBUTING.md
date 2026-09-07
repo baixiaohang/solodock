@@ -1,14 +1,14 @@
 # Contributing to SoloDock
 
-Thank you for improving SoloDock. Before proposing a change, read the [product scope](docs/product-scope.md), [architecture](docs/architecture.md), and [threat model](docs/threat-model.md). Preserve the single-host, single-administrator, single-service application model and its existing security boundaries.
+Thank you for improving SoloDock. Read the [product scope](docs/product-scope.md) when changing product boundaries, the [architecture](docs/architecture.md) for structural changes, and the [threat model](docs/threat-model.md) for security-sensitive work. Preserve the single-host, single-administrator, single-service application model and its existing security boundaries.
 
 Repository documentation and GitHub-visible collaboration use English. Simplified Chinese files under `docs/zh-CN/` and `README.zh-CN.md` are translations; the English versions are authoritative.
 
 ## Development workflow
 
 1. Create a short-lived branch from the latest `main`.
-2. Keep the change small and reviewable. Behavior changes should add deterministic tests at the lowest useful layer and update both language versions of affected documentation.
-3. Run only the local validation directly related to the change. Docker E2E must use an isolated daemon or an explicit test context.
+2. Keep the change small and reviewable. Add deterministic tests at the lowest useful layer for behavior changes with coverage gaps, and update both language versions of affected documentation.
+3. Start with the smallest relevant local validation; broaden safe checks only when changes, failures, or unresolved concerns justify it. Host Docker E2E requires an explicit maintainer request and must use an isolated daemon or an explicit test context.
 4. Open a Pull Request in English and describe the behavior, risks, security or data impact, documentation synchronization, and validation performed.
 5. Wait for `ci-gate` and all other required checks, then resolve review feedback. Workflows from external forks require maintainer approval before they run.
 

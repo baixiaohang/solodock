@@ -28,7 +28,9 @@ npm run check
 npm run build
 ```
 
-Run the smallest validation directly related to the change. Do not run the complete suite or host Docker E2E unless the maintainer explicitly requests it.
+Start with the smallest validation directly related to the change. Broaden or repeat safe local checks only when new changes, failures, or unresolved concerns justify it. Documentation-only changes do not require application tests by default; see [documentation-change validation](docs/testing.md#documentation-change-validation). Test concurrency must not exceed 2. Report local results separately from CI; required CI checks remain applicable.
+
+Host Docker E2E requires an explicit maintainer request and the isolation and cleanup boundaries below.
 
 ## Development and security boundaries
 
@@ -43,5 +45,5 @@ Run the smallest validation directly related to the change. Do not run the compl
 
 - Keep changes small and reviewable. Do not commit generated output such as `target/`, `web/node_modules/`, or `web/dist/`.
 - Commit Rust and npm lockfiles together with dependency changes.
-- Add deterministic tests at the lowest useful layer for new behavior. Prioritize failure paths, security boundaries, and destructive operations.
+- Add deterministic tests at the lowest useful layer when behavior changes leave a coverage gap. Prioritize failure paths, security boundaries, and destructive operations.
 - Do not expand the product boundary or perform volume/data migrations without maintainer approval for the specific design.
