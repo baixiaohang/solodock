@@ -161,6 +161,8 @@ Backup helper 会从自身不可变 package generation 解析 `solodock` binary�
 
 SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。清理永远不会定时执行，也不会由磁盘阈值触发。除 active/pending/恢复事实外，每个应用还保留三个最近的回滚 release，且绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。
 
+两个清理面板都区分 `CLEANUP_RECOVERY_REFERENCE_MISSING`：某个部署仍需要已缺失的 release 或配置 revision。使用页面的 request ID 在服务日志中定位应用与部署 ID；其他清单问题保留原有保守错误分类。应用完成已验证注销后，旧 `needs_attention` 历史仍可能显示，清理不会改写历史或 attention 计数。旧数据处置见[恢复](recovery.md#已完成的应用注销)。
+
 ## 按应用选择容器安全策略
 
 应用配置可选 `security_profile`，例如 `codex-v1`；空值/null 保持 Docker 默认策略。它是**宿主机预装的策略对名称**，并非任意 Compose 安全选项。SoloDock 只给该应用的单个服务生成 `seccomp=/etc/solodock/security-profiles/<name>/seccomp.json` 和 `apparmor=solodock-<name>`。名称以小写字母开头，长 1–48 个字符，仅含小写 ASCII 字母、数字或连字符；拒绝 `unconfined`。不会添加 capabilities、宿主机 namespace 或 privileged 模式。

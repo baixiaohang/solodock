@@ -171,12 +171,59 @@ impl IdempotencyService {
         Ok(())
     }
 
+    pub async fn preserve_completed_unregistrations(
+        &self,
+        store: &crate::app_store::AppStore,
+    ) -> Result<(), IdempotencyError> {
+        crate::app_unregistration::backfill(&self.database, store).await
+    }
+
+    pub async fn validate_completed_unregistrations(
+        database: &Database,
+        store: &crate::app_store::AppStore,
+    ) -> Result<(), IdempotencyError> {
+        Self::validate_app_tombstones(database, store).await?;
+        crate::app_unregistration::completed_apps(database, store)
+            .await
+            .map(|_| ())
+    }
+
+    /// All API, startup and background finalizers publish the durable lifecycle
+    /// fact before removing the last application deletion marker.
+    pub async fn finalize_app_unregistration(
+        &self,
+        store: &crate::app_store::AppStore,
+        app_id: Uuid,
+        operation_id: Uuid,
+    ) -> Result<(), IdempotencyError> {
+        if !self
+            .succeeded_app_tombstones(store)
+            .await?
+            .contains(&(app_id, operation_id))
+        {
+            return Err(IdempotencyError::RecordInvalid);
+        }
+        let has_tombstone = store.tombstones()?.contains(&(app_id, operation_id));
+        if has_tombstone {
+            store.sync_tombstone(app_id, operation_id)?;
+        }
+        crate::app_unregistration::preserve_proof(&self.database, store, app_id, operation_id)
+            .await?;
+        if has_tombstone {
+            store.finalize_tombstone(app_id, operation_id)?;
+        }
+        crate::app_unregistration::mark_finalized(&self.database, store, app_id, operation_id)
+            .await?;
+        Ok(())
+    }
+
     pub async fn finalize_succeeded_tombstones(
         &self,
         store: &crate::app_store::AppStore,
     ) -> Result<(), IdempotencyError> {
         for (app_id, operation_id) in self.succeeded_app_tombstones(store).await? {
-            store.finalize_tombstone(app_id, operation_id)?;
+            self.finalize_app_unregistration(store, app_id, operation_id)
+                .await?;
         }
         Ok(())
     }
@@ -185,7 +232,11 @@ impl IdempotencyService {
         &self,
         store: &crate::app_store::AppStore,
     ) -> Result<Vec<(Uuid, Uuid)>, IdempotencyError> {
-        Self::validate_app_tombstones(&self.database, store).await
+        let mut result = Self::validate_app_tombstones(&self.database, store).await?;
+        result.extend(crate::app_unregistration::pending(&self.database).await?);
+        result.sort_unstable();
+        result.dedup();
+        Ok(result)
     }
 
     /// Read-only shared recovery inventory; never finalizes a deletion.
@@ -540,7 +591,7 @@ impl IdempotencyService {
         let mut tx = self.database.pool().begin().await?;
         let mut deleted = 0;
         for (rowid, operation_id) in rows {
-            deleted += sqlx::query("DELETE FROM idempotency_records WHERE rowid=? AND operation_id=? AND status IN ('succeeded','failed') AND updated_at < ? AND NOT EXISTS (SELECT 1 FROM storage_cleanup_operations c WHERE c.operation_id=idempotency_records.operation_id AND c.retirement_pending=1)")
+            deleted += sqlx::query("DELETE FROM idempotency_records WHERE rowid=? AND operation_id=? AND status IN ('succeeded','failed') AND updated_at < ? AND NOT EXISTS (SELECT 1 FROM storage_cleanup_operations c WHERE c.operation_id=idempotency_records.operation_id AND c.retirement_pending=1) AND NOT EXISTS (SELECT 1 FROM app_unregistrations u WHERE u.operation_id=idempotency_records.operation_id AND u.finalized=0)")
                 .bind(rowid)
                 .bind(operation_id.to_string())
                 .bind(&retention_cutoff)

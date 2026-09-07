@@ -298,7 +298,11 @@ pub async fn apply(
         }
         let current = match build_plan(&m3.store, &m3.database).await {
             Ok(plan) => plan,
-            Err(CleanupError::InventoryIncomplete | CleanupError::RecordInvalid) => {
+            Err(
+                CleanupError::InventoryIncomplete
+                | CleanupError::RecordInvalid
+                | CleanupError::RecoveryReferenceMissing { .. },
+            ) => {
                 return finish_error(
                     m3,
                     APPLY_ROUTE,
@@ -700,8 +704,21 @@ fn public_artifact_id(ordinal: usize, artifact: &CleanupArtifact) -> String {
     }
 }
 
-fn cleanup_error(error: CleanupError, request_id: RequestId) -> ApiError {
+pub(crate) fn cleanup_error(error: CleanupError, request_id: RequestId) -> ApiError {
     match error {
+        CleanupError::RecoveryReferenceMissing {
+            app_id,
+            deployment_id,
+        } => {
+            tracing::warn!(request_id = %request_id.0, %app_id, %deployment_id,
+                code = "CLEANUP_RECOVERY_REFERENCE_MISSING", "cleanup preview rejected");
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "CLEANUP_RECOVERY_REFERENCE_MISSING",
+                "A deployment recovery reference is missing; cleanup is blocked",
+                request_id,
+            )
+        }
         CleanupError::InventoryIncomplete | CleanupError::RecordInvalid => ApiError::new(
             StatusCode::CONFLICT,
             "CLEANUP_INVENTORY_INCOMPLETE",

@@ -131,21 +131,15 @@ bind fixture 必须位于本次测试私有临时根；cleanup 不得把“数�
 
 ## 文档变更验证
 
-纯文档 PR 至少执行：
+纯文档 PR 运行 `git diff --check`，并检查受影响文档：
 
-```bash
-git diff --check
-rg -n "proposals/" README.md README.zh-CN.md docs --glob '!testing.md' --glob '!AGENTS.md'
-```
+- 相对 Markdown 链接，以及文档新增、删除或重命名影响的导航；
+- 修改专题文档的中英文配对与语义一致性；
+- 修改后的事实与对应 code/schema/test 一致；
+- 未重新引入已完成提案、固定测试计数或第二套事实源；
+- diff 只包含本任务授权的文档与协作文件。
 
-并人工检查：
-
-- 所有相对 Markdown 链接目标存在；
-- 每个英文专题文档都有同名 `docs/zh-CN/` 翻译，反之亦然；
-- README 能导航到当前专题；
-- 文档事实与对应 code/schema/test 一致；
-- 没有重新引入已完成 milestone、计划目录、固定测试计数或第二套事实源；
-- diff 只包含本任务授权的文档。
+文档结构调整，或发现的不一致可能超出修改文件时，再扩大全部文档链接、翻译配对、README 导航和过期提案引用的审计。纯措辞改动无需默认运行应用测试。CI 路径分类和必需检查保持不变。
 
 日常开发命令和默认验证边界见仓库根 `AGENTS.md`；运维验收与恢复演练分别见 [运维](operations.md) 和 [恢复](recovery.md)。
 
