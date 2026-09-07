@@ -80,6 +80,8 @@ pub enum CleanupError {
     Database(#[from] sqlx::Error),
     #[error("the recovery inventory is incomplete")]
     InventoryIncomplete,
+    #[error("a deployment recovery reference is missing")]
+    RecoveryReferenceMissing { app_id: Uuid, deployment_id: Uuid },
     #[error("cleanup records are invalid")]
     RecordInvalid,
 }
@@ -298,6 +300,10 @@ async fn build_plan_inner(
     protect_from_deployments(
         database,
         &releases,
+        &revisions.keys().copied().collect(),
+        &crate::app_unregistration::completed_apps(database, store)
+            .await
+            .map_err(|_| CleanupError::RecordInvalid)?,
         &mut release_protection,
         &mut revision_protection,
     )
@@ -739,10 +745,12 @@ async fn exact_item_states(
 async fn protect_from_deployments(
     database: &Database,
     releases: &[ValidRelease],
+    revisions: &HashSet<(Uuid, Uuid)>,
+    unregistered_apps: &HashSet<Uuid>,
     release_protection: &mut HashMap<(Uuid, Uuid), BTreeSet<ProtectionReason>>,
     revision_protection: &mut HashMap<(Uuid, Uuid), BTreeSet<ProtectionReason>>,
 ) -> Result<(), CleanupError> {
-    let rows = sqlx::query("SELECT id,app_id,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,predecessor_runtime_release_id,candidate_release_id,rollback_target_release_id,status FROM deployments ORDER BY created_at DESC,id DESC")
+    let rows = sqlx::query("SELECT id,app_id,requested_revision,from_release_id,expected_pending_release_id,expected_actual_release_id,predecessor_runtime_release_id,candidate_release_id,rollback_target_release_id,status,phase,completed_at FROM deployments ORDER BY created_at DESC,id DESC")
         .fetch_all(database.pool())
         .await?;
     let valid: HashSet<_> = releases
@@ -752,6 +760,23 @@ async fn protect_from_deployments(
     let mut recent: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for row in rows {
         let app_id = parse_db_uuid(row.get::<String, _>(1))?;
+        if unregistered_apps.contains(&app_id) {
+            if row.get::<&str, _>("phase") != "terminal"
+                || !matches!(
+                    row.get::<&str, _>("status"),
+                    "succeeded"
+                        | "no_op"
+                        | "failed"
+                        | "rolled_back"
+                        | "needs_attention"
+                        | "interrupted"
+                )
+                || row.get::<Option<String>, _>("completed_at").is_none()
+            {
+                return Err(CleanupError::InventoryIncomplete);
+            }
+            continue;
+        }
         let status: String = row.get(9);
         let requested_revision = parse_db_uuid(row.get::<String, _>(2))?;
         let references = [
@@ -788,6 +813,17 @@ async fn protect_from_deployments(
             status.as_str(),
             "queued" | "running" | "interrupted" | "needs_attention"
         ) {
+            if !revisions.contains(&(app_id, requested_revision))
+                || references
+                    .iter()
+                    .flatten()
+                    .any(|id| !valid.contains(&(app_id, *id)))
+            {
+                return Err(CleanupError::RecoveryReferenceMissing {
+                    app_id,
+                    deployment_id: parse_db_uuid(row.get::<String, _>(0))?,
+                });
+            }
             protect_revision(
                 revision_protection,
                 app_id,

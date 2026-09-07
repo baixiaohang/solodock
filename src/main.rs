@@ -109,6 +109,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         idempotency.integrity_key(),
         settings.allowed_bind_roots.clone(),
     )?;
+    idempotency
+        .preserve_completed_unregistrations(&app_store)
+        .await?;
+    IdempotencyService::validate_completed_unregistrations(&database, &app_store).await?;
     let cleanup_degraded =
         match solodock::storage_cleanup::finalize_succeeded(&app_store, &database).await {
             Ok(()) => false,
@@ -441,6 +445,7 @@ async fn validate_restore(
         return Err("restored application state is degraded".into());
     }
     solodock::storage_cleanup::pending_operation_count(&store, &database).await?;
+    IdempotencyService::validate_completed_unregistrations(&database, &store).await?;
     solodock::image_cleanup::validate_operations(&database).await?;
     let webhooks = WebhookStore::new(store.clone(), key.clone());
     for app in &report.valid_apps {

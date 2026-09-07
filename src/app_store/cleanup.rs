@@ -21,6 +21,10 @@ pub const CLEANUP_TRASH_DIRECTORY: &str = ".cleanup-trash";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CleanupFault {
+    AppTombstoneRenamed,
+    AppTombstoneSync,
+    AppTombstoneFinalize,
+    AppTombstoneRemoved,
     MarkerPublished,
     Rename,
     SourceSync,
@@ -99,7 +103,7 @@ impl AppStore {
         *self.cleanup_fault.lock().expect("cleanup fault lock") = Some(point);
     }
 
-    fn cleanup_checkpoint(&self, point: CleanupFault) -> Result<(), StoreError> {
+    pub(super) fn cleanup_checkpoint(&self, point: CleanupFault) -> Result<(), StoreError> {
         #[cfg(any(test, feature = "docker-e2e"))]
         {
             let mut fault = self.cleanup_fault.lock().expect("cleanup fault lock");

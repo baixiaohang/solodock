@@ -1,6 +1,7 @@
 import type { Messages } from './en'
 
 export const zhCN = {
+  'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.': '部署恢复引用缺失，解决后才能执行清理。',
   'Removed': '已删除',
   'Retained': '已保留',
   'Docker image cleanup': 'Docker 镜像清理',

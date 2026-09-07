@@ -842,7 +842,7 @@ async fn publish_deletion(
     }
 }
 
-fn finalize_deletion_or_reconcile(
+async fn finalize_deletion_or_reconcile(
     services: &M3Services,
     app_id: Uuid,
     operation_id: Uuid,
@@ -850,8 +850,9 @@ fn finalize_deletion_or_reconcile(
 ) {
     let finalized = publication.can_finalize
         && services
-            .store
-            .finalize_tombstone(app_id, operation_id)
+            .idempotency
+            .finalize_app_unregistration(&services.store, app_id, operation_id)
+            .await
             .is_ok();
     if !finalized {
         // A reconciler may have repaired the projection before the
@@ -2494,9 +2495,15 @@ pub async fn delete_app(
     {
         let _catalog = services.coordinator.catalog_lock().await;
         let tombstone = services.store.tombstone_path(app_id, operation_id);
-        if std::fs::symlink_metadata(&tombstone).is_ok() {
+        if std::fs::symlink_metadata(&tombstone).is_ok()
+            || services
+                .idempotency
+                .succeeded_app_tombstones(&services.store)
+                .await
+                .is_ok_and(|pending| pending.contains(&(app_id, operation_id)))
+        {
             let publication = publish_deletion(&state, services, app_id).await;
-            finalize_deletion_or_reconcile(services, app_id, operation_id, &publication);
+            finalize_deletion_or_reconcile(services, app_id, operation_id, &publication).await;
         } else {
             let _ = refresh(&state, services).await;
         }
@@ -2647,7 +2654,7 @@ pub async fn delete_app(
             request_id,
         )
         .await?;
-        finalize_deletion_or_reconcile(services, app_id, operation_id, &publication);
+        finalize_deletion_or_reconcile(services, app_id, operation_id, &publication).await;
         return Ok(response);
     }
     if !app_directory_exists {
@@ -2992,7 +2999,7 @@ pub async fn delete_app(
         request_id,
     )
     .await?;
-    finalize_deletion_or_reconcile(services, app_id, operation_id, &publication);
+    finalize_deletion_or_reconcile(services, app_id, operation_id, &publication).await;
     Ok(response)
 }
 

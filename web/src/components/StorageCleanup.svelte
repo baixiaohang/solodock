@@ -37,7 +37,10 @@
       if (current !== generation) return
       preview = null
       error = localized('Could not create a safe storage cleanup preview.')
-      if (cause instanceof ApiError) requestId = cause.body.request_id
+      if (cause instanceof ApiError) {
+        requestId = cause.body.request_id
+        if (cause.body.code === 'CLEANUP_RECOVERY_REFERENCE_MISSING') error = localized('A deployment recovery reference is missing. Cleanup is blocked until it is resolved.')
+      }
     } finally {
       if (current === generation) scanning = false
     }

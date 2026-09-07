@@ -45,6 +45,12 @@ Legacy naming/config/release schemas remain readable and rollback-capable. Old a
 
 See [operations](operations.md) for routine installation, backup, and health checks, and [application model](application-model.md) for resource-retention and deletion semantics.
 
+## Completed application unregistrations
+
+`app_unregistrations` preserves the application ID, operation ID, source, completion timestamp, and finalization state after terminal replay GC. API retries, startup, and background recovery share the same exact-proof finalizer. A receipt-write failure retains the tombstone. A final unlink/sync failure keeps the receipt pending and protects its replay proof; recovery repeats the missing barrier before allowing cleanup. `validate-restore` validates these lifecycle facts and pending proofs. A completed receipt never permits skipping a malformed or reappeared application/tombstone.
+
+Startup may preserve a recognizable, still-retained successful deletion response for an already absent application; it does not infer unregistration from directory absence. Older operator migrations with no surviving deletion proof require separate, audited reconciliation of the exact application, historical migration evidence, live/stopped containers, and pending artifacts. An `operator_repair` record requires a matching `app_unregistration_repair` success audit with the same application and operation/request ID. Do not delete deployment history, change `needs_attention` to manufacture success, or broadly mark missing applications as unregistered.
+
 ## Cleanup recovery
 
 `.cleanup-trash/<operation UUID>` holds a signed plan marker and artifacts atomically detached by that durable plan. Do not delete, rename, or edit it. Startup/background finalization removes its payload only when the integrity marker, stored plan/items, and exact successful idempotency response all agree. Payload removal may be partial: the marker remains intact until the payload is gone and its parent is synced. The marker then moves to the exact `<operation UUID>.retired.toml` sibling until the empty operation directory is durably removed. Before retirement starts, a durable database retirement intent protects the exact terminal proof, even after the last marker is visibly unlinked. Only a successful final parent-directory sync clears that intent and the pending health state. Recovery repeats the sync if the marker is absent, or validates and retires it again if a crash restores it. Arbitrary missing markers without retirement intent or unknown trash still fail closed.

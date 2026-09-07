@@ -1,4 +1,5 @@
 export const en = {
+  'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.': 'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.',
   'Removed': 'Removed',
   'Retained': 'Retained',
   'Docker image cleanup': 'Docker image cleanup',
