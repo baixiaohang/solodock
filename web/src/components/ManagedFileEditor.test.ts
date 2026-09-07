@@ -1,5 +1,8 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen } from '@testing-library/svelte'
+import { buildManagedFileProjection, managedFileRowsFromDraft } from '../lib/managedFileRows'
+import userEvent from '@testing-library/user-event'
+import type { DraftResponse } from '../lib/types'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import ManagedFileEditor from './ManagedFileEditor.svelte'
@@ -29,4 +32,22 @@ describe('ManagedFileEditor', () => {
     expect(paths[1].getAttribute('aria-invalid')).toBe('true')
     expect(screen.getByText('文件目标不能嵌套')).toBeTruthy()
   })
+})
+
+
+it('preserves public multiline content after projection and readback while keeping stored secrets hidden', async () => {
+  const yaml = 'key:\n  value: true\n\n'
+  const draft = { files: [ { logical_name: 'config', target_path: '/config', sensitive: false, content: yaml },
+    { logical_name: 'key', target_path: '/key', sensitive: true } ] } as DraftResponse
+  const rows = managedFileRowsFromDraft(draft)
+  render(ManagedFileEditor, { rows })
+  const fields = screen.getAllByLabelText('内容')
+  expect(fields[0]).toHaveProperty('value', yaml)
+  expect(fields[1]).toHaveProperty('value', '')
+  expect(buildManagedFileProjection(rows).files[1]).toMatchObject({ operation: 'keep' })
+  const user = userEvent.setup()
+  await user.click(fields[0]); await user.clear(fields[0]); await user.paste(yaml + 'end\n')
+  const saved = buildManagedFileProjection(rows).files
+  const reloaded = managedFileRowsFromDraft({ files: saved } as DraftResponse)
+  expect(reloaded[0].value).toBe(yaml + 'end\n')
 })
