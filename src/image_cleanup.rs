@@ -146,14 +146,6 @@ pub(crate) async fn build_plan_for_operation(
     validate_operations(database).await?;
     let inventory = crate::storage_cleanup::image_protection_inventory(store, database).await?;
     let tombstones: BTreeSet<_> = store.cleanup_tombstones()?.into_iter().collect();
-    let rows = sqlx::query("SELECT c.*,o.plan_json,o.plan_hash,o.status AS operation_status,o.retirement_pending FROM cleaned_releases c JOIN storage_cleanup_operations o ON o.operation_id=c.cleanup_operation_id ORDER BY c.app_id,c.release_id LIMIT 4097")
-        .fetch_all(database.pool()).await?;
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cleaned_releases")
-        .fetch_one(database.pool())
-        .await?;
-    if rows.len() > 4096 || count != rows.len() as i64 {
-        return Err(CleanupError::InventoryIncomplete);
-    }
     let mut retained = inventory.releases;
     for operation in sqlx::query("SELECT operation_id,plan_json FROM image_cleanup_operations WHERE operation_id IN (SELECT operation_id FROM image_cleanup_items WHERE status IN ('planned','started')) ORDER BY operation_id").fetch_all(database.pool()).await? {
         let id: String = operation.get("operation_id");
@@ -171,52 +163,77 @@ pub(crate) async fn build_plan_for_operation(
         });
     }
     let mut cleaned = Vec::new();
-    for row in rows {
-        let record = CleanedReleaseRecord {
-            manifest_digest: row.get("manifest_digest"),
-            local_image_id: row.get("local_image_id"),
-            platform_os: row.get("platform_os"),
-            platform_architecture: row.get("platform_architecture"),
-            platform_variant: row.get("platform_variant"),
-        };
-        identity(&record)?;
-        let app: String = row.get("app_id");
-        let release: String = row.get("release_id");
-        let operation: String = row.get("cleanup_operation_id");
-        let operation_id = Uuid::parse_str(&operation).map_err(|_| CleanupError::RecordInvalid)?;
-        let json: String = row.get("plan_json");
-        let hash: Vec<u8> = row.get("plan_hash");
-        let plan: CleanupPlan =
-            serde_json::from_str(&json).map_err(|_| CleanupError::RecordInvalid)?;
-        if plan_hash(&json) != hash {
-            return Err(CleanupError::RecordInvalid);
+    // Keep count, pages and item proofs in one SQLite read snapshot. The caller
+    // holds the existing cleanup locks for filesystem and deployment facts.
+    let mut transaction = database.pool().begin().await?;
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM cleaned_releases")
+        .fetch_one(&mut *transaction)
+        .await?;
+    let mut scanned = 0i64;
+    let mut cursor = (String::new(), String::new());
+    const HISTORY_PAGE_SIZE: i64 = 128;
+    loop {
+        let rows = sqlx::query("SELECT c.*,o.plan_json,o.plan_hash,o.status AS operation_status,o.retirement_pending FROM cleaned_releases c JOIN storage_cleanup_operations o ON o.operation_id=c.cleanup_operation_id WHERE (c.app_id,c.release_id) > (?,?) ORDER BY c.app_id,c.release_id LIMIT ?")
+            .bind(&cursor.0).bind(&cursor.1).bind(HISTORY_PAGE_SIZE)
+            .fetch_all(&mut *transaction).await?;
+        if rows.is_empty() {
+            break;
         }
-        let matching: Vec<_> = plan.candidates.iter().enumerate().filter(|(_, item)| matches!(&item.artifact, CleanupArtifact::Release { app_id, release_id, .. } if app_id.to_string()==app && release_id.to_string()==release) && item.release_record.as_ref()==Some(&record)).collect();
-        if matching.len() != 1 {
-            return Err(CleanupError::RecordInvalid);
-        }
-        let item = sqlx::query("SELECT app_id,artifact_id,artifact_kind,status FROM storage_cleanup_items WHERE operation_id=? AND ordinal=?")
-            .bind(&operation).bind(matching[0].0 as i64).fetch_one(database.pool()).await?;
-        if item.get::<String, _>("app_id") != app
-            || item.get::<String, _>("artifact_id") != release
-            || item.get::<String, _>("artifact_kind") != "release"
-            || item.get::<String, _>("status") != "detached"
-        {
-            return Err(CleanupError::RecordInvalid);
-        }
-        let terminal = matches!(
-            row.get::<&str, _>("operation_status"),
-            "completed" | "completed_with_failures"
-        );
-        if terminal
-            && row.get::<i64, _>("retirement_pending") == 0
-            && !tombstones.contains(&operation_id)
-        {
-            cleaned.push(record);
-        } else {
-            retained.push(record);
+        for row in rows {
+            scanned += 1;
+            cursor = (row.get("app_id"), row.get("release_id"));
+            let record = CleanedReleaseRecord {
+                manifest_digest: row.get("manifest_digest"),
+                local_image_id: row.get("local_image_id"),
+                platform_os: row.get("platform_os"),
+                platform_architecture: row.get("platform_architecture"),
+                platform_variant: row.get("platform_variant"),
+            };
+            identity(&record)?;
+            let app: String = row.get("app_id");
+            let release: String = row.get("release_id");
+            let operation: String = row.get("cleanup_operation_id");
+            let operation_id =
+                Uuid::parse_str(&operation).map_err(|_| CleanupError::RecordInvalid)?;
+            let json: String = row.get("plan_json");
+            let hash: Vec<u8> = row.get("plan_hash");
+            let plan: CleanupPlan =
+                serde_json::from_str(&json).map_err(|_| CleanupError::RecordInvalid)?;
+            if plan_hash(&json) != hash {
+                return Err(CleanupError::RecordInvalid);
+            }
+            let matching: Vec<_> = plan.candidates.iter().enumerate().filter(|(_, item)| matches!(&item.artifact, CleanupArtifact::Release { app_id, release_id, .. } if app_id.to_string()==app && release_id.to_string()==release) && item.release_record.as_ref()==Some(&record)).collect();
+            if matching.len() != 1 {
+                return Err(CleanupError::RecordInvalid);
+            }
+            let item = sqlx::query("SELECT app_id,artifact_id,artifact_kind,status FROM storage_cleanup_items WHERE operation_id=? AND ordinal=?")
+            .bind(&operation).bind(matching[0].0 as i64).fetch_one(&mut *transaction).await?;
+            if item.get::<String, _>("app_id") != app
+                || item.get::<String, _>("artifact_id") != release
+                || item.get::<String, _>("artifact_kind") != "release"
+                || item.get::<String, _>("status") != "detached"
+            {
+                return Err(CleanupError::RecordInvalid);
+            }
+            let terminal = matches!(
+                row.get::<&str, _>("operation_status"),
+                "completed" | "completed_with_failures"
+            );
+            if terminal
+                && row.get::<i64, _>("retirement_pending") == 0
+                && !tombstones.contains(&operation_id)
+            {
+                cleaned.push(record);
+            } else {
+                retained.push(record);
+            }
         }
     }
+    // INNER JOIN must never turn a missing operation proof into an omitted row.
+    if scanned != count {
+        return Err(CleanupError::InventoryIncomplete);
+    }
+    transaction.commit().await?;
     let containers = docker
         .all_containers()
         .await
@@ -363,21 +380,16 @@ pub(crate) async fn build_plan_for_operation(
     let mut candidates = BTreeMap::new();
     let mut protected = BTreeSet::new();
     let mut observations = BTreeMap::new();
+    let mut inspect_cache = BTreeMap::new();
     for record in &cleaned {
         let expected = identity(record)?;
         let requested = ExactImageId::parse(&record.local_image_id)
             .map_err(|_| CleanupError::InventoryIncomplete)?;
-        let mut observed = docker
-            .inspect(&requested)
-            .await
-            .map_err(|_| CleanupError::InventoryIncomplete)?;
+        let mut observed = cached_inspect(docker, &mut inspect_cache, &requested).await?;
         if observed.is_none() && record.manifest_digest != record.local_image_id {
             let manifest = ExactImageId::parse(&record.manifest_digest)
                 .map_err(|_| CleanupError::InventoryIncomplete)?;
-            observed = docker
-                .inspect(&manifest)
-                .await
-                .map_err(|_| CleanupError::InventoryIncomplete)?;
+            observed = cached_inspect(docker, &mut inspect_cache, &manifest).await?;
         }
         let Some(observed) = observed else {
             continue;
@@ -440,6 +452,22 @@ pub(crate) async fn build_plan_for_operation(
         protected_count: protected.len(),
         facts_hash: plan_hash(&facts),
     })
+}
+
+async fn cached_inspect(
+    docker: &dyn ImageCleanup,
+    cache: &mut BTreeMap<ExactImageId, Option<CleanupImage>>,
+    id: &ExactImageId,
+) -> Result<Option<CleanupImage>, CleanupError> {
+    if let Some(value) = cache.get(id) {
+        return Ok(value.clone());
+    }
+    let value = docker
+        .inspect(id)
+        .await
+        .map_err(|_| CleanupError::InventoryIncomplete)?;
+    cache.insert(id.clone(), value.clone());
+    Ok(value)
 }
 
 pub async fn current_app_ids(
