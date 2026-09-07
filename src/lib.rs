@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app_store;
+mod app_unregistration;
 pub mod auth;
 pub mod compose;
 pub mod config;

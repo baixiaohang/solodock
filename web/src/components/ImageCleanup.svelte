@@ -13,6 +13,7 @@
   let acknowledge = $state(false)
   let busy = $state(false)
   let error = $state<UserMessage | null>(null)
+  let requestId = $state('')
   let result = $state<Result | null>(null)
   let retry = $state<RetryIdentity | undefined>()
   let retained = $state<ApplyBody | undefined>()
@@ -49,20 +50,26 @@
   async function scan() {
     if (busy || retry) return
     const current = ++generation
-    busy = true; error = null; result = null
+    busy = true; error = null; result = null; requestId = ''
     try {
       const value = await mutation<unknown>('/api/v1/system/image-cleanup/preview', {}, { expectedStatus: 200 })
       if (current !== generation) return
       if (!validPreview(value)) throw unconfirmed()
       preview = value; selected = []; acknowledge = false
-    } catch {
-      if (current === generation) { preview = null; error = localized('Could not create a safe image cleanup preview.') }
+    } catch (cause) {
+      if (current === generation) {
+        preview = null; error = localized('Could not create a safe image cleanup preview.')
+        if (cause instanceof ApiError) {
+          requestId = cause.body.request_id
+          if (cause.body.code === 'CLEANUP_RECOVERY_REFERENCE_MISSING') error = localized('A deployment recovery reference is missing. Cleanup is blocked until it is resolved.')
+        }
+      }
     } finally { if (current === generation) busy = false }
   }
   async function apply() {
     if (busy || !preview || !acknowledge || !selected.length) return
     const current = ++generation
-    busy = true; error = null
+    busy = true; error = null; requestId = ''
     const body = retained ?? { confirmation_token: preview.confirmation_token, image_ids: [...selected].sort(), acknowledge_image_removal: true as const }
     retained = body; retry = retryIdentity(retry, body)
     try {
@@ -72,6 +79,7 @@
       result = value; preview = null; selected = []; acknowledge = false; retained = undefined; retry = undefined
     } catch (cause) {
       if (current !== generation) return
+      if (cause instanceof ApiError) requestId = cause.body.request_id
       const failure = mutationFailure(retry, cause)
       retry = failure.retry
       if (failure.outcome === 'outcome_unknown') error = localized('The image cleanup result is unknown. Retry only this exact operation; do not start another cleanup.')
@@ -87,7 +95,7 @@
   <h2>{$t('Docker image cleanup')}</h2>
   <p class="muted">{$t('Only images from confirmed cleaned releases are considered. Every retained release and every running or stopped container protects its images, including containers outside SoloDock.')}</p>
   <p class="security-note">{$t('Docker reported size is an upper estimate, not guaranteed reclaimed space or proof of ownership. Cleanup never removes containers, volumes, networks, or parent images and never forces deletion.')}</p>
-  {#if error}<p class="notice danger" role="alert">{messageText(error, $t)}</p>{/if}
+  {#if error}<p class="notice danger" role="alert">{requestId ? $t('{detail} (request {requestId})', { detail: messageText(error, $t), requestId }) : messageText(error, $t)}</p>{/if}
   {#if preview}
     <p>{$t('Protected images')}: {preview.protected_count}</p>
     {#if !preview.candidates.length}<p>{$t('No unused images are eligible for cleanup.')}</p>{/if}

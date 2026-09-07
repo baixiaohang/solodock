@@ -145,3 +145,16 @@ describe('StorageCleanup', () => {
     expect(document.body.textContent).not.toContain('/private/path')
   })
 })
+
+it.each(['CLEANUP_RECOVERY_REFERENCE_MISSING', 'CLEANUP_INVENTORY_INCOMPLETE'])('shows a safe preview diagnosis and request ID for %s', async code => {
+  const fetch = vi.fn(async () => new Response(JSON.stringify({ code, message: 'private-path-secret-canary', request_id: 'cleanup-request-1' }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+  vi.stubGlobal('fetch', fetch)
+  render(StorageCleanup)
+  await userEvent.setup().click(screen.getByRole('button', { name: '扫描可清理存储' }))
+  const alert = await screen.findByRole('alert')
+  expect(alert.textContent).toContain(code === 'CLEANUP_RECOVERY_REFERENCE_MISSING' ? '部署恢复引用缺失' : '无法生成安全的存储清理预览')
+  expect(alert.textContent).toContain('cleanup-request-1')
+  expect(alert.textContent).not.toContain('private-path-secret-canary')
+  expect(fetch).toHaveBeenCalledTimes(1)
+  expect(screen.queryByRole('checkbox')).toBeNull()
+})

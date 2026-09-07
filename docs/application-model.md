@@ -114,6 +114,9 @@ See [deployments and rollback](deployments.md) for active/pending and rollback s
 
 ## Manual artifact cleanup
 
+A finalized unregistration removes only that absent application’s terminal historical deployment references from cleanup protection; it does not rewrite deployment status or audit history. A reappeared application directory, unfinished deletion, or nonterminal deployment is not excused by the record. Applications without a verified unregistration still fail closed on missing recovery references. Every retained running or stopped container continues to protect its image, including containers left behind by unregister.
+
+
 Storage cleanup is an explicit preview-and-confirm operation. It always protects active and pending releases, the current draft revision, recovery references from `queued`, `running`, `interrupted`, and `needs_attention` deployments, cleanup recovery artifacts, and three additional recent rollback releases per application. A preview selects at most 100 of the globally oldest verified, unreferenced releases; config revisions become candidates only when no retained release or draft references them. Known private temporary artifacts use the same typed store inventory. Unknown names, links, types, ownership, modes, signatures, or ledger facts make the entire inventory fail closed.
 
 Cleanup never removes application metadata, deployments, audit history, credentials, containers, volumes, bind data, networks, backups, or operator-managed Docker resources. Logical-size estimates are not a promise of reclaimed disk space.

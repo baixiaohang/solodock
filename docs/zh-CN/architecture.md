@@ -38,6 +38,9 @@ Browser
 
 ## 唯一事实来源
 
+完成的应用注销是 SQLite 中的持久生命周期事实，独立于 `app_index` 和会过期的幂等响应。API、启动与后台共用 finalizer：验证精确删除成功证明、补齐目录持久化屏障、记录完成意图，最后在 tombstone 删除及父目录同步成功后标记完成。即使 tombstone 已不可见，未完成意图仍保留原始重放证明。
+
+
 | 事实 | 权威来源 |
 | --- | --- |
 | app metadata、draft config、managed files、credential引用 | 私有文件系统 |

@@ -1,3 +1,4 @@
+mod app_unregistration;
 mod image_cleanup;
 mod support;
 
@@ -4051,6 +4052,13 @@ async fn delete_resumes_after_token_consumption_and_tombstone_failpoints() {
             "tombstoned={tombstoned}: {response}"
         );
         assert!(!harness.apps.join(app_id).exists());
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_unregistrations WHERE app_id=?")
+                .bind(app_id)
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipts, 1);
         assert!(harness.catalog.get(app_id.parse().unwrap()).is_none());
         if tombstoned {
             assert!(
