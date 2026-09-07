@@ -66,6 +66,10 @@ Compose 后的首次 observation 是 ownership claim boundary：唯一非 predec
 
 candidate 达到 health policy 后才把 `active` 原子切向该 release，并清理对应 `pending`。active rename、pending unlink、parent fsync 和 desired-state publication由可重放 finalizer收敛；不能因后续 metadata 失败倒退已经可见的 active。
 
+部署健康验证与自动回滚共享按策略计算的期限。Running 为启动保留 300 秒，再加完整的配置稳定窗口及 10 秒观察余量。自定义 HTTP 检查期限取 300 秒与“启动宽限期 + 重试次数 ×（间隔 + 超时）+ 10 秒余量”中的较大值；其他策略保留有界的 300 秒等待。每次 inspect 受剩余期限约束，并可取消。
+
+提交 active 或自动回滚清除 pending 前，会再次核对通过健康验证的容器 ID、启动时间、重启次数与策略条件：Healthy 要求 Running 且 Healthy，Running/Disabled 要求 Running，Completed 要求 Exited 且退出码为零。已知候选异常进入补偿；身份或观察不确定时保留恢复事实。最终检查不会重新等待稳定窗口，也不保证容器未来始终健康。
+
 ## 失败恢复与回滚
 
 确定性 candidate identity/apply/health 失败且现场被证明属于该 candidate 时，系统进入同一补偿路径：有旧 active 时先用 candidate release 的宽限停止失败 candidate，再自动恢复并重新验证旧 release；没有旧 active 时先按 candidate 宽限显式 stop，再执行精确 `rm --force` 并复核 container 已不存在。rollback 重新执行旧 release 所需的 digest pull、resource/bind/data-root/candidate preflight、fixed Compose action、post-observation 和健康门禁，而不是直接信任历史 YAML 或旧 container。

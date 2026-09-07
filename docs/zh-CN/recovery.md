@@ -45,6 +45,8 @@ binary、config 和 state 必须来自兼容的一组备份。SQLite migration �
 
 日常安装、备份和 health 检查入口见 [运维](operations.md)；资源保留与删除语义见 [应用模型](application-model.md)。
 
+重试已有 pending 的部署时，普通镜像拉取失败会保留 pending 与 active，并以原拉取错误记录 `needs_attention`。首次部署中断、尚无 active 时也适用：先前尝试可能已经创建候选容器。新发布且尚无容器副作用的候选在拉取失败后仍可清除 pending 并记为 failed。不能仅因最近一次尝试在 Compose 前失败就删除保留的 pending 引用。
+
 ## 清理恢复
 
 `.cleanup-trash/<operation UUID>` 保存已持久化计划的签名 marker 及原子移出的 artifact。不要手工删除、重命名或编辑。Startup/background finalizer 只有在 integrity marker、已存 plan/items 与精确成功 idempotency response 全部一致时才删除 payload。payload 部分删除后 marker 仍保留；payload 完全移除并同步父目录后，marker 才转移到精确的同级 `<operation UUID>.retired.toml`，直到空 operation 目录也完成持久删除。退休开始前先在数据库持久化退休意图，即使最后一份 marker 已可见地 unlink，精确终态 proof 仍受保护。只有最后的父目录同步成功后才能清除退休意图和 pending 健康状态。恢复时 marker 缺失会重新同步；若崩溃使 marker 再次出现，则重新验证并完成退休。没有退休意图的任意缺 marker 或未知 trash 仍然 fail closed。
