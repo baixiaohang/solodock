@@ -142,7 +142,7 @@
   }
 </script>
 
-<section class="panel">
+<section class="panel cleanup-panel">
   <h2>{$t('Storage cleanup')}</h2>
   <p class="muted">{$t('Scan for old immutable releases, derived configuration revisions, and known temporary artifacts. SoloDock never cleans them automatically.')}</p>
   <p class="security-note">{$t('Active, pending, current draft, recovery references, and three recent rollback releases per application stay protected. Containers, volumes, binds, networks, credentials, deployments, and audit history are never removed here.')}</p>
@@ -151,12 +151,15 @@
     <p class="notice danger" role="alert">{requestId ? $t('{detail} (request {requestId})', { detail: messageText(error, $t), requestId }) : messageText(error, $t)}</p>
   {/if}
   {#if preview}
-    <div class="configuration-stack">
+    <div class="cleanup-content">
       <p><strong>{$t('Cleanup candidates')}</strong> · {preview.candidates.length} · {$t('Estimated logical size')}: {bytes(preview.estimated_logical_bytes)}</p>
       {#if preview.candidates.length}
-        <ul>
+        <ul class="cleanup-candidates">
           {#each preview.candidates as item}
-            <li><code>{item.artifact_kind}</code> · {candidateId(item)}{#if item.app_id} · {$t('Application')}: {item.app_id}{/if}{#if item.release_created_at} · {$t('Created')}: {item.release_created_at}{/if} · {bytes(item.estimated_logical_bytes)}</li>
+            <li class="cleanup-item">
+              <span><code>{item.artifact_kind}</code> · <code>{candidateId(item)}</code></span>
+              <p class="muted">{#if item.app_id}{$t('Application')}: {item.app_id} · {/if}{#if item.release_created_at}{$t('Created')}: {item.release_created_at} · {/if}{bytes(item.estimated_logical_bytes)}</p>
+            </li>
           {/each}
         </ul>
       {:else}
@@ -170,17 +173,19 @@
           {/each}
         </ul>
       {/if}
-      <label><input type="checkbox" bind:checked={acknowledge} disabled={applying || Boolean(applyRetry)} /> {$t('I understand that cleanup permanently removes the listed rollback artifacts')}</label>
+      <label class="checkbox"><input type="checkbox" bind:checked={acknowledge} disabled={applying || Boolean(applyRetry)} /><span>{$t('I understand that cleanup permanently removes the listed rollback artifacts')}</span></label>
       <div class="actions">
         <button class="primary" disabled={!acknowledge || applying || preview.candidates.length === 0} onclick={() => void applyCleanup()}>{applying ? $t('Processing…') : applyRetry ? $t('Confirm exact cleanup result') : $t('Apply exact cleanup plan')}</button>
         <button class="ghost" disabled={applying || Boolean(applyRetry)} onclick={() => void scan()}>{$t('Scan again')}</button>
       </div>
     </div>
   {:else}
-    <button disabled={scanning || applying} onclick={() => void scan()}>{scanning ? $t('Scanning…') : $t('Scan removable storage')}</button>
+    <div class="actions">
+      <button disabled={scanning || applying} onclick={() => void scan()}>{scanning ? $t('Scanning…') : $t('Scan removable storage')}</button>
+    </div>
   {/if}
   {#if result}
-    <div class="notice" role="status">
+    <div class="notice cleanup-result" role="status">
       <p>{result.status === 'completed' ? $t('Cleanup completed.') : $t('Cleanup completed with retained items. Scan again for current facts.')}</p>
       <ul>{#each result.items as item}<li>{item.artifact_kind} · {item.artifact_id} · {item.status}</li>{/each}</ul>
     </div>

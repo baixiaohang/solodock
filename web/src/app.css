@@ -250,6 +250,18 @@ button.compact { min-height: 2.2rem; padding: 0.45rem 0.7rem; }
 .deployment-row code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .deployment-header { color: var(--color-muted); background: var(--color-surface-subtle); font-size: 0.72rem; font-weight: 750; text-transform: uppercase; }
 .settings-form { display: grid; gap: var(--space-4); }
+.cleanup-panel, .cleanup-content { display: grid; gap: var(--space-4); min-width: 0; }
+.cleanup-panel h2, .cleanup-panel p, .cleanup-panel .notice { margin: 0; }
+.cleanup-panel .security-note { line-height: 1.6; }
+.cleanup-panel ul { display: grid; gap: var(--space-2); min-width: 0; margin: 0; padding-left: var(--space-5); overflow-wrap: anywhere; }
+.cleanup-panel .cleanup-candidates { gap: var(--space-3); padding: 0; list-style: none; }
+.cleanup-candidates > li { min-width: 0; padding: var(--space-3); border: 1px solid var(--color-border-subtle); border-radius: var(--radius-control); background: var(--color-surface-subtle); }
+.cleanup-item { display: grid; gap: var(--space-2); min-width: 0; overflow-wrap: anywhere; }
+.cleanup-item .muted { font-size: 0.8rem; font-weight: 400; }
+.cleanup-panel .checkbox { align-items: start; line-height: 1.5; }
+.cleanup-panel .checkbox input { margin: 0.25rem 0 0; }
+.cleanup-panel .checkbox span { min-width: 0; overflow-wrap: anywhere; }
+.cleanup-panel .cleanup-result { display: grid; gap: var(--space-3); }
 .success-text { color: var(--color-success); font-weight: 700; }
 .global-warning { margin: var(--space-4) clamp(var(--space-6), 3vw, var(--space-10)) 0; }
 pre { max-width: 100%; overflow: auto; padding: 1rem; border: 1px solid var(--color-border-subtle); border-radius: var(--radius-control); background: var(--color-surface-subtle); white-space: pre-wrap; }
