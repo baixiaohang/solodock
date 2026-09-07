@@ -120,7 +120,14 @@
   }
 
   function bytes(value: number): string {
-    return new Intl.NumberFormat(undefined, { style: 'unit', unit: 'byte', notation: 'compact' }).format(value)
+    const units = ['B', 'KB', 'MB', 'GB']
+    let amount = value
+    let index = 0
+    while (amount >= 1000 && index < units.length - 1) {
+      amount /= 1000
+      index += 1
+    }
+    return `${new Intl.NumberFormat(undefined, { maximumFractionDigits: index === 0 ? 0 : 1 }).format(amount)} ${units[index]}`
   }
 
   function protectionReason(reason: CleanupProtectionReason): string {
