@@ -177,4 +177,6 @@ Containerd 上通过 tag 创建的容器可能引用 image index，而 descripto
 
 Artifact 清理后使用独立的 **系统设置 → Docker 镜像清理**。扫描、逐项选择、确认，再应用。不会自动选择，不设定时或磁盘阈值自动清理。Preview 不是锁；执行前重新检查全部 release 及运行/停止 container 引用，daemon 还会阻止 non-force 冲突。Docker 报告字节数只是上限估算，不保证实际释放空间或证明归属，共享 layer 可能继续保留。
 
-只按 fresh exact image ID 删除，使用 `force=false`、`noprune=true`。In-use 或 multiple-reference 冲突保留镜像，SoloDock 不会升级 force/prune 或删除父镜像。Container、volume、network、业务数据、credential、backup、deployment 和 audit 不在范围内。来源/container inventory 不完整或超限会 fail closed（cleaned record 或 container 上限 4,096；每次预览最多选择 100 个镜像）。应先解决 inventory 问题再扫描，不可宽泛删除绕过。
+只按 fresh exact image ID 删除，使用 `force=false`、`noprune=true`。In-use 或 multiple-reference 冲突保留镜像，SoloDock 不会升级 force/prune 或删除父镜像。Container、volume、network、业务数据、credential、backup、deployment 和 audit 不在范围内。Inventory 不完整或当前 container 超过 4,096 个时会 fail closed；每次预览最多选择 100 个镜像。应先解决 inventory 问题再扫描，不可宽泛删除绕过。
+
+镜像清理在同一个数据库读取快照中按稳定键分批扫描全部已清理 release 历史。选择镜像前会验证每条 release 及其清理证明，包含后续页的保护事实与缺失操作证明检查。已不存在的历史镜像不会阻止清理，重复镜像身份共享 Docker 观察。清理历史和回滚材料丢失标记仍保留；当前容器清单上限及每次最多删除 100 个镜像的约束不变。

@@ -34,6 +34,7 @@ struct ImageState {
     removes: Vec<String>,
     fault: Option<&'static str>,
     inspect_failure: bool,
+    inspects: usize,
     unavailable: bool,
 }
 #[async_trait]
@@ -47,6 +48,7 @@ impl ImageCleanup for Images {
     }
     async fn inspect(&self, id: &ExactImageId) -> Result<Option<CleanupImage>, DockerError> {
         let mut state = self.state.lock().unwrap();
+        state.inspects += 1;
         if state.inspect_failure {
             state.inspect_failure = false;
             return Err(DockerError::new(DockerErrorKind::Unavailable));
@@ -1074,4 +1076,159 @@ async fn unselected_eligible_image_survives_and_corrupt_durable_plan_blocks_reco
             .iter()
             .all(|id| id == &digest(0))
     );
+}
+
+async fn large_history(h: &Harness) -> String {
+    use solodock::{
+        app_store::cleanup::CleanupArtifact,
+        storage_cleanup::{CleanedReleaseRecord, CleanupCandidate, CleanupPlan, plan_hash},
+    };
+    let app = Uuid::from_u128(u128::MAX);
+    let now = solodock::db::format_time(time::OffsetDateTime::now_utc()).unwrap();
+    let mut tx = h.database.pool().begin().await.unwrap();
+    let mut last_operation = String::new();
+    for first in (0..4097).step_by(100) {
+        let operation = Uuid::new_v4().to_string();
+        last_operation = operation.clone();
+        let candidates: Vec<_> = (first..(first + 100).min(4097))
+            .map(|index| {
+                let image = if index == 4095 {
+                    digest(15)
+                } else if index == 4096 || index % 1000 == 0 {
+                    digest(0)
+                } else {
+                    digest(14)
+                };
+                CleanupCandidate {
+                    artifact: CleanupArtifact::Release {
+                        app_id: app,
+                        release_id: Uuid::from_u128(index as u128 + 1),
+                        config_revision_id: Uuid::nil(),
+                    },
+                    estimated_logical_bytes: 0,
+                    release_created_at: None,
+                    release_record: Some(CleanedReleaseRecord {
+                        manifest_digest: image.clone(),
+                        local_image_id: image,
+                        platform_os: "linux".into(),
+                        platform_architecture: "amd64".into(),
+                        platform_variant: None,
+                    }),
+                }
+            })
+            .collect();
+        let json = serde_json::to_string(&CleanupPlan {
+            candidates: candidates.clone(),
+            protected: vec![],
+            estimated_logical_bytes: 0,
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO storage_cleanup_operations (operation_id,cleanup_kind,plan_hash,plan_json,status,created_at,completed_at) VALUES (?,'artifacts',?,?,'completed',?,?)")
+            .bind(&operation).bind(plan_hash(&json)).bind(json).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+        let hash = plan_hash(
+            &serde_json::to_string(&CleanupPlan {
+                candidates: candidates.clone(),
+                protected: vec![],
+                estimated_logical_bytes: 0,
+            })
+            .unwrap(),
+        );
+        let receipt = json!({"operation_id": operation, "plan_hash": hash.iter().map(|byte|format!("{byte:02x}")).collect::<String>(),
+            "status": "completed", "idempotency_replayed": false,
+            "items": candidates.iter().map(|item|json!({"app_id": app, "artifact_kind": "release", "artifact_id": item.artifact.public_id(), "status": "deleted"})).collect::<Vec<_>>() });
+        sqlx::query("INSERT INTO idempotency_records (actor,route,key_hmac,request_hmac,operation_id,status,response_status,response_body,created_at,updated_at) VALUES ('admin','/api/v1/system/storage-cleanup/apply',?,?,?,'succeeded',200,?,?,?)")
+            .bind(plan_hash(&operation)).bind(&hash).bind(&operation).bind(receipt.to_string()).bind(&now).bind(&now).execute(&mut *tx).await.unwrap();
+        for (ordinal, item) in candidates.iter().enumerate() {
+            let release = item.artifact.public_id();
+            let record = item.release_record.as_ref().unwrap();
+            sqlx::query("INSERT INTO storage_cleanup_items (operation_id,ordinal,app_id,artifact_kind,artifact_id,config_revision_id,status) VALUES (?,?,?,'release',?,'00000000-0000-0000-0000-000000000000','detached')")
+                .bind(&operation).bind(ordinal as i64).bind(app.to_string()).bind(&release).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO cleaned_releases (app_id,release_id,cleanup_operation_id,removed_at,manifest_digest,local_image_id,platform_os,platform_architecture) VALUES (?,?,?,?,?,?,'linux','amd64')")
+                .bind(app.to_string()).bind(release).bind(&operation).bind(&now).bind(&record.manifest_digest).bind(&record.local_image_id).execute(&mut *tx).await.unwrap();
+        }
+    }
+    tx.commit().await.unwrap();
+    last_operation
+}
+
+#[tokio::test]
+async fn history_pages_cover_more_than_4096_records_and_late_protection() {
+    let (h, images, _, _) = fixture().await;
+    let last_operation = large_history(&h).await;
+    images.state.lock().unwrap().images.remove(&digest(14));
+    images.state.lock().unwrap().inspects = 0;
+    let first = preview(&h).await;
+    assert_eq!(first["candidates"].as_array().unwrap().len(), 2);
+    assert_eq!(first["candidates"][0]["image_id"], digest(0));
+    assert_eq!(
+        images.state.lock().unwrap().inspects,
+        3,
+        "duplicate history shares Docker observations"
+    );
+    // A retained proof on the final page protects earlier copies of the same image.
+    sqlx::query("UPDATE storage_cleanup_operations SET retirement_pending=1 WHERE operation_id=?")
+        .bind(&last_operation)
+        .execute(h.database.pool())
+        .await
+        .unwrap();
+    let protected = solodock::image_cleanup::build_plan(&h.store, &h.database, images.as_ref())
+        .await
+        .unwrap();
+    assert!(protected.candidates.is_empty());
+    sqlx::query("UPDATE storage_cleanup_operations SET retirement_pending=0 WHERE operation_id=?")
+        .bind(&last_operation)
+        .execute(h.database.pool())
+        .await
+        .unwrap();
+    let current = preview(&h).await;
+    assert_eq!(
+        current["candidates"][1]["image_id"],
+        digest(15),
+        "find an image occurring only on the last page"
+    );
+    let (status, result) = body(
+        h.image_mutate("POST", APPLY, Some("large-history"), &request(&current))
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(images.state.lock().unwrap().removes, vec![digest(0)]);
+    assert_eq!(preview(&h).await["candidates"][0]["image_id"], digest(15));
+}
+
+#[tokio::test]
+async fn history_pages_reject_late_corruption_and_missing_join_proof_without_removing() {
+    let (h, images, _, _) = fixture().await;
+    let operation = large_history(&h).await;
+    images.state.lock().unwrap().images.remove(&digest(14));
+    sqlx::query("UPDATE storage_cleanup_items SET status='planned' WHERE operation_id=?")
+        .bind(&operation)
+        .execute(h.database.pool())
+        .await
+        .unwrap();
+    let (status, _) = body(h.image_mutate("POST", PREVIEW, None, &json!({})).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    sqlx::query("UPDATE storage_cleanup_items SET status='detached' WHERE operation_id=?")
+        .bind(&operation)
+        .execute(h.database.pool())
+        .await
+        .unwrap();
+    let mut connection = h.database.pool().acquire().await.unwrap();
+    sqlx::query("PRAGMA foreign_keys=OFF")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM storage_cleanup_operations WHERE operation_id=?")
+        .bind(operation)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("PRAGMA foreign_keys=ON")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let (status, _) = body(h.image_mutate("POST", PREVIEW, None, &json!({})).await).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(images.state.lock().unwrap().removes.is_empty());
 }
