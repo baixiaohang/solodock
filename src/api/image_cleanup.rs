@@ -45,7 +45,13 @@ pub async fn preview(
     let plan =
         crate::image_cleanup::build_plan(&m3.store, &m3.database, state.image_cleanup.as_ref())
             .await
-            .map_err(|_| {
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    crate::storage_cleanup::CleanupError::RecoveryReferenceMissing { .. }
+                ) {
+                    return super::storage_cleanup::cleanup_error(error, id);
+                }
                 ApiError::new(
                     StatusCode::CONFLICT,
                     "CLEANUP_INVENTORY_INCOMPLETE",

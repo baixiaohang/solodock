@@ -327,6 +327,7 @@ impl AppStore {
             other => other,
         })?;
         after_rename()?;
+        self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneRenamed)?;
         sync_directory(&trash)?;
         sync_directory(&self.apps_directory)?;
         Ok(target)
@@ -365,8 +366,37 @@ impl AppStore {
     pub fn finalize_tombstone(&self, app_id: Uuid, operation_id: Uuid) -> Result<(), StoreError> {
         let path = self.tombstone_path(app_id, operation_id);
         self.read_tombstone_metadata(app_id, operation_id)?;
+        self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneFinalize)?;
         fs::remove_dir_all(path)?;
+        self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneRemoved)?;
         sync_directory(&self.apps_directory.join(".trash"))?;
+        Ok(())
+    }
+
+    /// Repeat the rename barriers when a previous attempt exposed the tombstone
+    /// but failed before synchronizing both parent directories.
+    pub fn sync_tombstone(&self, app_id: Uuid, operation_id: Uuid) -> Result<(), StoreError> {
+        self.read_tombstone_metadata(app_id, operation_id)?;
+        self.cleanup_checkpoint(cleanup::CleanupFault::AppTombstoneSync)?;
+        self.sync_unregistered_app(app_id)
+    }
+
+    pub(crate) fn sync_unregistered_app(&self, app_id: Uuid) -> Result<(), StoreError> {
+        match fs::symlink_metadata(self.app_directory(app_id)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Err(StoreError::AppConflict),
+        }
+        let trash = self.apps_directory.join(".trash");
+        match fs::symlink_metadata(&trash) {
+            Ok(_) => {
+                check_private(&trash, true)?;
+                sync_directory(&trash)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        check_private(&self.apps_directory, true)?;
+        sync_directory(&self.apps_directory)?;
         Ok(())
     }
 

@@ -139,6 +139,8 @@ Apply 会取得 catalog 与按序的 application guard、重建 fresh facts；in
 
 Draft 输入和响应增加可选 `security_profile: string | null`。省略/null 使用 Docker 默认策略；非空名称选择[运维文档](operations.md#按应用选择容器安全策略)中的预装策略对。该字段属于配置身份、Compose 预览及不可变 revision。名称无效时返回 `security_profile` 字段错误。客户端编辑现有 draft 时应保留该字段，除非有意清空。历史 schema 1–3 revision 仍可读取并采用 Docker 默认配置；向未签入该字段的历史 schema 注入安全策略值会被拒绝。
 
+两类清理预览在部署恢复所需引用缺失时返回 `409 CLEANUP_RECOVERY_REFERENCE_MISSING`。标准错误 envelope 包含 request ID，对应脱敏日志包含应用和部署 ID；其他不完整清单仍使用 `CLEANUP_INVENTORY_INCOMPLETE`。被拒绝的预览不发放确认 token，也不执行清理。
+
 ## Docker 镜像清理
 
 `POST /api/v1/system/image-cleanup/preview` 只接受 `{}`，返回 canonical image ID、manifest/platform、Docker 报告字节数、受保护数量，以及绑定 session、五分钟过期的 write-only 确认 token。`POST /api/v1/system/image-cleanup/apply` 要求 `Idempotency-Key`，且只接受 `confirmation_token`、预览内非空且排序去重的 `image_ids` 子集（最多 100 个）及 `acknowledge_image_removal: true`。两条 route 保持 management authority、session、exact Origin、CSRF、16 KiB body、安全错误和 no-store 边界。不接受 tag、path、prune option 或任意 Docker 参数。

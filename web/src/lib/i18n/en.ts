@@ -10,6 +10,7 @@ export const en = {
   "Could not load deployment history. Previously loaded entries are preserved.": "Could not load deployment history. Previously loaded entries are preserved.",
   "Could not load webhook settings.": "Could not load webhook settings.",
 
+  'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.': 'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.',
   'Removed': 'Removed',
   'Retained': 'Retained',
   'Docker image cleanup': 'Docker image cleanup',

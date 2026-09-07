@@ -38,6 +38,9 @@ The packaged systemd profile sets `SOLODOCK_PACKAGED_LAYOUT=1`. The same Rust `C
 
 ## Sources of truth
 
+Completed application unregistrations are durable SQLite lifecycle facts, independent of `app_index` and expiring idempotency responses. A shared finalizer verifies the exact successful deletion proof, repeats directory durability barriers, records finalization intent, and only marks the fact finalized after tombstone removal and parent synchronization. Pending intent retains the original replay proof even if the tombstone is no longer visible.
+
+
 | Fact | Authoritative source |
 | --- | --- |
 | Application metadata, draft config, managed files, credential references | Private filesystem |

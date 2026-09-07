@@ -12,6 +12,7 @@ export const zhCN = {
   "Could not load deployment history. Previously loaded entries are preserved.": "无法加载部署历史，已保留此前加载的记录。",
   "Could not load webhook settings.": "无法加载 Webhook 设置。",
 
+  'A deployment recovery reference is missing. Cleanup is blocked until it is resolved.': '部署恢复引用缺失，解决后才能执行清理。',
   'Removed': '已删除',
   'Retained': '已保留',
   'Docker image cleanup': 'Docker 镜像清理',

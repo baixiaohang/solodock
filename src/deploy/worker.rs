@@ -23,6 +23,8 @@ use crate::{
     registry::{CredentialStore, ImageReference, Platform, RegistryResolver, ResolvedImage},
 };
 
+use super::health::{health_deadline, policy_ready};
+
 use super::{
     DeploymentLedger, DeploymentPhase, DeploymentRecord, DeploymentStatus, DeploymentTrigger,
     HealthError, HealthVerifier, ImagePuller, PullError,
@@ -231,6 +233,10 @@ impl DeploymentEngine {
                 return Err(EngineError::Interrupted);
             }
             if matches!(error, PullError::CleanupFailed | PullError::OutputUnsafe) {
+                return Err(EngineError::NeedsAttention(error.public_code()));
+            }
+            // A resumed candidate may already exist even though this attempt has not applied it.
+            if record.expected_pending_release_id.is_some() {
                 return Err(EngineError::NeedsAttention(error.public_code()));
             }
             self.cleanup_pending(record.app_id, candidate_id)?;
@@ -488,7 +494,7 @@ impl DeploymentEngine {
                     .image_identity()
                     .map_err(|_| EngineError::NeedsAttention("RELEASE_INVALID"))?,
                 &loaded.metadata.health,
-                Duration::from_secs(300),
+                health_deadline(&loaded.metadata.health),
             )
             .await
         {
@@ -538,7 +544,12 @@ impl DeploymentEngine {
         if final_candidate.id != candidate.id {
             return Err(EngineError::NeedsAttention("CONTAINER_CHANGED"));
         }
-        if !candidate_matches_release(&final_candidate, &candidate_release) {
+        let final_health = if !candidate_matches_release(&final_candidate, &candidate_release) {
+            Err(HealthError::IdentityMismatch)
+        } else {
+            health.recheck(&final_candidate, &loaded.metadata.health)
+        };
+        if let Err(error) = final_health {
             return self
                 .rollback_or_fail(
                     state,
@@ -548,7 +559,7 @@ impl DeploymentEngine {
                         active,
                         candidate: candidate_id,
                         container: &final_candidate,
-                        code: "CANDIDATE_INVALID",
+                        code: error.public_code(),
                     },
                 )
                 .await;
@@ -1065,19 +1076,7 @@ impl DeploymentEngine {
                 .map_err(|_| EngineError::Internal)?,
         )
         .map_err(|_| EngineError::Stable("RELEASE_INVALID"))?;
-        Ok(match loaded.metadata.health {
-            crate::domain::HealthPolicy::Completed => {
-                container.status == ContainerStatus::Exited && container.exit_code == Some(0)
-            }
-            crate::domain::HealthPolicy::Healthy { .. } => {
-                container.status == ContainerStatus::Running
-                    && container.health == crate::docker::models::HealthStatus::Healthy
-            }
-            crate::domain::HealthPolicy::Running { .. }
-            | crate::domain::HealthPolicy::Disabled { .. } => {
-                container.status == ContainerStatus::Running
-            }
-        })
+        Ok(policy_ready(&container, &loaded.metadata.health).unwrap_or(false))
     }
 
     async fn observe_owned_candidate(
@@ -1390,7 +1389,8 @@ impl DeploymentEngine {
             )
             .await
             .map_err(|_| EngineError::Internal)?;
-        self.health
+        let health = self
+            .health
             .verify(
                 &container.id,
                 old_id,
@@ -1398,9 +1398,19 @@ impl DeploymentEngine {
                 &old.image_identity()
                     .map_err(|_| EngineError::NeedsAttention("ROLLBACK_TARGET_INVALID"))?,
                 &loaded.metadata.health,
-                Duration::from_secs(300),
+                health_deadline(&loaded.metadata.health),
             )
             .await
+            .map_err(|_| EngineError::NeedsAttention("ROLLBACK_HEALTH_FAILED"))?;
+        let final_container = self
+            .observe_owned_candidate(record.app_id, old_id, None)
+            .await?;
+        if final_container.id != container.id || !candidate_matches_release(&final_container, &old)
+        {
+            return Err(EngineError::NeedsAttention("ROLLBACK_HEALTH_FAILED"));
+        }
+        health
+            .recheck(&final_container, &loaded.metadata.health)
             .map_err(|_| EngineError::NeedsAttention("ROLLBACK_HEALTH_FAILED"))?;
         self.cleanup_pending(record.app_id, candidate)?;
         let _ = crate::api::mutations::refresh(state, m3).await;

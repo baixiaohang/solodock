@@ -118,6 +118,9 @@ preview 合并 active、pending 与 draft 中的文件、volume、bind、network
 
 ## 手动 artifact 清理
 
+完成注销后，清理保护只排除该已不存在应用的终态历史部署引用，不修改部署状态或审计历史。应用目录重新出现、删除尚未完成或仍有非终态部署时，注销记录不能解除保护。没有已验证注销记录的应用，其恢复引用缺失仍会阻止清理。所有保留的运行或停止容器仍保护各自镜像，包括注销时留下的容器。
+
+
 存储清理是显式的“预览并确认”操作。它始终保护 active/pending release、当前 draft revision、`queued`、`running`、`interrupted` 与 `needs_attention` deployment 的恢复引用、清理恢复 artifact，以及每个应用额外三个最近的回滚 release。每次预览最多选择全局最旧的 100 个已验证且无引用 release；config revision 只有在没有任何保留 release 或 draft 引用时才成为候选。已知私有临时 artifact 复用同一 typed store inventory。未知名称、链接、类型、owner、mode、签名或 ledger 事实都会让整个 inventory fail closed。
 
 清理绝不删除应用 metadata、deployment、audit 历史、credential、container、volume、bind 数据、network、backup 或 operator 管理的 Docker 资源。逻辑大小估算不承诺实际释放的磁盘空间。

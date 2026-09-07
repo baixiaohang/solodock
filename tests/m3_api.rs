@@ -1,3 +1,4 @@
+mod app_unregistration;
 mod image_cleanup;
 mod support;
 
@@ -89,7 +90,14 @@ impl StopScenario {
                     }
                 }
             }
-            ComposeAction::DeployCandidate => self.phase.store(2, Ordering::SeqCst),
+            ComposeAction::DeployCandidate => self.phase.store(
+                if self.stop_calls.load(Ordering::SeqCst) >= 2 {
+                    5
+                } else {
+                    2
+                },
+                Ordering::SeqCst,
+            ),
             ComposeAction::Start => self.phase.store(4, Ordering::SeqCst),
             _ => {}
         }
@@ -374,6 +382,9 @@ impl ImagePuller for NoopPuller {
 
 #[derive(Default)]
 struct ScenarioDocker {
+    health_inspects: std::sync::atomic::AtomicUsize,
+    fail_after_health: bool,
+    fail_rollback_final: bool,
     scenario: Option<Arc<StopScenario>>,
     records: std::sync::Mutex<Option<(ContainerRecord, ContainerRecord)>>,
 }
@@ -393,13 +404,31 @@ impl ScenarioDocker {
             .map(|scenario| scenario.phase.load(std::sync::atomic::Ordering::SeqCst))
             .unwrap_or_default();
         let mut value = match phase {
-            0 | 4 => active,
+            0 | 4 | 5 => active,
             1 => active,
             2 | 3 => candidate,
             _ => return Vec::new(),
         };
         if matches!(phase, 1 | 3) {
             value.status = ContainerStatus::Exited;
+        }
+        if self.fail_after_health
+            && phase == 2
+            && self
+                .health_inspects
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        {
+            value.health = HealthStatus::Unhealthy;
+        }
+        if self.fail_rollback_final
+            && phase == 5
+            && self
+                .health_inspects
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 4
+        {
+            value.health = HealthStatus::Unhealthy;
         }
         vec![value]
     }
@@ -423,7 +452,10 @@ impl DockerReadApi for ScenarioDocker {
     }
 
     async fn inspect_container(&self, id: &str) -> Result<ContainerRecord, DockerError> {
-        self.observed()
+        let values = self.observed();
+        self.health_inspects
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        values
             .into_iter()
             .find(|container| container.id == id)
             .ok_or_else(|| {
@@ -4051,6 +4083,13 @@ async fn delete_resumes_after_token_consumption_and_tombstone_failpoints() {
             "tombstoned={tombstoned}: {response}"
         );
         assert!(!harness.apps.join(app_id).exists());
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_unregistrations WHERE app_id=?")
+                .bind(app_id)
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(receipts, 1);
         assert!(harness.catalog.get(app_id.parse().unwrap()).is_none());
         if tombstoned {
             assert!(
@@ -5522,4 +5561,186 @@ async fn settings_fail_closed_when_docker_root_cannot_be_observed() {
             .allowed_bind_roots
             .is_empty()
     );
+}
+
+struct UnavailablePuller;
+#[async_trait]
+impl ImagePuller for UnavailablePuller {
+    async fn pull(
+        &self,
+        _: Uuid,
+        _: &solodock::registry::ResolvedImage,
+        _: Option<&solodock::registry::LoadedCredential>,
+        _: Vec<Vec<u8>>,
+    ) -> Result<(), PullError> {
+        Err(PullError::Unavailable)
+    }
+}
+
+#[tokio::test]
+async fn deployment_recovery_pull_failure_keeps_existing_pending_with_or_without_active() {
+    for has_active in [false, true] {
+        let docker = Arc::new(ScriptedDocker::default());
+        let harness =
+            Harness::new_with_components(docker.clone(), None, Some(Arc::new(UnavailablePuller)))
+                .await;
+        let (status, created) = body(
+            harness
+                .create(Some("recovery-create-test"), &draft("secret"))
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let app_id = created["app"]["id"].as_str().unwrap().parse().unwrap();
+        let active = has_active.then(Uuid::new_v4);
+        if let Some(active) = active {
+            harness.publish_active(
+                app_id,
+                active,
+                &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+            );
+        }
+        let pending = harness.publish_pending(
+            app_id,
+            Uuid::new_v4(),
+            &format!("registry.example/app@sha256:{}", "b".repeat(64)),
+            active,
+        );
+        let container = release_container('b', app_id, &pending);
+        docker.set(vec![vec![container.clone()]]);
+        harness.compose_actions.lock().unwrap().clear();
+        let (status, response) = body(harness.mutate("POST", &format!("/api/v1/apps/{app_id}/deployments"), Some("recovery-pull-test"), &json!({
+            "expected_draft_revision": created["app"]["config_revision"],
+            "expected_active_release_id": active, "expected_pending_release_id": pending.id,
+            "expected_actual_release_id": pending.id, "expected_actual_container_id": container.id,
+            "acknowledge_non_rollbackable_data": true
+        })).await).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let id = serde_json::from_str::<Value>(&response).unwrap()["deployment_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let result = wait_for_deployment(&harness, id).await;
+        assert_eq!(
+            result.status,
+            solodock::deploy::DeploymentStatus::NeedsAttention
+        );
+        assert_eq!(
+            harness.store.read_release_link(app_id, "pending").unwrap(),
+            Some(pending.id)
+        );
+        assert_eq!(
+            harness.store.read_release_link(app_id, "active").unwrap(),
+            active
+        );
+        assert!(harness.compose_actions.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deployment_recovery_final_unhealthy_observation_enters_compensation() {
+    for fail_rollback_final in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let scenario = Arc::new(StopScenario {
+            source: root.path().join("unused"),
+            replacement: None,
+            mutate_on_stop: usize::MAX,
+            stop_calls: std::sync::atomic::AtomicUsize::new(0),
+            phase: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let docker = Arc::new(ScenarioDocker {
+            scenario: Some(scenario.clone()),
+            fail_after_health: true,
+            fail_rollback_final,
+            ..Default::default()
+        });
+        let harness = Harness::new_with_components(
+            docker.clone(),
+            Some(scenario),
+            Some(Arc::new(NoopPuller)),
+        )
+        .await;
+        let mut input = draft("secret");
+        input["health"] = json!({"policy": "healthy"});
+        let (status, created) =
+            body(harness.create(Some("final-health-create"), &input).await).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let created: Value = serde_json::from_str(&created).unwrap();
+        let app_id = created["app"]["id"].as_str().unwrap().parse().unwrap();
+        let active_id = Uuid::new_v4();
+        harness.publish_active(
+            app_id,
+            active_id,
+            &format!("registry.example/app@sha256:{}", "a".repeat(64)),
+        );
+        let active = harness.store.load_v2_release(app_id, active_id).unwrap();
+        let pending = harness.publish_pending(
+            app_id,
+            Uuid::new_v4(),
+            &format!("registry.example/app@sha256:{}", "b".repeat(64)),
+            Some(active_id),
+        );
+        let mut active_container = release_container('a', app_id, &active);
+        active_container.health = HealthStatus::Healthy;
+        let mut candidate = release_container('b', app_id, &pending);
+        candidate.health = HealthStatus::Healthy;
+        docker.install(active_container.clone(), candidate);
+        harness.compose_actions.lock().unwrap().clear();
+        let (status, response) = body(harness.mutate("POST", &format!("/api/v1/apps/{app_id}/deployments"), Some("final-health-test"), &json!({
+        "expected_draft_revision": created["app"]["config_revision"], "expected_active_release_id": active_id,
+        "expected_pending_release_id": pending.id, "expected_actual_release_id": active_id,
+        "expected_actual_container_id": active_container.id, "acknowledge_non_rollbackable_data": true
+    })).await).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let id = serde_json::from_str::<Value>(&response).unwrap()["deployment_id"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let result = wait_for_deployment(&harness, id).await;
+        assert_ne!(result.status, solodock::deploy::DeploymentStatus::Succeeded);
+        assert!(
+            docker
+                .health_inspects
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+        assert_eq!(
+            harness.store.read_release_link(app_id, "active").unwrap(),
+            Some(active_id)
+        );
+        assert!(harness.compose_actions.lock().unwrap().starts_with(&[
+            ComposeAction::Stop,
+            ComposeAction::DeployCandidate,
+            ComposeAction::Stop
+        ]));
+        assert_eq!(
+            result.status,
+            if fail_rollback_final {
+                solodock::deploy::DeploymentStatus::NeedsAttention
+            } else {
+                solodock::deploy::DeploymentStatus::RolledBack
+            }
+        );
+        let stored_health: String =
+            sqlx::query_scalar("SELECT health_result FROM deployments WHERE id=?")
+                .bind(id.to_string())
+                .fetch_one(harness.database.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&stored_health).unwrap()["outcome"],
+            "passed"
+        );
+        assert_eq!(
+            harness.store.read_release_link(app_id, "pending").unwrap(),
+            if fail_rollback_final {
+                Some(pending.id)
+            } else {
+                None
+            }
+        );
+    }
 }
