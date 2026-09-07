@@ -86,6 +86,10 @@ DELETE 提交 token、slug 和是否移除 container；系统在 token consume �
 
 成功 tombstone 必须先从 catalog 发布移除，再精确 finalize；projection 或 fsync 不确定时保留 tombstone并由 reconciler/startup继续收敛。删除 app 会永久删除其受管 config/secret 与 webhook secret，因此 locked preview 必须明确提示。
 
+应用详情在页面可见时约每 10 秒刷新应用事实和部署历史，页面重新可见时立即刷新；资源指标继续使用 SSE。新刷新、变更操作或页面卸载会取消旧读取，并忽略被取代的响应。刷新失败保留上次成功数据并提供重试；首次加载、应用不存在和可重试失败都有明确状态。凭据、设置、Webhook 与历史接口独立降级，不阻止应用主体显示；配置能力不可用时禁止保存。
+
+后台刷新保留编辑表单及其原 revision。远端 draft 改变时提示冲突，并提供会丢弃本地编辑的明确重新载入入口。保存使用表单原 revision，Deploy 使用刷新后的实际事实。确定的冲突会刷新事实，等待用户再次操作；部署结果未知时，刷新后重试仍保留原请求体和幂等 key。
+
 ## SSE 共同边界
 
 events、logs 和 stats 都是 server-to-client 的 SSE，不提供 WebSocket、terminal、shell 或 exec。
