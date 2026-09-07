@@ -38,6 +38,8 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 
 生成的 Compose 不含 secret 原值，只引用权限受限的受管文件。
 
+配置编辑器在保存和校验前都会解析当前批量普通环境变量文本。无效文本保持可见并阻止提交，编辑 Secret 也不会绕过该检查；修正后提交当前值。提交时还会重新检查 Secret 名称冲突。
+
 ## 受管文件
 
 受管文本文件包含 logical name、容器 target path、sensitive 标记和只读属性。public 内容可读取；secret 内容使用与环境变量相同的 write-only operation。配置 revision 对单文件和总量设置配额，并将 public/secret 内容存入不同权限边界。
@@ -45,6 +47,8 @@ draft 保存一个带 tag 的 discovery image reference。tag 只用于 Registry
 宿主上的 state root、应用目录、config revision 及 `files/{public,secret}` 目录保持 `0700 solodock:solodock`；只有实际 bind mount 的 `files/public/<logical-name>` 与 `files/secret/<logical-name>` direct leaf 是精确 `0444 solodock:solodock`。因此任意常见非 root 容器 UID/GID 可以读取显式挂入自己的文件，而普通宿主用户仍无法穿过私有 ancestor 枚举或读取 state tree。环境 secret、Registry/webhook credential、SQLite、release metadata 和其他控制面文件不使用该例外，继续保持私有文件权限。
 
 所有受管文件仍以 Compose `read_only: true` 挂载，容器不能写回宿主 inode。需要容器写入的持久内容必须使用 volume 或显式确认的 read-write bind，不能借受管文件绕过 secret、配额或不可变 release 语义。每次发布在私有 temp revision 内写完、显式设置最终 mode 并 fsync 后才原子可见；部署前 strict loader 会拒绝 mode、owner、类型或 symlink 漂移，并沿用相应部署阶段的配置或 release 无效错误。
+
+托管文件内容使用多行文本框，保留缩进、空行与末尾换行。新输入的敏感文件文本在编辑时可见；已保存秘密不会回传，已存秘密输入留空表示保留，保存成功后清空替换输入。
 
 ## Port、volume、bind 与 network
 
@@ -113,6 +117,9 @@ preview 合并 active、pending 与 draft 中的文件、volume、bind、network
 部署、active/pending 和 rollback 语义见 [部署与回滚](deployments.md)，恢复时的文件权限与链接约束见 [恢复](recovery.md)。
 
 ## 手动 artifact 清理
+
+完成注销后，清理保护只排除该已不存在应用的终态历史部署引用，不修改部署状态或审计历史。应用目录重新出现、删除尚未完成或仍有非终态部署时，注销记录不能解除保护。没有已验证注销记录的应用，其恢复引用缺失仍会阻止清理。所有保留的运行或停止容器仍保护各自镜像，包括注销时留下的容器。
+
 
 存储清理是显式的“预览并确认”操作。它始终保护 active/pending release、当前 draft revision、`queued`、`running`、`interrupted` 与 `needs_attention` deployment 的恢复引用、清理恢复 artifact，以及每个应用额外三个最近的回滚 release。每次预览最多选择全局最旧的 100 个已验证且无引用 release；config revision 只有在没有任何保留 release 或 draft 引用时才成为候选。已知私有临时 artifact 复用同一 typed store inventory。未知名称、链接、类型、owner、mode、签名或 ledger 事实都会让整个 inventory fail closed。
 

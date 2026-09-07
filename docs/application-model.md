@@ -38,6 +38,8 @@ Environment variables have one canonical data model. Public variables can switch
 
 Generated Compose contains no secret plaintext; it references permission-constrained managed files.
 
+The configuration editor validates the current bulk public-environment text before both Save and Validate. Invalid text remains visible and blocks submission even after editing secrets; correcting it submits the current values. Secret names are checked for conflicts again at submission.
+
 ## Managed files
 
 A managed text file has a logical name, container target path, sensitive flag, and read-only property. Public contents can be read. Secret contents use the same write-only operation model as secret environment variables. Config revisions enforce per-file and aggregate quotas and store public and secret contents in separate permission boundaries.
@@ -45,6 +47,8 @@ A managed text file has a logical name, container target path, sensitive flag, a
 On the host, the state root, application directory, config revision, and `files/{public,secret}` directories remain `0700 solodock:solodock`. Only a direct leaf mounted into a container at `files/public/<logical-name>` or `files/secret/<logical-name>` is exactly `0444 solodock:solodock`. This lets common non-root container UIDs/GIDs read a file explicitly mounted into their container while ordinary host users cannot traverse or enumerate the private state tree. Environment secrets, Registry/webhook credentials, SQLite, release metadata, and other control-plane files do not use this exception and remain private.
 
 Compose still mounts every managed file with `read_only: true`, so the container cannot write to the host inode. Persistent writable content must use a volume or an explicitly confirmed read-write bind, not managed files that bypass secret, quota, or immutable-release semantics. Publication writes into a private temporary revision, applies the final mode, and fsyncs before the revision becomes atomically visible. Before deployment, the strict loader rejects mode, owner, file-type, or symlink drift and returns the configuration- or release-invalid error appropriate to that deployment phase.
+
+Managed file content uses multiline text fields and preserves indentation, blank lines, and trailing newlines. Newly entered secret file text is visible while editing; stored secrets are never returned, empty stored-secret input keeps its value, and successful saving clears replacement inputs.
 
 ## Ports, volumes, binds, and networks
 
@@ -113,6 +117,9 @@ Deletion unregisters by default. Explicit removal still removes only the exact o
 See [deployments and rollback](deployments.md) for active/pending and rollback semantics, and [recovery](recovery.md) for file-permission and link requirements.
 
 ## Manual artifact cleanup
+
+A finalized unregistration removes only that absent application’s terminal historical deployment references from cleanup protection; it does not rewrite deployment status or audit history. A reappeared application directory, unfinished deletion, or nonterminal deployment is not excused by the record. Applications without a verified unregistration still fail closed on missing recovery references. Every retained running or stopped container continues to protect its image, including containers left behind by unregister.
+
 
 Storage cleanup is an explicit preview-and-confirm operation. It always protects active and pending releases, the current draft revision, recovery references from `queued`, `running`, `interrupted`, and `needs_attention` deployments, cleanup recovery artifacts, and three additional recent rollback releases per application. A preview selects at most 100 of the globally oldest verified, unreferenced releases; config revisions become candidates only when no retained release or draft references them. Known private temporary artifacts use the same typed store inventory. Unknown names, links, types, ownership, modes, signatures, or ledger facts make the entire inventory fail closed.
 

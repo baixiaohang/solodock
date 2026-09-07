@@ -7,7 +7,7 @@
     type EnvironmentRow,
   } from '../lib/environmentRows'
   import { EnvironmentTextError, parseEnvironmentText, serializeEnvironmentText } from '../lib/environmentText'
-  import { issuesUnder, type FormIssue } from '../lib/formErrors'
+  import { FormValidationError, issuesUnder, type FormIssue } from '../lib/formErrors'
   import { localized, messageText, t } from '../lib/i18n'
 
   let {
@@ -23,19 +23,22 @@
     if (row.originalKey !== null) row.removed = true
     else rows = rows.filter((candidate) => candidate.id !== row.id)
     rows = [...rows]
+    if (mode === 'text') updateBatch(batchText)
     onStructureChange?.('environment')
   }
 
   function update(row: EnvironmentRow, field: 'key' | 'value', value: string) {
     row[field] = value
-    clientIssue = null
     rows = [...rows]
+    if (mode === 'text') updateBatch(batchText)
+    else clientIssue = null
   }
 
   function updateSensitive(row: EnvironmentRow, sensitive: boolean) {
     row.sensitive = sensitive
-    clientIssue = null
     rows = [...rows]
+    if (mode === 'text') updateBatch(batchText)
+    else clientIssue = null
     onStructureChange?.('environment')
   }
 
@@ -76,6 +79,12 @@
   function addSecret() {
     rows = [...rows, emptySecretEnvironmentRow()]
     onStructureChange?.('environment')
+  }
+
+  export function prepare(): EnvironmentRow[] {
+    if (mode === 'text') updateBatch(batchText)
+    if (clientIssue) throw new FormValidationError([clientIssue])
+    return rows
   }
 
   function openRowsMode() {

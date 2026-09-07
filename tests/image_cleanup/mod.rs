@@ -1232,3 +1232,50 @@ async fn history_pages_reject_late_corruption_and_missing_join_proof_without_rem
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(images.state.lock().unwrap().removes.is_empty());
 }
+
+#[tokio::test]
+async fn unregistered_app_history_never_releases_a_retained_containers_image() {
+    for running in [false, true] {
+        let (h, images, app, revision) = fixture().await;
+        let route = format!("/api/v1/apps/{app}");
+        let (status, value) = body(
+            h.mutate(
+                "POST",
+                &format!("{route}/deletion-preview"),
+                None,
+                &json!({"remove_container":false}),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let value: Value = serde_json::from_str(&value).unwrap();
+        sqlx::query("UPDATE deployments SET status='needs_attention',phase='terminal',completed_at=updated_at WHERE app_id=?").bind(app.to_string()).execute(h.database.pool()).await.unwrap();
+        let mut retained = container(running, true);
+        retained.labels.insert(APP_ID_LABEL.into(), app.to_string());
+        images.state.lock().unwrap().containers.push(retained);
+        let request = json!({"confirmation_token":value["confirmation_token"],"slug":"example","expected_revision":revision,"remove_container":false});
+        let (status, value) = body(
+            h.mutate(
+                "DELETE",
+                &route,
+                Some("unregistration-retain-container"),
+                &request,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{value}");
+        let result = preview(&h).await;
+        assert!(
+            !result["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v["image_id"] == digest(0))
+        );
+        assert!(images.state.lock().unwrap().removes.is_empty());
+        assert!(images.state.lock().unwrap().images.contains_key(&digest(0)));
+        assert_eq!(images.state.lock().unwrap().containers.len(), 1);
+    }
+}
