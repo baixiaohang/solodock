@@ -131,21 +131,15 @@ See [resource budget](resource-budget.md) for targets, report format, and curren
 
 ## Documentation-change validation
 
-At minimum, a documentation-only Pull Request runs:
+For a documentation-only Pull Request, run `git diff --check` and check the affected documents:
 
-```bash
-git diff --check
-rg -n "proposals/" README.md README.zh-CN.md docs --glob '!testing.md' --glob '!AGENTS.md'
-```
+- relative Markdown links and any navigation affected by added, removed, or renamed documents;
+- English/Chinese pairing and meaning for changed topic documents;
+- changed facts against the corresponding code, schema, or tests;
+- no reintroduction of completed proposals, fixed test counts, or a second source of truth;
+- only documentation and collaboration files authorized by the task appear in the diff.
 
-Also verify manually:
-
-- every relative Markdown link target exists;
-- each English topic document has a same-named `docs/zh-CN/` translation and vice versa;
-- README navigates to current topics;
-- documented facts match the corresponding code, schema, and tests;
-- no completed milestones, planning directories, fixed test counts, or second source of truth was reintroduced;
-- the diff contains only documentation and collaboration files authorized by the task.
+Broaden the audit to all documentation links, translation pairs, README navigation, and stale proposal references when restructuring the documentation or when a detected inconsistency may extend beyond the changed files. Pure wording changes do not require application tests by default. CI classification and required checks remain unchanged.
 
 See repository-root `AGENTS.md` for routine development commands and default validation scope, [operations](operations.md) for operational acceptance, and [recovery](recovery.md) for restoration exercises.
 
