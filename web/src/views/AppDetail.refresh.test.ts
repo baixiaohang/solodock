@@ -59,6 +59,49 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.useRealTimers(); vi.restoreAllMocks() })
 
 describe('app detail refresh and loading recovery', () => {
+  it('hides disabled webhooks without a warning or repeated polling requests', async () => {
+    failures.set('/api/v1/apps/app-id/webhook', new ApiError(501, { code: 'WEBHOOK_UNAVAILABLE', message: 'The webhook endpoint is not configured', request_id: '' }))
+    await mount()
+    expect(screen.getByRole('heading', { name: 'Refresh demo' })).toBeTruthy()
+    expect(screen.queryByText('无法加载 Webhook 设置。')).toBeNull()
+    expect(screen.queryByRole('button', { name: '重试加载' })).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+    expect(screen.queryByRole('heading', { name: 'Registry recheck webhook' })).toBeNull()
+    await poll()
+    expect(read.mock.calls.filter(([path]) => path.endsWith('/webhook'))).toHaveLength(1)
+  })
+
+  it.each([
+    new Error('offline'),
+    new ApiError(503, { code: 'WEBHOOK_STORE_DEGRADED', message: 'Unavailable', request_id: '' }),
+    new ApiError(501, { code: 'HTTP_ERROR', message: 'Not implemented', request_id: '' }),
+    new ApiError(500, { code: 'WEBHOOK_UNAVAILABLE', message: 'Failed', request_id: '' }),
+  ])('keeps real webhook failures visible and allows retry (%s)', async (cause) => {
+    failures.set('/api/v1/apps/app-id/webhook', cause)
+    await mount()
+    expect(screen.getByText('无法加载 Webhook 设置。')).toBeTruthy()
+    failures.clear()
+    await fireEvent.click(screen.getByRole('button', { name: '重试加载' })); await settle()
+    expect(screen.queryByText('无法加载 Webhook 设置。')).toBeNull()
+    await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+    expect(screen.getByRole('heading', { name: 'Registry recheck webhook' })).toBeTruthy()
+  })
+
+  it('clears a stale webhook panel and warning when a retry reports disabled webhooks', async () => {
+    failures.set('/api/v1/apps/app-id/deployments?limit=20', new Error('offline'))
+    await mount()
+    await fireEvent.click(screen.getByRole('button', { name: '配置' }))
+    expect(screen.getByRole('heading', { name: 'Registry recheck webhook' })).toBeTruthy()
+    failures.clear()
+    failures.set('/api/v1/apps/app-id/webhook', new Error('offline'))
+    await fireEvent.click(screen.getByRole('button', { name: '重试加载' })); await settle()
+    expect(screen.getByText('无法加载 Webhook 设置。')).toBeTruthy()
+    failures.set('/api/v1/apps/app-id/webhook', new ApiError(501, { code: 'WEBHOOK_UNAVAILABLE', message: 'The webhook endpoint is not configured', request_id: '' }))
+    await fireEvent.click(screen.getByRole('button', { name: '重试加载' })); await settle()
+    expect(screen.queryByText('无法加载 Webhook 设置。')).toBeNull()
+    expect(screen.queryByRole('heading', { name: 'Registry recheck webhook' })).toBeNull()
+  })
+
   it.each([
     [new Error('offline'), '无法加载应用。'],
     [new ApiError(500, { code: 'INTERNAL', message: 'Failed', request_id: '' }), '无法加载应用。'],
