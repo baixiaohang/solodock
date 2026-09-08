@@ -174,7 +174,14 @@
     if (auxiliary || !webhookReady) requests.push(
         api<WebhookStatus>(`/api/v1/apps/${appId}/webhook`, { signal: controller.signal }).then((value) => {
           if (current()) { webhook = value; webhookError = false; webhookReady = true }
-        }).catch(() => { if (current()) webhookError = true }),
+        }).catch((cause) => {
+          if (!current()) return
+          if (cause instanceof ApiError && cause.status === 501 && cause.body.code === 'WEBHOOK_UNAVAILABLE') {
+            webhook = null; webhookError = false; webhookReady = true
+          } else {
+            webhookError = true
+          }
+        }),
     )
     if (auxiliary || !settingsReady) requests.push(
         api<SettingsResponse>('/api/v1/settings', { signal: controller.signal }).then((value) => {
