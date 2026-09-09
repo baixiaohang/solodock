@@ -7,6 +7,7 @@ pub mod image_inspection;
 pub mod middleware;
 pub mod mutations;
 pub mod presets;
+pub mod retention;
 pub mod settings;
 pub mod storage_cleanup;
 pub mod streams;
@@ -52,6 +53,7 @@ pub struct AppState {
     pub redactor: SecretRedactor,
     pub state_directory: PathBuf,
     pub shutdown: CancellationToken,
+    pub retention_notify: Arc<tokio::sync::Notify>,
     pub stream_tasks: TaskTracker,
     pub m3: Option<Arc<mutations::M3Services>>,
     pub m4: Option<Arc<deployments::M4Services>>,
@@ -85,6 +87,7 @@ impl AppState {
             stream_gate: streams::StreamGate::default(),
             redactor: SecretRedactor::new(&EmptySecretProvider),
             state_directory,
+            retention_notify: Arc::new(tokio::sync::Notify::new()),
             shutdown,
             stream_tasks,
             m3: None,
@@ -150,6 +153,10 @@ pub fn router(state: AppState) -> Router {
         )
         .layer(DefaultBodyLimit::max(16 * 1024));
     let settings = Router::new()
+        .route(
+            "/api/v1/apps/{id}/retention",
+            get(retention::get).put(retention::update),
+        )
         .route("/api/v1/settings", get(settings::get).put(settings::update))
         .layer(DefaultBodyLimit::max(16 * 1024));
     let presets = Router::new()

@@ -19,7 +19,7 @@ use super::{
 };
 use crate::{
     db::{format_time, parse_time},
-    docker::image_cleanup::{ExactImageId, RemoveImageResult},
+    docker::image_cleanup::ExactImageId,
     error::{ApiError, RequestId},
     image_cleanup::{ImageCandidate, ImagePlan},
     mutation::ClaimResult,
@@ -234,90 +234,16 @@ async fn execute(
         )
         .await?;
     }
-    // Verify the whole ledger before effects; a mismatched/extra item must never
-    // be interpreted as a new authorization to remove an image.
-    let rows=sqlx::query("SELECT ordinal,image_id,status FROM image_cleanup_items WHERE operation_id=? ORDER BY ordinal").bind(operation.to_string()).fetch_all(m3.database.pool()).await?;
-    if rows.len() != selected.len() {
-        return Err(Failure::Unknown);
-    }
-    for (ordinal, (row, candidate)) in rows.iter().zip(&selected).enumerate() {
-        if row.get::<i64, _>("ordinal") != ordinal as i64
-            || row.get::<String, _>("image_id") != candidate.image_id.as_str()
-            || !matches!(
-                row.get::<&str, _>("status"),
-                "planned" | "started" | "removed" | "retained"
-            )
-        {
-            return Err(Failure::Unknown);
-        }
-    }
-    for (ordinal, (row, candidate)) in rows.iter().zip(&selected).enumerate() {
-        let previous: &str = row.get("status");
-        if !matches!(previous, "removed" | "retained") {
-            let eligible = current.candidates.iter().any(|value| value == candidate);
-            let observed = state
-                .image_cleanup
-                .inspect(&candidate.image_id)
-                .await
-                .map_err(|_| Failure::Unknown)?;
-            let next = match observed {
-                None => {
-                    if previous == "started" {
-                        "removed"
-                    } else {
-                        "retained"
-                    }
-                }
-                Some(observed)
-                    if !eligible
-                        || observed.image.id != candidate.image_id.as_str()
-                        || !crate::image_cleanup::matches_inspect(
-                            &candidate.identity,
-                            &observed,
-                        )
-                        .map_err(|_| Failure::Unknown)? =>
-                {
-                    "retained"
-                }
-                Some(_) => {
-                    sqlx::query("UPDATE image_cleanup_items SET status='started' WHERE operation_id=? AND ordinal=? AND status IN ('planned','started')").bind(operation.to_string()).bind(ordinal as i64).execute(m3.database.pool()).await?;
-                    match state
-                        .image_cleanup
-                        .remove(&candidate.image_id)
-                        .await
-                        .map_err(|_| Failure::Unknown)?
-                    {
-                        RemoveImageResult::Retained => "retained",
-                        RemoveImageResult::Accepted => {
-                            if state
-                                .image_cleanup
-                                .inspect(&candidate.image_id)
-                                .await
-                                .map_err(|_| Failure::Unknown)?
-                                .is_none()
-                            {
-                                "removed"
-                            } else {
-                                "retained"
-                            }
-                        }
-                    }
-                }
-            };
-            sqlx::query(
-                "UPDATE image_cleanup_items SET status=? WHERE operation_id=? AND ordinal=?",
-            )
-            .bind(next)
-            .bind(operation.to_string())
-            .bind(ordinal as i64)
-            .execute(m3.database.pool())
-            .await?;
-        }
-    }
-    crate::image_cleanup::terminal_result(&m3.database, operation, &selected, &hash)
-        .await
-        .map_err(|_| Failure::Unknown)?
-        .ok_or(Failure::Unknown)
+    crate::cleanup_execution::execute_images(
+        m3,
+        state.image_cleanup.as_ref(),
+        operation,
+        &selected,
+        &current,
+        &hash,
+    )
+    .await
+    .map_err(|_| Failure::Unknown)
 }
 
 async fn publish(

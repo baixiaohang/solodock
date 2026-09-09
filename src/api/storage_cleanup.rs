@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use axum::{
     Json,
@@ -19,7 +19,7 @@ use super::{
     },
 };
 use crate::{
-    app_store::cleanup::{CleanupArtifact, DetachResult},
+    app_store::cleanup::CleanupArtifact,
     db::{format_time, parse_time},
     error::{ApiError, RequestId},
     mutation::ClaimResult,
@@ -356,184 +356,17 @@ pub async fn apply(
     } else {
         None
     };
-    let artifacts: Vec<_> = plan
-        .candidates
-        .iter()
-        .map(|candidate| candidate.artifact.clone())
-        .collect();
-    if m3
-        .store
-        .prepare_cleanup_tombstone(operation_id, &preview_hash, &artifacts)
-        .is_err()
-    {
-        return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-    }
-    if sqlx::query("UPDATE storage_cleanup_operations SET status='running' WHERE operation_id=? AND status='planned'")
-        .bind(operation_id.to_string())
-        .execute(m3.database.pool())
-        .await
-        .is_err()
-    {
-        return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-    }
-
-    let mut failed_revisions = HashSet::new();
-    for (ordinal, candidate) in plan.candidates.iter().enumerate() {
-        let stored_status: String = match sqlx::query_scalar(
-            "SELECT status FROM storage_cleanup_items WHERE operation_id=? AND ordinal=?",
-        )
-        .bind(operation_id.to_string())
-        .bind(ordinal as i64)
-        .fetch_one(m3.database.pool())
-        .await
-        {
-            Ok(status) => status,
-            Err(_) => return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await,
-        };
-        if stored_status == "detached" || stored_status == "failed" {
-            if stored_status == "failed"
-                && let CleanupArtifact::Release {
-                    app_id,
-                    config_revision_id,
-                    ..
-                } = candidate.artifact
-            {
-                failed_revisions.insert((app_id, config_revision_id));
-            }
-            continue;
-        }
-        // A canonical artifact may have gained a reference while this operation
-        // was interrupted. Retain it in this exact plan instead of detaching it.
-        // A rename already completed before a failed progress write is resumed
-        // separately so its directory durability barriers are still repeated.
-        let newly_protected = if let Some(eligible) = &eligible {
-            if eligible.contains(&candidate.artifact) {
-                false
-            } else {
-                match m3.store.cleanup_artifact_is_detached(
-                    operation_id,
-                    ordinal,
-                    &candidate.artifact,
-                ) {
-                    Ok(detached) => !detached,
-                    Err(_) => {
-                        return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-                    }
-                }
-            }
-        } else {
-            false
-        };
-        if newly_protected {
-            if let CleanupArtifact::Release {
-                app_id,
-                config_revision_id,
-                ..
-            } = candidate.artifact
-            {
-                failed_revisions.insert((app_id, config_revision_id));
-            }
-            if record_item_failure(m3, operation_id, ordinal, "CLEANUP_ITEM_PROTECTED")
-                .await
-                .is_err()
-            {
-                return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-            }
-            continue;
-        }
-        if let CleanupArtifact::ConfigRevision {
-            app_id,
-            revision_id,
-        } = candidate.artifact
-            && failed_revisions.contains(&(app_id, revision_id))
-        {
-            if record_item_failure(m3, operation_id, ordinal, "RELEASE_RETAINED")
-                .await
-                .is_err()
-            {
-                return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-            }
-            continue;
-        }
-        match m3
-            .store
-            .detach_cleanup_artifact(operation_id, ordinal, &candidate.artifact)
-        {
-            Ok(DetachResult::Detached | DetachResult::AlreadyDetached) => {
-                if record_detached(m3, operation_id, ordinal, candidate)
-                    .await
-                    .is_err()
-                {
-                    return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-                }
-            }
-            Ok(DetachResult::ConfirmedMissing) => {
-                return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-            }
-            Ok(DetachResult::ConfirmedRetained) => {
-                if let CleanupArtifact::Release {
-                    app_id,
-                    config_revision_id,
-                    ..
-                } = candidate.artifact
-                {
-                    failed_revisions.insert((app_id, config_revision_id));
-                }
-                if record_item_failure(m3, operation_id, ordinal, "CLEANUP_ITEM_RETAINED")
-                    .await
-                    .is_err()
-                {
-                    return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-                }
-            }
-            Err(crate::app_store::StoreError::ReleaseConflict) => {
-                if let CleanupArtifact::Release {
-                    app_id,
-                    config_revision_id,
-                    ..
-                } = candidate.artifact
-                {
-                    failed_revisions.insert((app_id, config_revision_id));
-                }
-                if record_item_failure(m3, operation_id, ordinal, "CLEANUP_ITEM_RETAINED")
-                    .await
-                    .is_err()
-                {
-                    return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-                }
-            }
-            Err(_) => return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await,
-        }
-    }
-    let items =
-        match crate::storage_cleanup::exact_terminal_items(&m3.database, operation_id, &plan).await
-        {
-            Ok(items) => items,
-            Err(_) => return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await,
-        };
-    let has_failures = items.iter().any(|item| item["status"] == "retained");
-    let status = if has_failures {
-        "completed_with_failures"
-    } else {
-        "completed"
-    };
-    let now = format_time(OffsetDateTime::now_utc()).map_err(|_| ApiError::internal(request_id))?;
-    if sqlx::query("UPDATE storage_cleanup_operations SET status=?,completed_at=? WHERE operation_id=? AND status IN ('planned','running')")
-        .bind(status)
-        .bind(&now)
-        .bind(operation_id.to_string())
-        .execute(m3.database.pool())
-        .await
-        .is_err()
-    {
-        return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await;
-    }
-    let response_body = ApplyResponse {
+    let response_body = match crate::cleanup_execution::execute_artifacts(
+        m3,
         operation_id,
-        plan_hash: crate::app_store::cleanup::encode_hex(&preview_hash),
-        status,
-        items,
-        idempotency_replayed: false,
+        &plan,
+        &preview_hash,
+        eligible.as_ref(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(_) => return interrupt_internal(m3, APPLY_ROUTE, raw_key, request_id).await,
     };
     let response = finish_json(
         m3,
@@ -614,68 +447,6 @@ async fn publish_plan(
     tx.commit().await
 }
 
-async fn record_detached(
-    m3: &super::mutations::M3Services,
-    operation_id: Uuid,
-    ordinal: usize,
-    candidate: &CleanupCandidate,
-) -> Result<(), sqlx::Error> {
-    let mut tx = m3.database.pool().begin().await?;
-    let changed = sqlx::query("UPDATE storage_cleanup_items SET status='detached',error_code=NULL WHERE operation_id=? AND ordinal=? AND status='planned'")
-        .bind(operation_id.to_string())
-        .bind(ordinal as i64)
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if changed != 1 {
-        return Err(sqlx::Error::Protocol("cleanup item state changed".into()));
-    }
-    if let (
-        CleanupArtifact::Release {
-            app_id, release_id, ..
-        },
-        Some(record),
-    ) = (&candidate.artifact, &candidate.release_record)
-    {
-        sqlx::query("INSERT INTO cleaned_releases (app_id,release_id,cleanup_operation_id,removed_at,manifest_digest,local_image_id,platform_os,platform_architecture,platform_variant) VALUES (?,?,?,?,?,?,?,?,?)")
-            .bind(app_id.to_string())
-            .bind(release_id.to_string())
-            .bind(operation_id.to_string())
-            .bind(
-                format_time(OffsetDateTime::now_utc())
-                    .map_err(|error| sqlx::Error::Protocol(error.to_string()))?,
-            )
-            .bind(&record.manifest_digest)
-            .bind(&record.local_image_id)
-            .bind(&record.platform_os)
-            .bind(&record.platform_architecture)
-            .bind(&record.platform_variant)
-            .execute(&mut *tx)
-            .await?;
-    }
-    tx.commit().await
-}
-
-async fn record_item_failure(
-    m3: &super::mutations::M3Services,
-    operation_id: Uuid,
-    ordinal: usize,
-    code: &'static str,
-) -> Result<(), sqlx::Error> {
-    let changed = sqlx::query("UPDATE storage_cleanup_items SET status='failed',error_code=? WHERE operation_id=? AND ordinal=? AND status='planned'")
-        .bind(code)
-        .bind(operation_id.to_string())
-        .bind(ordinal as i64)
-        .execute(m3.database.pool())
-        .await?
-        .rows_affected();
-    if changed == 1 {
-        Ok(())
-    } else {
-        Err(sqlx::Error::Protocol("cleanup item state changed".into()))
-    }
-}
-
 fn preview_candidate(ordinal: usize, candidate: &CleanupCandidate) -> PreviewCandidateResponse {
     PreviewCandidateResponse {
         app_id: candidate.artifact.app_id(),
@@ -725,6 +496,8 @@ pub(crate) fn cleanup_error(error: CleanupError, request_id: RequestId) -> ApiEr
             "The cleanup inventory is incomplete",
             request_id,
         ),
-        CleanupError::Store(_) | CleanupError::Database(_) => ApiError::internal(request_id),
+        CleanupError::Busy | CleanupError::Store(_) | CleanupError::Database(_) => {
+            ApiError::internal(request_id)
+        }
     }
 }

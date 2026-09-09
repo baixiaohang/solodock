@@ -36,6 +36,7 @@ struct ImageState {
     inspect_failure: bool,
     inspects: usize,
     unavailable: bool,
+    always_retained: std::collections::HashSet<String>,
 }
 #[async_trait]
 impl ImageCleanup for Images {
@@ -58,6 +59,9 @@ impl ImageCleanup for Images {
     async fn remove(&self, id: &ExactImageId) -> Result<RemoveImageResult, DockerError> {
         let mut state = self.state.lock().unwrap();
         state.removes.push(id.as_str().into());
+        if state.always_retained.contains(id.as_str()) {
+            return Ok(RemoveImageResult::Retained);
+        }
         let fault = state.fault.take();
         if fault == Some("before") {
             return Err(DockerError::new(DockerErrorKind::Unavailable));
@@ -1279,3 +1283,5 @@ async fn unregistered_app_history_never_releases_a_retained_containers_image() {
         assert_eq!(images.state.lock().unwrap().containers.len(), 1);
     }
 }
+
+mod retention;

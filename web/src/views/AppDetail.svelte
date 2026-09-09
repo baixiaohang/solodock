@@ -1,4 +1,5 @@
 <script lang="ts">
+  import RetentionSettings from '../components/RetentionSettings.svelte'
   import { onMount } from 'svelte'
   import { ApiError, api, mutation } from '../lib/api'
   import { openSse } from '../lib/sse'
@@ -581,6 +582,7 @@
     {:else}
       {#if app.drift_codes.length}<div class="notice warning">{#each app.drift_codes as code}<span>{driftText(code, $t)}</span>{/each}</div>{/if}
       <section class="detail-grid">
+        {#key app.id}<RetentionSettings appId={app.id} />{/key}
         <article class="panel"><h2>{$t('Release comparison')}</h2><dl class="fact-list"><div><dt>{$t('Active image')}</dt><dd><code>{shortRef(app.active_release?.image_ref)}</code></dd></div><div><dt>{$t('Actual image')}</dt><dd><code>{shortRef(app.actual?.configured_image_ref)}</code></dd></div><div><dt>{$t('Container ID')}</dt><dd><code>{app.actual?.id.slice(0, 12) ?? '—'}</code></dd></div><div><dt>{$t('Restart count')}</dt><dd>{app.actual?.restart_count ?? '—'}</dd></div><div><dt>{$t('Exit code')}</dt><dd>{app.actual?.exit_code ?? '—'}</dd></div></dl></article>
         <article class="panel"><h2>{$t('Live resources')}</h2><dl class="fact-list"><div><dt>{$t('CPU')}</dt><dd>{stats?.cpu_percent?.toFixed(2) ?? '—'}%</dd></div><div><dt>{$t('Memory')}</dt><dd>{formatBytes(stats?.memory_usage_bytes ?? null)} / {formatBytes(stats?.memory_limit_bytes ?? null)}</dd></div><div><dt>{$t('Received')}</dt><dd>{formatBytes(stats?.network_rx_bytes ?? null)}</dd></div><div><dt>{$t('Sent')}</dt><dd>{formatBytes(stats?.network_tx_bytes ?? null)}</dd></div></dl></article>
         <article class="panel wide"><h2>{$t('Automatic deployment')}</h2><dl class="fact-list"><div><dt>{$t('Status')}</dt><dd>{app.draft?.auto_deploy_enabled ? $t('Enabled') : $t('Disabled')}</dd></div><div><dt>{$t('Last result')}</dt><dd class:warning={pollNeedsAttention(app.polling)}>{pollOutcomeText(app.polling, $t)}</dd></div><div><dt>{$t('Last checked')}</dt><dd><time datetime={app.polling?.last_checked_at ?? undefined}>{formatTimestamp(app.polling?.last_checked_at, $timeSettings.timezone, $locale)}</time></dd></div><div><dt>{$t('Next check not before')}</dt><dd><time datetime={app.polling?.next_check_not_before ?? undefined}>{formatTimestamp(app.polling?.next_check_not_before, $timeSettings.timezone, $locale)}</time></dd></div><div><dt>{$t('Manifest')}</dt><dd><code>{app.polling?.last_manifest_digest ?? '—'}</code></dd></div><div><dt>{$t('Platform')}</dt><dd>{app.polling?.last_platform ?? '—'}</dd></div><div><dt>{$t('Error')}</dt><dd>{app.polling?.last_error_code ?? $t('None')}</dd></div></dl>{#if app.polling?.suppressed_deployment_id}<a href={`#/deployments/${app.polling.suppressed_deployment_id}`}>{$t('View suppressed failed deployment')}</a>{/if}</article>

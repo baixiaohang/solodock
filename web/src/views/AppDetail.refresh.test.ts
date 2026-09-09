@@ -196,9 +196,10 @@ describe('app detail refresh and loading recovery', () => {
       return Promise.resolve(response(path)) as never
     })
     await poll()
-    const calls = read.mock.calls.length
+    const appReads = () => read.mock.calls.filter(([path]) => path === '/api/v1/apps/app-id').length
+    const calls = appReads()
     await act(async () => { await vi.advanceTimersByTimeAsync(5_000) })
-    expect(read.mock.calls).toHaveLength(calls)
+    expect(appReads()).toBe(calls)
     current.display_name = 'New result'
     read.mockImplementation(async (path) => response(path) as never)
     await fireEvent(document, new Event('visibilitychange')); await settle()

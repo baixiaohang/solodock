@@ -144,8 +144,8 @@
 
 <section class="panel cleanup-panel">
   <h2>{$t('Storage cleanup')}</h2>
-  <p class="muted">{$t('Scan for old immutable releases, derived configuration revisions, and known temporary artifacts. SoloDock never cleans them automatically.')}</p>
-  <p class="security-note">{$t('Active, pending, current draft, recovery references, and three recent rollback releases per application stay protected. Containers, volumes, binds, networks, credentials, deployments, and audit history are never removed here.')}</p>
+  <p class="muted">{$t('Scan for old immutable releases, derived configuration revisions, and known temporary artifacts. Automatic retention can be enabled separately for each application.')}</p>
+  <p class="security-note">{$t('Active, pending, current draft and recovery references stay protected. Enabled applications use their successful-version retention count; other applications retain three additional rollback releases. Workload data and history are never removed here.')}</p>
   <p class="security-note">{$t('Cleaned deployment history remains visible, but rollback to a listed release becomes permanently unavailable.')}</p>
   {#if error}
     <p class="notice danger" role="alert">{requestId ? $t('{detail} (request {requestId})', { detail: messageText(error, $t), requestId }) : messageText(error, $t)}</p>

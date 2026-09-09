@@ -304,11 +304,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         redactor,
         state_directory: config.state_directory.clone(),
         shutdown: shutdown.clone(),
+        retention_notify: Arc::new(tokio::sync::Notify::new()),
         stream_tasks: stream_tasks.clone(),
         m3: Some(m3),
         m4: Some(m4),
         webhooks,
     };
+    let retention_task = solodock::retention::start(state.clone());
     let poller_task = {
         let m3 = state.m3.as_ref().expect("M3 services configured").clone();
         let m4 = state.m4.as_ref().expect("M4 services configured").clone();
@@ -346,6 +348,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         let _ = compose_capability_task.await;
         let _ = projection_task.await;
         let _ = poller_task.await;
+        let _ = retention_task.await;
         stream_tasks.wait().await;
     })
     .await
