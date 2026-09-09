@@ -528,6 +528,7 @@ impl MutationHarness {
             DockerSupervisor::from_snapshot(probe),
         );
         let mut state = AppState {
+            retention_notify: Arc::new(tokio::sync::Notify::new()),
             image_cleanup: Arc::new(docker_api.image_cleanup()),
             auth,
             public_origin: "https://solodock.example.com".into(),

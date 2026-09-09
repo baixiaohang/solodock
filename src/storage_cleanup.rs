@@ -74,6 +74,8 @@ pub enum ProtectionReason {
 
 #[derive(Debug, Error)]
 pub enum CleanupError {
+    #[error("application or Compose mutation is busy")]
+    Busy,
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -109,10 +111,27 @@ pub async fn build_plan(
     store: &AppStore,
     database: &Database,
 ) -> Result<CleanupPlan, CleanupError> {
-    match build_plan_inner(store, database, None).await {
+    match build_plan_inner(store, database, None, None).await {
         Err(CleanupError::Store(_)) => Err(CleanupError::InventoryIncomplete),
         result => result.map(|inventory| inventory.plan),
     }
+}
+
+pub(crate) async fn automatic_plan(
+    store: &AppStore,
+    database: &Database,
+    app: Uuid,
+    resuming: Option<Uuid>,
+) -> Result<CleanupPlan, CleanupError> {
+    let policy = crate::retention::load(database, app).await?;
+    let mut plan = build_plan_inner(store, database, resuming, Some(app))
+        .await?
+        .plan;
+    if !policy.enabled {
+        plan.candidates.clear();
+        plan.estimated_logical_bytes = 0;
+    }
+    Ok(plan)
 }
 
 /// Recheck current protections under the catalog and candidate app guards.
@@ -123,7 +142,7 @@ pub(crate) async fn resume_candidates(
     database: &Database,
     operation: Uuid,
 ) -> Result<HashSet<CleanupArtifact>, CleanupError> {
-    Ok(build_plan_inner(store, database, Some(operation))
+    Ok(build_plan_inner(store, database, Some(operation), None)
         .await?
         .plan
         .candidates
@@ -142,13 +161,14 @@ pub(crate) async fn image_protection_inventory(
     store: &AppStore,
     database: &Database,
 ) -> Result<ArtifactInventory, CleanupError> {
-    build_plan_inner(store, database, None).await
+    build_plan_inner(store, database, None, None).await
 }
 
 async fn build_plan_inner(
     store: &AppStore,
     database: &Database,
     resuming_operation: Option<Uuid>,
+    automatic_app: Option<Uuid>,
 ) -> Result<ArtifactInventory, CleanupError> {
     let report = store.scan_read_only()?;
     crate::mutation::idempotency::IdempotencyService::validate_app_tombstones(database, store)
@@ -346,7 +366,9 @@ async fn build_plan_inner(
         if candidates.len() == MAX_CLEANUP_ITEMS {
             break;
         }
-        if release_protection.contains_key(&(item.app_id, item.release.id)) {
+        if automatic_app.is_some_and(|app| app != item.app_id)
+            || release_protection.contains_key(&(item.app_id, item.release.id))
+        {
             continue;
         }
         selected_releases.insert((item.app_id, item.release.id));
@@ -378,7 +400,9 @@ async fn build_plan_inner(
         if candidates.len() == MAX_CLEANUP_ITEMS {
             break;
         }
-        if !retained_revisions.contains(&(app_id, revision)) {
+        if automatic_app.is_none_or(|app| app == app_id)
+            && !retained_revisions.contains(&(app_id, revision))
+        {
             candidates.push(CleanupCandidate {
                 artifact: CleanupArtifact::ConfigRevision {
                     app_id,
@@ -394,7 +418,7 @@ async fn build_plan_inner(
         if candidates.len() == MAX_CLEANUP_ITEMS {
             break;
         }
-        if !temporary_protection.contains(&temp.artifact) {
+        if automatic_app.is_none() && !temporary_protection.contains(&temp.artifact) {
             candidates.push(temp);
         }
     }
@@ -601,6 +625,15 @@ async fn verify_terminal_proof(
     status: &str,
     expected_items: Vec<serde_json::Value>,
 ) -> Result<(), CleanupError> {
+    if let Some(authorization) =
+        crate::retention::authorization(database, operation_id, "artifacts").await?
+    {
+        let expected = serde_json::json!({"operation_id":operation_id,"plan_hash":encoded_plan_hash,"status":status,"items":expected_items,"idempotency_replayed":false});
+        if authorization.result.as_ref() != Some(&expected) {
+            return Err(CleanupError::RecordInvalid);
+        }
+        return Ok(());
+    }
     let proof = sqlx::query("SELECT route,status,response_status,response_body FROM idempotency_records WHERE operation_id=?")
         .bind(operation_id.to_string())
         .fetch_optional(database.pool())
@@ -629,6 +662,11 @@ async fn verify_terminal_proof(
 }
 
 async fn proof_is_recoverable(database: &Database, operation: Uuid) -> Result<bool, CleanupError> {
+    if let Some(authorization) =
+        crate::retention::authorization(database, operation, "artifacts").await?
+    {
+        return Ok(authorization.result.is_none());
+    }
     let row = sqlx::query("SELECT route,status FROM idempotency_records WHERE operation_id=?")
         .bind(operation.to_string())
         .fetch_optional(database.pool())
@@ -757,6 +795,48 @@ async fn protect_from_deployments(
         .iter()
         .map(|item| (item.app_id, item.release.id))
         .collect();
+    let policies = crate::retention::enabled_policies(database).await?;
+    for (app, policy) in &policies {
+        if unregistered_apps.contains(app) {
+            continue;
+        }
+        let active = release_protection
+            .iter()
+            .find_map(|((id, release), reasons)| {
+                (*id == *app && reasons.contains(&ProtectionReason::Active)).then_some(*release)
+            });
+        let mut successes = Vec::new();
+        for row in &rows {
+            if parse_db_uuid(row.get::<String, _>(1))? == *app
+                && row.get::<&str, _>("status") == "succeeded"
+                && row.get::<&str, _>("phase") == "terminal"
+            {
+                let completed: Option<String> = row.get("completed_at");
+                let at =
+                    crate::db::parse_time(completed.as_deref().ok_or(CleanupError::RecordInvalid)?)
+                        .map_err(|_| CleanupError::RecordInvalid)?;
+                if let Some(release) = optional_db_uuid(row.get::<Option<String>, _>(7))?
+                    && valid.contains(&(*app, release))
+                {
+                    successes.push((at, row.get::<String, _>(0), release));
+                }
+            }
+        }
+        successes.sort_by(|a, b| b.cmp(a));
+        let selected = crate::retention::retained_releases(
+            active,
+            policy.keep_versions as usize,
+            successes.into_iter().map(|(_, _, release)| release),
+        );
+        for release in selected {
+            protect_release(
+                release_protection,
+                *app,
+                Some(release),
+                ProtectionReason::RecentRollback,
+            );
+        }
+    }
     let mut recent: HashMap<Uuid, BTreeSet<Uuid>> = HashMap::new();
     for row in rows {
         let app_id = parse_db_uuid(row.get::<String, _>(1))?;
@@ -788,10 +868,12 @@ async fn protect_from_deployments(
             optional_db_uuid(row.get::<Option<String>, _>(8))?,
         ];
         let candidate = references[4];
-        if matches!(
-            status.as_str(),
-            "succeeded" | "no_op" | "failed" | "rolled_back"
-        ) && let Some(candidate) = candidate
+        if !policies.contains_key(&app_id)
+            && matches!(
+                status.as_str(),
+                "succeeded" | "no_op" | "failed" | "rolled_back"
+            )
+            && let Some(candidate) = candidate
             && valid.contains(&(app_id, candidate))
             && !release_protection
                 .get(&(app_id, candidate))
@@ -928,21 +1010,10 @@ async fn protect_from_cleanup_operations(
             }
             matched_preparations.insert(operation);
         }
-        if matches!(status.as_str(), "planned" | "running") {
-            let proof =
-                sqlx::query("SELECT route,status FROM idempotency_records WHERE operation_id=?")
-                    .bind(operation.to_string())
-                    .fetch_optional(database.pool())
-                    .await?
-                    .ok_or(CleanupError::RecordInvalid)?;
-            if proof.get::<String, _>(0) != "/api/v1/system/storage-cleanup/apply"
-                || !matches!(
-                    proof.get::<String, _>(1).as_str(),
-                    "pending" | "interrupted"
-                )
-            {
-                return Err(CleanupError::RecordInvalid);
-            }
+        if matches!(status.as_str(), "planned" | "running")
+            && !proof_is_recoverable(database, operation).await?
+        {
+            return Err(CleanupError::RecordInvalid);
         }
         if has_tombstone {
             let marker = store.read_cleanup_marker(operation)?;
@@ -982,17 +1053,7 @@ async fn protect_from_cleanup_operations(
             return Err(CleanupError::RecordInvalid);
         }
         if resuming_operation == Some(operation) {
-            let proof =
-                sqlx::query("SELECT route,status FROM idempotency_records WHERE operation_id=?")
-                    .bind(operation.to_string())
-                    .fetch_one(database.pool())
-                    .await?;
-            if proof.get::<String, _>(0) != "/api/v1/system/storage-cleanup/apply"
-                || !matches!(
-                    proof.get::<String, _>(1).as_str(),
-                    "pending" | "interrupted"
-                )
-            {
+            if !proof_is_recoverable(database, operation).await? {
                 return Err(CleanupError::RecordInvalid);
             }
             continue;

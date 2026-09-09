@@ -370,3 +370,12 @@ export interface Deployment {
   warnings?: string[]
 }
 export interface DeploymentPage { items: Deployment[]; next_cursor: string | null }
+
+export interface RetentionPolicy {
+  enabled: boolean
+  keep_versions: number
+  revision: string
+  last_checked_at: string | null
+  last_status: string | null
+  last_error_code: string | null
+}

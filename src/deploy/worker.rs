@@ -122,6 +122,8 @@ impl DeploymentEngine {
                 record_terminal_error(&engine.ledger, deployment_id, error).await;
                 m3.reconcile_notify.notify_one();
             }
+            drop(_guards);
+            state.retention_notify.notify_one();
         });
     }
 

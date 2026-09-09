@@ -127,3 +127,9 @@ After webhook HMAC verification, nonce claim, audit, and per-application wake se
 ## Data and recovery boundary
 
 Unregister, remove, and delete preserve named/external volumes, bind contents, and networks. Business data is outside the control-plane backup, and release rollback does not reverse data migrations. See [operations](operations.md), [recovery](recovery.md), and the [threat model](threat-model.md).
+
+## Retention coordination
+
+SQLite `app_retention` is the single writable source for application operational retention policy. Missing rows mean disabled with a default target of three. The background coordinator uses catalog, application and Compose guards in the existing cleanup order; deployment workers release their mutation guards before sending a wake-up. The scheduler is bounded, local to the process and independent of the deployment health gate.
+
+Manual and automatic callers share artifact detach/item persistence/finalization and exact image execution. Automatic operations carry `automatic_cleanup_authorizations`, binding the application, enabled policy snapshot and exact plan hash, with a terminal result proof. They do not fabricate administrator sessions or confirmation tokens. Historical manual proofs remain valid. Restart resumes published automatic operations even after policy disable, rechecks current policy and global references before new effects, and finalizes already detached payloads. Application filtering happens before batch limits so unrelated manual candidates cannot starve automatic work.

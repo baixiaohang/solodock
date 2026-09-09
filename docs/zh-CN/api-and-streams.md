@@ -148,3 +148,9 @@ Draft 输入和响应增加可选 `security_profile: string | null`。省略/nul
 `POST /api/v1/system/image-cleanup/preview` 只接受 `{}`，返回 canonical image ID、manifest/platform、Docker 报告字节数、受保护数量，以及绑定 session、五分钟过期的 write-only 确认 token。`POST /api/v1/system/image-cleanup/apply` 要求 `Idempotency-Key`，且只接受 `confirmation_token`、预览内非空且排序去重的 `image_ids` 子集（最多 100 个）及 `acknowledge_image_removal: true`。两条 route 保持 management authority、session、exact Origin、CSRF、16 KiB body、安全错误和 no-store 边界。不接受 tag、path、prune option 或任意 Docker 参数。
 
 Fresh facts 与预览不同会在 token consume 或任何 remove 前返回 `CLEANUP_PREVIEW_STALE`。发布前的 invalid/expired preview、app/Compose busy 和 inventory 不完整同样零副作用。Token consume、精确选择的 plan/items 和安全 audit 在一个 SQLite transaction 中发布。只有 exact HTTP 200 且 per-image 终态响应校验通过才确认完成。`completed_with_failures` 报告保留项并要求重新预览。transport/daemon/SQLite 结果未知时保留同 body/key；已发布操作不会因 busy 或其他 session 重试被错误终结为已知拒绝。
+
+## 应用保留策略
+
+`GET /api/v1/apps/{id}/retention` 返回 `enabled`、`keep_versions`、`revision` 及最近一轮的 `last_checked_at`、`last_status`、`last_error_code`。缺少策略时默认关闭、保留三版本、nil revision。同一路径 `PUT` 要求 `expected_revision`、`enabled`、`keep_versions`（1–100）及 `Idempotency-Key`，沿用 management session、exact Origin、CSRF、no-store 和 16 KiB body 边界。revision 过期返回 `409 RETENTION_REVISION_STALE`，应用忙返回 `409 APP_BUSY`。未知结果用相同 body/key 重试。策略、审计和精确成功重放响应原子提交后才唤醒后台清理，不等待或承诺删除成功。
+
+轮次状态为 `pending`、`completed`、`partially_retained` 或 `blocked`；错误区分 `APP_BUSY`、`ARTIFACT_CLEANUP_BLOCKED` 和 `IMAGE_CLEANUP_INVENTORY_INCOMPLETE`。这些结果不修改部署状态。原手动预览、确认接口及其幂等语义继续保留。

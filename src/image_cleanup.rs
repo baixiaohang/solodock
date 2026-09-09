@@ -143,6 +143,16 @@ pub(crate) async fn build_plan_for_operation(
     docker: &dyn ImageCleanup,
     resuming: Option<Uuid>,
 ) -> Result<ImagePlan, CleanupError> {
+    build_scoped_plan(store, database, docker, resuming, None).await
+}
+
+pub(crate) async fn build_scoped_plan(
+    store: &AppStore,
+    database: &Database,
+    docker: &dyn ImageCleanup,
+    resuming: Option<Uuid>,
+    automatic_app: Option<Uuid>,
+) -> Result<ImagePlan, CleanupError> {
     validate_operations(database).await?;
     let inventory = crate::storage_cleanup::image_protection_inventory(store, database).await?;
     let tombstones: BTreeSet<_> = store.cleanup_tombstones()?.into_iter().collect();
@@ -223,7 +233,9 @@ pub(crate) async fn build_plan_for_operation(
                 && row.get::<i64, _>("retirement_pending") == 0
                 && !tombstones.contains(&operation_id)
             {
-                cleaned.push(record);
+                if automatic_app.is_none_or(|id| id.to_string() == app) {
+                    cleaned.push(record);
+                }
             } else {
                 retained.push(record);
             }
@@ -444,11 +456,39 @@ pub(crate) async fn build_plan_for_operation(
         observations.values().collect::<Vec<_>>(),
     ))
     .map_err(|_| CleanupError::RecordInvalid)?;
+    let mut candidates: Vec<_> = candidates.into_values().collect();
+    if let Some(app) = automatic_app {
+        // Fair retries use durable attempt facts, not another mutable cursor.
+        // Never let permanent non-force conflicts monopolize the first batch.
+        let mut attempted = BTreeMap::new();
+        let mut reserved = BTreeSet::new();
+        for row in sqlx::query("SELECT i.image_id,a.created_at,a.operation_id FROM image_cleanup_items i JOIN automatic_cleanup_authorizations a ON a.operation_id=i.operation_id WHERE a.app_id=? AND a.cleanup_kind='images'").bind(app.to_string()).fetch_all(database.pool()).await? {
+            let id: String = row.get("image_id");
+            let operation: String = row.get("operation_id");
+            if resuming.is_some_and(|op| op.to_string() == operation) { reserved.insert(id); continue; }
+            let at = crate::db::parse_time(row.get("created_at")).map_err(|_|CleanupError::RecordInvalid)?;
+            let attempt = (at, operation);
+            let latest = attempted.entry(id).or_insert_with(||attempt.clone());
+            if attempt > *latest { *latest = attempt; }
+        }
+        candidates.sort_by(|a, b| {
+            (
+                !reserved.contains(a.image_id.as_str()),
+                attempted.get(a.image_id.as_str()),
+                &a.image_id,
+            )
+                .cmp(&(
+                    !reserved.contains(b.image_id.as_str()),
+                    attempted.get(b.image_id.as_str()),
+                    &b.image_id,
+                ))
+        });
+    }
+    candidates.truncate(crate::storage_cleanup::MAX_CLEANUP_ITEMS);
+    // Immutable plans retain canonical image-ID order, independent of scheduling.
+    candidates.sort_by(|a, b| a.image_id.cmp(&b.image_id));
     Ok(ImagePlan {
-        candidates: candidates
-            .into_values()
-            .take(crate::storage_cleanup::MAX_CLEANUP_ITEMS)
-            .collect(),
+        candidates,
         protected_count: protected.len(),
         facts_hash: plan_hash(&facts),
     })
@@ -512,6 +552,16 @@ pub async fn validate_operations(database: &Database) -> Result<(), CleanupError
         for item in &plan {
             identity(&item.identity)?;
         }
+        if let Some(auth) = crate::retention::authorization(database, uuid, "images").await? {
+            if operation.get::<Option<Vec<u8>>, _>("token_hmac").is_some() {
+                return Err(CleanupError::RecordInvalid);
+            }
+            let result = terminal_result(database, uuid, &plan, &hash).await?;
+            if auth.result.is_some() && auth.result != result {
+                return Err(CleanupError::RecordInvalid);
+            }
+            continue;
+        }
         let preview = sqlx::query(
             "SELECT plan_json,consumed_at FROM image_cleanup_previews WHERE token_hmac=?",
         )
@@ -558,7 +608,8 @@ pub async fn validate_operations(database: &Database) -> Result<(), CleanupError
 pub async fn pending_operation_count(database: &Database) -> Result<usize, CleanupError> {
     validate_operations(database).await?;
     let count:i64=sqlx::query_scalar("SELECT COUNT(*) FROM image_cleanup_operations o JOIN idempotency_records p ON p.operation_id=o.operation_id WHERE p.status IN ('pending','interrupted')").fetch_one(database.pool()).await?;
-    usize::try_from(count).map_err(|_| CleanupError::RecordInvalid)
+    let automatic: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM automatic_cleanup_authorizations WHERE cleanup_kind='images' AND result_json IS NULL").fetch_one(database.pool()).await?;
+    usize::try_from(count + automatic).map_err(|_| CleanupError::RecordInvalid)
 }
 
 pub(crate) async fn terminal_result(

@@ -159,7 +159,7 @@ Backup helper 会从自身不可变 package generation 解析 `solodock` binary�
 
 ## 手动存储清理
 
-SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。清理永远不会定时执行，也不会由磁盘阈值触发。除 active/pending/恢复事实外，每个应用还保留三个最近的回滚 release，且绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。
+SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。先扫描并检查精确的 release/config/temp 清单与回滚损失，再确认并应用。Preview 不是锁：apply 会重新核验所有受保护事实；计划发生变化时零删除拒绝。未启用自动保留的应用继续沿用原规则：除 active/pending/恢复事实外，额外保留三个最近回滚 release。已启用应用的手动与自动计划均采用配置的成功版本总数。Artifact 清理绝不触碰业务数据或 Docker 资源。显示的逻辑大小只是估算，不保证实际释放空间。
 
 两个清理面板都区分 `CLEANUP_RECOVERY_REFERENCE_MISSING`：某个部署仍需要已缺失的 release 或配置 revision。使用页面的 request ID 在服务日志中定位应用与部署 ID；其他清单问题保留原有保守错误分类。应用完成已验证注销后，旧 `needs_attention` 历史仍可能显示，清理不会改写历史或 attention 计数。旧数据处置见[恢复](recovery.md#已完成的应用注销)。
 
@@ -173,12 +173,22 @@ SoloDock owned immutable artifact 请使用 **系统设置 → 存储清理**。
 
 ## 手动 Docker 镜像清理
 
-已知保守限制：某些正常运行的多架构容器，其选中子镜像无法由 Docker 按 digest 独立 inspect。这会拒绝**整次镜像清理预览**，包括无关的合格镜像；不会停止或影响这些应用运行。SoloDock 不会忽略这些容器，也不会自动拉取镜像修复 inventory。本版本并非兼容所有原本合法的 containerd inventory。E2E 显式准备子镜像只是测试准备，不是运行时恢复功能。
+已知保守限制：某些正常运行的多架构容器，其选中子镜像无法由 Docker 按 digest 独立 inspect。这会阻塞**整次镜像清理预览和自动镜像阶段**，包括无关的合格镜像；不会停止或影响这些应用运行。SoloDock 不会忽略这些容器，也不会自动拉取镜像修复 inventory。本版本并非兼容所有原本合法的 containerd inventory。E2E 显式准备子镜像只是测试准备，不是运行时恢复功能。
 
 Containerd 上通过 tag 创建的容器可能引用 image index，而 descriptor 指向平台选中的 manifest。清理会验证精确 index 并独立 inspect 子 manifest，保护两种 identity 以及子镜像 config ID。子 identity/platform 缺失或冲突仍会阻断整个 inventory；不会把 index 当成可清理的 release manifest。
 
-Artifact 清理后使用独立的 **系统设置 → Docker 镜像清理**。扫描、逐项选择、确认，再应用。不会自动选择，不设定时或磁盘阈值自动清理。Preview 不是锁；执行前重新检查全部 release 及运行/停止 container 引用，daemon 还会阻止 non-force 冲突。Docker 报告字节数只是上限估算，不保证实际释放空间或证明归属，共享 layer 可能继续保留。
+Artifact 清理后使用独立的 **系统设置 → Docker 镜像清理**。扫描、逐项选择、确认，再应用。手动镜像选择默认为空。已启用自动保留的应用另有策略授权的后台清理；两条路径均不由磁盘阈值触发。Preview 不是锁；执行前重新检查全部 release 及运行/停止 container 引用，daemon 还会阻止 non-force 冲突。Docker 报告字节数只是上限估算，不保证实际释放空间或证明归属，共享 layer 可能继续保留。
 
 只按 fresh exact image ID 删除，使用 `force=false`、`noprune=true`。In-use 或 multiple-reference 冲突保留镜像，SoloDock 不会升级 force/prune 或删除父镜像。Container、volume、network、业务数据、credential、backup、deployment 和 audit 不在范围内。Inventory 不完整或当前 container 超过 4,096 个时会 fail closed；每次预览最多选择 100 个镜像。应先解决 inventory 问题再扫描，不可宽泛删除绕过。
 
 镜像清理在同一个数据库读取快照中按稳定键分批扫描全部已清理 release 历史。选择镜像前会验证每条 release 及其清理证明，包含后续页的保护事实与缺失操作证明检查。已不存在的历史镜像不会阻止清理，重复镜像身份共享 Docker 观察。清理历史和回滚材料丢失标记仍保留；当前容器清单上限及每次最多删除 100 个镜像的约束不变。
+
+## 自动版本保留
+
+在应用概览启用 **自动版本清理**，设置保留 1–100 个版本（默认 3）。新旧应用均默认关闭。启用即授权清理已有超额发布及其无引用本机镜像。策略作为 SQLite 运维设置保存，不产生工作负载配置漂移，也不随应用回滚还原。
+
+active 占一个名额，其余按成功部署完成时间保留不同 release（同时间由 deployment ID 确定顺序）。失败、no-op 和重复部署同一 release 不占名额。没有 active 时最多保留 N 个成功 release。pending、部署恢复及清理恢复引用额外保护，因此数量是目标而非强制上限。相同镜像但不同配置的 release 仍是不同版本。
+
+单个后台任务在策略修改和部署完成后唤醒，启动时和每 60 秒补偿扫描，并用五秒暂停合并密集通知。每轮每应用最多处理 100 个 artifact 和 100 个镜像；后续轮次推进积压并重试暂时错误。镜像批次依据持久化尝试历史优先处理尚未尝试及最久未尝试的身份，持续 non-force 冲突不会阻塞后续镜像；最终计划仍按 exact image ID 排序。先完成 artifact finalization，再选择镜像。自动候选排除临时文件和未启用应用，而全部应用保留的 release 与宿主所有运行/停止容器均可阻止镜像删除。
+
+应用概览显示最近一轮结果、时间、保留项和受阻阶段；系统设置保留手动预览入口。镜像清单错误（包括无法 inspect 的多架构 child）会保留镜像，显示镜像阶段受阻并重试。清理失败不改变部署成功结果。关闭后停止新选择；已中断的精确删除仍收尾持久化记录和 finalization，并保留新增引用保护的 canonical 项。历史继续可查，已清理 release 不可回滚。数据卷、bind 数据与远端镜像仓库不纳入清理。

@@ -127,3 +127,9 @@ webhook HMAC验证后，把nonce claim、audit和per-app wake sequence在一个S
 ## 数据与恢复边界
 
 unregister/remove/delete保留named/external volume、bind内容和network。业务数据不属于control-plane backup，release rollback也不回滚数据migration。安装、备份和故障处置分别见 [运维](operations.md)、[恢复](recovery.md) 和 [威胁模型](threat-model.md)。
+
+## 保留策略协调
+
+SQLite `app_retention` 是应用运维保留策略唯一可写来源。缺少记录代表关闭，默认保留目标为三。后台协调沿用清理的 catalog、app、Compose 锁顺序；部署 worker 在发出唤醒前释放 mutation guard。调度在本进程内有界执行，独立于部署健康 gate。
+
+手动与自动调用共享 artifact detach、逐项持久化、finalization 和精确镜像执行。自动操作通过 `automatic_cleanup_authorizations` 绑定应用、启用策略快照和精确计划 hash，并记录终态结果证明；不伪造管理员 session 或确认 token。历史手动证明继续有效。重启会恢复已发布自动操作，即使策略已关闭；新 effect 前核对当前策略及全局引用，并收尾已经 detach 的内容。应用筛选在批量上限之前完成，避免无关手动候选阻塞自动任务。
