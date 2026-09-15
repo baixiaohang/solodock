@@ -4485,6 +4485,100 @@ async fn validate_returns_the_exact_compose_artifact_given_to_the_runner() {
 }
 
 #[tokio::test]
+async fn environment_order_survives_save_reload_and_secret_edits() {
+    let harness = Harness::new().await;
+    let mut candidate = draft("order-secret-canary");
+    candidate["environment"] = json!({
+        "order": ["Z_PUBLIC", "Z_SECRET", "A_PUBLIC", "A_SECRET"],
+        "public": [{"key":"Z_PUBLIC","value":"z"},{"key":"A_PUBLIC","value":"a"}],
+        "secrets": [
+            {"key":"Z_SECRET","operation":"replace","value":"order-secret-canary"},
+            {"key":"A_SECRET","operation":"replace","value":"another-secret-canary"}
+        ]
+    });
+    let (status, created) = body(harness.create(Some("env-order-create"), &candidate).await).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let mut revision = created["app"]["config_revision"].clone();
+
+    for step in 0..2 {
+        let loaded = solodock::app_store::config_revision::load_verified(
+            &harness.store.app_directory(app_id),
+            revision.as_str().unwrap().parse().unwrap(),
+            harness.store.integrity_key().unwrap(),
+        )
+        .unwrap();
+        let normalized = loaded
+            .normalize_verified(
+                "Example".into(),
+                "registry.example/app:stable".into(),
+                None,
+                false,
+                300,
+                harness.store.integrity_key().unwrap(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&normalized.metadata.environment_order).unwrap(),
+            candidate["environment"]["order"]
+        );
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}"))
+                    .header(header::HOST, "solodock.example.com")
+                    .header(header::COOKIE, &harness.cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, response) = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(!response.contains("secret-canary"));
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(
+            response["draft"]["environment_order"],
+            candidate["environment"]["order"]
+        );
+
+        if step == 0 {
+            candidate["environment"] = json!({
+                "order": ["Z_PUBLIC", "RENAMED_SECRET", "A_PUBLIC", "NEW_PUBLIC"],
+                "public": [{"key":"Z_PUBLIC","value":"edited"},{"key":"A_PUBLIC","value":"a"},{"key":"NEW_PUBLIC","value":"new"}],
+                "secrets": [
+                    {"key":"A_SECRET","operation":"delete"},
+                    {"key":"Z_SECRET","operation":"delete"},
+                    {"key":"RENAMED_SECRET","operation":"replace","value":"renamed-secret-canary"}
+                ]
+            });
+            let (status, saved) = body(harness.mutate("PUT", &format!("/api/v1/apps/{app_id}/draft"),
+                Some("env-order-save-0001"), &json!({"expected_revision": revision, "draft": mutable(candidate.clone())})).await).await;
+            assert_eq!(status, StatusCode::OK, "{saved}");
+            revision =
+                serde_json::from_str::<Value>(&saved).unwrap()["app"]["config_revision"].clone();
+        } else {
+            let mut tampered = loaded.metadata.clone();
+            tampered.environment_order.as_mut().unwrap().reverse();
+            assert!(
+                solodock::domain::verify_config_integrity(
+                    &tampered,
+                    &loaded.public_environment,
+                    &loaded.public_files,
+                    &loaded.secrets,
+                    harness.store.integrity_key().unwrap()
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn draft_validation_returns_safe_field_issues_for_preview_and_save() {
     let harness = Harness::new().await;
     let (_, created) = body(

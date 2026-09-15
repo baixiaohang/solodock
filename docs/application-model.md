@@ -28,6 +28,8 @@ For a multi-platform image, SoloDock records the source descriptor, optional ind
 
 ## Environment variables
 
+The editor preserves the submitted row order across saves and reloads, including interleaved public and secret variables. Bulk editing preserves the positions of existing secret rows; new public rows are appended. Older revisions without order metadata use their existing public-then-secret order; their original insertion order cannot be recovered.
+
 Environment variables have one canonical data model. Public variables can switch losslessly between a row editor and bulk `KEY=VALUE` text. Bulk mode splits on the first `=`, ignores blank lines, and reports line numbers for missing separators, invalid keys, and duplicate keys. Secrets remain in a separate write-only row editor; they never enter bulk text or use placeholders that could be submitted accidentally.
 
 - Public values can be read and edited.

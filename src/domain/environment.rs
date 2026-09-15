@@ -28,6 +28,8 @@ pub enum SecretOperation {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EnvironmentInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<Vec<String>>,
     pub public: Vec<PublicEnvInput>,
     pub secrets: Vec<SecretEnvInput>,
 }

@@ -51,7 +51,7 @@ describe('confirmed draft row baselines', () => {
     saved = submittedDraftRows(env, file)
     env = acceptEnvironmentSave(env, saved.environment); file = acceptManagedFileSave(file, saved.files)
     env[0].value = ''; file[0].value = ''
-    expect(buildEnvironment(env)).toEqual({ public: [{ key: 'TOKEN', value: '' }], secrets: [] })
+    expect(buildEnvironment(env)).toEqual({ order: ['TOKEN'], public: [{ key: 'TOKEN', value: '' }], secrets: [] })
     expect(buildManagedFiles(file)).toEqual([{ logical_name: 'key', target_path: '/key', sensitive: false, readonly: true, content: '' }])
     env[0].removed = true; file[0].removed = true
     saved = submittedDraftRows(env, file)

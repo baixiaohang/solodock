@@ -57,6 +57,8 @@ pub struct ConfigMetadata {
     pub schema_version: u32,
     #[serde(default = "default_stop_grace_period_seconds")]
     pub stop_grace_period_seconds: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment_order: Option<Vec<String>>,
     pub public_env_keys: Vec<String>,
     pub secret_keys: Vec<String>,
     pub secret_hmacs: BTreeMap<String, String>,
@@ -206,8 +208,25 @@ fn normalize_draft_with_options(
         ));
     }
 
+    let environment_order = input.environment.order.clone();
     let (public_environment, secret_environment) =
         normalize_environment(input.environment, existing, hmac_key)?;
+    if let Some(order) = &environment_order {
+        let keys: HashSet<&str> = public_environment
+            .iter()
+            .map(|entry| entry.key.as_str())
+            .chain(secret_environment.keys().map(String::as_str))
+            .collect();
+        let ordered_keys: HashSet<&str> = order.iter().map(String::as_str).collect();
+        if order.len() != keys.len() || ordered_keys != keys {
+            return Err(DraftValidationError::at(
+                DomainError::ConfigInvalid,
+                "environment.order",
+                "INVALID_ENV_ORDER",
+                "Must list every active environment variable exactly once",
+            ));
+        }
+    }
     let (files, file_request_indexes, public_files, secret_files) =
         normalize_files(input.files, existing, hmac_key)?;
     let mut ports = input.ports;
@@ -283,6 +302,7 @@ fn normalize_draft_with_options(
             )
         })?;
     let mut metadata = ConfigMetadata {
+        environment_order,
         security_profile: input.security_profile.clone(),
         schema_version: 4,
         stop_grace_period_seconds: input.stop_grace_period_seconds,
@@ -1418,7 +1438,9 @@ fn canonical_non_secret(
     public_environment: &[PublicEnvInput],
     public_files: &BTreeMap<String, String>,
 ) -> Result<Vec<u8>, DomainError> {
-    if metadata.schema_version < 4 && metadata.security_profile.is_some() {
+    if metadata.schema_version < 4
+        && (metadata.security_profile.is_some() || metadata.environment_order.is_some())
+    {
         return Err(DomainError::ConfigInvalid);
     }
     if metadata.schema_version == 1 {
@@ -1672,6 +1694,42 @@ impl DomainError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_order_requires_an_exact_active_key_permutation() {
+        for order in [
+            vec![],
+            vec!["MODE"],
+            vec!["MODE", "MODE"],
+            vec!["MODE", "UNKNOWN"],
+        ] {
+            let mut draft = input();
+            draft.environment.public = vec![PublicEnvInput {
+                key: "MODE".into(),
+                value: "prod".into(),
+            }];
+            draft.environment.secrets = vec![SecretEnvInput {
+                key: "TOKEN".into(),
+                operation: SecretOperation::Replace {
+                    value: "canary".into(),
+                },
+            }];
+            draft.environment.order = Some(order.into_iter().map(String::from).collect());
+            let error =
+                normalize_draft_with_issues(draft, &ExistingSecrets::default(), b"key", &[])
+                    .err()
+                    .unwrap();
+            assert_eq!(error.issues[0].path, "environment.order");
+            assert_eq!(error.issues[0].code, "INVALID_ENV_ORDER");
+            assert!(!format!("{error:?}").contains("canary"));
+        }
+        let mut draft = input();
+        draft.environment = EnvironmentInput {
+            order: Some(vec![]),
+            ..EnvironmentInput::default()
+        };
+        assert!(normalize_draft(draft, &ExistingSecrets::default(), b"key", &[]).is_ok());
+    }
 
     #[test]
     fn security_profile_is_optional_validated_and_integrity_protected() {
@@ -2238,6 +2296,7 @@ mod tests {
             auto_deploy_enabled: false,
             poll_interval_seconds: normalized.poll_interval_seconds,
             stop_grace_period_seconds: normalized.stop_grace_period_seconds,
+            environment_order: normalized.metadata.environment_order.clone(),
             public_environment: normalized.public_environment,
             secret_keys: normalized.metadata.secret_keys,
             files: vec![crate::domain::dto::ManagedFileResponse {

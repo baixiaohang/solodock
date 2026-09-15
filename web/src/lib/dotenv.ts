@@ -21,7 +21,7 @@ export function parseDotenv(input: string): EnvEntry[] {
     seen.add(key)
     entries.push({ key, value })
   }
-  return entries.sort((left, right) => left.key.localeCompare(right.key))
+  return entries
 }
 
 function parseValue(raw: string): string {
@@ -48,8 +48,7 @@ function parseValue(raw: string): string {
 }
 
 export function serializeDotenv(entries: EnvEntry[]): string {
-  return [...entries]
-    .sort((left, right) => left.key.localeCompare(right.key))
+  return entries
     .map(({ key, value }) => `${key}=${quote(value)}`)
     .join('\n')
 }
