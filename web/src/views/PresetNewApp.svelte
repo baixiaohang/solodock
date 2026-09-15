@@ -1,11 +1,16 @@
 <script lang="ts">
+  import { untrack } from 'svelte'
   import { api, mutation } from '../lib/api'
   import { mutationFailure, retryIdentity, type RetryIdentity } from '../lib/mutationState'
   import type { AppDetailResponse, AppMutationResponse } from '../lib/types'
   import { localized, messageText, t, type UserMessage } from '../lib/i18n'
   import { presetDescription } from '../lib/presets'
 
-  let slug = $state('postgres')
+  let { presetId = 'postgresql' }: { presetId?: 'postgresql' | 'pgadmin' } = $props()
+  const isPgAdmin = $derived(presetId === 'pgadmin')
+  let slug = $state(untrack(() => presetId === 'pgadmin' ? 'pgadmin' : 'postgres'))
+  let email = $state('')
+  let hostPort = $state(5050)
   let major = $state('18')
   let username = $state('postgres')
   let database = $state('postgres')
@@ -63,7 +68,7 @@
 
   async function create() {
     if (!createdAppId && (!acknowledgeNonRollbackableData || !passwordSaved)) {
-      confirmationError = localized('Confirm both PostgreSQL safety acknowledgements before creating the service.')
+      confirmationError = localized(isPgAdmin ? 'Confirm both pgAdmin safety acknowledgements before creating the service.' : 'Confirm both PostgreSQL safety acknowledgements before creating the service.')
       return
     }
 
@@ -77,9 +82,9 @@
       if (!createdAppId) {
         const request = {
           slug,
-          preset_id: 'postgresql',
+          preset_id: presetId,
           preset_schema_version: 1,
-          variables: { major, username, database, password, initdb_args: '' },
+          variables: isPgAdmin ? { email, password, host_port: hostPort } : { major, username, database, password, initdb_args: '' },
         }
         createRetry = retryIdentity(createRetry, request)
         mutationStage = 'create'
@@ -142,9 +147,15 @@
   <div class="page-heading">
     <div>
       <p class="eyebrow">{$t('QUICK DEPLOY')}</p>
-      <h1>PostgreSQL</h1>
-      <p class="muted">{presetDescription('postgresql', 'Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.', $t)}</p>
-      <p class="muted">{$t('Only a service name is required by default. No host port is published; other services connect at {host}:5432.', { host: slug || 'postgres' })}</p>
+      <h1>{isPgAdmin ? 'pgAdmin' : 'PostgreSQL'}</h1>
+      {#if isPgAdmin}
+        <p class="muted">{presetDescription('pgadmin', 'pgAdmin with persistent settings and internal access to PostgreSQL services.', $t)}</p>
+        <p class="muted">{$t('Open pgAdmin on the SoloDock host at http://127.0.0.1:{port}, or forward that port over SSH for remote access.', { port: hostPort })}</p>
+        <p class="muted">{$t('In pgAdmin, register a server using the PostgreSQL service slug as Host, port 5432, and its database name, username and password. Both services must have service discovery enabled in their deployed configuration; enable it and redeploy older services if needed.')}</p>
+      {:else}
+        <p class="muted">{presetDescription('postgresql', 'Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.', $t)}</p>
+        <p class="muted">{$t('Only a service name is required by default. No host port is published; other services connect at {host}:5432.', { host: slug || 'postgres' })}</p>
+      {/if}
     </div>
   </div>
   {#if error}
@@ -155,9 +166,15 @@
   {/if}
   <form class="panel configuration-stack" onsubmit={(event) => { event.preventDefault(); void create() }}>
     <label>{$t('Service name')}<input bind:value={slug} maxlength="20" required disabled={busy || createdAppId !== null} /></label>
-    <label>{$t('Major')}<select bind:value={major} disabled={busy || createdAppId !== null}><option value="18">18 ({$t('Recommended')})</option><option value="17">17</option></select></label>
-    <label>{$t('Username')}<input bind:value={username} required disabled={busy || createdAppId !== null} /></label>
-    <label>{$t('Database')}<input bind:value={database} required disabled={busy || createdAppId !== null} /></label>
+    {#if isPgAdmin}
+      <label>{$t('Login email')}<input type="email" bind:value={email} maxlength="254" required disabled={busy || createdAppId !== null} /></label>
+      <label>{$t('Host port')}<input type="number" bind:value={hostPort} min="1" max="65535" step="1" required disabled={busy || createdAppId !== null} /></label>
+      <p class="muted">{$t('The pgAdmin login is separate from your PostgreSQL credentials. Initial credentials apply only to an empty pgAdmin volume; change an existing password inside pgAdmin.')}</p>
+    {:else}
+      <label>{$t('Major')}<select bind:value={major} disabled={busy || createdAppId !== null}><option value="18">18 ({$t('Recommended')})</option><option value="17">17</option></select></label>
+      <label>{$t('Username')}<input bind:value={username} required disabled={busy || createdAppId !== null} /></label>
+      <label>{$t('Database')}<input bind:value={database} required disabled={busy || createdAppId !== null} /></label>
+    {/if}
     {#if !createdAppId}
       <label>
         {$t('Generated password')}
@@ -167,6 +184,7 @@
           oninput={(event) => changePassword(event.currentTarget.value)}
           required
           minlength="16"
+          maxlength="256"
           disabled={busy}
         />
         <span class="muted">{$t('Copy and save it before creating the service. SoloDock never returns it after saving.')}</span>
@@ -179,7 +197,7 @@
           required
           disabled={busy}
         />
-        {$t('I understand that PostgreSQL data in the named volume does not roll back with a deployment or rollback')}
+        {$t(isPgAdmin ? 'I understand that pgAdmin settings in the named volume do not roll back with a deployment or rollback' : 'I understand that PostgreSQL data in the named volume does not roll back with a deployment or rollback')}
       </label>
       <label class="checkbox">
         <input
@@ -189,7 +207,7 @@
           required
           disabled={busy}
         />
-        {$t('I saved the generated PostgreSQL password outside SoloDock')}
+        {$t(isPgAdmin ? 'I saved the generated pgAdmin password outside SoloDock' : 'I saved the generated PostgreSQL password outside SoloDock')}
       </label>
       {#if confirmationError}<p class="form-error" role="alert">{messageText(confirmationError, $t)}</p>{/if}
     {/if}

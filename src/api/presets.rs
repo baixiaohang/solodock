@@ -14,7 +14,7 @@ use crate::{
     domain::{ExistingSecrets, normalize_draft, validate_slug},
     error::{ApiError, RequestId},
     mutation::ClaimResult,
-    presets::{self, postgresql},
+    presets::{self, pgadmin, postgresql},
 };
 
 const ROUTE: &str = "/api/v1/apps/from-preset";
@@ -31,18 +31,32 @@ pub struct CreateFromPresetRequest {
     slug: String,
     preset_id: String,
     preset_schema_version: u32,
-    variables: PostgreSqlVariables,
+    variables: PresetVariables,
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct PostgreSqlVariables {
-    major: String,
-    username: String,
-    database: String,
-    password: String,
-    #[serde(default)]
-    initdb_args: String,
+#[serde(untagged)]
+enum PresetVariables {
+    PostgreSql(postgresql::Variables),
+    PgAdmin(pgadmin::Variables),
+}
+
+fn render(input: CreateFromPresetRequest) -> Result<crate::domain::DraftInput, &'static str> {
+    match (
+        input.preset_id.as_str(),
+        input.preset_schema_version,
+        input.variables,
+    ) {
+        (
+            postgresql::PRESET_ID,
+            postgresql::SCHEMA_VERSION,
+            PresetVariables::PostgreSql(variables),
+        ) => postgresql::render(&input.slug, variables),
+        (pgadmin::PRESET_ID, pgadmin::SCHEMA_VERSION, PresetVariables::PgAdmin(variables)) => {
+            pgadmin::render(&input.slug, variables)
+        }
+        _ => Err("PRESET_UNSUPPORTED"),
+    }
 }
 
 pub async fn create(
@@ -81,29 +95,8 @@ pub async fn create(
         ClaimResult::New(id) | ClaimResult::Resume(id) => id,
         ClaimResult::Replay { .. } => unreachable!(),
     };
-    if input.preset_id != postgresql::PRESET_ID
-        || input.preset_schema_version != postgresql::SCHEMA_VERSION
-    {
-        return mutations::finish_error(
-            services,
-            ROUTE,
-            raw_key,
-            "PRESET_UNSUPPORTED",
-            StatusCode::UNPROCESSABLE_ENTITY,
-            request_id,
-        )
-        .await;
-    }
-    let draft_input = match postgresql::render(
-        &input.slug,
-        postgresql::Variables {
-            major: input.variables.major,
-            username: input.variables.username,
-            database: input.variables.database,
-            password: input.variables.password,
-            initdb_args: input.variables.initdb_args,
-        },
-    ) {
+    let slug = input.slug.clone();
+    let draft_input = match render(input) {
         Ok(value) => value,
         Err(code) => {
             return mutations::finish_error(
@@ -160,7 +153,7 @@ pub async fn create(
         .store
         .scan_read_only()
         .map_err(|_| ApiError::internal(request_id))?;
-    if report.valid_apps.iter().any(|app| app.slug == input.slug) {
+    if report.valid_apps.iter().any(|app| app.slug == slug) {
         return mutations::finish_error(
             services,
             ROUTE,
@@ -181,7 +174,7 @@ pub async fn create(
     })?;
     let metadata = match services.store.create_app(
         operation_id,
-        &input.slug,
+        &slug,
         operation_id,
         Some((operation_id, &draft)),
         OffsetDateTime::now_utc(),

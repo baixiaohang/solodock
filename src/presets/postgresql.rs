@@ -3,16 +3,19 @@ use crate::domain::{
     VolumeInput,
 };
 
-use super::PresetDescriptor;
+use super::{PresetDefaults, PresetDescriptor};
 
 pub const PRESET_ID: &str = "postgresql";
 pub const SCHEMA_VERSION: u32 = 1;
 
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct Variables {
     pub major: String,
     pub username: String,
     pub database: String,
     pub password: String,
+    #[serde(default)]
     pub initdb_args: String,
 }
 
@@ -22,10 +25,12 @@ pub fn descriptor() -> PresetDescriptor {
         schema_version: SCHEMA_VERSION,
         display_name: "PostgreSQL",
         description: "Single-instance PostgreSQL with a persistent volume and the platform service-discovery network.",
-        default_major: "18",
-        supported_majors: &["18", "17"],
-        default_username: "postgres",
-        default_database: "postgres",
+        defaults: PresetDefaults::PostgreSql {
+            default_major: "18",
+            supported_majors: &["18", "17"],
+            default_username: "postgres",
+            default_database: "postgres",
+        },
         password_generated_by_client: true,
     }
 }

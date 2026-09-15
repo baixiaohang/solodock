@@ -140,6 +140,17 @@ The global display timezone is selected in **System settings** from the backend 
 
 The Web UI language can be changed between English and Simplified Chinese on the bootstrap/sign-in screen and in the authenticated header. SoloDock stores an explicit choice only in browser `localStorage` under the versioned, non-sensitive key `solodock.ui.locale.v1`; it never sends the locale to the API, session, audit log, URL, SQLite, or server settings. Without a valid stored value, a first preferred browser language of `zh` or `zh-*` selects `zh-CN`; every other value selects English. Unavailable storage and invalid values fail safely without blocking the UI. Language changes immediately update visible text, localized timestamps, accessibility labels, and the document `lang` attribute.
 
+
+### pgAdmin quick deployment
+
+Choose **New service → Quick deploy → pgAdmin**, enter a login email and an available host port (default `5050`), save the generated password, and confirm persistent-storage behavior. The preset uses `dpage/pgadmin4:9.17` and an owned volume at `/var/lib/pgadmin`. Initial credentials only initialize an empty volume; update existing account passwords inside pgAdmin. Container mail delivery is disabled; password-reset email requires separate external SMTP configuration. These settings follow the [official pgAdmin container configuration](https://www.pgadmin.org/docs/pgadmin4/9.17/container_deployment.html).
+
+Open `http://127.0.0.1:5050` on the SoloDock host, substituting your chosen port. For remote access, forward it with `ssh -L 5050:127.0.0.1:5050 user@host`, then open that address locally. The preset binds only to loopback.
+
+In pgAdmin, choose **Register → Server**. Give the connection a name, then set **Host name/address** to the PostgreSQL service slug (for example, `postgres`), **Port** to `5432` (or its configured container port), **Maintenance database** to its database name, and **Username/Password** to its PostgreSQL credentials. The pgAdmin login is separate. Database host ports do not need to be published.
+
+Both applications must have service discovery enabled in their deployed configuration. For an older PostgreSQL application, enable it under network settings and deploy the saved configuration before connecting. The network shares the existing internal trust domain; it does not bypass PostgreSQL authentication or server access rules. pgAdmin settings and saved connections persist in its volume and do not roll back with releases.
+
 ## Backup
 
 Stop the service before backup:
