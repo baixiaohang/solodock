@@ -68,6 +68,8 @@ terminal replay record 通常在 24 小时后过期，但清理是低频 service
 
 草稿编辑器在保存期间继续允许输入。确认成功后，当前编辑会话使用响应中的 `app.config_revision` 推进基准，并同步已保存 Secret/文件基准，保留等待期间新增的输入。只有仍与提交值匹配的敏感输入才会清空，后续保存相对已确认 revision 生成 keep/replace/delete。后续读取失败时仍保留 revision 和输入，并标明应用事实尚未刷新；读取到外部修改产生的其他 revision 仍需处理冲突，结果未知的请求不会推进基准。普通环境变量批量原文（包括非法行）、编辑模式和校验错误在同一编辑会话内切换页签后保留。预检成功与错误响应仅作用于发起该请求且输入未变化的编辑会话。保存和预检校验当前原文；显式重新载入草稿或开始新编辑会话会重置原文。
 
+草稿请求支持可选的 `environment.order` 数组，必须将所有有效普通变量和 Secret 的 key 各列一次，不包含已删除的 Secret。存在时，草稿响应通过 `environment_order` 返回该顺序。顺序持久化到配置元数据并受配置完整性哈希保护；顺序变化会创建新的配置 revision。省略顺序时沿用旧版规范排序。已有 revision 无需迁移，保留原哈希。
+
 `GET /api/v1/app-presets` 只返回版本化公开 descriptor；`POST /api/v1/apps/from-preset` 以 write-only 变量生成正常 revision。PostgreSQL v1 支持 major 18/17，分别挂载 `/var/lib/postgresql` 与 `/var/lib/postgresql/data`，不使用 `latest`，且 response 不回显密码。Web 随后以独立稳定幂等键调用现有 deployment mutation；创建成功而部署失败时保留可恢复应用。
 
 pgAdmin v1 使用 `preset_id: "pgadmin"`、`preset_schema_version: 1` 和 `variables: {"email": "admin@example.com", "password": "<16–256 字节>", "host_port": 5050}`。公开 descriptor 包含 `image` 和 `default_host_port`；PostgreSQL 专用默认字段仍仅出现在 PostgreSQL descriptor 中。模板固定使用 `dpage/pgadmin4:9.17`，仅发布 `127.0.0.1:<host_port>:5050/tcp`，并启用服务发现。密码沿用现有受管 secret 流程，绝不回显。未知变量、无效邮箱/端口/密码和不支持的模板/schema 组合均被拒绝。

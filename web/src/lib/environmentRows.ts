@@ -37,7 +37,6 @@ export function publicEnvironmentEntries(rows: EnvironmentRow[]): PublicEnvironm
 
 export function replacePublicEnvironmentRows(rows: EnvironmentRow[], entries: PublicEnvironmentEntry[]): EnvironmentRow[] {
   const publicRows = rows.filter((row) => !row.removed && !row.sensitive)
-  const retainedSecrets = rows.filter((row) => row.sensitive || (row.removed && row.originalSensitive))
   const projected = entries.map(({ key, value }, index) => {
     const existing = publicRows[index]
     return existing
@@ -51,11 +50,17 @@ export function replacePublicEnvironmentRows(rows: EnvironmentRow[], entries: Pu
     .slice(entries.length)
     .filter((row) => row.originalSensitive)
     .map((row) => ({ ...row, removed: true }))
-  return [...projected, ...retainedSecrets, ...removedSecretConversions]
+  let publicIndex = 0
+  const result: EnvironmentRow[] = []
+  for (const row of rows) {
+    if (row.sensitive || (row.removed && row.originalSensitive)) result.push(row)
+    else if (!row.removed && publicIndex < projected.length) result.push(projected[publicIndex++]!)
+  }
+  return [...result, ...projected.slice(publicIndex), ...removedSecretConversions]
 }
 
-export function environmentRowsFromDraft(draft: Pick<DraftResponse, 'public_environment' | 'secret_keys'>): EnvironmentRow[] {
-  return [
+export function environmentRowsFromDraft(draft: Pick<DraftResponse, 'public_environment' | 'secret_keys' | 'environment_order'>): EnvironmentRow[] {
+  const rows: EnvironmentRow[] = [
     ...draft.public_environment.map(({ key, value }) => ({
       id: rowId(), key, value, sensitive: false,
       originalKey: key, originalSensitive: false, storedSecret: false, removed: false,
@@ -65,6 +70,14 @@ export function environmentRowsFromDraft(draft: Pick<DraftResponse, 'public_envi
       originalKey: key, originalSensitive: true, storedSecret: true, removed: false,
     })),
   ]
+  if (!draft.environment_order) return rows
+  const byKey = new Map(rows.map((row) => [row.key, row]))
+  const ordered: EnvironmentRow[] = []
+  for (const key of draft.environment_order) {
+    const row = byKey.get(key)
+    if (row) { ordered.push(row); byKey.delete(key) }
+  }
+  return [...ordered, ...byKey.values()]
 }
 
 export interface EnvironmentProjection {
@@ -125,7 +138,7 @@ export function buildEnvironmentProjection(rows: EnvironmentRow[]): EnvironmentP
     secretRequestRowIndexes.push(visibleSecretRows.indexOf(row))
   }
   return {
-    environment: { public: publicEntries, secrets: secretOperations },
+    environment: { order: active.map((row) => row.key), public: publicEntries, secrets: secretOperations },
     secretRequestRowIndexes,
   }
 }

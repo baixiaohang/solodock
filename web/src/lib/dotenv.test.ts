@@ -4,7 +4,7 @@ import { parseDotenv, serializeDotenv } from './dotenv'
 describe('finite dotenv grammar', () => {
   it('supports comments, export, quotes and deterministic round trips', () => {
     const parsed = parseDotenv(`# comment\nexport B="two words"\nA='one\\#value'`)
-    expect(parsed).toEqual([{ key: 'A', value: 'one#value' }, { key: 'B', value: 'two words' }])
+    expect(parsed).toEqual([{ key: 'B', value: 'two words' }, { key: 'A', value: 'one#value' }])
     expect(parseDotenv(serializeDotenv(parsed))).toEqual(parsed)
   })
 

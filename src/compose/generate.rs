@@ -484,6 +484,7 @@ mod tests {
                 poll_interval_seconds: 300,
                 stop_grace_period_seconds: 60,
                 environment: crate::domain::EnvironmentInput {
+                    order: None,
                     public: vec![],
                     secrets: vec![crate::domain::SecretEnvInput {
                         key: "TOKEN".into(),

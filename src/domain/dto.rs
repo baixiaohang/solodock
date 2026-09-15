@@ -13,6 +13,8 @@ pub struct DraftResponse {
     pub auto_deploy_enabled: bool,
     pub poll_interval_seconds: u32,
     pub stop_grace_period_seconds: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_order: Option<Vec<String>>,
     pub public_environment: Vec<PublicEnvInput>,
     pub secret_keys: Vec<String>,
     pub files: Vec<ManagedFileResponse>,

@@ -176,6 +176,7 @@ export interface DraftInput {
   poll_interval_seconds: number
   stop_grace_period_seconds: number
   environment: {
+    order?: string[]
     public: Array<{ key: string; value: string }>
     secrets: Array<{ key: string } & SecretOperation>
   }
@@ -253,6 +254,7 @@ export interface DraftResponse {
   auto_deploy_enabled: boolean
   poll_interval_seconds: number
   stop_grace_period_seconds: number
+  environment_order?: string[]
   public_environment: Array<{ key: string; value: string }>
   secret_keys: string[]
   files: Array<{ logical_name: string; target_path: string; sensitive: boolean; readonly: boolean; content?: string }>

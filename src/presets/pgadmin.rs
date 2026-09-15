@@ -48,6 +48,7 @@ pub fn render(slug: &str, variables: Variables) -> Result<DraftInput, &'static s
         poll_interval_seconds: crate::domain::default_poll_interval(),
         stop_grace_period_seconds: crate::domain::default_stop_grace_period_seconds(),
         environment: EnvironmentInput {
+            order: None,
             public: vec![
                 PublicEnvInput {
                     key: "PGADMIN_DEFAULT_EMAIL".into(),

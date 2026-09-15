@@ -96,6 +96,7 @@ impl LoadedRevision {
             auto_deploy_enabled,
             poll_interval_seconds,
             stop_grace_period_seconds: self.metadata.stop_grace_period_seconds,
+            environment_order: self.metadata.environment_order.clone(),
             public_environment: self.public_environment.clone(),
             secret_keys: self.metadata.secret_keys.clone(),
             files: self
@@ -150,6 +151,7 @@ impl LoadedRevision {
             poll_interval_seconds,
             stop_grace_period_seconds: self.metadata.stop_grace_period_seconds,
             environment: EnvironmentInput {
+                order: self.metadata.environment_order.clone(),
                 public: self.public_environment.clone(),
                 secrets: self
                     .metadata
@@ -768,6 +770,7 @@ mod tests {
             poll_interval_seconds: 300,
             stop_grace_period_seconds: 10,
             environment: EnvironmentInput {
+                order: None,
                 public: vec![PublicEnvInput {
                     key: "MODE".into(),
                     value: "production".into(),
