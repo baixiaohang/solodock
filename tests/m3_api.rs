@@ -3154,6 +3154,14 @@ async fn postgresql_preset_is_versioned_idempotent_and_never_echoes_password() {
         "postgresql"
     );
 
+    let descriptors: Value = serde_json::from_str(&descriptors).unwrap();
+    assert_eq!(descriptors[0]["default_major"], "18");
+    assert_eq!(descriptors[1]["id"], "pgadmin");
+    assert_eq!(descriptors[1]["schema_version"], 1);
+    assert_eq!(descriptors[1]["default_host_port"], 5050);
+    assert_eq!(descriptors[1]["image"], "dpage/pgadmin4:9.17");
+    assert!(descriptors[1].get("default_database").is_none());
+
     let password = "POSTGRES_PRESET_SECRET_CANARY";
     let request = json!({
         "slug":"postgres",
@@ -3209,6 +3217,186 @@ async fn postgresql_preset_is_versioned_idempotent_and_never_echoes_password() {
     let replay: Value = serde_json::from_str(&replay).unwrap();
     assert_eq!(replay["app"]["id"], created["app"]["id"]);
     assert_eq!(replay["idempotency_replayed"], true);
+}
+
+#[tokio::test]
+async fn pgadmin_preset_persists_internal_network_and_redacts_idempotent_responses() {
+    let harness = Harness::new().await;
+    let password = "PGADMIN_PRESET_SECRET_CANARY";
+    let request = json!({
+        "slug": "pgadmin", "preset_id": "pgadmin", "preset_schema_version": 1,
+        "variables": { "email": "admin@example.com", "password": password, "host_port": 5051 }
+    });
+    let (status, created) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps/from-preset",
+                Some("pgadmin-preset-create"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert!(!created.contains(password));
+    let created: Value = serde_json::from_str(&created).unwrap();
+    let app_id: Uuid = created["app"]["id"].as_str().unwrap().parse().unwrap();
+    let revision: Uuid = created["app"]["config_revision"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let loaded = solodock::app_store::config_revision::load_verified(
+        &harness.store.app_directory(app_id),
+        revision,
+        harness.store.integrity_key().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        harness
+            .store
+            .read_metadata(app_id)
+            .unwrap()
+            .discovery_image_ref
+            .as_deref(),
+        Some("dpage/pgadmin4:9.17")
+    );
+    assert!(loaded.metadata.service_discovery_enabled);
+    assert!(loaded.metadata.owned_default_network);
+    assert_eq!(
+        loaded.secrets.environment["PGADMIN_DEFAULT_PASSWORD"],
+        password
+    );
+    assert!(
+        loaded
+            .public_environment
+            .iter()
+            .all(|entry| !entry.value.contains(password))
+    );
+    for (key, value) in [
+        ("PGADMIN_DEFAULT_EMAIL", "admin@example.com"),
+        ("PGADMIN_LISTEN_PORT", "5050"),
+        ("PGADMIN_DISABLE_POSTFIX", "1"),
+    ] {
+        assert!(
+            loaded
+                .public_environment
+                .iter()
+                .any(|entry| entry.key == key && entry.value == value)
+        );
+    }
+
+    assert!(
+        matches!(&loaded.metadata.volumes[0], solodock::domain::VolumeInput::Owned { target_path, .. } if target_path == "/var/lib/pgadmin")
+    );
+    assert_eq!(loaded.metadata.ports[0].host_ip, "127.0.0.1");
+    assert_eq!(loaded.metadata.ports[0].host_port, 5051);
+    assert_eq!(loaded.metadata.ports[0].container_port, 5050);
+    for route in [format!("/api/v1/apps/{app_id}"), "/api/v1/apps".to_owned()] {
+        let response = harness
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .header(header::HOST, "solodock.example.com")
+                    .header(header::COOKIE, &harness.cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, response) = body(response).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert!(!response.contains(password));
+    }
+    let (status, replay) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps/from-preset",
+                Some("pgadmin-preset-create"),
+                &request,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(!replay.contains(password));
+    let replay: Value = serde_json::from_str(&replay).unwrap();
+    assert_eq!(replay["app"]["id"], created["app"]["id"]);
+    assert_eq!(replay["idempotency_replayed"], true);
+    let mut changed = request.clone();
+    changed["variables"]["password"] = json!("A_DIFFERENT_SECRET_CANARY");
+    let (status, conflict) = body(
+        harness
+            .mutate(
+                "POST",
+                "/api/v1/apps/from-preset",
+                Some("pgadmin-preset-create"),
+                &changed,
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(!conflict.contains("A_DIFFERENT_SECRET_CANARY"));
+}
+
+#[tokio::test]
+async fn pgadmin_preset_rejects_unsupported_or_invalid_requests_without_creation() {
+    let harness = Harness::new().await;
+    let base = json!({
+        "slug": "pgadmin", "preset_id": "pgadmin", "preset_schema_version": 1,
+        "variables": { "email": "admin@example.com", "password": "PGADMIN_SECRET_CANARY", "host_port": 5050 }
+    });
+    for (index, (pointer, value)) in [
+        ("/preset_schema_version", json!(2)),
+        ("/preset_id", json!("postgresql")),
+        ("/variables/email", json!("invalid")),
+        ("/variables/password", json!("short")),
+        ("/variables/host_port", json!(0)),
+        ("/variables/host_port", json!(65536)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut request = base.clone();
+        *request.pointer_mut(pointer).unwrap() = value;
+        let (status, response) = body(
+            harness
+                .mutate(
+                    "POST",
+                    "/api/v1/apps/from-preset",
+                    Some(&format!("pgadmin-invalid-{index}")),
+                    &request,
+                )
+                .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+        assert!(!response.contains("PGADMIN_SECRET_CANARY"));
+    }
+    let mut unknown = base;
+    unknown["variables"]["host_ip"] = json!("0.0.0.0");
+    let response = harness
+        .mutate(
+            "POST",
+            "/api/v1/apps/from-preset",
+            Some("pgadmin-unknown-field"),
+            &unknown,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(
+        harness
+            .store
+            .scan_read_only()
+            .unwrap()
+            .valid_apps
+            .is_empty()
+    );
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@
 
   $: appId = route.match(/^#\/apps\/([0-9a-f-]+)$/)?.[1]
   $: creating = route === '#/apps/new'
-  $: creatingPostgresql = route === '#/apps/new/postgresql'
+  $: creatingPreset = route === '#/apps/new/postgresql' ? 'postgresql' as const : route === '#/apps/new/pgadmin' ? 'pgadmin' as const : null
   $: credentials = route === '#/credentials'
   $: settings = route === '#/settings'
   $: deploymentId = route.match(/^#\/deployments\/([0-9a-f-]+)$/)?.[1]
@@ -45,8 +45,10 @@
       {#key deploymentId}
         <DeploymentDetail {deploymentId} />
       {/key}
-    {:else if creatingPostgresql}
-      <PresetNewApp />
+    {:else if creatingPreset}
+      {#key creatingPreset}
+        <PresetNewApp presetId={creatingPreset} />
+      {/key}
     {:else if creating}
       <NewApp />
     {:else if appId}

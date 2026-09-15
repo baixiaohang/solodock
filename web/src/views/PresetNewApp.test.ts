@@ -250,3 +250,62 @@ describe('PostgreSQL quick deploy', () => {
     expect(JSON.parse(deploymentBodies[0]).acknowledge_non_rollbackable_data).toBe(true)
   })
 })
+
+describe('pgAdmin quick deploy', () => {
+  it('shows internal connection guidance and requires saved credentials and storage consent', async () => {
+    stubCrypto()
+    const fetch = vi.fn()
+    vi.stubGlobal('fetch', fetch)
+    render(PresetNewApp, { presetId: 'pgadmin' })
+    const user = userEvent.setup()
+    expect(screen.getByRole('heading', { name: 'pgAdmin' })).toBeTruthy()
+    expect(screen.getByText(/Host 填 PostgreSQL 服务 slug/)).toBeTruthy()
+    expect(screen.getByText(/127.0.0.1:5050/)).toBeTruthy()
+    expect(screen.queryByLabelText('数据库')).toBeNull()
+    const submit = screen.getByRole('button', { name: '创建并部署' }) as HTMLButtonElement
+    expect(submit.disabled).toBe(true)
+    await user.click(screen.getByRole('checkbox', { name: /pgAdmin 设置不会随部署或回滚恢复/ }))
+    expect(submit.disabled).toBe(true)
+    const saved = screen.getByRole('checkbox', { name: /保存生成的 pgAdmin 密码/ }) as HTMLInputElement
+    await user.click(saved)
+    expect(submit.disabled).toBe(false)
+    await user.type(screen.getByLabelText(/自动生成密码/), 'x')
+    expect(saved.checked).toBe(false)
+    expect(submit.disabled).toBe(true)
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('retries an uncertain pgAdmin creation and preserves recovery after deployment failure', async () => {
+    stubCrypto()
+    const requests: Array<{ key: string | null; body: Record<string, unknown> }> = []
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.endsWith('/apps/from-preset')) {
+        requests.push({ key: new Headers(init?.headers).get('Idempotency-Key'), body: JSON.parse(String(init?.body)) })
+        if (requests.length === 1) throw new TypeError('response lost')
+        return new Response(JSON.stringify({ app: { id: '00000000-0000-4000-8000-000000000061' } }), { status: 201 })
+      }
+      if (url.endsWith('/apps/00000000-0000-4000-8000-000000000061')) {
+        return new Response(JSON.stringify({ draft_revision: '00000000-0000-4000-8000-000000000062', active_release: null, pending_release_id: null, actual_release_id: null, actual: null }))
+      }
+      if (url.endsWith('/deployments')) throw new TypeError('deployment response lost')
+      throw new Error(`unexpected request: ${url}`)
+    })
+    vi.stubGlobal('fetch', fetch)
+    render(PresetNewApp, { presetId: 'pgadmin' })
+    const user = userEvent.setup()
+    await user.type(screen.getByLabelText('登录邮箱'), 'admin@example.com')
+    await user.clear(screen.getByLabelText('宿主端口'))
+    await user.type(screen.getByLabelText('宿主端口'), '5051')
+    await user.click(screen.getByRole('checkbox', { name: /pgAdmin 设置不会随部署或回滚恢复/ }))
+    await user.click(screen.getByRole('checkbox', { name: /保存生成的 pgAdmin 密码/ }))
+    await user.click(screen.getByRole('button', { name: '创建并部署' }))
+    expect(await screen.findByText(/创建失败/)).toBeTruthy()
+    await user.click(screen.getByRole('button', { name: '创建并部署' }))
+    expect(await screen.findByText(/生成的密码不会再次显示/)).toBeTruthy()
+    expect(requests[1]).toEqual(requests[0])
+    expect(requests[0].body).toEqual({ slug: 'pgadmin', preset_id: 'pgadmin', preset_schema_version: 1, variables: { email: 'admin@example.com', password: expect.any(String), host_port: 5051 } })
+    expect(screen.queryByLabelText(/自动生成密码/)).toBeNull()
+    expect(screen.getByRole('link', { name: '进入服务详情' }).getAttribute('href')).toBe('#/apps/00000000-0000-4000-8000-000000000061')
+  })
+})

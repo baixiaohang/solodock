@@ -70,6 +70,8 @@ terminal replay record 通常在 24 小时后过期，但清理是低频 service
 
 `GET /api/v1/app-presets` 只返回版本化公开 descriptor；`POST /api/v1/apps/from-preset` 以 write-only 变量生成正常 revision。PostgreSQL v1 支持 major 18/17，分别挂载 `/var/lib/postgresql` 与 `/var/lib/postgresql/data`，不使用 `latest`，且 response 不回显密码。Web 随后以独立稳定幂等键调用现有 deployment mutation；创建成功而部署失败时保留可恢复应用。
 
+pgAdmin v1 使用 `preset_id: "pgadmin"`、`preset_schema_version: 1` 和 `variables: {"email": "admin@example.com", "password": "<16–256 字节>", "host_port": 5050}`。公开 descriptor 包含 `image` 和 `default_host_port`；PostgreSQL 专用默认字段仍仅出现在 PostgreSQL descriptor 中。模板固定使用 `dpage/pgadmin4:9.17`，仅发布 `127.0.0.1:<host_port>:5050/tcp`，并启用服务发现。密码沿用现有受管 secret 流程，绝不回显。未知变量、无效邮箱/端口/密码和不支持的模板/schema 组合均被拒绝。
+
 `POST /api/v1/images/inspect-config` 复用 Registry credential 与 manifest resolver，验证 config blob digest/大小/media type，只投影 exposed ports、volume targets、healthcheck presence、user 和 stop signal。Web 通过统一的 JSON/CSRF mutation helper 发起这个只读 POST，并原样提交当前选择的 credential reference；它不需要 durable idempotency ledger。API 不返回 image Env、labels、entrypoint/command，不写 revision；用户明确采用建议后仍走正常 draft mutation。
 
 应用详情返回版本化 naming helper 基于不可变 slug 和 UUID 生成的 resource name，并把依据实际 release identity 选择的 immutable expected network plan、expected owned identity、Docker actual driver/bridge 和 container attachment 分开展示。实际 attachment name 集不相等时报告 `NETWORK_ATTACHMENT_MISMATCH`；driver 或显式 bridge option 不一致时报告 `NETWORK_BRIDGE_IDENTITY_MISMATCH`；external attachment 缺少任一期望 alias 时报告 `NETWORK_ALIAS_MISMATCH`。不完整 inspect 不伪造 mismatch，而使 observation 保持 incomplete。

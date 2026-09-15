@@ -1,6 +1,15 @@
 import type { Messages } from './en'
 
 export const zhCN = {
+  "pgAdmin with persistent settings and internal access to PostgreSQL services.": "持久保存 pgAdmin 设置，并通过内部网络连接 PostgreSQL 服务。",
+  "Confirm both pgAdmin safety acknowledgements before creating the service.": "创建服务前，请完成两项 pgAdmin 安全确认。",
+  "Open pgAdmin on the SoloDock host at http://127.0.0.1:{port}, or forward that port over SSH for remote access.": "在 SoloDock 宿主机访问 http://127.0.0.1:{port}，远程访问请通过 SSH 转发该端口。",
+  "In pgAdmin, register a server using the PostgreSQL service slug as Host, port 5432, and its database name, username and password. Both services must have service discovery enabled in their deployed configuration; enable it and redeploy older services if needed.": "在 pgAdmin 中注册服务器：Host 填 PostgreSQL 服务 slug，端口填 5432，并填写对应的数据库名、用户名和密码。两边的已部署配置都须启用服务发现；旧服务如未启用，请修改后重新部署。",
+  "Login email": "登录邮箱",
+  "The pgAdmin login is separate from your PostgreSQL credentials. Initial credentials apply only to an empty pgAdmin volume; change an existing password inside pgAdmin.": "pgAdmin 登录账号与 PostgreSQL 凭据相互独立。初始凭据仅用于空的 pgAdmin 数据卷；已有账号请在 pgAdmin 内修改密码。",
+  "I understand that pgAdmin settings in the named volume do not roll back with a deployment or rollback": "我了解命名卷中的 pgAdmin 设置不会随部署或回滚恢复",
+  "I saved the generated pgAdmin password outside SoloDock": "我已在 SoloDock 之外保存生成的 pgAdmin 密码",
+
   "Automatic version cleanup": "自动版本清理",
   "Keep the active version and the most recently successful versions. Pending and recovery versions are protected in addition. Enabling also cleans existing old releases and their unused local images.": "保留当前版本与最近成功上线的版本，额外保护待部署和恢复所需的版本。启用后也会清理已有旧发布及其无引用的本机镜像。",
   "Automatically clean old versions": "自动清理旧版本",

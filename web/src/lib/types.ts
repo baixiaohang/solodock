@@ -306,7 +306,7 @@ export interface AppMutationResponse {
 }
 
 export interface ImageConfigSuggestion { resolved_digest: string; exposed_ports: Array<{ container_port: number; protocol: 'tcp' | 'udp' }>; volume_targets: string[]; has_healthcheck: boolean; user: string | null; stop_signal: string | null; warnings: string[] }
-export interface AppPresetDescriptor { id: string; schema_version: number; display_name: string; description: string; default_major: string; supported_majors: string[]; default_username: string; default_database: string; password_generated_by_client: boolean }
+export interface AppPresetDescriptor { id: string; schema_version: number; display_name: string; description: string; default_major?: string; supported_majors?: string[]; default_username?: string; default_database?: string; default_host_port?: number; image?: string; password_generated_by_client: boolean }
 
 export interface AppListItem {
   id: string

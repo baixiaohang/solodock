@@ -1,4 +1,13 @@
 export const en = {
+  "pgAdmin with persistent settings and internal access to PostgreSQL services.": "pgAdmin with persistent settings and internal access to PostgreSQL services.",
+  "Confirm both pgAdmin safety acknowledgements before creating the service.": "Confirm both pgAdmin safety acknowledgements before creating the service.",
+  "Open pgAdmin on the SoloDock host at http://127.0.0.1:{port}, or forward that port over SSH for remote access.": "Open pgAdmin on the SoloDock host at http://127.0.0.1:{port}, or forward that port over SSH for remote access.",
+  "In pgAdmin, register a server using the PostgreSQL service slug as Host, port 5432, and its database name, username and password. Both services must have service discovery enabled in their deployed configuration; enable it and redeploy older services if needed.": "In pgAdmin, register a server using the PostgreSQL service slug as Host, port 5432, and its database name, username and password. Both services must have service discovery enabled in their deployed configuration; enable it and redeploy older services if needed.",
+  "Login email": "Login email",
+  "The pgAdmin login is separate from your PostgreSQL credentials. Initial credentials apply only to an empty pgAdmin volume; change an existing password inside pgAdmin.": "The pgAdmin login is separate from your PostgreSQL credentials. Initial credentials apply only to an empty pgAdmin volume; change an existing password inside pgAdmin.",
+  "I understand that pgAdmin settings in the named volume do not roll back with a deployment or rollback": "I understand that pgAdmin settings in the named volume do not roll back with a deployment or rollback",
+  "I saved the generated pgAdmin password outside SoloDock": "I saved the generated pgAdmin password outside SoloDock",
+
   "Automatic version cleanup": "Automatic version cleanup",
   "Keep the active version and the most recently successful versions. Pending and recovery versions are protected in addition. Enabling also cleans existing old releases and their unused local images.": "Keep the active version and the most recently successful versions. Pending and recovery versions are protected in addition. Enabling also cleans existing old releases and their unused local images.",
   "Automatically clean old versions": "Automatically clean old versions",

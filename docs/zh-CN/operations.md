@@ -142,6 +142,17 @@ PostgreSQL 快速部署默认使用 major 18 和 `/var/lib/postgresql` owned vol
 
 Web UI 可在 bootstrap/login 页面和登录后的 header 中切换 English 与简体中文。SoloDock 只在浏览器 `localStorage` 的版本化非敏感 key `solodock.ui.locale.v1` 中保存显式选择，不把 locale 写入 API、session、audit、URL、SQLite 或 server settings。没有有效已存值时，浏览器第一偏好语言为 `zh` 或 `zh-*` 才选择 `zh-CN`，其他情况使用 English；storage 不可用或值非法时会安全回退，不阻塞 UI。切换会立即更新可见文案、本地化时间、可访问性标签和 document `lang` 属性。
 
+
+### pgAdmin 快速部署
+
+选择 **新建服务 → 快速部署 → pgAdmin**，填写登录邮箱及可用宿主端口（默认 `5050`），保存生成的密码并确认持久化存储行为。模板使用 `dpage/pgadmin4:9.17`，owned volume 挂载至 `/var/lib/pgadmin`。初始凭据仅初始化空卷；已有账号请在 pgAdmin 内修改密码。容器邮件投递默认关闭，密码重置邮件需要另行配置外部 SMTP。配置依据为 [pgAdmin 官方容器文档](https://www.pgadmin.org/docs/pgadmin4/9.17/container_deployment.html)。
+
+在 SoloDock 宿主机打开 `http://127.0.0.1:5050`（按所选端口替换）。远程访问可使用 `ssh -L 5050:127.0.0.1:5050 user@host` 转发后在本机打开该地址。模板只绑定 loopback。
+
+在 pgAdmin 选择 **Register → Server**，为连接命名，在 **Host name/address** 填 PostgreSQL 服务 slug（例如 `postgres`），**Port** 填 `5432`（或配置的容器端口），**Maintenance database** 填数据库名，**Username/Password** 填 PostgreSQL 凭据。pgAdmin 登录账号与数据库凭据相互独立，无需发布数据库宿主端口。
+
+两边的已部署配置均须启用服务发现。旧 PostgreSQL 应用如未启用，请在网络设置启用并保存、部署后连接。此方式使用现有内部信任域，不绕过 PostgreSQL 认证或服务端访问规则。pgAdmin 设置和保存的连接持久化在卷中，不随发布回滚。
+
 ## 备份
 
 停止服务后执行：
